@@ -16,7 +16,7 @@ PR content/comments --untrusted--> Codex/ChatGPT reviewer
 Repository files   --untrusted--> Codex implementer
 GitHub bot markers --validated--> Local phase orchestrator
 Local gh identity  --trusted dispatcher--> GitHub workflow_dispatch
-GitHub Actions      --trusted controller--> branch and status
+GitHub Actions      --trusted controller--> PR labels, comments and status
 CI evidence         --trusted when re-queried and bound to SHA--> phase gate
 External C2/MCP     --untrusted until approved/bound--> Adapter
 ```
@@ -26,7 +26,7 @@ External C2/MCP     --untrusted until approved/bound--> Adapter
 | Threat | Control |
 |---|---|
 | PR/Source prompt injection | Reviewer/implementer prompts treat repository content as data; protected governance files; sanitize structured requests |
-| Codex changes tests/spec to pass | Protected path diff check; branch protection; independent review |
+| Codex changes tests/spec to pass | Base-branch protected-path checker; checker self-protection; separate governance PR; independent review; manual SHA-bound merge checklist |
 | Forged PASS comment | Local schema validation; gate actor check; reviewer permalink lookup; reviewer login, head SHA, phase base and actual Check Run revalidation |
 | Forged implementation/ready marker | Local orchestrator accepts only `github-actions[bot]`, exact current phase and exact current HEAD SHA |
 | Stale review applied to new code | Exact 40-char `reviewed_sha == PR head.sha` |
@@ -40,13 +40,21 @@ External C2/MCP     --untrusted until approved/bound--> Adapter
 | Phase gate bypass | Ordered phase plan; label/current phase match; prior PASS marker; required Check Runs queried from GitHub |
 | Real offensive action from CI | No external credentials; Mock/Test servers; Human Gate for Phase 4/5 |
 | Secret in logs/artifacts | Reference-only prompts; redaction; no raw output upload |
-| Workflow supply-chain change | Pin third-party actions by commit SHA in production; CODEOWNERS for `.github/` |
+| Workflow supply-chain change | Pin third-party actions by commit SHA in production; advisory CODEOWNERS routing; separate human-reviewed governance PR |
 
 ## Residual Risk
 
 - An LLM reviewer can miss a flaw even with independent context.
-- A compromised GitHub account with repository administration can change protection rules.
+- Branch protection and rulesets are unavailable on the current private-repository plan. Required
+  reviews, checks, conversation resolution, and direct/force-push prohibitions are manual controls
+  and are not enforced by GitHub.
+- A compromised write-capable GitHub account can direct-push or merge without completing the
+  manual checklist. Human error can also apply evidence to the wrong SHA.
+- A compromised GitHub account with repository administration can change repository controls.
 - GitHub-hosted runner egress is broader than a dedicated isolated runner unless organization controls restrict it.
 - Phase 4/5 vendor behavior may differ from mocks and requires isolated integration testing.
 
-These risks are why deterministic CI, independent review, phase gates, Human Gate, and final human merge are all retained.
+The repository owner explicitly accepts the current manual-control residual risk. Deterministic
+CI, independent SHA-bound review, phase gates, Human Gate, recorded merge evidence, and final human
+merge are all retained. Server-enforced branch protection should replace the manual boundary when
+the repository plan supports it.

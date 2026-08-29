@@ -20,8 +20,8 @@ GitHub comments, labels and checks preserve the state for a later restart.
 ## One-time repository setup
 
 1. Put the governance/bootstrap changes on a dedicated pull request created with only the
-   `governance-change` label. Review and merge it manually before enabling the branch-protection
-   rules below. This first merge is not a Phase 0A PASS.
+   `governance-change` label. Review and merge it manually before starting the loop. This first
+   merge is not a Phase 0A PASS.
 2. Reauthenticate GitHub CLI if necessary and confirm the active identity:
 
    ```bash
@@ -57,9 +57,23 @@ GitHub comments, labels and checks preserve the state for a later restart.
 7. Set the GitHub Actions spending limit to zero if use beyond the included private-repository
    quota must be prevented.
 
-## Branch protection for `main`
+## Repository control mode: manual merge
 
-Require a pull request and these checks:
+This private repository's current GitHub plan does not expose branch protection or repository
+rulesets. Do not create an empty ruleset. The controls in this section are therefore mandatory
+operator procedure, not server-enforced protection. This is an explicitly accepted residual risk
+and is weaker than GitHub-enforced branch protection.
+
+Neither GitHub Actions nor Codex may merge, push directly to `main`, force-push, delete `main`, or
+receive a merge bypass. `CODEOWNERS` identifies the human reviewer but cannot require that review
+on the current plan. Repository collaborators must make every change through a pull request.
+
+Immediately before every governance or implementation merge, the human operator must:
+
+1. Copy the pull request's current full 40-character head SHA and confirm it is still current.
+2. Confirm an implementation PR has no governance-controlled paths. A PR that intentionally
+   changes those paths must have only the `governance-change` control label, not `ai-loop`.
+3. Confirm the following exact checks are successful for that head SHA:
 
 - `tests (3.12)`
 - `tests (3.14)`
@@ -67,9 +81,17 @@ Require a pull request and these checks:
 - `governance-integrity`
 - `redteam/phase-review`
 
-Also require CODEOWNERS review, dismiss stale approvals, require conversation resolution, and block
-force pushes and deletion. Neither GitHub Actions nor Codex may bypass protection or merge pull
-requests.
+4. Confirm the Codex review and `redteam/phase-review` evidence refer to the same current head SHA.
+5. Resolve all review conversations and inspect the complete final diff.
+6. Add a PR comment recording the reviewed head SHA, the five successful checks, the review
+   permalink, and whether governance-controlled paths changed.
+7. Merge through the GitHub pull request UI as the human operator. Never use a direct push,
+   force-push, automated merge, or command-line bypass to update `main`.
+
+If GitHub branch protection or rulesets later become available, configure the pull-request,
+CODEOWNERS, stale-review, conversation-resolution, force-push/deletion, and five exact status-check
+requirements before treating them as server-enforced. Keep this manual checklist until the active
+rules are independently verified.
 
 ## Create the Phase 0A pull request
 

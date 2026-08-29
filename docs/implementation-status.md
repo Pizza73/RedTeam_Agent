@@ -14,9 +14,15 @@ Review baseline:
 - Current branch coverage: 84%
 - Current phase gate: automation validation and Ruff PASS; Mypy FAIL with 40 errors in 16 files
 - Git repository: initialized and connected to the private GitHub repository
-- Governance input revision: `21be5c06e70b7e8bc5c8184af363d1cf88d61802`
-- AI loop controls: local phase orchestrator implemented without OpenAI API; pending governance PR,
-  valid `gh` authentication, ChatGPT/Codex GitHub connection and repository-variable setup
+- Governance input revision: `66e86918e19a1304334e872ed62c0ffc489c9c44`
+- AI loop controls: governance bootstrap PR merged; local phase orchestrator implemented without
+  OpenAI API; `AI_GATE_APPROVER_LOGIN`, `AI_REVIEWER_LOGIN`, and iteration limit configured;
+  label bootstrap and the long-lived Phase 0A pull request remain pending
+- Repository control mode: the current private-repository plan does not expose branch protection
+  or rulesets; direct/force pushes and automated merges are prohibited by manual governance but
+  are not server-enforced
+- Phase 0A fix candidate: `94f6a2d` on `ai/redteam-agent-build`; the independent SHA-bound Phase 0A
+  review is still required before Phase 0B
 - Review identity: all new implementation and review results must be bound to the pull request HEAD SHA
 - BLOCKER: 6
 - HIGH: 7

@@ -28,6 +28,7 @@ def test_regular_implementation_change_is_allowed() -> None:
         "docs/ai-loop-runbook.md",
         "docs/safety-invariants.md",
         "prompts/phases/phase-0a-security-fix.md",
+        "scripts/ci/check_governance.py",
         "scripts/ci/run_phase_gate.sh",
         "scripts/ci/validate_automation.py",
         "pyproject.toml",
@@ -51,6 +52,10 @@ def test_explicit_human_governance_pull_request_is_allowed() -> None:
     assert result.protected_paths == (
         ".github/workflows/ci.yml",
         "docs/ai-development-loop.md",
+    )
+    assert result.reason == (
+        "explicit governance-change pull request; manual owner review is required "
+        "but not server-enforced"
     )
 
 

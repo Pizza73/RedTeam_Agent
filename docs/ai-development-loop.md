@@ -14,8 +14,26 @@ state, so terminating the local process pauses polling without losing phase prog
 
 A `governance-change` PR is not a phase implementation and does not receive an AI phase verdict.
 CI runs the complete test suite plus control-file validation and marks `redteam/phase-review` as
-not applicable only after those deterministic jobs succeed; CODEOWNERS human review is still
-required. An `ai-loop` PR always runs the complete current-phase gate, including Mypy and coverage.
+not applicable only after those deterministic jobs succeed. A human owner review is still a
+mandatory operator step, although the current GitHub plan does not enforce `CODEOWNERS`. An
+`ai-loop` PR always runs the complete current-phase gate, including Mypy and coverage.
+
+## Repository enforcement boundary
+
+The private repository's current plan does not provide branch protection or repository rulesets.
+No empty ruleset is created. Pull-request-only changes, human owner review, conversation
+resolution, direct-push prohibition, force-push/deletion prohibition and required checks are
+governance requirements, but GitHub does not currently enforce them at the branch boundary.
+
+The local orchestrator, GitHub Actions and Codex never merge or push to `main`. Before a human
+merge, the operator must bind the decision to the current 40-character PR head SHA, verify the
+complete final diff and all five required checks, verify the current SHA-bound Codex review and
+`redteam/phase-review` result, record that evidence on the PR, and merge only through the GitHub UI.
+The runbook contains the exact checklist. Direct and force pushes to `main` remain prohibited.
+
+This manual control has a greater account-compromise and operator-error risk than server-enforced
+protection. When the repository plan supports protection, the same requirements must be configured
+and independently verified before the control is described as enforced.
 
 There is no deployment workflow in Phase 0A through Phase 3. Phase 4 and Phase 5 remain behind
 provider-specific Human Gates and CI never connects to a real C2, MCP server or target.
@@ -29,7 +47,7 @@ provider-specific Human Gates and CI never connects to a real C2, MCP server or 
 | Codex GitHub Review or ChatGPT | Fresh-context semantic/security review | PR review/comment only |
 | CI | Tests, lint, type check, coverage and protected-path enforcement | Check results and ready comment |
 | Record AI Phase Review | Revalidate reviewer identity, review SHA, base SHA and actual checks | PR labels/comments/status |
-| Human | Start/restart local orchestration, approve Phase 4/5 and final merge | Explicit approval only |
+| Human | Start/restart local orchestration, verify manual merge evidence, approve Phase 4/5 and final merge | Explicit approval and GitHub UI merge only |
 
 The implementer and reviewer must use separate runs and contexts. A review result is evidence only
 when its GitHub permalink resolves to content authored by `AI_REVIEWER_LOGIN` and it is bound to the
