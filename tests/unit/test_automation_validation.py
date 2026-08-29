@@ -1,0 +1,53 @@
+from __future__ import annotations
+
+import json
+import shutil
+from pathlib import Path
+
+import pytest
+
+from scripts.ci.validate_automation import (
+    AutomationValidationError,
+    strict_json_load,
+    validate_automation,
+)
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_repository_automation_configuration_is_valid() -> None:
+    validate_automation(REPO_ROOT)
+
+
+def test_nested_duplicate_json_key_is_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "duplicate.json"
+    path.write_text('{"outer":{"phase":"phase-0a","phase":"phase-1"}}', encoding="utf-8")
+
+    with pytest.raises(AutomationValidationError, match="duplicate JSON key"):
+        strict_json_load(path)
+
+
+def test_unknown_phase_plan_field_is_rejected(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    shutil.copytree(REPO_ROOT / "automation", repo / "automation")
+    shutil.copytree(REPO_ROOT / "prompts", repo / "prompts")
+    plan_path = repo / "automation" / "phase-plan.json"
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    plan["unexpected"] = True
+    plan_path.write_text(json.dumps(plan), encoding="utf-8")
+
+    with pytest.raises(AutomationValidationError, match="schema validation failed"):
+        validate_automation(repo)
+
+
+def test_approved_but_incomplete_provider_gate_is_rejected(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    shutil.copytree(REPO_ROOT / "automation", repo / "automation")
+    shutil.copytree(REPO_ROOT / "prompts", repo / "prompts")
+    gates_path = repo / "automation" / "provider-gates.json"
+    gates = json.loads(gates_path.read_text(encoding="utf-8"))
+    gates["phase-4"]["approved"] = True
+    gates_path.write_text(json.dumps(gates), encoding="utf-8")
+
+    with pytest.raises(AutomationValidationError, match="approved provider gate is incomplete"):
+        validate_automation(repo)

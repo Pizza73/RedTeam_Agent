@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/redteam-agent/review-result.schema.json",
+  "title": "RedTeam Agent Independent Review Result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "phase",
+    "reviewed_sha",
+    "base_sha",
+    "verdict",
+    "summary",
+    "findings",
+    "required_checks"
+  ],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "phase": {"pattern": "^phase-(0a|0b|0c|[1-5])$", "type": "string"},
+    "reviewed_sha": {"pattern": "^[0-9a-f]{40}$", "type": "string"},
+    "base_sha": {"pattern": "^[0-9a-f]{40}$", "type": "string"},
+    "verdict": {"enum": ["PASS", "CHANGES_REQUESTED", "BLOCKED"]},
+    "summary": {"minLength": 1, "type": "string"},
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "severity", "requirement_id", "evidence", "required_fix", "retest"],
+        "properties": {
+          "id": {"pattern": "^[A-Z][A-Z0-9-]+$", "type": "string"},
+          "severity": {"enum": ["BLOCKER", "HIGH", "MEDIUM", "LOW"]},
+          "requirement_id": {"minLength": 1, "type": "string"},
+          "evidence": {"minLength": 1, "type": "string"},
+          "required_fix": {"minLength": 1, "type": "string"},
+          "retest": {"type": "array", "items": {"type": "string"}, "minItems": 1}
+        }
+      }
+    },
+    "required_checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "status"],
+        "properties": {
+          "name": {"type": "string"},
+          "status": {"enum": ["PASS", "FAIL", "MISSING"]}
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"verdict": {"const": "PASS"}}},
+      "then": {"properties": {"findings": {"maxItems": 0}}}
+    },
+    {
+      "if": {"properties": {"verdict": {"const": "CHANGES_REQUESTED"}}},
+      "then": {"properties": {"findings": {"minItems": 1}}}
+    }
+  ]
+}

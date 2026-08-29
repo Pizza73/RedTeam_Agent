@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/redteam-agent/provider-gates.schema.json",
+  "title": "RedTeam Agent Provider Gates",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "phase-4", "phase-5"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "phase-4": {"$ref": "#/$defs/phase4"},
+    "phase-5": {"$ref": "#/$defs/phase5"}
+  },
+  "$defs": {
+    "nullableString": {"type": ["string", "null"]},
+    "phase4": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "approved", "provider_product", "provider_version", "isolated_lab_reference",
+        "credential_reference_name", "egress_policy_reference", "approved_by", "approved_at"
+      ],
+      "properties": {
+        "approved": {"type": "boolean"},
+        "provider_product": {"$ref": "#/$defs/nullableString"},
+        "provider_version": {"$ref": "#/$defs/nullableString"},
+        "isolated_lab_reference": {"$ref": "#/$defs/nullableString"},
+        "credential_reference_name": {"$ref": "#/$defs/nullableString"},
+        "egress_policy_reference": {"$ref": "#/$defs/nullableString"},
+        "approved_by": {"$ref": "#/$defs/nullableString"},
+        "approved_at": {"$ref": "#/$defs/nullableString"}
+      }
+    },
+    "phase5": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "approved", "mcp_server_name", "protocol_revision",
+        "transport_identity_policy_reference", "execution_location_class",
+        "trust_policy_reference", "approved_by", "approved_at"
+      ],
+      "properties": {
+        "approved": {"type": "boolean"},
+        "mcp_server_name": {"$ref": "#/$defs/nullableString"},
+        "protocol_revision": {"$ref": "#/$defs/nullableString"},
+        "transport_identity_policy_reference": {"$ref": "#/$defs/nullableString"},
+        "execution_location_class": {"$ref": "#/$defs/nullableString"},
+        "trust_policy_reference": {"$ref": "#/$defs/nullableString"},
+        "approved_by": {"$ref": "#/$defs/nullableString"},
+        "approved_at": {"$ref": "#/$defs/nullableString"}
+      }
+    }
+  }
+}
