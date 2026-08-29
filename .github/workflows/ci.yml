@@ -61,7 +61,21 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.lock
           python -m pip install -e . --no-deps
-      - name: Run tests
+      - name: Run governance bootstrap tests
+        if: >-
+          contains(github.event.pull_request.labels.*.name, 'governance-change') &&
+          !contains(github.event.pull_request.labels.*.name, 'ai-loop')
+        shell: bash
+        run: |
+          python -m pytest -q \
+            tests/unit/test_automation_validation.py \
+            tests/unit/test_governance_check.py \
+            tests/unit/test_phase_loop.py \
+            --strict-markers
+      - name: Run application tests
+        if: >-
+          !contains(github.event.pull_request.labels.*.name, 'governance-change') ||
+          contains(github.event.pull_request.labels.*.name, 'ai-loop')
         shell: bash
         run: |
           python -m pytest -q tests/unit --strict-markers
