@@ -6,7 +6,7 @@
 
 修正後は、Planner/CallerがPolicyDecisionをGateへObjectとして注入できず、Gateは永続化済みPlan ID / PolicyDecision IDからTrusted Repositoryを参照する。Mission、Policy、Registry、Session、Adapter、Sandbox、Remote Trust、Available Toolのcurrent値は、timestamp推測ではなく明示的な`AuthorizationRuntimeBinding`から取得する。GateはPolicy Engineの評価を同じTrusted Inputから再実行し、Target Set、Risk、Side Effect、Approval Requirement、Adapter、Data Accessを含むDecision完全性を比較する。
 
-既存Testを削除せず、Gate ReviewのNegative Probeを正式なRegression Testへ追加した。2026-08-30の正式Phase GateではUnit 60、Integration 4、Security 107、合計171件がすべてPASSし、Ruff、Mypy、Coverage、Automation Validation、dependency checkもPASSした。
+既存Testを削除せず、Gate ReviewのNegative Probeを正式なRegression Testへ追加した。2026-08-30の正式Phase GateではUnit 61、Integration 4、Security 109、合計174件がすべてPASSし、Ruff、Mypy、Coverage、Automation Validation、dependency checkもPASSした。
 
 ## 2. Fixed Findings
 
@@ -25,7 +25,7 @@
 | H-05 | FIXED | Mission Revision public lookupを`get(mission_id, mission_revision)`の複合Keyへ統一 | `repositories/mission.py::MissionRevisionRepository.get` | `test_gate_review_regressions.py::test_mission_revision_repository_requires_composite_key` |
 | H-06 | FIXED | Review-only probesを正式Security Regressionへ移し、既存Testを維持 | `tests/security/test_gate_review_regressions.py`、`test_approval_and_context_regressions.py`、更新済みMission/Context/Policy tests | Security 107 PASS |
 
-H-07（Git Revision Traceability）はFIXEDである。Repositoryの現在の基準commitは`21be5c06e70b7e8bc5c8184af363d1cf88d61802`、branchは`main`である。Phase 0Aの実装・自動化・governance変更は未commitのdirty working treeとして明示的に保持されており、独立reviewはcommit/push後の新しいPR HEAD SHAに固定して実施する。本作業ではcommit、push、merge、履歴操作を実施していない。
+H-07（Git Revision Traceability）は再修正済みである。独立レビュー入力はPR #3のcommit `fb3e2e8947e0402fa55ca1520ee71f9ad24367e3`、Phase baseは`2e50db4dbcc127d87237c212b909edb499c1bd34`、branchは`ai/redteam-agent-phase-loop`である。Codex reviewとP1 inline findingはいずれも同じinput review SHAへ固定された。P1修正後の新しいPR HEADは、このレポート内に自己参照SHAとして埋め込まず、GitHubのreview `commit_id`、PR head SHA、phase-review checkへ外部証跡として固定する。
 
 ## 3. Modified Files
 
@@ -54,7 +54,13 @@ H-07（Git Revision Traceability）はFIXEDである。Repositoryの現在の基
 
 - New: `tests/security/test_gate_review_regressions.py`
 - New: `tests/security/test_approval_and_context_regressions.py`
+- New: `tests/security/test_review_evidence.py`
 - Updated: integration flow、Mission、Context、Policy/Gate、Snapshot、Tool Availability、Remote MCP Trust、TTL、shared helpers
+
+### Independent review remediation
+
+- Updated: `docs/review/phase-0a-fix-report.md`
+- Added: `tests/security/test_review_evidence.py`
 
 ## 4. Architecture Changes
 
@@ -131,6 +137,7 @@ Fresh databaseはMigration 1→2を適用する。既存Phase 0A v1 schemaから
 - Sandbox: 別Runtime capability拒否
 - Runtime current selection: newer timestamp snapshotを暗黙選択しない
 - Migration: v1→v2 upgrade
+- Revision evidence: Phase 0A reportのinput review SHA、phase base、reviewed branchを固定し、旧dirty-tree証跡の再混入を拒否
 
 ## 7. Existing Tests
 
@@ -155,10 +162,10 @@ PATH=/home/kali/Red_Agent/.venv/bin:$PATH \
 AUTOMATION_VALIDATION=PASS
 Ruff: PASS
 Mypy: Success: no issues found in 61 source files
-Unit: 60 passed
+Unit: 61 passed
 Integration: 4 passed
-Security: 107 passed
-Full coverage run: 171 passed
+Security: 109 passed
+Full coverage run: 174 passed
 Dependency check: No broken requirements found
 PHASE_GATE=phase-0a PASS
 ```
@@ -174,6 +181,8 @@ Pydantic 2.13.4
 pytest 9.1.1
 jsonschema 4.26.0
 ```
+
+P1 remediation後の最初の同一Gate実行は、追加test fileのimport blockに対するRuff `I001`でFAILした。空行のみを修正後、同じ`bash scripts/ci/run_phase_gate.sh phase-0a`を再実行してPASSし、最終report更新後にも同じcommandを再実行して上記174件PASSを確認した。Security test、requirement、acceptance criterionの削除・緩和・skipはない。
 
 ## 9. Lint / Type / Coverage
 
@@ -193,8 +202,8 @@ jsonschema 4.26.0
 - M-03 polymorphic `data_access_grants` parentのDB FKはSQLite schema上未追加。Repository envelope/child exact-matchとprovenance-controlled serviceでFail Closedする。
 - M-05 concurrent commit-after-response retryの完全なfault injectionは未追加。Deterministic ID、unique constraint、idempotent immutable insertは維持。
 - L-01 PostgreSQL用Protocol/Unit of Workは未実装。
-- 独立review verdictは未取得。実装GateのPASSを、SHA固定の独立Phase 0A PASSとして扱ってはならない。
-- GitHub automation/governance filesはworking treeに存在するが未commit・未pushであり、GitHub上のAI loopはまだ起動していない。
+- 独立reviewはinput SHA `fb3e2e8947e0402fa55ca1520ee71f9ad24367e3`へP1を1件記録した。このP1修正を含む新しいPR HEADに対する再reviewがPASSするまでは、SHA固定の独立Phase 0A PASSとして扱ってはならない。
+- GitHub AI loopの標準Codex reviewは起動済みだが、reviewer loginとmachine-readable verdict形式を現在のfail-closed parserが受理できるかは未解決である。
 
 上記にBLOCKER B-01〜B-06またはHIGH H-01〜H-06の未修正はない。
 
@@ -241,12 +250,13 @@ B-01〜B-06とH-01〜H-07はSource Evidenceと実行済みRegression Testの両�
 | Item | Value |
 |---|---|
 | Prior independent review identity | `snapshot_sha256=3a7fae9806d473ca6e180fcf9e950df52f69d56f72e3fa5e46406a44132e2c9a` |
-| Current base commit | `21be5c06e70b7e8bc5c8184af363d1cf88d61802` |
-| Branch | `main` |
-| Working tree | DIRTY（意図的、未commit） |
-| Tracked unstaged diff | 63 files, 418 insertions, 282 deletions |
-| Staged additions | 1 file (`docs/archive/api-workflows/codex-implement.yml`) |
-| Untracked files | 43 files（automation/governance/phase prompts/testsを含む） |
+| Input independent review SHA | `fb3e2e8947e0402fa55ca1520ee71f9ad24367e3` |
+| Phase base SHA | `2e50db4dbcc127d87237c212b909edb499c1bd34` |
+| Reviewed branch | `ai/redteam-agent-phase-loop` |
+| Input review working tree | CLEAN (`git status --short --branch` showed only branch tracking state) |
+| Input review diff from phase base | 63 files, 494 insertions, 310 deletions |
+| Independent review evidence | GitHub review `id=5059475416`, `commit_id=fb3e2e8947e0402fa55ca1520ee71f9ad24367e3`, P1 inline finding `id=3887981472` |
+| P1 remediation diff | This report plus `tests/security/test_review_evidence.py`; exact post-commit SHA is bound by PR/review metadata |
 | Diff whitespace check | `git diff --check`: PASS |
 
 今回のMypy closureで直接変更した実装は以下である。
@@ -257,4 +267,4 @@ B-01〜B-06とH-01〜H-07はSource Evidenceと実行済みRegression Testの両�
 - Repository/provenance: `repositories/base.py`, `repositories/llm.py`, `repositories/context.py`
 - Typed security states/seeds: `models/context.py`, `context/authorization.py`, `executor/authorization_gate.py`, `seeds.py`
 
-No test was removed, weakened, skipped, or marked as an expected failure. No external dispatch, C2, MCP side effect, local attack command, or Phase 0B behavior was added.
+No test was removed, weakened, skipped, or marked as an expected failure. No external dispatch, C2, MCP side effect, local attack command, or Phase 0B behavior was added. The P1 remediation must receive a new independent review on the resulting PR HEAD before Phase 0B starts.
