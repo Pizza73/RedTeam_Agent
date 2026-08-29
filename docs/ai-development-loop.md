@@ -27,9 +27,11 @@ governance requirements, but GitHub does not currently enforce them at the branc
 
 The local orchestrator, GitHub Actions and Codex never merge or push to `main`. Before a human
 merge, the operator must bind the decision to the current 40-character PR head SHA, verify the
-complete final diff and all five required checks, verify the current SHA-bound Codex review and
-`redteam/phase-review` result, record that evidence on the PR, and merge only through the GitHub UI.
-The runbook contains the exact checklist. Direct and force pushes to `main` remain prohibited.
+complete final diff and all five required checks, and record that evidence on the PR. An
+implementation PR additionally requires the current SHA-bound Codex review and phase result; a
+governance PR requires the human owner review and the SHA-bound not-applicable governance status.
+The operator merges only through the GitHub UI. The runbook contains the exact checklist. Direct
+and force pushes to `main` remain prohibited.
 
 This manual control has a greater account-compromise and operator-error risk than server-enforced
 protection. When the repository plan supports protection, the same requirements must be configured

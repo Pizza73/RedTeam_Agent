@@ -81,10 +81,14 @@ Immediately before every governance or implementation merge, the human operator 
 - `governance-integrity`
 - `redteam/phase-review`
 
-4. Confirm the Codex review and `redteam/phase-review` evidence refer to the same current head SHA.
+4. For an implementation PR, confirm the Codex review and `redteam/phase-review` evidence refer to
+   the same current head SHA. For a governance PR, confirm `redteam/phase-review` reports
+   `not applicable: human-reviewed governance change` for that SHA and perform the owner review
+   yourself; a governance PR does not receive an AI phase verdict.
 5. Resolve all review conversations and inspect the complete final diff.
-6. Add a PR comment recording the reviewed head SHA, the five successful checks, the review
-   permalink, and whether governance-controlled paths changed.
+6. Add a PR comment recording the reviewed head SHA, the five successful checks, the applicable
+   Codex-review permalink or governance-review status, and whether governance-controlled paths
+   changed.
 7. Merge through the GitHub pull request UI as the human operator. Never use a direct push,
    force-push, automated merge, or command-line bypass to update `main`.
 
