@@ -22,6 +22,7 @@ PROTECTED_FILES = frozenset(
         "docs/threat-model.md",
         "pyproject.toml",
         "requirements.lock",
+        "scripts/ci/check_governance.py",
         "scripts/ci/run_phase_gate.sh",
         "scripts/ci/validate_automation.py",
     }
@@ -74,7 +75,10 @@ def evaluate_governance(changed_paths: list[str], labels: set[str]) -> Governanc
     return GovernanceResult(
         True,
         protected,
-        "explicit governance-change pull request; CODEOWNERS review is still required",
+        (
+            "explicit governance-change pull request; manual owner review is required "
+            "but not server-enforced"
+        ),
     )
 
 

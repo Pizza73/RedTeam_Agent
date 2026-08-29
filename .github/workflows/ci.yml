@@ -29,12 +29,16 @@ jobs:
           python-version: "3.12"
       - name: Reject AI self-modification of governance
         env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_LABELS_JSON: ${{ toJSON(github.event.pull_request.labels.*.name) }}
         shell: bash
         run: |
+          base_checker="$RUNNER_TEMP/base-check-governance.py"
+          git show "${BASE_SHA}:scripts/ci/check_governance.py" > "$base_checker"
           git diff --name-only -z \
-            "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}" \
-            | python scripts/ci/check_governance.py --labels-json "$PR_LABELS_JSON"
+            "${BASE_SHA}...${HEAD_SHA}" \
+            | python "$base_checker" --labels-json "$PR_LABELS_JSON"
 
   tests:
     name: tests (${{ matrix.python-version }})
