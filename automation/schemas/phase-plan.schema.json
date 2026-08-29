@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/redteam-agent/phase-plan.schema.json",
+  "title": "RedTeam Agent Phase Plan",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "phases"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "phases": {
+      "type": "array",
+      "minItems": 8,
+      "maxItems": 8,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "label", "title", "prompt", "auto_start"],
+        "properties": {
+          "id": {"pattern": "^phase-(0a|0b|0c|[1-5])$", "type": "string"},
+          "label": {"pattern": "^phase-(0a|0b|0c|[1-5])$", "type": "string"},
+          "title": {"minLength": 1, "type": "string"},
+          "prompt": {"pattern": "^prompts/phases/[a-z0-9-]+\\.md$", "type": "string"},
+          "auto_start": {"type": "boolean"},
+          "human_gate_reason": {"minLength": 1, "type": "string"}
+        },
+        "allOf": [
+          {
+            "if": {"properties": {"auto_start": {"const": false}}},
+            "then": {"required": ["human_gate_reason"]}
+          }
+        ]
+      }
+    }
+  }
+}

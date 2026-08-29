@@ -1,0 +1,274 @@
+name: AI Codex Implement
+
+on:
+  issue_comment:
+    types: [created]
+
+concurrency:
+  group: redteam-codex-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  prepare:
+    if: >-
+      github.event.issue.pull_request &&
+      (contains(github.event.comment.body, '<!-- redteam-ai-review') ||
+       contains(github.event.comment.body, '<!-- redteam-implementation-request'))
+    runs-on: ubuntu-latest
+    env:
+      AI_REVIEWER_LOGIN: ${{ vars.AI_REVIEWER_LOGIN }}
+      AI_LOOP_MAX_ITERATIONS: ${{ vars.AI_LOOP_MAX_ITERATIONS }}
+    outputs:
+      valid: ${{ steps.prepare.outputs.valid }}
+      head_ref: ${{ steps.prepare.outputs.head_ref }}
+      head_sha: ${{ steps.prepare.outputs.head_sha }}
+      phase: ${{ steps.prepare.outputs.phase }}
+      request_b64: ${{ steps.prepare.outputs.request_b64 }}
+    steps:
+      - id: prepare
+        name: Validate request
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = context.payload.comment.body || '';
+            const reviewPattern = /<!--\s*redteam-ai-review\s*([\s\S]*?)-->/;
+            const requestPattern = /<!--\s*redteam-implementation-request\s*([\s\S]*?)-->/;
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+            });
+            if (pr.head.repo.full_name !== `${context.repo.owner}/${context.repo.repo}`) {
+              core.setOutput('valid', 'false');
+              core.setFailed('Fork pull requests are not accepted.');
+              return;
+            }
+            const phases = pr.labels.map((item) => item.name).filter((name) => /^phase-(0a|0b|0c|[1-5])$/.test(name));
+            if (phases.length !== 1) {
+              core.setOutput('valid', 'false');
+              core.setFailed(`Exactly one phase label required, got: ${phases.join(', ')}`);
+              return;
+            }
+
+            const { data: planFile } = await github.rest.repos.getContent({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              path: 'automation/phase-plan.json',
+              ref: pr.head.sha,
+            });
+            const plan = JSON.parse(Buffer.from(planFile.content, 'base64').toString('utf8'));
+            const phaseConfig = plan.phases.find((item) => item.id === phases[0]);
+            if (!phaseConfig) {
+              core.setOutput('valid', 'false');
+              core.setFailed(`Unknown phase: ${phases[0]}`);
+              return;
+            }
+
+            let request;
+            const reviewMatch = body.match(reviewPattern);
+            const implementationMatch = body.match(requestPattern);
+            if (reviewMatch) {
+              if (!process.env.AI_REVIEWER_LOGIN || context.payload.comment.user.login !== process.env.AI_REVIEWER_LOGIN) {
+                core.setOutput('valid', 'false');
+                core.setFailed('Review implementation request came from an untrusted actor.');
+                return;
+              }
+              const review = JSON.parse(reviewMatch[1].trim());
+              if (review.verdict !== 'CHANGES_REQUESTED') {
+                core.setOutput('valid', 'false');
+                return;
+              }
+              if (review.phase !== phases[0] || review.reviewed_sha !== pr.head.sha) {
+                core.setOutput('valid', 'false');
+                core.setFailed('Review phase/SHA is stale.');
+                return;
+              }
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr.number,
+                per_page: 100,
+              });
+              let count = 0;
+              for (const comment of comments) {
+                const match = comment.body?.match(reviewPattern);
+                if (!match) continue;
+                try {
+                  const prior = JSON.parse(match[1].trim());
+                  if (prior.phase === phases[0] && prior.verdict === 'CHANGES_REQUESTED') count += 1;
+                } catch (_) {}
+              }
+              const maximum = Number.parseInt(process.env.AI_LOOP_MAX_ITERATIONS || '5', 10);
+              if (count > maximum) {
+                core.setOutput('valid', 'false');
+                await github.rest.issues.addLabels({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  issue_number: pr.number, labels: ['ai-loop-blocked'],
+                });
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  issue_number: pr.number,
+                  body: `Codex was not started: ${phases[0]} exceeded ${maximum} iterations.`,
+                });
+                return;
+              }
+              request = {
+                schema_version: '1.0',
+                action: 'FIX_REVIEW_FINDINGS',
+                trigger: 'REVIEW_FINDINGS',
+                phase: phases[0],
+                head_sha: pr.head.sha,
+                phase_prompt: phaseConfig.prompt,
+                review,
+              };
+            } else if (implementationMatch) {
+              if (context.payload.comment.user.login !== 'github-actions[bot]') {
+                core.setOutput('valid', 'false');
+                core.setFailed('Phase implementation marker must come from the trusted loop controller.');
+                return;
+              }
+              request = JSON.parse(implementationMatch[1].trim());
+              if (request.action !== 'IMPLEMENT_PHASE' || request.phase !== phases[0] || request.head_sha !== pr.head.sha) {
+                core.setOutput('valid', 'false');
+                core.setFailed('Phase implementation request is stale or malformed.');
+                return;
+              }
+              request.phase_prompt = phaseConfig.prompt;
+            } else {
+              core.setOutput('valid', 'false');
+              return;
+            }
+
+            core.setOutput('valid', 'true');
+            core.setOutput('head_ref', pr.head.ref);
+            core.setOutput('head_sha', pr.head.sha);
+            core.setOutput('phase', phases[0]);
+            core.setOutput('request_b64', Buffer.from(JSON.stringify(request), 'utf8').toString('base64'));
+
+  implement:
+    needs: prepare
+    if: needs.prepare.outputs.valid == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      PHASE: ${{ needs.prepare.outputs.phase }}
+      HEAD_REF: ${{ needs.prepare.outputs.head_ref }}
+      REQUEST_B64: ${{ needs.prepare.outputs.request_b64 }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.head_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install locked dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.lock
+          python -m pip install -e . --no-deps
+      - name: Materialize validated request
+        shell: bash
+        run: |
+          python - <<'PY'
+          import base64
+          import os
+          from pathlib import Path
+
+          Path('/tmp/redteam-loop-request.json').write_bytes(
+              base64.b64decode(os.environ['REQUEST_B64'], validate=True)
+          )
+          PY
+      - name: Run Codex implementation
+        id: codex
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt-file: .github/prompts/implement.md
+          output-file: /tmp/codex-final.md
+          sandbox: workspace-write
+          safety-strategy: drop-sudo
+          codex-args: '["--ephemeral", "--ignore-user-config"]'
+      - name: Reject governance changes
+        shell: bash
+        run: |
+          git diff --exit-code -- \
+            AGENTS.md \
+            SystemDesign.md \
+            .github \
+            automation \
+            docs/requirements.md \
+            docs/acceptance-criteria.md \
+            docs/safety-invariants.md \
+            docs/threat-model.md \
+            prompts/phases
+      - name: Run independent phase gate
+        shell: bash
+        run: bash scripts/ci/run_phase_gate.sh "$PHASE"
+      - name: Check for implementation changes
+        id: changes
+        shell: bash
+        run: |
+          if git diff --quiet && test -z "$(git ls-files --others --exclude-standard)"; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Commit validated changes
+        if: steps.changes.outputs.changed == 'true'
+        shell: bash
+        run: |
+          git config user.name "redteam-codex-bot"
+          git config user.email "redteam-codex-bot@users.noreply.github.com"
+          git add -A
+          git commit -m "fix(${PHASE}): apply bounded AI implementation"
+      - name: Push validated changes
+        if: steps.changes.outputs.changed == 'true'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:${HEAD_REF}"
+      - name: Stop on no-op implementation
+        if: steps.changes.outputs.changed != 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              labels: ['ai-loop-blocked'],
+            });
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: 'AI loop stopped because Codex produced no implementation change for an active request.',
+            });
+            core.setFailed('Codex produced no changes.');
+      - name: Mark failed implementation attempt
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              labels: ['ai-loop-blocked'],
+            });
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `Codex implementation stopped before push for \`${process.env.PHASE}\`. Inspect the failed workflow and resolve the blocker; no unvalidated changes were pushed.`,
+            });

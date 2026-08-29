@@ -1,0 +1,64 @@
+schema_version: "1.0"
+
+project:
+  name: RedTeam_Agent
+  base_branch: main
+  development_branch: ai/redteam-agent-build
+  required_pr_label: ai-loop
+
+repository_setup:
+  existing_git_repository_required: true
+  github_remote_required: true
+  remote_name: origin
+  initialize_git: false
+  configure_remote: false
+  require_clean_worktree_before_install: true
+
+loop:
+  max_iterations_per_phase: 5
+  same_finding_limit: 3
+  final_merge_requires_human: true
+  allow_fork_pull_requests: false
+  reviewer_status_context: redteam/phase-review
+  ai_runs_in_github_actions: false
+  implementation_trigger: local_orchestrator
+  review_trigger: local_orchestrator_after_ci
+  initial_request_workflow: Start AI Loop
+  local_orchestrator:
+    command: .venv/bin/python automation/run_phase_loop.py
+    github_actor_must_equal: AI_GATE_APPROVER_LOGIN
+    reviewer_login_variable: AI_REVIEWER_LOGIN
+    trusted_marker_author: github-actions[bot]
+    poll_seconds: 30
+    max_runtime_hours: 24
+    automatic_phases:
+      - phase-0a
+      - phase-0b
+      - phase-0c
+      - phase-1
+      - phase-2
+      - phase-3
+      - phase-4-after-human-gate
+      - phase-5-after-human-gate
+
+cost_controls:
+  openai_api_allowed: false
+  openai_api_key_secret_allowed: false
+  github_actions_spending_limit_required: 0
+
+current_state:
+  phase: phase-0a
+  verdict: NO-GO
+  phase_0b_allowed: false
+
+human_gates:
+  - phase-4
+  - phase-5
+  - final-merge
+
+required_repository_variables:
+  - AI_GATE_APPROVER_LOGIN
+  - AI_REVIEWER_LOGIN
+  - AI_LOOP_MAX_ITERATIONS
+
+required_repository_secrets: []

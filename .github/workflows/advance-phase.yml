@@ -1,0 +1,172 @@
+name: Advance AI Loop Phase
+
+on:
+  workflow_dispatch:
+    inputs:
+      pull_request_number:
+        description: Pull request number
+        required: true
+        type: number
+      target_phase:
+        description: Expected next phase
+        required: true
+        type: choice
+        options:
+          - phase-4
+          - phase-5
+      confirmation:
+        description: Type I_APPROVE_PHASE_ADVANCE
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+  statuses: write
+
+jobs:
+  advance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Validate human gate and start next phase
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        env:
+          AI_GATE_APPROVER_LOGIN: ${{ vars.AI_GATE_APPROVER_LOGIN }}
+          PR_NUMBER: ${{ inputs.pull_request_number }}
+          TARGET_PHASE: ${{ inputs.target_phase }}
+          CONFIRMATION: ${{ inputs.confirmation }}
+        with:
+          script: |
+            if (process.env.CONFIRMATION !== 'I_APPROVE_PHASE_ADVANCE') {
+              core.setFailed('Confirmation text does not match.');
+              return;
+            }
+            if (!process.env.AI_GATE_APPROVER_LOGIN || context.actor !== process.env.AI_GATE_APPROVER_LOGIN) {
+              core.setFailed(`Untrusted Human Gate actor: ${context.actor}`);
+              return;
+            }
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const pull_number = Number.parseInt(process.env.PR_NUMBER, 10);
+            const { data: pr } = await github.rest.pulls.get({owner, repo, pull_number});
+            if (pr.head.repo.full_name !== `${owner}/${repo}`) {
+              core.setFailed('Fork pull requests are not accepted.');
+              return;
+            }
+            const labels = pr.labels.map((item) => item.name);
+            if (!labels.includes('ai-human-gate') || !labels.includes('ai-review-passed')) {
+              core.setFailed('PR is not at a passed Human Gate.');
+              return;
+            }
+            const phases = labels.filter((name) => /^phase-(0a|0b|0c|[1-5])$/.test(name));
+            if (phases.length !== 1) {
+              core.setFailed(`Exactly one current phase is required, got ${phases.join(', ')}`);
+              return;
+            }
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number: pull_number, per_page: 100,
+            });
+            const markerPattern = /<!--\s*redteam-phase-gate\s*([\s\S]*?)-->/;
+            const hasCurrentPass = comments.some((comment) => {
+              if (comment.user?.login !== 'github-actions[bot]') return false;
+              const match = comment.body?.match(markerPattern);
+              if (!match) return false;
+              try {
+                const record = JSON.parse(match[1].trim());
+                return record.schema_version === '1.0' &&
+                  record.phase === phases[0] &&
+                  record.reviewed_sha === pr.head.sha &&
+                  record.verdict === 'PASS';
+              } catch (_) {
+                return false;
+              }
+            });
+            if (!hasCurrentPass) {
+              core.setFailed('Latest head does not have a trusted SHA-bound PASS record.');
+              return;
+            }
+            const { data: planFile } = await github.rest.repos.getContent({
+              owner,
+              repo,
+              path: 'automation/phase-plan.json',
+              ref: context.payload.repository.default_branch,
+            });
+            if (Array.isArray(planFile) || planFile.type !== 'file' || !planFile.content) {
+              core.setFailed('Trusted phase plan is unavailable.');
+              return;
+            }
+            const plan = JSON.parse(Buffer.from(planFile.content, 'base64').toString('utf8'));
+            const currentIndex = plan.phases.findIndex((item) => item.id === phases[0]);
+            const target = plan.phases[currentIndex + 1];
+            if (!target || target.id !== process.env.TARGET_PHASE || target.auto_start !== false) {
+              core.setFailed('Target is not the configured next Human Gate phase.');
+              return;
+            }
+            const { data: gateFile } = await github.rest.repos.getContent({
+              owner,
+              repo,
+              path: 'automation/provider-gates.json',
+              ref: context.payload.repository.default_branch,
+            });
+            if (Array.isArray(gateFile) || gateFile.type !== 'file' || !gateFile.content) {
+              core.setFailed('Trusted provider gate configuration is unavailable.');
+              return;
+            }
+            const gates = JSON.parse(Buffer.from(gateFile.content, 'base64').toString('utf8'));
+            const gate = gates[target.id];
+            if (!gate || gate.approved !== true) {
+              core.setFailed(`Provider gate ${target.id} is not approved in automation/provider-gates.json.`);
+              return;
+            }
+            const requiredByPhase = {
+              'phase-4': [
+                'provider_product', 'provider_version', 'isolated_lab_reference',
+                'credential_reference_name', 'egress_policy_reference', 'approved_by', 'approved_at'
+              ],
+              'phase-5': [
+                'mcp_server_name', 'protocol_revision', 'transport_identity_policy_reference',
+                'execution_location_class', 'trust_policy_reference', 'approved_by', 'approved_at'
+              ],
+            };
+            const missing = requiredByPhase[target.id].filter((field) => {
+              const value = gate[field];
+              return value === null || value === undefined || String(value).trim() === '';
+            });
+            if (missing.length > 0) {
+              core.setFailed(`Provider gate ${target.id} is incomplete: ${missing.join(', ')}`);
+              return;
+            }
+            for (const name of [phases[0], 'ai-human-gate', 'ai-review-passed']) {
+              try {
+                await github.rest.issues.removeLabel({owner, repo, issue_number: pull_number, name});
+              } catch (error) {
+                if (error.status !== 404) throw error;
+              }
+            }
+            await github.rest.issues.addLabels({
+              owner, repo, issue_number: pull_number,
+              labels: [target.label, 'ai-needs-implementation'],
+            });
+            await github.rest.repos.createCommitStatus({
+              owner,
+              repo,
+              sha: pr.head.sha,
+              state: 'pending',
+              context: 'redteam/phase-review',
+              description: `${target.id}: implementation pending`.slice(0, 140),
+            });
+            const request = {
+              schema_version: '1.0',
+              action: 'IMPLEMENT_PHASE',
+              trigger: 'HUMAN_GATE',
+              phase: target.id,
+              head_sha: pr.head.sha,
+              phase_prompt: target.prompt,
+            };
+            const marker = `<!-- redteam-implementation-request\n${JSON.stringify(request)}\n-->`;
+            await github.rest.issues.createComment({
+              owner, repo, issue_number: pull_number,
+              body: `Human Gate approved for \`${target.id}\`. Restart the local phase orchestrator to request the Codex implementation. No AI API runs in GitHub Actions.\n\n${marker}`,
+            });
