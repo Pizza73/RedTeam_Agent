@@ -1,0 +1,3 @@
+# Runtime used to validate Phase 0A in this workspace.
+python==3.14.6
+sqlite==3.53.4

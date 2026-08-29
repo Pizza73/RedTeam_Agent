@@ -1,0 +1,15 @@
+# Phase 0A reproducible dependency set. Generated from the validated local environment.
+annotated-types==0.8.0
+attrs==26.1.0
+jsonschema==4.26.0
+jsonschema-specifications==2023.12.1
+packaging==26.2
+pluggy==1.6.0
+pydantic==2.13.4
+pydantic-core==2.46.4
+Pygments==2.20.0
+pytest==9.1.1
+referencing==0.37.0
+rpds-py==0.30.0
+typing-extensions==4.16.0
+typing-inspection==0.4.4
