@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Literal
 
 from redteam_agent.errors import TargetExtractorResolutionError
 from redteam_agent.models.plans import ExecutionPlanProposal
@@ -48,13 +48,18 @@ def _network(proposal: ExecutionPlanProposal, tool: ToolDefinition) -> tuple[Tar
     if not isinstance(requires_port, bool) or not isinstance(requires_protocol, bool):
         raise TargetExtractorResolutionError("invalid endpoint requirement declaration")
     port = arguments.get(port_field) if port_field is not None else None
-    protocol = arguments.get(protocol_field) if protocol_field is not None else None
+    protocol_value = arguments.get(protocol_field) if protocol_field is not None else None
     if port is not None and (not isinstance(port, int) or isinstance(port, bool)):
         raise TargetExtractorResolutionError("network port must be an integer")
-    if protocol is not None:
-        if not isinstance(protocol, str) or protocol.lower() not in {"tcp", "udp"}:
-            raise TargetExtractorResolutionError("network protocol must be tcp or udp")
-        protocol = protocol.lower()
+    protocol: Literal["tcp", "udp"] | None
+    if protocol_value is None:
+        protocol = None
+    elif isinstance(protocol_value, str) and protocol_value.lower() == "tcp":
+        protocol = "tcp"
+    elif isinstance(protocol_value, str) and protocol_value.lower() == "udp":
+        protocol = "udp"
+    else:
+        raise TargetExtractorResolutionError("network protocol must be tcp or udp")
     if requires_port and port is None:
         raise TargetExtractorResolutionError("required network port was not extracted")
     if requires_protocol and protocol is None:

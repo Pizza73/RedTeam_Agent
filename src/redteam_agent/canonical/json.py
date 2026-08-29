@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import math
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from .models import CanonicalJsonObject
@@ -19,7 +19,7 @@ from .models import CanonicalJsonObject
 def _datetime_text(value: datetime) -> str:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("canonical datetime must be timezone-aware")
-    normalized = value.astimezone(timezone.utc)
+    normalized = value.astimezone(UTC)
     if normalized.microsecond:
         text = normalized.isoformat(timespec="microseconds")
     else:

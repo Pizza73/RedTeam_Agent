@@ -12,7 +12,6 @@ from redteam_agent.models.base import StrictImmutableBoundaryModel
 from redteam_agent.models.capabilities import (
     AdapterCapabilities,
     AdapterCapabilitySnapshot,
-    RemoteMCPTrust,
     RemoteMCPTrustSnapshot,
     SandboxCapabilities,
     SandboxCapabilitySnapshot,
@@ -102,6 +101,7 @@ class ToolAvailabilityResolver:
             if view is not None:
                 views.append(view)
         views.sort(key=lambda item: (item.tool_ref.tool_id, item.tool_ref.registry_revision))
+        scope_digest = execution_scope_digest(mission)
         base = {
             "schema_version": "tool-availability-calculation-v1",
             "mission_id": mission.mission_id,
@@ -109,7 +109,7 @@ class ToolAvailabilityResolver:
             "authorization_epoch": mission.authorization_epoch,
             "registry_digest": registry.registry_digest,
             "policy_version": policy_version,
-            "execution_scope_digest": execution_scope_digest(mission),
+            "execution_scope_digest": scope_digest,
             "session_security_context_digest": session_snapshot.snapshot_digest,
             "adapter_capabilities_digest": adapter_snapshot.snapshot_digest,
             "sandbox_capabilities_digest": sandbox_snapshot.snapshot_digest,
@@ -123,7 +123,7 @@ class ToolAvailabilityResolver:
             authorization_epoch=mission.authorization_epoch,
             registry_digest=registry.registry_digest,
             policy_version=policy_version,
-            execution_scope_digest=base["execution_scope_digest"],
+            execution_scope_digest=scope_digest,
             session_security_context_digest=session_snapshot.snapshot_digest,
             adapter_capabilities_digest=adapter_snapshot.snapshot_digest,
             sandbox_capabilities_digest=sandbox_snapshot.snapshot_digest,
@@ -259,6 +259,8 @@ class ToolAvailabilityResolver:
     def _scope_compatible(tool: ToolDefinition, mission: Mission) -> bool:
         if tool.target_mode == "none":
             return True
+        if tool.target_extractor_id is None:
+            return False
         rule_type = {
             "network_target_v1": NetworkScopeRule,
             "host_target_v1": HostScopeRule,
@@ -287,9 +289,7 @@ class ToolAvailabilityResolver:
         if requirement is None:
             return True
 
-        execution_location = (
-            tool.execution_location if tool.adapter == "mcp" else "local_process"
-        )
+        execution_location = tool.execution_location if tool.adapter == "mcp" else "local_process"
 
         def meets(item: SandboxCapabilities) -> bool:
             checks = {
@@ -304,7 +304,9 @@ class ToolAvailabilityResolver:
                 "memory_limit": requirement.memory_limit_required,
                 "process_limit": requirement.process_limit_required,
             }
-            return all(not required or getattr(item, capability) for capability, required in checks.items())
+            return all(
+                not required or getattr(item, capability) for capability, required in checks.items()
+            )
 
         return any(
             item.runtime_id == tool.execution_runtime_id
@@ -327,12 +329,12 @@ class ToolAvailabilityResolver:
         )
 
     @staticmethod
-    def _remote_trust_satisfies(
-        tool: ToolDefinition, snapshot: RemoteMCPTrustSnapshot
-    ) -> bool:
+    def _remote_trust_satisfies(tool: ToolDefinition, snapshot: RemoteMCPTrustSnapshot) -> bool:
         if tool.adapter != "mcp":
             return True
-        trust = next((item for item in snapshot.policies if item.adapter_id == tool.adapter_id), None)
+        trust = next(
+            (item for item in snapshot.policies if item.adapter_id == tool.adapter_id), None
+        )
         if trust is None or trust.execution_location != tool.execution_location:
             return False
         if trust.execution_location == "local_process":

@@ -9,4 +9,3 @@ __all__ = [
     "TrustedTargetExtractorRegistry",
     "build_registry_revision",
 ]
-

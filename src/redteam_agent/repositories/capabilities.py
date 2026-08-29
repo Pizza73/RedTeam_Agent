@@ -25,12 +25,19 @@ class SessionSecurityContextSnapshotRepository(
     def verify_integrity(self, model: SessionSecurityContextSnapshot) -> None:
         verify_capability_snapshot(model)
 
-    def verify_row_binding(self, identifier: str | int, model: SessionSecurityContextSnapshot) -> None:
+    def verify_row_binding(
+        self, identifier: str | int, model: SessionSecurityContextSnapshot
+    ) -> None:
         row = self.database.connection.execute(
             "SELECT snapshot_digest, mission_id FROM session_security_context_snapshots "
-            "WHERE snapshot_id = ?", (identifier,)
+            "WHERE snapshot_id = ?",
+            (identifier,),
         ).fetchone()
-        if row is None or row["snapshot_digest"] != model.snapshot_digest or row["mission_id"] != model.mission_id:
+        if (
+            row is None
+            or row["snapshot_digest"] != model.snapshot_digest
+            or row["mission_id"] != model.mission_id
+        ):
             from redteam_agent.errors import DigestIntegrityError
 
             raise DigestIntegrityError("session snapshot row binding mismatch")
@@ -116,9 +123,7 @@ class RemoteMCPTrustSnapshotRepository(ImmutableJsonRepository[RemoteMCPTrustSna
         return snapshot
 
 
-def _verify_snapshot_digest_column(
-    repository: Any, identifier: str | int, expected: str
-) -> None:
+def _verify_snapshot_digest_column(repository: Any, identifier: str | int, expected: str) -> None:
     row = repository.database.connection.execute(
         f"SELECT snapshot_digest FROM {repository.table} WHERE {repository.id_column} = ?",  # noqa: S608
         (identifier,),

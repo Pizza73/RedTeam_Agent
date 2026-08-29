@@ -11,7 +11,6 @@ from .common import UtcDatetime
 from .goals import SuccessCondition
 from .scope import ApprovalPolicy, DataAccessPolicy, ExecutionScopeRule
 
-
 MissionLifecycleState = Literal[
     "DRAFT",
     "VALIDATED",
@@ -54,7 +53,7 @@ class MissionRevision(StrictImmutableBoundaryModel):
     approval_policy: ApprovalPolicy
 
     @model_validator(mode="after")
-    def mission_revision_invariants(self) -> "MissionRevision":
+    def mission_revision_invariants(self) -> MissionRevision:
         if self.valid_from >= self.valid_until:
             raise ValueError("valid_from must be earlier than valid_until")
         condition_ids = [condition.condition_id for condition in self.success_conditions]
@@ -100,7 +99,7 @@ class Mission(StrictImmutableBoundaryModel):
     approval_policy: ApprovalPolicy
 
     @model_validator(mode="after")
-    def mission_invariants(self) -> "Mission":
+    def mission_invariants(self) -> Mission:
         if self.valid_from >= self.valid_until:
             raise ValueError("valid_from must be earlier than valid_until")
         ids = [condition.condition_id for condition in self.success_conditions]
@@ -124,4 +123,3 @@ class Mission(StrictImmutableBoundaryModel):
             state=self.state,
             updated_at=updated_at,
         )
-

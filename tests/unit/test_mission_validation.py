@@ -30,4 +30,3 @@ def test_mission_schema_errors_use_typed_taxonomy() -> None:
 def test_boundary_schema_errors_use_typed_taxonomy() -> None:
     with pytest.raises(PydanticBoundaryValidationError):
         validate_boundary(ExecutionPlanProposal, {"adapter": "c2"})
-

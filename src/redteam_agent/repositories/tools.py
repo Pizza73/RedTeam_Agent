@@ -6,6 +6,7 @@ from redteam_agent.canonical import sha256_digest, stable_id, verify_model_diges
 from redteam_agent.errors import DigestIntegrityError, MissionTTLExceededError
 from redteam_agent.models.mission import MissionRevision
 from redteam_agent.models.tools import AvailableToolSnapshot, ToolRegistryRevision
+from redteam_agent.tools.registry import registry_payload
 
 from .base import ImmutableJsonRepository, model_json, parse_model_json
 from .capabilities import (
@@ -14,7 +15,6 @@ from .capabilities import (
     SandboxCapabilitySnapshotRepository,
     SessionSecurityContextSnapshotRepository,
 )
-from redteam_agent.tools.registry import registry_payload
 
 
 class ToolRegistryRepository(ImmutableJsonRepository[ToolRegistryRevision]):

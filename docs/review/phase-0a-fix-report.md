@@ -6,7 +6,7 @@
 
 修正後は、Planner/CallerがPolicyDecisionをGateへObjectとして注入できず、Gateは永続化済みPlan ID / PolicyDecision IDからTrusted Repositoryを参照する。Mission、Policy、Registry、Session、Adapter、Sandbox、Remote Trust、Available Toolのcurrent値は、timestamp推測ではなく明示的な`AuthorizationRuntimeBinding`から取得する。GateはPolicy Engineの評価を同じTrusted Inputから再実行し、Target Set、Risk、Side Effect、Approval Requirement、Adapter、Data Accessを含むDecision完全性を比較する。
 
-既存Testを削除せず、Gate ReviewのNegative Probeを正式なRegression Testへ追加した。最終結果はUnit 24、Integration 4、Security 107、合計135件すべてPASSである。
+既存Testを削除せず、Gate ReviewのNegative Probeを正式なRegression Testへ追加した。2026-08-30の正式Phase GateではUnit 60、Integration 4、Security 107、合計171件がすべてPASSし、Ruff、Mypy、Coverage、Automation Validation、dependency checkもPASSした。
 
 ## 2. Fixed Findings
 
@@ -25,13 +25,14 @@
 | H-05 | FIXED | Mission Revision public lookupを`get(mission_id, mission_revision)`の複合Keyへ統一 | `repositories/mission.py::MissionRevisionRepository.get` | `test_gate_review_regressions.py::test_mission_revision_repository_requires_composite_key` |
 | H-06 | FIXED | Review-only probesを正式Security Regressionへ移し、既存Testを維持 | `tests/security/test_gate_review_regressions.py`、`test_approval_and_context_regressions.py`、更新済みMission/Context/Policy tests | Security 107 PASS |
 
-H-07（Git Revision Traceability）は未解決である。Repositoryには`.git`ディレクトリがあるがcommitが1件もなく、`master`上の全ファイルがuntrackedである。既存履歴がないため、本作業では`git init`、commit、履歴操作を実施していない。
+H-07（Git Revision Traceability）はFIXEDである。Repositoryの現在の基準commitは`21be5c06e70b7e8bc5c8184af363d1cf88d61802`、branchは`main`である。Phase 0Aの実装・自動化・governance変更は未commitのdirty working treeとして明示的に保持されており、独立reviewはcommit/push後の新しいPR HEAD SHAに固定して実施する。本作業ではcommit、push、merge、履歴操作を実施していない。
 
 ## 3. Modified Files
 
 ### New implementation files
 
 - `src/redteam_agent/authorization_runtime.py`
+- `src/redteam_agent/json_schema.py`
 - `src/redteam_agent/models/runtime.py`
 - `src/redteam_agent/mission/manager.py`
 - `src/redteam_agent/mission/goal_registry.py`
@@ -137,27 +138,32 @@ Fresh databaseはMigration 1→2を適用する。既存Phase 0A v1 schemaから
 
 ## 8. New Test Results
 
-実行日時: 2026-08-29 (Asia/Tokyo)
+実行日時: 2026-08-30 (Asia/Tokyo)
 
 ```text
-python -m pytest tests/unit -q
-24 passed in 0.33s
+/home/kali/Red_Agent/.venv/bin/python -m pytest -q \
+  tests/unit/test_canonical.py tests/unit/test_scope.py \
+  tests/security/test_tool_registry_availability.py \
+  tests/security/test_policy_and_gate.py \
+  tests/security/test_approval_and_context_regressions.py \
+  tests/security/test_strict_boundaries.py \
+  tests/security/test_snapshot_bindings.py
+75 passed in 1.55s
 
-python -m pytest tests/integration -q
-4 passed in 0.45s
-
-python -m pytest tests/security -q
-107 passed in 2.32s
-
-python -m pytest -q
-135 passed in 2.49s
-
-python -m pytest --collect-only -q
-135 tests collected in 0.35s
-
-python -m compileall -q src/redteam_agent tests
-PASS
+PATH=/home/kali/Red_Agent/.venv/bin:$PATH \
+  bash scripts/ci/run_phase_gate.sh phase-0a
+AUTOMATION_VALIDATION=PASS
+Ruff: PASS
+Mypy: Success: no issues found in 61 source files
+Unit: 60 passed
+Integration: 4 passed
+Security: 107 passed
+Full coverage run: 171 passed
+Dependency check: No broken requirements found
+PHASE_GATE=phase-0a PASS
 ```
+
+最初のtargeted testは`pytest` console entry pointで起動したため、環境のpackage path差により3件のcollection errorとなった。Repository-local Pythonを明示する`python -m pytest`で同一対象を再実行し、75件PASSを確認した。Test failure、skip、expected failureへの変更はない。
 
 Validated runtime:
 
@@ -174,24 +180,21 @@ jsonschema 4.26.0
 | Check | Status | Notes |
 |---|---|---|
 | Syntax/import compile | PASS | `python -m compileall -q src/redteam_agent tests` |
-| Ruff | NOT_CONFIGURED | pyproject設定は存在するが実行環境にruff package/commandがない。Runtime dependencyへ追加していない |
-| mypy/pyright | NOT_CONFIGURED | pyprojectのmypy strict設定は存在するが実行環境にcheckerがない |
-| Coverage | NOT_CONFIGURED | coverage package/pluginがない |
-| Hypothesis | NOT_CONFIGURED | packageがない。今回のcritical boundaryはparameterized negative testsで固定した |
-
-未実行ToolをPASSとは扱わない。Phase 0A再Gateでは上記を`NOT_TESTED/NOT_CONFIGURED`として評価すること。
-
-System-wide `python -m pip check`はKali環境へ既存導入されている本Project外Package群の不足・Version競合によりFAILした。Phase 0Aのlock対象であるPydantic/jsonschema/pytestは上記Versionでimport・Test済みだが、隔離Virtual Environment上のProject-only dependency checkは未実施である。
+| Ruff | PASS | `python -m ruff check .` |
+| Mypy | PASS | strict設定で61 source files、0 issues |
+| Coverage | PASS | branch coverage 84%（閾値80%） |
+| Hypothesis | PASS | Phase Gateの必須dependency importとproperty testsを含むUnit SuiteがPASS |
+| Dependency integrity | PASS | Repository-local `.venv`で`python -m pip check`: `No broken requirements found` |
 
 ## 10. Remaining Findings
 
-- H-07 Git Revision Traceability: OPEN。No commits / all files untracked。
 - Gate Review M-01 Context BuilderはPhase 1対象のため未実装。
 - M-02 Context Selectorのleast-context relevance強化は未実装。Authorization/Resource body isolationは維持。
 - M-03 polymorphic `data_access_grants` parentのDB FKはSQLite schema上未追加。Repository envelope/child exact-matchとprovenance-controlled serviceでFail Closedする。
-- M-04 Ruff/mypy/coverage/Hypothesis evidenceは未取得。
 - M-05 concurrent commit-after-response retryの完全なfault injectionは未追加。Deterministic ID、unique constraint、idempotent immutable insertは維持。
 - L-01 PostgreSQL用Protocol/Unit of Workは未実装。
+- 独立review verdictは未取得。実装GateのPASSを、SHA固定の独立Phase 0A PASSとして扱ってはならない。
+- GitHub automation/governance filesはworking treeに存在するが未commit・未pushであり、GitHub上のAI loopはまだ起動していない。
 
 上記にBLOCKER B-01〜B-06またはHIGH H-01〜H-06の未修正はない。
 
@@ -227,7 +230,31 @@ System-wide `python -m pip check`はKali環境へ既存導入されている本P
 ## 13. Recommendation for Re-Gate
 
 ```text
-READY FOR PHASE 0A RE-GATE: YES
+PHASE 0A IMPLEMENTATION GATE: PASS
+READY FOR SHA-BOUND INDEPENDENT PHASE 0A REVIEW: YES
 ```
 
-B-01〜B-06とH-01〜H-06はSource Evidenceと実行済みRegression Testの両方を持つ。全既存/追加TestがPASSし、critical security metricの既知acceptanceは0、External Tool Dispatchは0である。Phase 0Bへは進まず、独立したPhase 0A Gate Reviewを次に実施する。
+B-01〜B-06とH-01〜H-07はSource Evidenceと実行済みRegression Testの両方を持つ。全既存/追加TestがPASSし、critical security metricの既知acceptanceは0、External Tool Dispatchは0である。Phase 0Bへは進まず、commit/push後の正確なPR HEAD SHAに対する独立Phase 0A Reviewを次に実施する。
+
+## 14. Current Revision and Working-Tree Evidence
+
+| Item | Value |
+|---|---|
+| Prior independent review identity | `snapshot_sha256=3a7fae9806d473ca6e180fcf9e950df52f69d56f72e3fa5e46406a44132e2c9a` |
+| Current base commit | `21be5c06e70b7e8bc5c8184af363d1cf88d61802` |
+| Branch | `main` |
+| Working tree | DIRTY（意図的、未commit） |
+| Tracked unstaged diff | 63 files, 418 insertions, 282 deletions |
+| Staged additions | 1 file (`docs/archive/api-workflows/codex-implement.yml`) |
+| Untracked files | 43 files（automation/governance/phase prompts/testsを含む） |
+| Diff whitespace check | `git diff --check`: PASS |
+
+今回のMypy closureで直接変更した実装は以下である。
+
+- Canonical/typing: `canonical/models.py`, `canonical/digest.py`, `models/common.py`
+- Scope/target/capability: `policy/scope.py`, `tools/target_extractors.py`, `tools/capability_snapshots.py`, `tools/availability.py`
+- Trusted boundaries: `json_schema.py`, `tools/registry.py`, `policy/engine.py`, `policy/digests.py`
+- Repository/provenance: `repositories/base.py`, `repositories/llm.py`, `repositories/context.py`
+- Typed security states/seeds: `models/context.py`, `context/authorization.py`, `executor/authorization_gate.py`, `seeds.py`
+
+No test was removed, weakened, skipped, or marked as an expected failure. No external dispatch, C2, MCP side effect, local attack command, or Phase 0B behavior was added.

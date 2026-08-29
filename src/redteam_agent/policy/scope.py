@@ -61,7 +61,9 @@ class TargetNormalizer:
         if isinstance(target, HostTargetReference):
             return NormalizedTarget(type="host", canonical_value=target.host_id, source="plan")
         if isinstance(target, SessionTargetReference):
-            return NormalizedTarget(type="session", canonical_value=target.session_id, source="plan")
+            return NormalizedTarget(
+                type="session", canonical_value=target.session_id, source="plan"
+            )
         raise UnsupportedScopeTypeError(f"scope type {target.type} is not implemented in Phase 0A")
 
 
@@ -89,6 +91,29 @@ class ScopeEvaluator:
         return ScopeEvaluation(False, "NO_ALLOWED_SCOPE_MATCH")
 
     @staticmethod
+    def _network_matches(
+        target_network: ipaddress.IPv4Network | ipaddress.IPv6Network,
+        scope_network: ipaddress.IPv4Network | ipaddress.IPv6Network,
+        *,
+        prohibited: bool,
+    ) -> bool:
+        if isinstance(target_network, ipaddress.IPv4Network):
+            if not isinstance(scope_network, ipaddress.IPv4Network):
+                return False
+            return (
+                target_network.overlaps(scope_network)
+                if prohibited
+                else target_network.subnet_of(scope_network)
+            )
+        if not isinstance(scope_network, ipaddress.IPv6Network):
+            return False
+        return (
+            target_network.overlaps(scope_network)
+            if prohibited
+            else target_network.subnet_of(scope_network)
+        )
+
+    @staticmethod
     def _matches(target: NormalizedTarget, rule: object, *, prohibited: bool) -> bool:
         if target.type in {"ip", "cidr"} and isinstance(rule, NetworkScopeRule):
             target_network = (
@@ -99,11 +124,8 @@ class ScopeEvaluator:
                 else ipaddress.ip_network(f"{target.canonical_value}/128", strict=False)
             )
             network_matches = any(
-                target_network.version == scope_network.version
-                and (
-                    target_network.overlaps(scope_network)
-                    if prohibited
-                    else target_network.subnet_of(scope_network)
+                ScopeEvaluator._network_matches(
+                    target_network, scope_network, prohibited=prohibited
                 )
                 for scope_network in (
                     ipaddress.ip_network(cidr, strict=False) for cidr in rule.cidrs

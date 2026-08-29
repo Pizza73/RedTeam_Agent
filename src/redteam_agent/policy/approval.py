@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from redteam_agent.authorization_runtime import AuthorizationRuntimeContextResolver
 from redteam_agent.canonical import canonicalize, digest_model, sha256_digest, stable_id
 from redteam_agent.canonical.models import CanonicalJsonObject
 from redteam_agent.errors import ApprovalBindingError, MissionTTLExceededError
@@ -17,7 +18,6 @@ from redteam_agent.models.mission import Mission
 from redteam_agent.models.plans import ExecutionPlan
 from redteam_agent.models.policy import PolicyDecision
 from redteam_agent.models.tools import ToolDefinition
-from redteam_agent.authorization_runtime import AuthorizationRuntimeContextResolver
 from redteam_agent.repositories.approval import ApprovalRecordRepository, ApprovalRequestRepository
 from redteam_agent.repositories.plans import PlanRepository
 from redteam_agent.repositories.policy import PolicyDecisionRepository
@@ -28,7 +28,9 @@ _APPROVAL_BUILDER_TOKEN = object()
 def _redacted_arguments(plan: ExecutionPlan, tool: ToolDefinition) -> CanonicalJsonObject:
     value = plan.proposal.arguments.to_dict()
     for path in tool.secret_argument_paths:
-        segments = tuple(segment for segment in path.strip("/.").replace("/", ".").split(".") if segment)
+        segments = tuple(
+            segment for segment in path.strip("/.").replace("/", ".").split(".") if segment
+        )
         current: object = value
         for segment in segments[:-1]:
             if not isinstance(current, dict) or segment not in current:

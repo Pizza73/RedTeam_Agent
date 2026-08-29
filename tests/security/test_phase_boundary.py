@@ -35,4 +35,3 @@ def test_sql_is_confined_to_storage_and_repository_layers() -> None:
             if relative.parts[0] not in {"repositories", "storage"}:
                 violations.append(str(relative))
     assert violations == []
-

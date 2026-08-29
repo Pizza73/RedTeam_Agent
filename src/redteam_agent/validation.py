@@ -2,24 +2,22 @@
 
 from __future__ import annotations
 
-from typing import Any, TypeVar
+from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
 from .canonical import canonical_loads, canonicalize
 from .errors import BoundaryJsonParseError, PydanticBoundaryValidationError
 
-BoundaryT = TypeVar("BoundaryT", bound=BaseModel)
 
-
-def validate_boundary(model_type: type[BoundaryT], value: Any) -> BoundaryT:
+def validate_boundary[BoundaryT: BaseModel](model_type: type[BoundaryT], value: Any) -> BoundaryT:
     try:
         return model_type.model_validate(value)
     except ValidationError as exc:
         raise PydanticBoundaryValidationError(str(exc)) from exc
 
 
-def parse_boundary_json(
+def parse_boundary_json[BoundaryT: BaseModel](
     raw: str | bytes,
     model_type: type[BoundaryT],
 ) -> BoundaryT:

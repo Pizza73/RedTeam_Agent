@@ -68,9 +68,7 @@ def build_runtime_binding(
         remote_mcp_trust_snapshot_id=remote_mcp_trust_snapshot_id,
         updated_at=updated_at,
     )
-    return provisional.model_copy(
-        update={"binding_digest": runtime_binding_digest(provisional)}
-    )
+    return provisional.model_copy(update={"binding_digest": runtime_binding_digest(provisional)})
 
 
 class PolicyStateRepository(ImmutableJsonRepository[PolicyState]):
@@ -122,7 +120,8 @@ class PolicyStateRepository(ImmutableJsonRepository[PolicyState]):
     def verify_row_binding(self, identifier: str | int, model: PolicyState) -> None:
         row = self.database.connection.execute(
             "SELECT state_version, policy_version, policy_digest FROM policy_states "
-            "WHERE mission_id = ?", (identifier,)
+            "WHERE mission_id = ?",
+            (identifier,),
         ).fetchone()
         if row is None or not (
             row["state_version"] == model.state_version
@@ -132,9 +131,7 @@ class PolicyStateRepository(ImmutableJsonRepository[PolicyState]):
             raise CurrentAuthorizationStateError("policy state row binding mismatch")
 
 
-class AuthorizationRuntimeBindingRepository(
-    ImmutableJsonRepository[AuthorizationRuntimeBinding]
-):
+class AuthorizationRuntimeBindingRepository(ImmutableJsonRepository[AuthorizationRuntimeBinding]):
     table = "authorization_runtime_bindings"
     id_column = "mission_id"
     model_type = AuthorizationRuntimeBinding
@@ -149,7 +146,9 @@ class AuthorizationRuntimeBindingRepository(
             current = self.get(binding.mission_id)
             assert current is not None
             if binding.binding_version != current.binding_version + 1:
-                raise CurrentAuthorizationStateError("runtime binding version must increment by one")
+                raise CurrentAuthorizationStateError(
+                    "runtime binding version must increment by one"
+                )
             self.database.connection.execute(
                 "UPDATE authorization_runtime_bindings SET binding_version = ?, "
                 "binding_digest = ?, payload_json = ? WHERE mission_id = ?",
@@ -178,12 +177,11 @@ class AuthorizationRuntimeBindingRepository(
     def verify_integrity(self, model: AuthorizationRuntimeBinding) -> None:
         verify_model_digest(model, model.binding_digest, exclude={"binding_digest"})
 
-    def verify_row_binding(
-        self, identifier: str | int, model: AuthorizationRuntimeBinding
-    ) -> None:
+    def verify_row_binding(self, identifier: str | int, model: AuthorizationRuntimeBinding) -> None:
         row = self.database.connection.execute(
             "SELECT binding_version, binding_digest FROM authorization_runtime_bindings "
-            "WHERE mission_id = ?", (identifier,)
+            "WHERE mission_id = ?",
+            (identifier,),
         ).fetchone()
         if row is None or not (
             row["binding_version"] == model.binding_version

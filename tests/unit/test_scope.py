@@ -85,4 +85,3 @@ def test_unimplemented_scope_is_not_normalized() -> None:
 def test_ipv4_mapped_ipv6_alias_is_rejected() -> None:
     with pytest.raises(ValueError):
         TargetNormalizer().normalize(IpTargetReference(type="ip", address="::ffff:10.0.0.1"))
-

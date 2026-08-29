@@ -1,16 +1,16 @@
 from __future__ import annotations
 
 import math
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
 from redteam_agent.canonical import canonical_loads, canonicalize, sha256_digest
+from redteam_agent.canonical.models import CanonicalJsonObject
 from redteam_agent.models.common import OperationalPhase
 from redteam_agent.models.plans import ExecutionPlanProposal
 from redteam_agent.models.scope import IpTargetReference
 from redteam_agent.models.tools import ToolRef
-from redteam_agent.canonical.models import CanonicalJsonObject
 from redteam_agent.policy.digests import proposal_digest
 
 
@@ -42,7 +42,7 @@ def test_canonical_json_ingress_is_utf8_only() -> None:
 
 
 def test_datetime_is_utc_canonical() -> None:
-    value = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    value = datetime(2026, 1, 1, tzinfo=UTC)
     assert canonicalize(value) == b'"2026-01-01T00:00:00Z"'
 
 

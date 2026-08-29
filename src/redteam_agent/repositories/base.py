@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import sqlite3
-from typing import Generic, TypeVar
 
 from pydantic import BaseModel
 
@@ -12,14 +11,12 @@ from redteam_agent.canonical.digest import model_payload
 from redteam_agent.errors import DigestIntegrityError, RepositoryConflictError
 from redteam_agent.storage import Database
 
-ModelT = TypeVar("ModelT", bound=BaseModel)
-
 
 def model_json(model: BaseModel) -> str:
     return canonicalize(model_payload(model)).decode("utf-8")
 
 
-def parse_model_json(model_type: type[ModelT], payload: str | bytes) -> ModelT:
+def parse_model_json[ModelT: BaseModel](model_type: type[ModelT], payload: str | bytes) -> ModelT:
     """Duplicate-aware parser for persisted security artifacts."""
 
     try:
@@ -29,7 +26,7 @@ def parse_model_json(model_type: type[ModelT], payload: str | bytes) -> ModelT:
         raise DigestIntegrityError(f"invalid persisted {model_type.__name__} payload") from exc
 
 
-class ImmutableJsonRepository(Generic[ModelT]):
+class ImmutableJsonRepository[ModelT: BaseModel]:
     table: str
     id_column: str
     model_type: type[ModelT]
@@ -76,6 +73,8 @@ class ImmutableJsonRepository(Generic[ModelT]):
             self.database.connection.execute(statement, parameters)
         except sqlite3.IntegrityError as exc:
             identifier = parameters[0]
+            if not isinstance(identifier, (str, int)):
+                raise RepositoryConflictError("invalid immutable row identifier") from exc
             existing = self._get_payload(identifier)
             if existing is None:
                 raise RepositoryConflictError(str(exc)) from exc

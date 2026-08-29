@@ -26,14 +26,18 @@ from redteam_agent.repositories.policy import PolicyDecisionRepository
 from redteam_agent.tools.availability import ToolAvailabilityResolver, execution_scope_digest
 from redteam_agent.tools.target_extractors import TrustedTargetExtractorRegistry
 
+AuthorizationGateStatus = Literal[
+    "AUTHORIZED", "DENIED", "STALE", "INVALID", "WAITING_APPROVAL"
+]
+
 
 class AuthorizationGateResult(StrictImmutableBoundaryModel):
-    status: Literal["AUTHORIZED", "DENIED", "STALE", "INVALID", "WAITING_APPROVAL"]
+    status: AuthorizationGateStatus
     reason_codes: tuple[str, ...]
     dispatch_performed: Literal[False] = False
 
 
-def _result(status: str, *reasons: str) -> AuthorizationGateResult:
+def _result(status: AuthorizationGateStatus, *reasons: str) -> AuthorizationGateResult:
     return AuthorizationGateResult(
         status=status,
         reason_codes=tuple(sorted(set(reasons))),

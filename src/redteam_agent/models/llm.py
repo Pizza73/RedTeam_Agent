@@ -36,4 +36,3 @@ class LLMCapabilityResult(StrictImmutableBoundaryModel):
     status: Literal["PASSED", "FAILED", "NOT_REQUIRED"]
     result_digest: str = Field(min_length=1)
     checked_at: UtcDatetime
-

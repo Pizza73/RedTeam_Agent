@@ -22,4 +22,3 @@ class DataAccessEvaluator:
         if any(matches(rule) for rule in policy.prohibited):
             return False
         return any(matches(rule) for rule in policy.allowed)
-

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from pydantic import BaseModel
+
 from redteam_agent.canonical import sha256_digest, stable_id
 from redteam_agent.errors import DigestIntegrityError
 from redteam_agent.models.capabilities import (
@@ -18,17 +20,17 @@ from redteam_agent.models.capabilities import (
 )
 
 
-def _build_snapshot(
+def _build_snapshot[SnapshotT: BaseModel, ValueT: BaseModel](
     *,
     prefix: str,
     schema_version: str,
     field_name: str,
-    values: tuple[object, ...],
+    values: tuple[ValueT, ...],
     source: str,
     created_at: datetime,
-    model_type: type,
+    model_type: type[SnapshotT],
     mission_id: str | None = None,
-) -> object:
+) -> SnapshotT:
     content = {
         "schema_version": schema_version,
         field_name: [value.model_dump(mode="python") for value in values],
@@ -46,11 +48,15 @@ def _build_snapshot(
     }
     if mission_id is not None:
         kwargs["mission_id"] = mission_id
-    return model_type(**kwargs)
+    return model_type.model_validate(kwargs)
 
 
 def build_session_snapshot(
-    *, mission_id: str, contexts: tuple[SessionSecurityContext, ...], source: str, created_at: datetime
+    *,
+    mission_id: str,
+    contexts: tuple[SessionSecurityContext, ...],
+    source: str,
+    created_at: datetime,
 ) -> SessionSecurityContextSnapshot:
     ordered = tuple(sorted(contexts, key=lambda item: item.session_id))
     return _build_snapshot(

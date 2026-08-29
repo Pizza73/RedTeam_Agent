@@ -36,4 +36,3 @@ class ExecutionPlan(StrictImmutableBoundaryModel):
     sandbox_capabilities_digest: str = Field(min_length=1)
     remote_mcp_trust_policy_digest: str = Field(min_length=1)
     created_at: UtcDatetime
-

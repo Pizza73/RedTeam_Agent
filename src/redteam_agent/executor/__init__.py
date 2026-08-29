@@ -3,4 +3,3 @@
 from .authorization_gate import AuthorizationGateResult, authorize_execution
 
 __all__ = ["AuthorizationGateResult", "authorize_execution"]
-

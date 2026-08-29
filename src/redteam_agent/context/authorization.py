@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from redteam_agent.authorization_runtime import AuthorizationRuntimeContextResolver
 from redteam_agent.canonical import digest_model, sha256_digest, stable_id, verify_model_digest
 from redteam_agent.errors import (
     AuthorizationEpochMismatchError,
@@ -16,13 +17,13 @@ from redteam_agent.models.capabilities import SessionSecurityContextSnapshot
 from redteam_agent.models.context import (
     CandidateContextResource,
     ContextDataAccessGrant,
+    ContextServiceIdentity,
     DataAccessGrant,
     ResourceBinding,
     SessionContextGrant,
 )
 from redteam_agent.models.mission import Mission
 from redteam_agent.models.scope import SessionScopeRule
-from redteam_agent.authorization_runtime import AuthorizationRuntimeContextResolver
 from redteam_agent.policy.data_access import DataAccessEvaluator
 from redteam_agent.repositories.context import (
     ContextAuthorizationRepository,
@@ -52,7 +53,7 @@ class ContextAuthorizationService:
         self,
         *,
         mission: Mission,
-        service_identity: str,
+        service_identity: ContextServiceIdentity,
         candidates: tuple[CandidateContextResource, ...],
         requested_session_ids: tuple[str, ...],
         session_snapshot: SessionSecurityContextSnapshot,
@@ -100,8 +101,7 @@ class ContextAuthorizationService:
             sorted(
                 set(requested_session_ids)
                 & in_scope_sessions
-                & existing_sessions
-                - prohibited_sessions
+                & existing_sessions - prohibited_sessions
             )
         )
         session_grant = SessionContextGrant(
@@ -159,7 +159,7 @@ class ContextAccessGate:
         *,
         grant_id: str,
         mission_id: str,
-        service_identity: str,
+        service_identity: ContextServiceIdentity,
         resource_id: str,
         operation: str,
         now: datetime,
@@ -175,7 +175,10 @@ class ContextAccessGate:
         if mission.state != "RUNNING":
             raise DataAccessDeniedError("context grants require a RUNNING mission")
         verify_model_digest(grant, grant.grant_digest, exclude={"grant_digest"})
-        if grant.mission_id != mission.mission_id or grant.mission_revision != mission.mission_revision:
+        if (
+            grant.mission_id != mission.mission_id
+            or grant.mission_revision != mission.mission_revision
+        ):
             raise DataAccessDeniedError("context grant mission binding mismatch")
         if grant.authorization_epoch != mission.authorization_epoch:
             raise AuthorizationEpochMismatchError("context grant authorization epoch is stale")
@@ -225,7 +228,7 @@ class ContextAuthorizationApplicationService:
         self,
         *,
         mission_id: str,
-        service_identity: str,
+        service_identity: ContextServiceIdentity,
         candidates: tuple[CandidateContextResource, ...],
         requested_session_ids: tuple[str, ...],
         issued_at: datetime,
@@ -242,6 +245,4 @@ class ContextAuthorizationApplicationService:
             issued_at=issued_at,
             expires_at=expires_at,
         )
-        return self.repository._store_issued(
-            grant, authorizer_token=_CONTEXT_AUTHORIZER_TOKEN
-        )
+        return self.repository._store_issued(grant, authorizer_token=_CONTEXT_AUTHORIZER_TOKEN)

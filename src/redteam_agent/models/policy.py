@@ -45,10 +45,9 @@ class PolicyDecision(StrictImmutableBoundaryModel):
     expires_at: UtcDatetime
 
     @model_validator(mode="after")
-    def valid_interval(self) -> "PolicyDecision":
+    def valid_interval(self) -> PolicyDecision:
         if self.issued_at >= self.expires_at:
             raise ValueError("decision issued_at must be before expires_at")
         if tuple(sorted(set(self.reason_codes))) != self.reason_codes:
             raise ValueError("reason codes must be sorted and unique")
         return self
-

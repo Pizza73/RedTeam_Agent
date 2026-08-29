@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-
-from jsonschema import Draft202012Validator
+from typing import Literal
 
 from redteam_agent.canonical import digest_model, sha256_digest, stable_id
 from redteam_agent.errors import (
@@ -12,8 +11,9 @@ from redteam_agent.errors import (
     MissionTTLExceededError,
     TargetExtractorResolutionError,
 )
-from redteam_agent.models.context import DataAccessGrant, ResourceBinding
+from redteam_agent.json_schema import is_json_schema_instance_valid
 from redteam_agent.models.common import RiskLevel
+from redteam_agent.models.context import DataAccessGrant, ResourceBinding
 from redteam_agent.models.mission import Mission
 from redteam_agent.models.plans import ExecutionPlan
 from redteam_agent.models.policy import PolicyDecision
@@ -64,9 +64,15 @@ class PolicyEngine:
     ) -> PolicyDecision:
         if issued_at >= expires_at or expires_at > mission.valid_until:
             raise MissionTTLExceededError("policy decision TTL violates mission validity")
-        if not (mission.valid_from <= issued_at < mission.valid_until) or mission.state != "RUNNING":
+        if (
+            not (mission.valid_from <= issued_at < mission.valid_until)
+            or mission.state != "RUNNING"
+        ):
             raise MissionTTLExceededError("mission is not currently executable")
-        if plan.mission_id != mission.mission_id or plan.mission_revision != mission.mission_revision:
+        if (
+            plan.mission_id != mission.mission_id
+            or plan.mission_revision != mission.mission_revision
+        ):
             raise AvailableToolSnapshotStaleError("plan mission revision is stale")
         if plan.authorization_epoch != mission.authorization_epoch:
             raise AvailableToolSnapshotStaleError("plan authorization epoch is stale")
@@ -111,6 +117,7 @@ class PolicyEngine:
         data_tuple = self._sorted_grants(authorized_data)
         effective_risk = self._effective_risk(tool, len(normalized_tuple))
 
+        decision_name: Literal["ALLOW", "REQUIRE_APPROVAL", "DENY"]
         if reasons:
             decision_name = "DENY"
         elif self._requires_approval(tool, mission, effective_risk):
@@ -181,21 +188,18 @@ class PolicyEngine:
     ) -> ToolDefinition:
         if not any(view.tool_ref == plan.proposal.tool_ref for view in snapshot.tools):
             raise AvailableToolSnapshotStaleError("proposal tool is not available")
-        tool = next((item for item in registry.tools if item.tool_ref == plan.proposal.tool_ref), None)
+        tool = next(
+            (item for item in registry.tools if item.tool_ref == plan.proposal.tool_ref), None
+        )
         if tool is None:
             raise AvailableToolSnapshotStaleError("proposal tool is not registered")
         return tool
 
     @staticmethod
-    def _validate_arguments(
-        tool: ToolDefinition, plan: ExecutionPlan, reasons: set[str]
-    ) -> None:
-        errors = tuple(
-            Draft202012Validator(tool.parameter_schema.to_dict()).iter_errors(
-                plan.proposal.arguments.to_dict()
-            )
-        )
-        if errors:
+    def _validate_arguments(tool: ToolDefinition, plan: ExecutionPlan, reasons: set[str]) -> None:
+        if not is_json_schema_instance_valid(
+            tool.parameter_schema.to_dict(), plan.proposal.arguments.to_dict()
+        ):
             reasons.add("ARGUMENT_SCHEMA_INVALID")
 
     def _validate_session(
@@ -307,9 +311,7 @@ class PolicyEngine:
 
     @staticmethod
     def _sorted_targets(targets: list[NormalizedTarget]) -> tuple[NormalizedTarget, ...]:
-        unique = {
-            sha256_digest(target.model_dump(mode="python")): target for target in targets
-        }
+        unique = {sha256_digest(target.model_dump(mode="python")): target for target in targets}
         return tuple(
             sorted(
                 unique.values(),

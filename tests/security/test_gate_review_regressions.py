@@ -10,8 +10,8 @@ from redteam_agent.canonical import CanonicalJsonObject, digest_model, stable_id
 from redteam_agent.errors import (
     BoundaryJsonParseError,
     DigestIntegrityError,
-    PydanticBoundaryValidationError,
     PolicyDecisionProvenanceError,
+    PydanticBoundaryValidationError,
 )
 from redteam_agent.executor import authorize_execution
 from redteam_agent.models.capabilities import SandboxCapabilities
@@ -27,18 +27,21 @@ from redteam_agent.policy.plans import create_execution_plan
 from redteam_agent.repositories import (
     AdapterCapabilitySnapshotRepository,
     AvailableToolSnapshotRepository,
-    ContextAuthorizationRepository,
     LLMProfileRepository,
     MissionRevisionRepository,
     PlanRepository,
-    PolicyDecisionRepository,
     RemoteMCPTrustSnapshotRepository,
     SandboxCapabilitySnapshotRepository,
     SessionSecurityContextSnapshotRepository,
 )
 from redteam_agent.repositories.base import model_json
-from redteam_agent.seeds import FIXED_TIME, mock_capability_snapshots, mock_mission, mock_network_tool
-from redteam_agent.seeds import mock_profile
+from redteam_agent.seeds import (
+    FIXED_TIME,
+    mock_capability_snapshots,
+    mock_mission,
+    mock_network_tool,
+    mock_profile,
+)
 from redteam_agent.storage import Database
 from redteam_agent.storage.migrations import MIGRATIONS
 from redteam_agent.tools import (
@@ -56,7 +59,9 @@ def _endpoint_tool(*, requires_session: bool = False) -> ToolDefinition:
     data.update(
         {
             "requires_session": requires_session,
-            "required_session_capabilities": frozenset({"shell"}) if requires_session else frozenset(),
+            "required_session_capabilities": frozenset({"shell"})
+            if requires_session
+            else frozenset(),
             "parameter_schema": CanonicalJsonObject(
                 {
                     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -117,9 +122,7 @@ def _endpoint_decision(
         tool_ref=tool.tool_ref,
         requested_targets=(),
         session_id=session_id,
-        arguments=CanonicalJsonObject(
-            {"target": "10.0.0.10", "port": port, "protocol": protocol}
-        ),
+        arguments=CanonicalJsonObject({"target": "10.0.0.10", "port": port, "protocol": protocol}),
     )
     plan = create_execution_plan(
         mission=mission, proposal=proposal, snapshot=snapshot, created_at=FIXED_TIME
@@ -137,15 +140,35 @@ def _endpoint_decision(
 @pytest.mark.parametrize(
     ("allowed_rule", "port", "protocol", "expected"),
     [
-        (NetworkScopeRule(type="network", cidrs=("10.0.0.0/24",), ports=(443,)), 443, "tcp", "ALLOW"),
+        (
+            NetworkScopeRule(type="network", cidrs=("10.0.0.0/24",), ports=(443,)),
+            443,
+            "tcp",
+            "ALLOW",
+        ),
         (NetworkScopeRule(type="network", cidrs=("10.0.0.0/24",), ports=(443,)), 22, "tcp", "DENY"),
-        (NetworkScopeRule(type="network", cidrs=("10.0.0.0/24",), protocols=("tcp",)), 443, "tcp", "ALLOW"),
-        (NetworkScopeRule(type="network", cidrs=("10.0.0.0/24",), protocols=("tcp",)), 443, "udp", "DENY"),
+        (
+            NetworkScopeRule(type="network", cidrs=("10.0.0.0/24",), protocols=("tcp",)),
+            443,
+            "tcp",
+            "ALLOW",
+        ),
+        (
+            NetworkScopeRule(type="network", cidrs=("10.0.0.0/24",), protocols=("tcp",)),
+            443,
+            "udp",
+            "DENY",
+        ),
     ],
 )
 def test_network_endpoint_scope_is_enforced(allowed_rule, port, protocol, expected) -> None:
     mission = mock_mission().model_copy(
-        update={"allowed_execution_scope": (allowed_rule, SessionScopeRule(type="session", session_id="session-1"))}
+        update={
+            "allowed_execution_scope": (
+                allowed_rule,
+                SessionScopeRule(type="session", session_id="session-1"),
+            )
+        }
     )
     decision = _endpoint_decision(
         mission=mission, tool=_endpoint_tool(), port=port, protocol=protocol
@@ -156,34 +179,26 @@ def test_network_endpoint_scope_is_enforced(allowed_rule, port, protocol, expect
 def test_prohibited_port_wins() -> None:
     mission = mock_mission().model_copy(
         update={
-            "allowed_execution_scope": (
-                NetworkScopeRule(type="network", cidrs=("10.0.0.0/24",)),
-            ),
+            "allowed_execution_scope": (NetworkScopeRule(type="network", cidrs=("10.0.0.0/24",)),),
             "prohibited_execution_scope": (
                 NetworkScopeRule(type="network", cidrs=("10.0.0.0/24",), ports=(443,)),
             ),
         }
     )
-    decision = _endpoint_decision(
-        mission=mission, tool=_endpoint_tool(), port=443, protocol="tcp"
-    )
+    decision = _endpoint_decision(mission=mission, tool=_endpoint_tool(), port=443, protocol="tcp")
     assert decision is not None and decision.decision == "DENY"
 
 
 def test_prohibited_endpoint_rule_does_not_match_an_unrelated_network() -> None:
     mission = mock_mission().model_copy(
         update={
-            "allowed_execution_scope": (
-                NetworkScopeRule(type="network", cidrs=("10.0.0.0/24",)),
-            ),
+            "allowed_execution_scope": (NetworkScopeRule(type="network", cidrs=("10.0.0.0/24",)),),
             "prohibited_execution_scope": (
                 NetworkScopeRule(type="network", cidrs=("192.0.2.0/24",), ports=(443,)),
             ),
         }
     )
-    decision = _endpoint_decision(
-        mission=mission, tool=_endpoint_tool(), port=443, protocol="tcp"
-    )
+    decision = _endpoint_decision(mission=mission, tool=_endpoint_tool(), port=443, protocol="tcp")
     assert decision is not None and decision.decision == "ALLOW"
 
 
@@ -196,18 +211,19 @@ def test_execution_session_scope_present_allows_and_absent_removes_tool() -> Non
     assert any(target.type == "session" for target in allowed.normalized_targets)
     no_session_scope = mock_mission().model_copy(
         update={
-            "allowed_execution_scope": (
-                NetworkScopeRule(type="network", cidrs=("10.0.0.0/24",)),
-            )
+            "allowed_execution_scope": (NetworkScopeRule(type="network", cidrs=("10.0.0.0/24",)),)
         }
     )
-    assert _endpoint_decision(
-        mission=no_session_scope,
-        tool=tool,
-        port=443,
-        protocol="tcp",
-        session_id="session-1",
-    ) is None
+    assert (
+        _endpoint_decision(
+            mission=no_session_scope,
+            tool=tool,
+            port=443,
+            protocol="tcp",
+            session_id="session-1",
+        )
+        is None
+    )
 
 
 def test_duplicate_keys_rejected_at_boundary_top_level_and_nested() -> None:
@@ -287,7 +303,9 @@ def _replace_decision(database: Database, decision) -> None:
         "DELETE FROM data_access_grants WHERE owner_type = 'policy' AND owner_id = ?",
         (decision.plan_id,),
     )
-    database.connection.execute("DELETE FROM policy_decisions WHERE plan_id = ?", (decision.plan_id,))
+    database.connection.execute(
+        "DELETE FROM policy_decisions WHERE plan_id = ?", (decision.plan_id,)
+    )
     database.connection.execute(
         "INSERT INTO policy_decisions"
         "(decision_id, decision_digest, mission_id, plan_id, authorization_digest, decision, "
@@ -377,9 +395,7 @@ def test_policy_repository_rejects_caller_issuance_and_invalid_digest() -> None:
         assert not hasattr(kernel.decisions, "add")
         invalid = kernel.decision.model_copy(update={"decision_digest": "sha256:invalid"})
         with pytest.raises(DigestIntegrityError):
-            kernel.decisions._store_issued(
-                invalid, issuer_token=_POLICY_ENGINE_ISSUER_TOKEN
-            )
+            kernel.decisions._store_issued(invalid, issuer_token=_POLICY_ENGINE_ISSUER_TOKEN)
         with pytest.raises(PolicyDecisionProvenanceError):
             kernel.decisions._store_issued(kernel.decision, issuer_token=object())
 
@@ -387,9 +403,11 @@ def test_policy_repository_rejects_caller_issuance_and_invalid_digest() -> None:
 def test_security_repositories_reject_invalid_digest_on_first_insert_and_read() -> None:
     environment = build_environment()
     with Database() as database:
-        kernel = persist_environment(database, environment)
+        persist_environment(database, environment)
         repository = AvailableToolSnapshotRepository(database)
-        invalid = environment.snapshot.model_copy(update={"snapshot_id": "new-id", "snapshot_digest": "bad"})
+        invalid = environment.snapshot.model_copy(
+            update={"snapshot_id": "new-id", "snapshot_digest": "bad"}
+        )
         with pytest.raises(DigestIntegrityError):
             repository.add(invalid)
         database.connection.execute(
@@ -405,9 +423,7 @@ def test_available_snapshot_read_revalidates_parent_capability_bindings() -> Non
         kernel = persist_environment(database, build_environment())
         database.connection.execute("DELETE FROM sandbox_capability_snapshots")
         with pytest.raises(DigestIntegrityError):
-            AvailableToolSnapshotRepository(database).get(
-                kernel.environment.snapshot.snapshot_id
-            )
+            AvailableToolSnapshotRepository(database).get(kernel.environment.snapshot.snapshot_id)
 
 
 def test_execution_plan_read_revalidates_persisted_proposal_binding() -> None:
@@ -468,9 +484,7 @@ def _llm_capability_result(*, profile_revision: str, profile_digest: str):
         checked_at=FIXED_TIME,
     )
     return provisional.model_copy(
-        update={
-            "result_digest": digest_model(provisional, exclude={"result_digest"})
-        }
+        update={"result_digest": digest_model(provisional, exclude={"result_digest"})}
     )
 
 
@@ -494,8 +508,7 @@ def test_llm_capability_result_enforces_profile_binding_on_store_and_read() -> N
         repository.add_capability_result(valid)
         corrupted = valid.model_copy(update={"profile_digest": "sha256:corrupted"})
         database.connection.execute(
-            "UPDATE llm_capability_results SET payload_json = ? "
-            "WHERE capability_result_id = ?",
+            "UPDATE llm_capability_results SET payload_json = ? WHERE capability_result_id = ?",
             (model_json(corrupted), valid.capability_result_id),
         )
         with pytest.raises(DigestIntegrityError):
@@ -531,7 +544,9 @@ def test_existing_v1_database_is_upgraded_to_v2(tmp_path) -> None:
     connection.commit()
     connection.close()
     with Database(path) as upgraded:
-        versions = {row[0] for row in upgraded.connection.execute("SELECT version FROM schema_migrations")}
+        versions = {
+            row[0] for row in upgraded.connection.execute("SELECT version FROM schema_migrations")
+        }
         assert versions == {1, 2}
         assert upgraded.connection.execute(
             "SELECT name FROM sqlite_master WHERE name='authorization_runtime_bindings'"

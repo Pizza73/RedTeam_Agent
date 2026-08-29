@@ -55,4 +55,3 @@ class ContextSelector:
             canonicalize(target.model_dump(mode="python")) for target in record.target_references
         }
         return bool(requested & indexed)
-

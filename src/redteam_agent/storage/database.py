@@ -58,10 +58,9 @@ class Database:
     def close(self) -> None:
         self.connection.close()
 
-    def __enter__(self) -> "Database":
+    def __enter__(self) -> Database:
         return self
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
         del exc_type, exc, traceback
         self.close()
-

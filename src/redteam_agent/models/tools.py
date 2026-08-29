@@ -68,7 +68,7 @@ class ToolDefinition(StrictImmutableBoundaryModel):
     sandbox_requirement: SandboxRequirement | None
 
     @model_validator(mode="after")
-    def definition_invariants(self) -> "ToolDefinition":
+    def definition_invariants(self) -> ToolDefinition:
         if self.default_timeout_seconds > self.max_timeout_seconds:
             raise ValueError("default timeout must not exceed maximum timeout")
         if self.target_mode == "required" and self.target_extractor_id is None:
@@ -77,7 +77,10 @@ class ToolDefinition(StrictImmutableBoundaryModel):
             raise ValueError("target_mode=none must not declare an extractor")
         if self.side_effect == SideEffect.DESTRUCTIVE and self.minimum_risk_level != RiskLevel.HIGH:
             raise ValueError("destructive tools require minimum risk high")
-        if self.side_effect == SideEffect.STATE_CHANGE and self.minimum_risk_level == RiskLevel.READ:
+        if (
+            self.side_effect == SideEffect.STATE_CHANGE
+            and self.minimum_risk_level == RiskLevel.READ
+        ):
             raise ValueError("state-changing tools cannot have read risk")
         if (
             self.adapter in {"local", "mcp"}
@@ -100,7 +103,7 @@ class ToolRegistryRevision(StrictImmutableBoundaryModel):
     created_at: UtcDatetime
 
     @model_validator(mode="after")
-    def unique_sorted_tools(self) -> "ToolRegistryRevision":
+    def unique_sorted_tools(self) -> ToolRegistryRevision:
         refs = [(tool.tool_ref.tool_id, tool.tool_ref.registry_revision) for tool in self.tools]
         if len(refs) != len(set(refs)):
             raise ValueError("tool references must be unique")
@@ -147,7 +150,7 @@ class AvailableToolSnapshot(StrictImmutableBoundaryModel):
     expires_at: UtcDatetime
 
     @model_validator(mode="after")
-    def snapshot_invariants(self) -> "AvailableToolSnapshot":
+    def snapshot_invariants(self) -> AvailableToolSnapshot:
         if self.created_at >= self.expires_at:
             raise ValueError("snapshot created_at must be before expires_at")
         refs = [(item.tool_ref.tool_id, item.tool_ref.registry_revision) for item in self.tools]

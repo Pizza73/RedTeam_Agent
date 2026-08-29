@@ -12,6 +12,8 @@ from .base import StrictImmutableBoundaryModel
 from .common import OperationalPhase, UtcDatetime
 from .scope import DataAccessOperation, DataResourceType, TargetReference
 
+ContextServiceIdentity = Literal["planner_context", "analyzer_context"]
+
 
 class ResourceBinding(StrictImmutableBoundaryModel):
     resource_id: str = Field(min_length=1)
@@ -43,7 +45,7 @@ class ContextDataAccessGrant(StrictImmutableBoundaryModel):
     mission_id: str = Field(min_length=1)
     mission_revision: int = Field(ge=1)
     authorization_epoch: int = Field(ge=0)
-    service_identity: Literal["planner_context", "analyzer_context"]
+    service_identity: ContextServiceIdentity
     resources: tuple[DataAccessGrant, ...]
     session_context: SessionContextGrant
     policy_version: str = Field(min_length=1)
@@ -51,12 +53,13 @@ class ContextDataAccessGrant(StrictImmutableBoundaryModel):
     expires_at: UtcDatetime
 
     @model_validator(mode="after")
-    def valid_interval(self) -> "ContextDataAccessGrant":
+    def valid_interval(self) -> ContextDataAccessGrant:
         if self.issued_at >= self.expires_at:
             raise ValueError("grant issued_at must be before expires_at")
-        if self.service_identity in {"planner_context", "analyzer_context"}:
-            if any("resolve" in item.operations for item in self.resources):
-                raise ValueError("LLM context grants may not resolve secret values")
+        if self.service_identity in {"planner_context", "analyzer_context"} and any(
+            "resolve" in item.operations for item in self.resources
+        ):
+            raise ValueError("LLM context grants may not resolve secret values")
         return self
 
 
@@ -73,7 +76,7 @@ class ContextResourceIndexRecord(StrictImmutableBoundaryModel):
     summary_metadata: CanonicalJsonObject
 
     @model_validator(mode="after")
-    def no_content_in_metadata(self) -> "ContextResourceIndexRecord":
+    def no_content_in_metadata(self) -> ContextResourceIndexRecord:
         forbidden = {
             "body",
             "content",
@@ -112,4 +115,3 @@ class ContextSelectionRequest(StrictImmutableBoundaryModel):
     current_targets: tuple[TargetReference, ...]
     candidate_session_ids: tuple[str, ...]
     operational_phase: OperationalPhase
-

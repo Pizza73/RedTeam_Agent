@@ -192,5 +192,5 @@ class ResourceAccessRequest(StrictImmutableBoundaryModel):
     operations: frozenset[DataAccessOperation] = Field(min_length=1)
 
     @model_validator(mode="after")
-    def planner_context_cannot_resolve(self) -> "ResourceAccessRequest":
+    def planner_context_cannot_resolve(self) -> ResourceAccessRequest:
         return self

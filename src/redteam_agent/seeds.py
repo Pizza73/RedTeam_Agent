@@ -2,20 +2,31 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
+from typing import Literal
 
 from redteam_agent.canonical import CanonicalJsonObject, digest_model
 from redteam_agent.models.capabilities import (
     AdapterCapabilities,
+    AdapterCapabilitySnapshot,
     RemoteMCPTrust,
+    RemoteMCPTrustSnapshot,
     SandboxCapabilities,
+    SandboxCapabilitySnapshot,
     SessionSecurityContext,
+    SessionSecurityContextSnapshot,
 )
 from redteam_agent.models.common import RiskLevel, SideEffect
 from redteam_agent.models.context import ContextResourceIndexRecord, ResourceBinding
 from redteam_agent.models.goals import SessionExistsCondition
 from redteam_agent.models.llm import MockAgentProfile
-from redteam_agent.models.mission import Mission, MissionRevision, MissionRoot, MissionState
+from redteam_agent.models.mission import (
+    Mission,
+    MissionLifecycleState,
+    MissionRevision,
+    MissionRoot,
+    MissionState,
+)
 from redteam_agent.models.scope import (
     ApprovalPolicy,
     DataAccessPolicy,
@@ -32,7 +43,6 @@ from redteam_agent.tools.capability_snapshots import (
     build_session_snapshot,
 )
 
-UTC = timezone.utc
 FIXED_TIME = datetime(2026, 1, 1, 0, 0, tzinfo=UTC)
 
 
@@ -48,7 +58,9 @@ def mock_profile() -> MockAgentProfile:
     )
 
 
-def mock_mission(*, state: str = "RUNNING", revision: int = 1, epoch: int = 0) -> Mission:
+def mock_mission(
+    *, state: MissionLifecycleState = "RUNNING", revision: int = 1, epoch: int = 0
+) -> Mission:
     profile = mock_profile()
     return Mission(
         mission_id="mission-phase-0a",
@@ -121,8 +133,8 @@ def mock_network_tool(
     *,
     tool_id: str = "tool.network.inspect",
     revision: int = 1,
-    risk: str = "read",
-    approval_rule: str = "policy",
+    risk: RiskLevel = RiskLevel.READ,
+    approval_rule: Literal["policy", "always"] = "policy",
 ) -> ToolDefinition:
     return ToolDefinition(
         tool_ref=ToolRef(tool_id=tool_id, registry_revision=revision),
@@ -166,7 +178,14 @@ def mock_network_tool(
     )
 
 
-def mock_capability_snapshots(mission_id: str):
+def mock_capability_snapshots(
+    mission_id: str,
+) -> tuple[
+    SessionSecurityContextSnapshot,
+    AdapterCapabilitySnapshot,
+    SandboxCapabilitySnapshot,
+    RemoteMCPTrustSnapshot,
+]:
     session = build_session_snapshot(
         mission_id=mission_id,
         contexts=(

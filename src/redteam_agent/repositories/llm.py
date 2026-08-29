@@ -45,10 +45,17 @@ class LLMProfileRepository:
         ).fetchone()
         if row is None:
             return None
-        model_type = MockAgentProfile if row["profile_type"] == "mock" else LocalLLMProfile
-        profile = parse_model_json(model_type, row["payload_json"])
+        if row["profile_type"] == "mock":
+            profile: AgentProfile = parse_model_json(MockAgentProfile, row["payload_json"])
+        elif row["profile_type"] == "local_llm":
+            profile = parse_model_json(LocalLLMProfile, row["payload_json"])
+        else:
+            raise DigestIntegrityError("unknown persisted LLM profile type")
         verify_model_digest(profile, profile.profile_digest, exclude={"profile_digest"})
-        if row["profile_type"] != profile.profile_type or row["profile_digest"] != profile.profile_digest:
+        if (
+            row["profile_type"] != profile.profile_type
+            or row["profile_digest"] != profile.profile_digest
+        ):
             raise DigestIntegrityError("LLM profile row binding mismatch")
         return profile
 
@@ -80,9 +87,7 @@ class LLMProfileRepository:
                 and existing["result_digest"] == result.result_digest
                 and existing["payload_json"] == payload
             ):
-                raise DigestIntegrityError(
-                    "LLM capability result ID reused with different payload"
-                )
+                raise DigestIntegrityError("LLM capability result ID reused with different payload")
             return result
         self.database.connection.execute(
             "INSERT INTO llm_capability_results"

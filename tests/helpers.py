@@ -3,7 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import timedelta
 
+from redteam_agent.authorization_runtime import AuthorizationRuntimeContextResolver
 from redteam_agent.canonical import CanonicalJsonObject
+from redteam_agent.mission import AuthorizationReferenceRegistry, MissionManager
 from redteam_agent.models.common import OperationalPhase
 from redteam_agent.models.plans import ExecutionPlan, ExecutionPlanProposal
 from redteam_agent.models.policy import PolicyDecision
@@ -32,8 +34,6 @@ from redteam_agent.repositories import (
     ToolRegistryRepository,
 )
 from redteam_agent.repositories.runtime import build_policy_state, build_runtime_binding
-from redteam_agent.authorization_runtime import AuthorizationRuntimeContextResolver
-from redteam_agent.mission import AuthorizationReferenceRegistry, MissionManager
 from redteam_agent.seeds import (
     FIXED_TIME,
     mission_records,
@@ -170,7 +170,9 @@ def persist_environment(database: Database, environment: KernelEnvironment) -> P
     )
     root, revision, _ = mission_records(environment.mission)
     manager.create(root, revision, now=FIXED_TIME - timedelta(minutes=2))
-    manager.transition_to_validated(environment.mission.mission_id, now=FIXED_TIME - timedelta(minutes=1))
+    manager.transition_to_validated(
+        environment.mission.mission_id, now=FIXED_TIME - timedelta(minutes=1)
+    )
     running = manager.start(environment.mission.mission_id, now=FIXED_TIME)
     assert running.mission_state_version == environment.mission.mission_state_version
 

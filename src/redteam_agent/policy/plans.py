@@ -46,4 +46,3 @@ def create_execution_plan(
         remote_mcp_trust_policy_digest=snapshot.remote_mcp_trust_policy_digest,
         created_at=created_at,
     )
-

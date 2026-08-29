@@ -41,7 +41,7 @@ class ApprovalRequest(StrictImmutableBoundaryModel):
     expires_at: UtcDatetime
 
     @model_validator(mode="after")
-    def valid_interval(self) -> "ApprovalRequest":
+    def valid_interval(self) -> ApprovalRequest:
         if self.issued_at >= self.expires_at:
             raise ValueError("approval request issued_at must be before expires_at")
         return self
@@ -65,7 +65,7 @@ class ApprovalRecord(StrictImmutableBoundaryModel):
     expires_at: UtcDatetime
 
     @model_validator(mode="after")
-    def valid_interval(self) -> "ApprovalRecord":
+    def valid_interval(self) -> ApprovalRecord:
         if self.issued_at >= self.expires_at:
             raise ValueError("approval record issued_at must be before expires_at")
         return self

@@ -19,8 +19,8 @@ from redteam_agent.repositories.mission import (
     compose_mission,
 )
 
-from .goal_registry import KnownGoalIdentifierRegistry
 from .authorization_registry import AuthorizationReferenceRegistry
+from .goal_registry import KnownGoalIdentifierRegistry
 from .validation import validate_mission_for_state
 
 

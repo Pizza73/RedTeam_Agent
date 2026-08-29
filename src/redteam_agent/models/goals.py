@@ -76,7 +76,7 @@ class LinuxGroupCondition(StrictImmutableBoundaryModel):
     membership: Literal["primary", "supplementary", "either"] = "either"
 
     @model_validator(mode="after")
-    def at_least_one_identifier(self) -> "LinuxGroupCondition":
+    def at_least_one_identifier(self) -> LinuxGroupCondition:
         if self.gid is None and not self.group_name:
             raise ValueError("gid or group_name is required")
         return self
@@ -121,4 +121,3 @@ SuccessCondition = Annotated[
     | ArtifactEvidenceCondition,
     Field(discriminator="type"),
 ]
-

@@ -18,15 +18,15 @@ from redteam_agent.errors import (
     SessionContextGrantStaleError,
 )
 from redteam_agent.executor import authorize_execution
+from redteam_agent.models.capabilities import SessionSecurityContext
 from redteam_agent.models.common import OperationalPhase, RiskLevel, SideEffect
 from redteam_agent.models.context import (
     ContextSelectionRequest,
     DataAccessGrant,
     ResourceBinding,
 )
-from redteam_agent.models.capabilities import SessionSecurityContext
 from redteam_agent.models.scope import NormalizedTarget
-from redteam_agent.policy.approval import ApprovalService, _APPROVAL_BUILDER_TOKEN
+from redteam_agent.policy.approval import _APPROVAL_BUILDER_TOKEN, ApprovalService
 from redteam_agent.policy.issuance import PolicyDecisionIssuanceService
 from redteam_agent.repositories import (
     AuthorizationRuntimeBindingRepository,
@@ -141,16 +141,10 @@ def test_misleading_approval_presentation_is_rejected(mutation: str) -> None:
             )
         elif mutation == "arguments":
             presentation = request.presentation.model_copy(
-                update={
-                    "redacted_arguments": CanonicalJsonObject(
-                        {"target": "harmless.example"}
-                    )
-                }
+                update={"redacted_arguments": CanonicalJsonObject({"target": "harmless.example"})}
             )
         elif mutation == "risk":
-            presentation = request.presentation.model_copy(
-                update={"effective_risk": RiskLevel.LOW}
-            )
+            presentation = request.presentation.model_copy(update={"effective_risk": RiskLevel.LOW})
         else:
             presentation = request.presentation.model_copy(
                 update={"side_effect": SideEffect.STATE_CHANGE}
@@ -327,7 +321,9 @@ def test_changed_current_session_security_context_rejects_old_grant() -> None:
             )
         )
         with pytest.raises(SessionContextGrantStaleError):
-            ContextAccessGate(kernel.resources, repository, kernel.runtime_resolver).authorize_resource(
+            ContextAccessGate(
+                kernel.resources, repository, kernel.runtime_resolver
+            ).authorize_resource(
                 grant_id=grant.grant_id,
                 mission_id=record.mission_id,
                 service_identity="planner_context",
@@ -365,7 +361,9 @@ def test_resource_version_and_digest_mismatch_each_fail_closed(binding) -> None:
         else:
             kernel.resources.add(changed)
         with pytest.raises(DataAccessDeniedError):
-            ContextAccessGate(kernel.resources, repository, kernel.runtime_resolver).authorize_resource(
+            ContextAccessGate(
+                kernel.resources, repository, kernel.runtime_resolver
+            ).authorize_resource(
                 grant_id=grant.grant_id,
                 mission_id=record.mission_id,
                 service_identity="planner_context",
@@ -382,9 +380,7 @@ def test_context_and_approval_repositories_reject_invalid_digest_first_insert() 
             update={"grant_id": "new-invalid-grant", "grant_digest": "sha256:invalid"}
         )
         with pytest.raises(DigestIntegrityError):
-            repository._store_issued(
-                invalid_grant, authorizer_token=_CONTEXT_AUTHORIZER_TOKEN
-            )
+            repository._store_issued(invalid_grant, authorizer_token=_CONTEXT_AUTHORIZER_TOKEN)
     with Database() as approval_database:
         approval_kernel = persist_environment(
             approval_database, build_environment(approval_rule="always")

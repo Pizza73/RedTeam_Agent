@@ -4,13 +4,12 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterator, Mapping
-from typing import Any
+from typing import Any, cast
 
 from pydantic_core import core_schema
 
-
-JsonScalar = None | bool | int | float | str
-FrozenJsonValue = JsonScalar | tuple["FrozenJsonValue", ...] | "CanonicalJsonObject"
+type JsonScalar = None | bool | int | float | str
+type FrozenJsonValue = JsonScalar | tuple[FrozenJsonValue, ...] | CanonicalJsonObject
 
 
 def _freeze(value: Any) -> FrozenJsonValue:
@@ -108,7 +107,6 @@ class CanonicalJsonObject(Mapping[str, FrozenJsonValue]):
 
     @classmethod
     def __get_pydantic_json_schema__(cls, schema: Any, handler: Any) -> dict[str, Any]:
-        generated = handler(schema)
+        generated = cast(dict[str, Any], handler(schema))
         generated.update({"type": "object", "additionalProperties": True})
         return generated
-

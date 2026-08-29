@@ -5,7 +5,7 @@ from datetime import timedelta
 
 import pytest
 
-from redteam_agent.canonical import CanonicalJsonObject, digest_model
+from redteam_agent.canonical import CanonicalJsonObject
 from redteam_agent.errors import AvailableToolSnapshotStaleError
 from redteam_agent.executor import authorize_execution
 from redteam_agent.mission import AuthorizationReferenceRegistry, MissionManager

@@ -6,7 +6,7 @@ import hashlib
 import hmac
 from collections.abc import Iterable
 from enum import Enum
-from typing import Any
+from typing import Any, cast
 
 from pydantic import BaseModel
 
@@ -53,7 +53,10 @@ def stable_id(prefix: str, value: Any) -> str:
 def model_payload(model: BaseModel, *, exclude: Iterable[str] = ()) -> dict[str, Any]:
     """Explicitly convert a typed model and omit self-referential digest fields."""
 
-    return _explicit_digest_value(model.model_dump(mode="python", exclude=set(exclude)))
+    return cast(
+        dict[str, Any],
+        _explicit_digest_value(model.model_dump(mode="python", exclude=set(exclude))),
+    )
 
 
 def digest_model(model: BaseModel, *, exclude: Iterable[str] = ()) -> str:

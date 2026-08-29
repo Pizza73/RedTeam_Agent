@@ -40,7 +40,8 @@ class ApprovalRequestRepository(ImmutableJsonRepository[ApprovalRequest]):
     def verify_row_binding(self, identifier: str | int, model: ApprovalRequest) -> None:
         row = self.database.connection.execute(
             "SELECT request_digest, policy_decision_id, expires_at FROM approval_requests "
-            "WHERE approval_request_id = ?", (identifier,)
+            "WHERE approval_request_id = ?",
+            (identifier,),
         ).fetchone()
         if row is None or not (
             row["request_digest"] == model.request_digest
@@ -118,7 +119,8 @@ class ApprovalRecordRepository(ImmutableJsonRepository[ApprovalRecord]):
     def verify_row_binding(self, identifier: str | int, model: ApprovalRecord) -> None:
         row = self.database.connection.execute(
             "SELECT approval_request_id, policy_decision_id, record_digest, expires_at "
-            "FROM approvals WHERE approval_id = ?", (identifier,)
+            "FROM approvals WHERE approval_id = ?",
+            (identifier,),
         ).fetchone()
         if row is None or not (
             row["approval_request_id"] == model.approval_request_id
@@ -154,7 +156,9 @@ class ApprovalRecordRepository(ImmutableJsonRepository[ApprovalRecord]):
             and record.authorization_digest == decision.authorization_digest
             and record.mission_id == request.mission_id == decision.mission_id
             and record.mission_revision == request.mission_revision == decision.mission_revision
-            and record.authorization_epoch == request.authorization_epoch == decision.authorization_epoch
+            and record.authorization_epoch
+            == request.authorization_epoch
+            == decision.authorization_epoch
         ):
             raise ApprovalBindingError("approval record/request/decision binding mismatch")
         payload = model_json(record)

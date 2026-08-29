@@ -64,7 +64,9 @@ class ContextResourceIndexRepository(ImmutableJsonRepository[ContextResourceInde
         ).fetchall()
         return tuple(self._verified_row(row) for row in rows)
 
-    def current_binding(self, mission_id: str, resource_id: str) -> ContextResourceIndexRecord | None:
+    def current_binding(
+        self, mission_id: str, resource_id: str
+    ) -> ContextResourceIndexRecord | None:
         row = self.database.connection.execute(
             "SELECT * FROM context_resource_index "
             "WHERE mission_id = ? AND resource_id = ? ORDER BY rowid DESC LIMIT 1",
@@ -88,7 +90,8 @@ class ContextAuthorizationRepository(ImmutableJsonRepository[ContextDataAccessGr
     def verify_row_binding(self, identifier: str | int, model: ContextDataAccessGrant) -> None:
         row = self.database.connection.execute(
             "SELECT mission_id, mission_revision, authorization_epoch, grant_digest, expires_at "
-            "FROM context_data_access_grants WHERE grant_id = ?", (identifier,)
+            "FROM context_data_access_grants WHERE grant_id = ?",
+            (identifier,),
         ).fetchone()
         if row is None or not (
             row["mission_id"] == model.mission_id
@@ -123,15 +126,15 @@ class ContextAuthorizationRepository(ImmutableJsonRepository[ContextDataAccessGr
                 "only ContextAuthorizationApplicationService may persist grants"
             )
         self.verify_integrity(grant)
-        index = ContextResourceIndexRepository(self.database)
+        index_repository = ContextResourceIndexRepository(self.database)
         for entry in grant.resources:
-            current = index.current_binding(grant.mission_id, entry.resource.resource_id)
+            current = index_repository.current_binding(
+                grant.mission_id, entry.resource.resource_id
+            )
             if current is None or current.binding != entry.resource:
                 from redteam_agent.errors import ContextAuthorizationError
 
-                raise ContextAuthorizationError(
-                    "context grant resource binding is absent or stale"
-                )
+                raise ContextAuthorizationError("context grant resource binding is absent or stale")
         mission = self._mission_revision(grant)
         if grant.expires_at > mission.valid_until:
             raise MissionTTLExceededError("context grant outlives mission")
@@ -155,14 +158,14 @@ class ContextAuthorizationRepository(ImmutableJsonRepository[ContextDataAccessGr
                     payload,
                 ),
             )
-            for index, entry in enumerate(grant.resources):
+            for entry_index, entry in enumerate(grant.resources):
                 connection.execute(
                     "INSERT INTO data_access_grants"
                     "(owner_type, owner_id, entry_index, resource_id, resource_version, "
                     "resource_digest, payload_json) VALUES ('context', ?, ?, ?, ?, ?, ?)",
                     (
                         grant.grant_id,
-                        index,
+                        entry_index,
                         entry.resource.resource_id,
                         entry.resource.resource_version,
                         entry.resource.resource_digest,

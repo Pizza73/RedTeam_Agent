@@ -8,8 +8,8 @@ from pydantic import ValidationError
 from redteam_agent.errors import (
     AuthorizationEpochMismatchError,
     MissionLifecycleAuthorizationError,
-    MissionValidationError,
     MissionStateVersionConflictError,
+    MissionValidationError,
 )
 from redteam_agent.mission import AuthorizationReferenceRegistry, MissionManager
 from redteam_agent.models.goals import ADPrincipalPrivilegeCondition

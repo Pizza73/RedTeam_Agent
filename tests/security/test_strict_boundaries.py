@@ -71,4 +71,3 @@ def test_canonical_json_object_is_deeply_immutable() -> None:
     assert frozen.to_dict() == {"nested": {"values": [1, 2]}}
     with pytest.raises(TypeError):
         frozen["new"] = "value"  # type: ignore[index]
-

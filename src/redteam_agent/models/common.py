@@ -10,9 +10,10 @@ from pydantic import AfterValidator
 
 
 def require_utc(value: datetime) -> datetime:
-    if value.tzinfo is None or value.utcoffset() is None:
+    offset = value.utcoffset()
+    if value.tzinfo is None or offset is None:
         raise ValueError("datetime must be timezone-aware UTC")
-    if value.utcoffset().total_seconds() != 0:
+    if offset.total_seconds() != 0:
         raise ValueError("datetime offset must be UTC")
     return value
 
@@ -42,4 +43,3 @@ class SideEffect(StrEnum):
     READ_ONLY = "read_only"
     STATE_CHANGE = "state_change"
     DESTRUCTIVE = "destructive"
-

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-
 MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (
         1,

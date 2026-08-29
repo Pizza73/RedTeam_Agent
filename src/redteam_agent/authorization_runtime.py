@@ -108,7 +108,12 @@ class AuthorizationRuntimeContextResolver:
             raise CurrentAuthorizationStateError("a bound authorization artifact is missing")
         assert revision is not None and latest_revision is not None
         assert registry is not None and snapshot is not None
-        assert session is not None and adapter is not None and sandbox is not None and remote is not None
+        assert (
+            session is not None
+            and adapter is not None
+            and sandbox is not None
+            and remote is not None
+        )
         mission = compose_mission(revision, state)
         valid = (
             binding.mission_revision == latest_revision.mission_revision
@@ -130,9 +135,7 @@ class AuthorizationRuntimeContextResolver:
         )
         if not valid:
             raise CurrentAuthorizationStateError("current authorization binding is stale")
-        recalculated = ToolAvailabilityResolver(
-            TrustedTargetExtractorRegistry()
-        ).calculate(
+        recalculated = ToolAvailabilityResolver(TrustedTargetExtractorRegistry()).calculate(
             mission=mission,
             registry=registry,
             session_snapshot=session,

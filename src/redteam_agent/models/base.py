@@ -13,4 +13,3 @@ class StrictImmutableBoundaryModel(StrictBoundaryModel):
     """Strict boundary model whose direct attributes cannot be reassigned."""
 
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
-

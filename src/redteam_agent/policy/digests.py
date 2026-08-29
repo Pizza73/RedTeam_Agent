@@ -85,8 +85,27 @@ def authorization_intent_payload(
     }
 
 
-def authorization_digest(**kwargs: object) -> str:
-    return sha256_digest(authorization_intent_payload(**kwargs))
+def authorization_digest(
+    *,
+    plan: ExecutionPlan,
+    tool: ToolDefinition,
+    normalized_targets: tuple[NormalizedTarget, ...],
+    authorized_data_access: tuple[DataAccessGrant, ...],
+    effective_risk: str,
+    policy_version: str,
+    registry_digest: str,
+) -> str:
+    return sha256_digest(
+        authorization_intent_payload(
+            plan=plan,
+            tool=tool,
+            normalized_targets=normalized_targets,
+            authorized_data_access=authorized_data_access,
+            effective_risk=effective_risk,
+            policy_version=policy_version,
+            registry_digest=registry_digest,
+        )
+    )
 
 
 def authorization_digest_from_decision(
@@ -101,4 +120,3 @@ def authorization_digest_from_decision(
         policy_version=decision.policy_version,
         registry_digest=decision.registry_digest,
     )
-

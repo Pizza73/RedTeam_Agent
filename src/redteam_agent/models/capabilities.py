@@ -31,7 +31,7 @@ class SessionSecurityContextSnapshot(StrictImmutableBoundaryModel):
     created_at: UtcDatetime
 
     @model_validator(mode="after")
-    def sorted_unique_contexts(self) -> "SessionSecurityContextSnapshot":
+    def sorted_unique_contexts(self) -> SessionSecurityContextSnapshot:
         ids = tuple(item.session_id for item in self.contexts)
         if ids != tuple(sorted(set(ids))):
             raise ValueError("session contexts must be sorted and unique")
@@ -57,7 +57,7 @@ class AdapterCapabilitySnapshot(StrictImmutableBoundaryModel):
     created_at: UtcDatetime
 
     @model_validator(mode="after")
-    def sorted_unique_adapters(self) -> "AdapterCapabilitySnapshot":
+    def sorted_unique_adapters(self) -> AdapterCapabilitySnapshot:
         ids = tuple((item.adapter_type, item.adapter_id) for item in self.adapters)
         if ids != tuple(sorted(set(ids))):
             raise ValueError("adapter capabilities must be sorted and unique")
@@ -91,7 +91,7 @@ class SandboxCapabilitySnapshot(StrictImmutableBoundaryModel):
     created_at: UtcDatetime
 
     @model_validator(mode="after")
-    def sorted_unique_sandboxes(self) -> "SandboxCapabilitySnapshot":
+    def sorted_unique_sandboxes(self) -> SandboxCapabilitySnapshot:
         ids = tuple(item.sandbox_id for item in self.sandboxes)
         if ids != tuple(sorted(set(ids))):
             raise ValueError("sandbox capabilities must be sorted and unique")
@@ -100,7 +100,9 @@ class SandboxCapabilitySnapshot(StrictImmutableBoundaryModel):
 
 class RemoteMCPTrust(StrictImmutableBoundaryModel):
     adapter_id: str = Field(min_length=1)
-    execution_location: Literal["local_process", "managed_remote", "untrusted_remote", "not_applicable"]
+    execution_location: Literal[
+        "local_process", "managed_remote", "untrusted_remote", "not_applicable"
+    ]
     stable_transport_identity: bool
     scope_enforcement: bool
     authentication_authorization: bool
@@ -118,7 +120,7 @@ class RemoteMCPTrustSnapshot(StrictImmutableBoundaryModel):
     created_at: UtcDatetime
 
     @model_validator(mode="after")
-    def sorted_unique_policies(self) -> "RemoteMCPTrustSnapshot":
+    def sorted_unique_policies(self) -> RemoteMCPTrustSnapshot:
         ids = tuple(item.adapter_id for item in self.policies)
         if ids != tuple(sorted(set(ids))):
             raise ValueError("remote trust policies must be sorted and unique")
