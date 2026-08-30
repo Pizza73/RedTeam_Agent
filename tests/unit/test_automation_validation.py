@@ -87,8 +87,11 @@ def test_phase_gate_uses_fail_closed_native_codex_evidence_chain() -> None:
         "ref: pass.reviewed_sha",
         "status.target_url !== pass._comment_url",
         "target_base_sha",
-        "merge_base_commit?.sha === refresh.target_base_sha",
+        "comparison.data.merge_base_commit?.sha === ancestorSha",
+        "isAncestor(refresh.target_base_sha, reviewedSha)",
         "Reviewed Phase 0A head is not descended from a trusted base refresh",
+        "Incorporated Phase 0A base-refresh evidence is ambiguous",
+        "maximalRefreshes.length !== 1",
         "Pull request head or phase changed before recording the gate",
     ):
         assert required_control in workflow

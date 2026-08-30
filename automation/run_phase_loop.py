@@ -1703,19 +1703,47 @@ class PhaseLoop:
                 for record in refresh_records
                 if record.payload.get("revalidate_phase") == state.phase
             ]
-            for record in reversed(candidates):
+            incorporated: dict[str, MarkerEvidence] = {}
+            for record in candidates:
                 validate_base_refresh_payload(record.payload)
                 old_head = str(record.payload["head_sha"])
                 target_base = str(record.payload["target_base_sha"])
                 if self.github.is_ancestor(
                     old_head, state.head_sha
                 ) and self.github.is_ancestor(target_base, state.head_sha):
-                    return target_base
-            if candidates:
+                    incorporated[canonical_digest(record.payload)] = record
+            if not incorporated and candidates:
                 raise UntrustedEvidenceError(
                     "current Phase 0A head is not descended from its trusted base refresh"
                 )
-            return state.base_sha
+            if not incorporated:
+                return state.base_sha
+
+            maximal: list[MarkerEvidence] = []
+            for candidate in incorporated.values():
+                candidate_old_head = str(candidate.payload["head_sha"])
+                candidate_target_base = str(candidate.payload["target_base_sha"])
+                dominated = False
+                for other in incorporated.values():
+                    if candidate is other:
+                        continue
+                    other_old_head = str(other.payload["head_sha"])
+                    other_target_base = str(other.payload["target_base_sha"])
+                    if (
+                        (candidate_old_head != other_old_head
+                         or candidate_target_base != other_target_base)
+                        and self.github.is_ancestor(candidate_old_head, other_old_head)
+                        and self.github.is_ancestor(candidate_target_base, other_target_base)
+                    ):
+                        dominated = True
+                        break
+                if not dominated:
+                    maximal.append(candidate)
+            if len(maximal) != 1:
+                raise UntrustedEvidenceError(
+                    "incorporated Phase 0A base-refresh evidence is ambiguous"
+                )
+            return str(maximal[0].payload["target_base_sha"])
         previous = PHASES[index - 1]
         passes = [
             record
