@@ -136,7 +136,7 @@ def test_base_refresh_is_sha_bound_and_cannot_merge_the_pull_request() -> None:
     assert permissions.strip().splitlines() == [
         "contents: read",
         "  issues: write",
-        "  pull-requests: read",
+        "  pull-requests: write",
         "  statuses: write",
     ]
     assert r"while (/\s/.test" in workflow
