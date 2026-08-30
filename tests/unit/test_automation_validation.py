@@ -196,8 +196,13 @@ def test_final_merge_policy_is_fail_closed_and_local_only() -> None:
     assert "governance-change" in policy["forbidden_labels"]
     assert "validate_final_merge_phase_chain" in runner
     assert "validate_final_phase_status" in runner
+    assert "redteam-final-merge-attempt" in runner
+    assert "FinalMergeReconciliationRequiredError" in runner
     assert "current default branch in PR HEAD ancestry" in runner
     assert "PROJECT_MERGED" in runner
+    assert runner.index("redteam-final-merge-attempt") < runner.index(
+        "self.github.merge_pull_request("
+    )
     for workflow_path in (REPO_ROOT / ".github" / "workflows").glob("*.yml"):
         workflow = workflow_path.read_text(encoding="utf-8")
         assert "github.rest.pulls.merge" not in workflow

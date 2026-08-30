@@ -186,4 +186,7 @@ base-refresh workflow never calls the final merge endpoint; only the local compl
 the Phase 0A→5 PASS chain backward from the current Phase 5 HEAD, verifies the latest workflow
 status and checks, confirms current `main` is already in the PR ancestry, re-reads the live PR, and
 then makes one merge request bound to that exact HEAD. Missing, duplicate, stale, failed or
-ambiguous evidence stops the process. Completion never deploys or authorizes a real target.
+ambiguous evidence stops the process. Before dispatch it writes a durable PR comment binding the
+attempt to PR, HEAD, current `main`, Phase 5 gate, policy digest and actor. Any recorded attempt on
+that exact PR/HEAD requires explicit live-outcome reconciliation and cannot be retried by a normal
+restart. Completion never deploys or authorizes a real target.

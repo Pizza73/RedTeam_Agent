@@ -8,6 +8,7 @@ import pytest
 from automation.run_phase_loop import (
     BASE_REFRESH_STATUS_DESCRIPTION,
     PHASES,
+    FinalMergeReconciliationRequiredError,
     FinalMergeRejectedError,
     GitHubClient,
     MarkerEvidence,
@@ -1054,10 +1055,18 @@ def test_github_final_merge_does_not_accept_an_uncertain_result() -> None:
 class _FinalMergeGitHub:
     repository = "example/repo"
 
-    def __init__(self, record: MarkerEvidence, *, default_is_ancestor: bool = True) -> None:
+    def __init__(
+        self,
+        record: MarkerEvidence,
+        *,
+        default_is_ancestor: bool = True,
+        merge_is_confirmed: bool = True,
+    ) -> None:
         self.record = record
         self.default_is_ancestor = default_is_ancestor
+        self.merge_is_confirmed = merge_is_confirmed
         self.merge_calls: list[tuple[int, str, str]] = []
+        self.issue_comments: list[dict[str, object]] = []
 
     def commit_statuses(self, sha: str) -> list[dict[str, object]]:
         assert sha == "8" * 40
@@ -1075,10 +1084,26 @@ class _FinalMergeGitHub:
         assert descendant_sha == "8" * 40
         return self.default_is_ancestor
 
+    def comments(self, number: int) -> list[dict[str, object]]:
+        assert number == 3
+        return self.issue_comments
+
+    def post_comment(self, number: int, body: str) -> dict[str, object]:
+        assert number == 3
+        comment: dict[str, object] = {
+            "user": {"login": ACTOR_LOGIN},
+            "html_url": f"{PULL_REQUEST_PREFIX}#issuecomment-final-attempt",
+            "body": body,
+        }
+        self.issue_comments.append(comment)
+        return comment
+
     def merge_pull_request(
         self, number: int, expected_head_sha: str, *, merge_method: str
     ) -> str:
         self.merge_calls.append((number, expected_head_sha, merge_method))
+        if not self.merge_is_confirmed:
+            raise FinalMergeRejectedError("GitHub did not confirm the merge")
         return "9" * 40
 
 
@@ -1119,6 +1144,8 @@ def configured_final_merge_loop(
     }
     loop.reviewer_login = REVIEWER_LOGIN
     loop.approver_login = ACTOR_LOGIN
+    loop.actor_login = ACTOR_LOGIN
+    loop.pull_request_number = 3
     loop.dry_run = False
     loop.log = lambda _message: None  # type: ignore[method-assign]
     loop.pr_state = lambda: state  # type: ignore[method-assign]
@@ -1132,10 +1159,12 @@ def test_automatic_final_merge_revalidates_and_merges_exact_head_once() -> None:
     github = _FinalMergeGitHub(records[-1])
     loop = configured_final_merge_loop(state, github)
 
-    result = loop.automatic_final_merge(state, records, DEFAULT_BRANCH_SHA)
+    result = loop.automatic_final_merge(state, [], records, DEFAULT_BRANCH_SHA)
 
     assert result == f"PROJECT_MERGED:{'9' * 40}"
     assert github.merge_calls == [(3, "8" * 40, "merge")]
+    assert len(github.issue_comments) == 1
+    assert "redteam-final-merge-attempt" in str(github.issue_comments[0]["body"])
 
 
 def test_automatic_final_merge_rejects_stop_label_without_calling_merge() -> None:
@@ -1145,7 +1174,7 @@ def test_automatic_final_merge_rejects_stop_label_without_calling_merge() -> Non
     loop = configured_final_merge_loop(state, github)
 
     with pytest.raises(UntrustedEvidenceError, match="stop-state label"):
-        loop.automatic_final_merge(state, records, DEFAULT_BRANCH_SHA)
+        loop.automatic_final_merge(state, [], records, DEFAULT_BRANCH_SHA)
 
     assert github.merge_calls == []
 
@@ -1157,7 +1186,7 @@ def test_automatic_final_merge_rejects_governance_pr_without_calling_merge() -> 
     loop = configured_final_merge_loop(state, github)
 
     with pytest.raises(UntrustedEvidenceError, match="stop-state label"):
-        loop.automatic_final_merge(state, records, DEFAULT_BRANCH_SHA)
+        loop.automatic_final_merge(state, [], records, DEFAULT_BRANCH_SHA)
 
     assert github.merge_calls == []
 
@@ -1169,9 +1198,32 @@ def test_automatic_final_merge_rejects_default_branch_not_in_head() -> None:
     loop = configured_final_merge_loop(state, github)
 
     with pytest.raises(UntrustedEvidenceError, match="default branch in PR HEAD ancestry"):
-        loop.automatic_final_merge(state, records, DEFAULT_BRANCH_SHA)
+        loop.automatic_final_merge(state, [], records, DEFAULT_BRANCH_SHA)
 
     assert github.merge_calls == []
+
+
+def test_uncertain_final_merge_attempt_is_durable_and_never_retried() -> None:
+    records = chained_phase_passes()
+    state = final_merge_state()
+    github = _FinalMergeGitHub(records[-1], merge_is_confirmed=False)
+    loop = configured_final_merge_loop(state, github)
+
+    with pytest.raises(FinalMergeRejectedError, match="did not confirm"):
+        loop.automatic_final_merge(state, [], records, DEFAULT_BRANCH_SHA)
+
+    assert len(github.issue_comments) == 1
+    assert github.merge_calls == [(3, "8" * 40, "merge")]
+
+    with pytest.raises(FinalMergeReconciliationRequiredError, match="reconcile"):
+        loop.automatic_final_merge(
+            state,
+            github.issue_comments,  # type: ignore[arg-type]
+            records,
+            DEFAULT_BRANCH_SHA,
+        )
+
+    assert github.merge_calls == [(3, "8" * 40, "merge")]
 
 
 class _ComparisonGitHub:

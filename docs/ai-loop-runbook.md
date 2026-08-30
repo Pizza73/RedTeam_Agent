@@ -101,9 +101,11 @@ The long-lived implementation PR is merged differently. `automation/final-merge-
 enables only the local orchestrator, Phase 5, `ai-loop` plus completion/PASS labels, absence of all
 stop labels, one exact `base_sha`-linked PASS per Phase, the latest trusted Phase status, all four
 current-head Check Runs, and current `main` ancestry. The orchestrator re-reads live state and calls
-GitHub's merge endpoint with `sha=<current-40-character-head>` and `merge_method=merge`. A 409,
-conflict, drift, malformed response or unknown outcome stops without an automatic retry. Fork and
-governance PRs cannot satisfy this policy.
+GitHub only after persisting a `redteam-final-merge-attempt` PR marker bound to PR, full HEAD,
+current `main`, Phase 5 gate, policy digest and actor. It then calls the merge endpoint with
+`sha=<current-40-character-head>` and `merge_method=merge`. A 409, conflict, drift, malformed
+response or unknown outcome stops without an automatic retry. The same PR/HEAD marker blocks every
+normal restart until explicit reconciliation. Fork and governance PRs cannot satisfy this policy.
 
 If GitHub branch protection or rulesets later become available, configure the pull-request,
 CODEOWNERS, stale-review, conversation-resolution, force-push/deletion, and five exact status-check

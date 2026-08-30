@@ -63,5 +63,6 @@
 - Phase 4/5の外部選択はHuman Gateを通す。
 - 最終mergeは、承認済みDefault Branch上のLocal OrchestratorだけがPhase 0A～5の
   SHA-bound PASS Chain、Current-HEAD CI/Status、Stop Label不在、Current Default Branch
-  ancestryを再検証し、Expected HEAD SHA固定で1回だけ実行する。Codex、GitHub Actions、
-  Governance PR、Fork PRはこの経路を使用できない。
+  ancestryを再検証し、Expected HEAD SHA固定で1回だけ実行する。Dispatch前に永続Attempt
+  Recordを保存し、同じPR/HEADのRecordは明示的Reconciliationまで再送を禁止する。
+  Codex、GitHub Actions、Governance PR、Fork PRはこの経路を使用できない。

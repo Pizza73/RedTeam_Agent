@@ -39,6 +39,7 @@ REQUIRED_CHECKS = frozenset({"tests (3.12)", "tests (3.14)", "quality", "governa
 REQUIRED_CHECK_ORDER = ("tests (3.12)", "tests (3.14)", "quality", "governance-integrity")
 TRUSTED_WORKFLOW_LOGIN = "github-actions[bot]"
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
+SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 BASE_REFRESH_STATUS_PREFIX = "redteam/base-refresh/"
 BASE_REFRESH_STATUS_DESCRIPTION = "trusted exact-SHA base refresh authorization"
 BASE_REFRESH_STATUS_PATTERN = re.compile(
@@ -75,6 +76,18 @@ PHASE_GATE_RECORD_KEYS = frozenset(
         "loop_state",
     }
 )
+FINAL_MERGE_ATTEMPT_KEYS = frozenset(
+    {
+        "schema_version",
+        "action",
+        "pull_request_number",
+        "head_sha",
+        "default_branch_sha",
+        "phase_gate_reference",
+        "policy_digest",
+        "attempted_by",
+    }
+)
 
 
 class PhaseLoopError(RuntimeError):
@@ -99,6 +112,10 @@ class LoopTimeoutError(PhaseLoopError):
 
 class FinalMergeRejectedError(PhaseLoopError):
     """Raised when GitHub does not confirm an exact-SHA final merge."""
+
+
+class FinalMergeReconciliationRequiredError(PhaseLoopError):
+    """Raised when a durable final-merge attempt already exists for the exact HEAD."""
 
 
 @dataclass(frozen=True)
@@ -422,6 +439,84 @@ def validate_final_phase_status(
         raise UntrustedEvidenceError(
             "automatic final merge phase-review status is untrusted, stale, or non-passing"
         )
+
+
+def final_merge_attempt_payload(
+    *,
+    pull_request_number: int,
+    head_sha: str,
+    default_branch_sha: str,
+    phase_gate_reference: str,
+    policy_digest: str,
+    attempted_by: str,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "schema_version": "1.0",
+        "action": "ATTEMPT_FINAL_MERGE",
+        "pull_request_number": pull_request_number,
+        "head_sha": head_sha,
+        "default_branch_sha": default_branch_sha,
+        "phase_gate_reference": phase_gate_reference,
+        "policy_digest": policy_digest,
+        "attempted_by": attempted_by,
+    }
+    validate_final_merge_attempt_payload(payload)
+    return payload
+
+
+def validate_final_merge_attempt_payload(payload: dict[str, Any]) -> None:
+    if set(payload) != FINAL_MERGE_ATTEMPT_KEYS:
+        raise UntrustedEvidenceError("final-merge attempt has missing or unknown fields")
+    if (
+        payload.get("schema_version") != "1.0"
+        or payload.get("action") != "ATTEMPT_FINAL_MERGE"
+    ):
+        raise UntrustedEvidenceError("final-merge attempt has an invalid version or action")
+    number = payload.get("pull_request_number")
+    if not isinstance(number, int) or isinstance(number, bool) or number < 1:
+        raise UntrustedEvidenceError("final-merge attempt has an invalid pull request number")
+    for field in ("head_sha", "default_branch_sha"):
+        value = payload.get(field)
+        if not isinstance(value, str) or not SHA_PATTERN.fullmatch(value):
+            raise UntrustedEvidenceError(f"final-merge attempt has an invalid {field}")
+    policy_digest = payload.get("policy_digest")
+    if not isinstance(policy_digest, str) or not SHA256_PATTERN.fullmatch(policy_digest):
+        raise UntrustedEvidenceError("final-merge attempt has an invalid policy_digest")
+    reference = payload.get("phase_gate_reference")
+    if not isinstance(reference, str) or not reference.startswith("https://github.com/"):
+        raise UntrustedEvidenceError("final-merge attempt has an invalid phase gate reference")
+    attempted_by = payload.get("attempted_by")
+    if not isinstance(attempted_by, str) or not attempted_by:
+        raise UntrustedEvidenceError("final-merge attempt has an invalid actor")
+
+
+def trusted_final_merge_attempts(
+    comments: list[dict[str, Any]],
+    *,
+    actor_login: str,
+    pull_request_number: int,
+    head_sha: str,
+) -> list[MarkerEvidence]:
+    result: list[MarkerEvidence] = []
+    for comment in comments:
+        if _github_author(comment) != actor_login:
+            continue
+        body = comment.get("body")
+        url = comment.get("html_url")
+        if not isinstance(body, str) or not isinstance(url, str):
+            continue
+        for payload in marker_payloads(body, "redteam-final-merge-attempt"):
+            validate_final_merge_attempt_payload(payload)
+            if payload.get("attempted_by") != actor_login:
+                raise UntrustedEvidenceError("final-merge attempt actor binding mismatch")
+            if (
+                payload.get("pull_request_number") == pull_request_number
+                and payload.get("head_sha") == head_sha
+            ):
+                result.append(
+                    MarkerEvidence(payload, url, actor_login, body, commit_id=head_sha)
+                )
+    return result
 
 
 def base_refresh_evidence_from_statuses(
@@ -1669,6 +1764,7 @@ class PhaseLoop:
     def automatic_final_merge(
         self,
         state: PullRequestState,
+        comments: list[dict[str, Any]],
         phase_records: list[MarkerEvidence],
         default_branch_sha: str,
     ) -> str | None:
@@ -1695,6 +1791,17 @@ class PhaseLoop:
             approver_login=self.approver_login,
             pull_request_prefix=pull_request_prefix,
         )
+        prior_attempts = trusted_final_merge_attempts(
+            comments,
+            actor_login=self.actor_login,
+            pull_request_number=state.number,
+            head_sha=state.head_sha,
+        )
+        if prior_attempts:
+            raise FinalMergeReconciliationRequiredError(
+                "a durable final-merge attempt already exists for this exact PR HEAD; "
+                "reconcile the live GitHub outcome before any new attempt"
+            )
         validate_final_phase_status(
             self.github.commit_statuses(state.head_sha),
             head_sha=state.head_sha,
@@ -1726,6 +1833,46 @@ class PhaseLoop:
             )
         if self.dry_run:
             return f"DRY_RUN:automatic final merge ready: {state.head_sha}"
+        fresh_attempts = trusted_final_merge_attempts(
+            self.comments(),
+            actor_login=self.actor_login,
+            pull_request_number=state.number,
+            head_sha=state.head_sha,
+        )
+        if fresh_attempts:
+            raise FinalMergeReconciliationRequiredError(
+                "a concurrent durable final-merge attempt exists for this exact PR HEAD"
+            )
+        policy_digest = canonical_digest(policy)
+        attempt_payload = final_merge_attempt_payload(
+            pull_request_number=state.number,
+            head_sha=state.head_sha,
+            default_branch_sha=default_branch_sha,
+            phase_gate_reference=final_record.url,
+            policy_digest=policy_digest,
+            attempted_by=self.actor_login,
+        )
+        attempt_marker = (
+            "<!-- redteam-final-merge-attempt\n"
+            f"{json.dumps(attempt_payload, sort_keys=True, separators=(',', ':'))}\n"
+            "-->"
+        )
+        attempt_comment = self.github.post_comment(
+            state.number,
+            "The trusted local orchestrator is making its single exact-SHA final merge attempt. "
+            "If the outcome is unknown, do not retry until the live PR state is explicitly "
+            f"reconciled.\n\n{attempt_marker}",
+        )
+        recorded_attempts = trusted_final_merge_attempts(
+            [attempt_comment],
+            actor_login=self.actor_login,
+            pull_request_number=state.number,
+            head_sha=state.head_sha,
+        )
+        if len(recorded_attempts) != 1 or recorded_attempts[0].payload != attempt_payload:
+            raise UntrustedEvidenceError(
+                "GitHub did not confirm the durable final-merge attempt record"
+            )
         self.log(f"merging project-complete PR at exact HEAD {state.head_sha}")
         merge_sha = self.github.merge_pull_request(
             state.number,
@@ -1751,7 +1898,7 @@ class PhaseLoop:
             phase_records = self.trusted_markers(comments, "redteam-phase-gate")
             if "ai-project-complete" in state.labels:
                 merge_result = self.automatic_final_merge(
-                    state, phase_records, default_branch_sha
+                    state, comments, phase_records, default_branch_sha
                 )
                 if merge_result is not None:
                     return merge_result

@@ -29,11 +29,22 @@ The local orchestrator performs the following fail-closed checks before one merg
 4. Re-query the four current-HEAD Check Runs and require success.
 5. Require current `main` to be an ancestor of the PR HEAD.
 6. Re-read the live PR HEAD, labels and current default-branch SHA.
-7. Call GitHub's merge endpoint once with `sha=<full-current-head>` and `merge_method=merge`.
-8. Accept completion only when GitHub returns `merged: true` and a full merge commit SHA.
+7. Re-query PR comments and persist one `redteam-final-merge-attempt` marker bound to PR, full HEAD,
+   current `main`, the Phase 5 gate, final-merge policy digest and operator identity.
+8. Call GitHub's merge endpoint once with `sha=<full-current-head>` and `merge_method=merge`.
+9. Accept completion only when GitHub returns `merged: true` and a full merge commit SHA.
 
 A conflict, drift, malformed/unknown/duplicate evidence, missing Phase, forged status, wrong PR
-permalink, unexpected response or unknown outcome stops without an automatic retry.
+permalink, existing exact-HEAD attempt, unexpected response or unknown outcome stops without an
+automatic retry. A normal restart cannot redispatch while the attempt marker exists; explicit live
+GitHub outcome reconciliation is required.
+
+## Independent review finding addressed
+
+- Codex P1: `https://github.com/Pizza73/RedTeam_Agent/pull/9#discussion_r3889226470`
+- Finding: a lost merge response could allow a restarted process to submit a second request
+- Fix: persist the exact PR/HEAD attempt marker before dispatch and reject every recorded attempt
+  until explicit reconciliation
 
 ## Modified files
 
@@ -51,17 +62,19 @@ permalink, unexpected response or unknown outcome stops without an automatic ret
 
 ## Regression coverage
 
-Positive tests cover the exact eight-record Phase chain, trusted final status, one merge API call,
+Positive tests cover the exact eight-record Phase chain, trusted final status, durable attempt
+record and one merge API call,
 exact input HEAD and confirmed merge SHA. Negative and failure-path tests cover unknown fields,
 broken chains, adjacent PR-number prefix confusion, untrusted status authors, stop labels,
-`governance-change`, missing current-main ancestry and an unconfirmed merge result.
+`governance-change`, missing current-main ancestry, an unconfirmed merge result and restart after an
+unknown outcome without a second dispatch.
 
 ## Validation results
 
 - `.venv/bin/python -m pytest -q tests/unit/test_phase_loop.py tests/unit/test_automation_validation.py --strict-markers`
-  - PASS: 70 tests
+  - PASS: 71 tests
 - `REDTEAM_COVERAGE_FILE=/tmp/redteam-auto-merge-coverage .venv/bin/python -m coverage run --source=automation,src -m pytest -q tests --strict-markers`
-  - PASS: 222 tests; total coverage 74%
+  - PASS: 223 tests; total coverage 74%
 - `.venv/bin/python -m ruff check automation/run_phase_loop.py scripts/ci/validate_automation.py tests/unit/test_phase_loop.py tests/unit/test_automation_validation.py`
   - PASS
 - `.venv/bin/python scripts/ci/validate_automation.py`
