@@ -6,16 +6,22 @@ from pathlib import Path
 import pytest
 
 from automation.run_phase_loop import (
+    PHASES,
+    GitHubClient,
     MarkerEvidence,
+    PhaseLoop,
+    PullRequestState,
     ReviewEvidence,
     UntrustedEvidenceError,
     canonical_digest,
+    codex_implementation_blocker,
     evaluate_native_review,
     marker_payloads,
     native_finding_key,
     select_evidence_action,
     select_finding_key,
     strict_json_loads,
+    validate_base_refresh,
     validate_implementation_request,
     validate_review_result,
 )
@@ -445,3 +451,239 @@ def test_native_finding_key_is_stable_when_only_line_number_changes() -> None:
     changed_line = {**finding, "line": 99}
 
     assert native_finding_key(finding) == native_finding_key(changed_line)
+
+
+def phase_state(*, phase: str = "phase-0a") -> PullRequestState:
+    return PullRequestState(
+        number=3,
+        head_sha=HEAD_SHA,
+        base_sha=BASE_SHA,
+        base_ref="main",
+        phase=phase,
+        labels=frozenset({"ai-loop", "ai-needs-implementation", phase}),
+        state="open",
+        head_repository="example/repo",
+    )
+
+
+def base_refresh_payload() -> dict[str, object]:
+    return {
+        "schema_version": "1.0",
+        "action": "REFRESH_BASE",
+        "from_phase": "phase-0b",
+        "revalidate_phase": "phase-0a",
+        "head_sha": HEAD_SHA,
+        "target_base_sha": BASE_SHA,
+        "prior_pass_reference": "https://github.com/example/repo/pull/3#issuecomment-pass",
+    }
+
+
+def test_base_refresh_is_bound_to_adjacent_phase_head_and_default_branch() -> None:
+    validate_base_refresh(
+        base_refresh_payload(), state=phase_state(), target_base_sha=BASE_SHA
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("from_phase", "phase-0c", "exactly one phase"),
+        ("head_sha", "c" * 40, "stale for the current PR head"),
+        ("target_base_sha", "d" * 40, "stale for the default branch"),
+    ],
+)
+def test_base_refresh_rejects_non_adjacent_or_stale_evidence(
+    field: str, value: str, message: str
+) -> None:
+    payload = base_refresh_payload()
+    payload[field] = value
+
+    with pytest.raises(UntrustedEvidenceError, match=message):
+        validate_base_refresh(payload, state=phase_state(), target_base_sha=BASE_SHA)
+
+
+def test_stale_base_refresh_is_reauthorized_for_new_default_head() -> None:
+    loop = PhaseLoop.__new__(PhaseLoop)
+    loop.dispatched_base_refreshes = set()
+    loop.started_base_updates = set()
+    loop.dry_run = True
+    loop.log = lambda _message: None  # type: ignore[method-assign]
+    stale_payload = base_refresh_payload()
+    stale_payload["target_base_sha"] = "c" * 40
+    stale_record = MarkerEvidence(
+        stale_payload,
+        "https://github.com/example/repo/pull/3#issuecomment-refresh",
+        "github-actions[bot]",
+        "",
+    )
+
+    assert loop.perform_pending_base_refresh(phase_state(), [stale_record]) is True
+    assert loop.dispatched_base_refreshes == {f"phase-0b:{HEAD_SHA}:{BASE_SHA}"}
+    assert loop.started_base_updates == set()
+
+
+def test_sha_bound_codex_implementation_blocker_is_detected() -> None:
+    request = implementation_request()
+    digest = canonical_digest(request)
+    trigger_body = marker(
+        "redteam-local-codex-trigger",
+        {
+            "schema_version": "1.0",
+            "kind": "implementation",
+            "phase": "phase-0a",
+            "head_sha": HEAD_SHA,
+            "source_digest": digest,
+        },
+    )
+    comments = [
+        {
+            "user": {"login": ACTOR_LOGIN},
+            "created_at": "2026-08-30T00:00:00Z",
+            "body": trigger_body,
+        },
+        {
+            "user": {"login": REVIEWER_LOGIN},
+            "created_at": "2026-08-30T00:01:00Z",
+            "html_url": "https://github.com/example/repo/pull/3#issuecomment-blocked",
+            "body": f"## BLOCKED\n\nPhase: phase-0a\nInput SHA: {HEAD_SHA}",
+        },
+    ]
+
+    assert codex_implementation_blocker(
+        comments=comments,
+        actor_login=ACTOR_LOGIN,
+        reviewer_login=REVIEWER_LOGIN,
+        phase="phase-0a",
+        head_sha=HEAD_SHA,
+        source_digest=digest,
+    ) == "https://github.com/example/repo/pull/3#issuecomment-blocked"
+
+
+def test_codex_blocker_for_another_sha_is_ignored() -> None:
+    request = implementation_request()
+    digest = canonical_digest(request)
+    comments = [
+        {
+            "user": {"login": ACTOR_LOGIN},
+            "created_at": "2026-08-30T00:00:00Z",
+            "body": marker(
+                "redteam-local-codex-trigger",
+                {
+                    "schema_version": "1.0",
+                    "kind": "implementation",
+                    "phase": "phase-0a",
+                    "head_sha": HEAD_SHA,
+                    "source_digest": digest,
+                },
+            ),
+        },
+        {
+            "user": {"login": REVIEWER_LOGIN},
+            "created_at": "2026-08-30T00:01:00Z",
+            "html_url": "https://github.com/example/repo/pull/3#issuecomment-stale",
+            "body": f"## BLOCKED\n\nPhase: phase-0a\nInput SHA: {'c' * 40}",
+        },
+    ]
+
+    assert codex_implementation_blocker(
+        comments=comments,
+        actor_login=ACTOR_LOGIN,
+        reviewer_login=REVIEWER_LOGIN,
+        phase="phase-0a",
+        head_sha=HEAD_SHA,
+        source_digest=digest,
+    ) is None
+
+
+class _CompareGitHub:
+    def __init__(self, ahead_by: int) -> None:
+        self.ahead_by = ahead_by
+
+    def compare(self, base_sha: str, head_sha: str) -> dict[str, object]:
+        assert (base_sha, head_sha) == (HEAD_SHA, BASE_SHA)
+        return {"ahead_by": self.ahead_by}
+
+
+def test_base_refresh_candidate_requires_prior_pass_on_current_head() -> None:
+    loop = PhaseLoop.__new__(PhaseLoop)
+    loop.github = _CompareGitHub(ahead_by=1)  # type: ignore[assignment]
+    loop.implementation_schema = load_schema("implementation-request.schema.json")
+    loop.phase_prompts = {phase: f"prompts/phases/{phase}.md" for phase in PHASES}
+    loop.phase_prompts["phase-0b"] = "prompts/phases/phase-0b.md"
+    request_payload = {
+        "schema_version": "1.0",
+        "action": "IMPLEMENT_PHASE",
+        "trigger": "PHASE_START",
+        "phase": "phase-0b",
+        "head_sha": HEAD_SHA,
+        "phase_prompt": "prompts/phases/phase-0b.md",
+    }
+    request = MarkerEvidence(request_payload, "request-url", "github-actions[bot]", "")
+    prior_pass = MarkerEvidence(
+        {"phase": "phase-0a", "verdict": "PASS", "reviewed_sha": HEAD_SHA},
+        "pass-url",
+        "github-actions[bot]",
+        "",
+    )
+
+    assert loop.base_refresh_candidate(
+        phase_state(phase="phase-0b"), [request], [prior_pass]
+    ) == prior_pass
+
+
+def test_base_refresh_candidate_is_absent_when_main_has_not_advanced() -> None:
+    loop = PhaseLoop.__new__(PhaseLoop)
+    loop.github = _CompareGitHub(ahead_by=0)  # type: ignore[assignment]
+    loop.implementation_schema = load_schema("implementation-request.schema.json")
+    loop.phase_prompts = {"phase-0b": "prompts/phases/phase-0b.md"}
+    request = MarkerEvidence(
+        {
+            "schema_version": "1.0",
+            "action": "IMPLEMENT_PHASE",
+            "trigger": "PHASE_START",
+            "phase": "phase-0b",
+            "head_sha": HEAD_SHA,
+            "phase_prompt": "prompts/phases/phase-0b.md",
+        },
+        "request-url",
+        "github-actions[bot]",
+        "",
+    )
+    prior_pass = MarkerEvidence(
+        {"phase": "phase-0a", "verdict": "PASS", "reviewed_sha": HEAD_SHA},
+        "pass-url",
+        "github-actions[bot]",
+        "",
+    )
+
+    assert loop.base_refresh_candidate(
+        phase_state(phase="phase-0b"), [request], [prior_pass]
+    ) is None
+
+
+class _RecordingCommand:
+    def __init__(self) -> None:
+        self.arguments: list[str] = []
+
+    def run(self, arguments: list[str]) -> str:
+        self.arguments = arguments
+        return '{"message":"Updating pull request branch."}'
+
+
+def test_branch_update_uses_expected_head_and_never_final_merge_endpoint() -> None:
+    client = GitHubClient.__new__(GitHubClient)
+    client.repository = "example/repo"
+    command = _RecordingCommand()
+    client.command = command  # type: ignore[assignment]
+
+    client.update_pull_request_branch(3, HEAD_SHA)
+
+    assert command.arguments == [
+        "api",
+        "--method",
+        "PUT",
+        "repos/example/repo/pulls/3/update-branch",
+        "--raw-field",
+        f"expected_head_sha={HEAD_SHA}",
+    ]
+    assert "/merge" not in " ".join(command.arguments)

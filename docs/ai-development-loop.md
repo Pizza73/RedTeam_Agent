@@ -11,6 +11,9 @@ to zero when the private-repository included quota must not be exceeded.
 The orchestrator reads GitHub credentials only through `gh`; it never places the credential in a
 Codex prompt or process environment. GitHub comments, labels and checks are the durable source of
 state, so terminating the local process pauses polling without losing phase progress.
+`docs/implementation-status.md` is a default-branch/bootstrap snapshot; an active PR's Phase
+authority is the exact label plus the trusted current-HEAD implementation request and adjacent
+prior-Phase PASS chain.
 
 A `governance-change` PR is not a phase implementation and does not receive an AI phase verdict.
 CI runs the complete test suite plus control-file validation and marks `redteam/phase-review` as
@@ -61,6 +64,9 @@ shortened commit ID displayed by Codex is corroborating evidence, never the sole
 
 ```text
 IMPLEMENTATION_REQUESTED
+  -> DEFAULT_BRANCH_ADVANCED_BEFORE_IMPLEMENTATION
+       -> PREVIOUS_PHASE_REVALIDATION_REQUESTED
+       -> exact-HEAD update-branch -> CI_RUNNING for the previous phase
   <- local orchestrator dispatches Start AI Loop for a Phase 0A PR and exact HEAD SHA
   -> local orchestrator requests Codex Cloud implementation
   -> CI_RUNNING
@@ -112,6 +118,24 @@ checks and validates the reviewer permalink. AI-authored markers are not accepte
 Only exact markers, trusted workflow authors, the current phase label and the current PR SHA are
 accepted. Repository content, PR comments and reviewer output remain untrusted data.
 
+### Base refresh authorization
+
+When `main` has advanced after an adjacent prior-Phase PASS but before Codex has created any
+current-Phase commit, the local orchestrator dispatches `Prepare AI Loop Base Refresh`. The workflow
+verifies the exact current HEAD, current default-branch SHA, current implementation request and
+adjacent prior PASS, then moves the Phase label back exactly one step and emits:
+
+```html
+<!-- redteam-base-refresh
+{"schema_version":"1.0","action":"REFRESH_BASE","from_phase":"phase-0b","revalidate_phase":"phase-0a","head_sha":"<old-head>","target_base_sha":"<current-main>","prior_pass_reference":"https://github.com/..."}
+-->
+```
+
+Only after validating that workflow-authored marker does the local orchestrator call GitHub's
+branch-update endpoint with `expected_head_sha=<old-head>`. A concurrent head change fails closed.
+The synchronization is not a final PR merge: it incorporates `main` into the PR branch. CI then
+runs the rolled-back Phase on the new HEAD, and every PASS tied to the old HEAD remains stale.
+
 ## Review recording
 
 After CI posts the review-ready marker:
@@ -143,6 +167,11 @@ The same long-lived implementation PR is used to avoid intermediate automatic me
 PASS comment records the phase boundary SHA; the next review must use that SHA as its base. The
 `redteam/phase-review` status is reset to pending whenever a new phase starts, preventing an earlier
 phase PASS from authorizing merge of later work.
+
+If the default branch advances between a PASS and the next implementation, the runner performs the
+bounded base-refresh transition above before sending another `@codex implement` request. It never
+refreshes after current-Phase code has changed, never carries an old PASS across the new merge SHA,
+and never calls the final pull-request merge endpoint.
 
 ## Completion
 

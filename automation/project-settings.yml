@@ -24,6 +24,9 @@ loop:
   implementation_trigger: local_orchestrator
   review_trigger: local_orchestrator_after_ci
   review_evidence_format: codex-native-v1
+  active_phase_authority: github-sha-bound-marker-chain
+  refresh_default_branch_before_new_phase_implementation: true
+  refresh_revalidates_previous_phase: true
   initial_request_workflow: Start AI Loop
   local_orchestrator:
     command: .venv/bin/python automation/run_phase_loop.py
@@ -47,7 +50,7 @@ cost_controls:
   openai_api_key_secret_allowed: false
   github_actions_spending_limit_required: 0
 
-current_state:
+bootstrap_state:
   phase: phase-0a
   verdict: NO-GO
   phase_0b_allowed: false

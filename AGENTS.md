@@ -20,6 +20,24 @@ Read these before changing code:
 
 If these conflict, stop with `BLOCKED` and identify the conflicting sections. Do not silently choose the less restrictive rule.
 
+### Active pull-request phase authority
+
+`docs/implementation-status.md` is a default-branch/bootstrap snapshot, not mutable authorization
+for an active `ai-loop` pull request. For such a pull request, resolve the current phase only from
+all of the following matching evidence:
+
+1. exactly one `phase-*` label;
+2. the latest `redteam-implementation-request` authored by `github-actions[bot]`, bound to the
+   current input HEAD SHA and the trusted phase prompt; and
+3. for Phase 0B and later, the adjacent prior phase's `redteam-phase-gate` PASS authored by
+   `github-actions[bot]` and bound to that same HEAD SHA.
+
+This narrow rule overrides only the snapshot fields in `docs/implementation-status.md`. It never
+overrides requirements, acceptance criteria, safety invariants, phase ordering, protected-file
+rules, Human Gates, or stop conditions. If the complete evidence chain is missing, stale,
+ambiguous, or inconsistent, stop with `BLOCKED`. After a default-branch refresh changes the PR
+HEAD, every earlier PASS for the old HEAD is stale and the rolled-back phase must pass again.
+
 ## Protected Files
 
 Implementation tasks must not modify the following unless the user explicitly requests governance changes:
