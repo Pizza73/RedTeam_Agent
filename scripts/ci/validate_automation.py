@@ -66,6 +66,7 @@ def validate_automation(repo_root: Path) -> None:
         "review-result.schema.json",
         "phase-plan.schema.json",
         "provider-gates.schema.json",
+        "final-merge-policy.schema.json",
     ):
         schema = strict_json_load(schemas / schema_name)
         try:
@@ -101,6 +102,18 @@ def validate_automation(repo_root: Path) -> None:
             not isinstance(value, str) or not value.strip() for value in values
         ):
             raise AutomationValidationError(f"approved provider gate is incomplete: {phase}")
+
+    merge_policy = _validate_instance(
+        root / "automation" / "final-merge-policy.json",
+        schemas / "final-merge-policy.schema.json",
+    )
+    if tuple(merge_policy["required_checks"]) != (
+        "tests (3.12)",
+        "tests (3.14)",
+        "quality",
+        "governance-integrity",
+    ):
+        raise AutomationValidationError("unexpected automatic final-merge check set")
 
 
 def main() -> int:

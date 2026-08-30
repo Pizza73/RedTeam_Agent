@@ -1,0 +1,31 @@
+{
+  "schema_version": "1.0",
+  "enabled": true,
+  "merge_method": "merge",
+  "claim_ref_prefix": "refs/redteam-final-merge-attempts",
+  "required_phase": "phase-5",
+  "required_labels": [
+    "ai-loop",
+    "ai-project-complete",
+    "ai-review-passed",
+    "phase-5"
+  ],
+  "forbidden_labels": [
+    "governance-change",
+    "ai-human-gate",
+    "ai-loop-blocked",
+    "ai-needs-fix",
+    "ai-needs-implementation",
+    "ai-needs-review"
+  ],
+  "required_checks": [
+    "tests (3.12)",
+    "tests (3.14)",
+    "quality",
+    "governance-integrity"
+  ],
+  "phase_status_context": "redteam/phase-review",
+  "trusted_record_author": "github-actions[bot]",
+  "approver_variable": "AI_GATE_APPROVER_LOGIN",
+  "reviewer_variable": "AI_REVIEWER_LOGIN"
+}

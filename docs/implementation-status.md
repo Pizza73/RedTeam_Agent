@@ -1,56 +1,65 @@
 # Implementation Status
 
-## Current state
+## Authority and scope
+
+This file is a default-branch snapshot for humans and for bootstrapping a new implementation PR.
+It is not mutable Phase authorization for an active `ai-loop` PR. In an active PR, the current
+Phase is resolved from the exact `phase-*` label, the current-HEAD implementation request, and the
+adjacent prior-Phase SHA-bound PASS as defined in `AGENTS.md`. Requirements, acceptance criteria,
+safety invariants, protected-file rules, and Human Gates remain authoritative in all contexts.
+
+## Default-branch bootstrap state
 
 ```text
-CURRENT PHASE: Phase 0A
-PHASE 0A GATE: NO-GO
-PHASE 0B ALLOWED: NO
+BOOTSTRAP PHASE: Phase 0A
+BOOTSTRAP PHASE 0A GATE: NO-GO
+BOOTSTRAP PHASE 0B ALLOWED: NO
+ACTIVE PR STATE: Resolve from trusted GitHub evidence; do not copy from this snapshot
 ```
 
-Review baseline:
+## Active implementation PR snapshot
 
-- Current local tests: Unit 60, Integration 4, Security 107, total 171 PASS
-- Current branch coverage: 84%
-- Current phase gate: automation validation and Ruff PASS; Mypy FAIL with 40 errors in 16 files
-- Git repository: initialized and connected to the private GitHub repository
-- Governance input revision: `66e86918e19a1304334e872ed62c0ffc489c9c44`
-- AI loop controls: governance bootstrap PR merged; local phase orchestrator implemented without
-  OpenAI API; `AI_GATE_APPROVER_LOGIN`, `AI_REVIEWER_LOGIN`, and iteration limit configured;
-  label bootstrap and the long-lived Phase 0A pull request remain pending
+- Long-lived implementation PR: #3, branch `ai/redteam-agent-phase-loop`
+- Last trusted Phase 0A PASS on the pre-refresh HEAD:
+  `8ab811eaba39848fd2804c6e9ed815235362ac4c`
+- PASS evidence:
+  `https://github.com/Pizza73/RedTeam_Agent/pull/3#issuecomment-5465826440`
+- A Phase 0B request was created for that same SHA, but Codex correctly stopped because the PR did
+  not yet contain the approved active-PR authority rule.
+- The governance default branch advanced after that PASS. The local orchestrator must therefore
+  prepare an exact-SHA base refresh, roll the PR label back to Phase 0A, incorporate the current
+  default branch, and obtain a fresh Phase 0A PASS for the resulting HEAD. The old PASS is historical
+  evidence only after the HEAD changes.
+
+This snapshot does not authorize Phase 0B. A fresh trusted Phase 0A PASS and the subsequently
+generated current-HEAD Phase 0B request do.
+
+## Phase 0A evidence snapshot
+
+- Phase 0A implementation candidate: `8ab811eaba39848fd2804c6e9ed815235362ac4c`
+- Deterministic checks and the native Codex review passed on that exact SHA.
+- The B-01 through B-06 and H-01 through H-07 findings were addressed on that SHA and remain
+  subject to the mandatory post-refresh Phase 0A regression gate.
+- Review bot identity: `chatgpt-codex-connector[bot]` (exact GitHub login, including suffix).
+- Required review identity: every implementation and review result is bound to the full PR HEAD
+  SHA; shortened display IDs are corroborating evidence only.
 - Repository control mode: the current private-repository plan does not expose branch protection
-  or rulesets; direct/force pushes and automated merges are prohibited by manual governance but
-  are not server-enforced
-- Phase 0A fix candidate: `94f6a2d` on `ai/redteam-agent-build`; the independent SHA-bound Phase 0A
-  review is still required before Phase 0B
-- Review identity: all new implementation and review results must be bound to the pull request HEAD SHA
-- BLOCKER: 6
-- HIGH: 7
-- MEDIUM: 5
-- LOW: 1
-
-Existing test success is insufficient because the following acceptance paths were reproduced.
-
-| Finding | Status | Summary |
-|---|---|---|
-| B-01 | OPEN | Port/protocol and execution-session scope false-allow |
-| B-02 | OPEN | Policy/approval/scope gate bypass by caller-controlled decision |
-| B-03 | OPEN | Mission validation and lifecycle bypass |
-| B-04 | OPEN | Stale context authorization accepted |
-| B-05 | OPEN | Approval presentation not bound to executable intent |
-| B-06 | OPEN | Invalid digest accepted on first persistence |
-| H-01 | OPEN | Current authorization state can be caller supplied |
-| H-02 | OPEN | Duplicate JSON key rejection not wired to real ingress |
-| H-03 | OPEN | Security repository integrity verification incomplete |
-| H-04 | OPEN | Sandbox capability not bound to actual runtime |
-| H-05 | OPEN | Ambiguous mission revision lookup |
-| H-06 | OPEN | Negative probes not in regression suite |
-| H-07 | CONFIGURED / VERIFY IN PR | Git/GitHub linkage is complete; verify SHA binding in the first loop run |
+  or rulesets. Direct/force pushes remain prohibited. Final merge is performed only by the local
+  orchestrator after its exact-SHA Phase 0A–5 evidence-chain gate and an atomic exact-PR/HEAD Git
+  ref claim; Codex and GitHub Actions retain no final-merge path.
 
 ## Next allowed action
 
-Implement Phase 0A fixes only, add regression tests, produce `docs/review/phase-0a-fix-report.md`, and stop for an independent Phase 0A Gate Review.
+After this governance change is human-reviewed and merged, update the local clean `main` checkout
+and restart `automation/run_phase_loop.py` for PR #3. It will:
 
-The automated loop may advance to Phase 0B only after Codex Cloud or ChatGPT produces an
-independent SHA-bound `PASS` result satisfying all Phase 0A zero metrics and the local orchestrator
-dispatches the approver-restricted phase-gate workflow with that validated evidence.
+1. detect that `main` advanced before Phase 0B implementation;
+2. dispatch the approver-restricted base-refresh preparation workflow;
+3. update the PR branch only if its full HEAD still matches the prior Phase 0A PASS;
+4. require Phase 0A CI and independent review again on the resulting HEAD; and
+5. create a new Phase 0B request only after that fresh PASS.
+
+After Phase 5 PASS, the local orchestrator revalidates all configured Phase records, the latest
+Phase status, current-HEAD checks, stop labels and current `main` ancestry. It then submits one
+GitHub merge request bound to the current 40-character PR HEAD. A conflict, drift, malformed record
+or uncertain response stops without automatic retry. Governance and fork PRs never qualify.

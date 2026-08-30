@@ -11,6 +11,9 @@ to zero when the private-repository included quota must not be exceeded.
 The orchestrator reads GitHub credentials only through `gh`; it never places the credential in a
 Codex prompt or process environment. GitHub comments, labels and checks are the durable source of
 state, so terminating the local process pauses polling without losing phase progress.
+`docs/implementation-status.md` is a default-branch/bootstrap snapshot; an active PR's Phase
+authority is the exact label plus the trusted current-HEAD implementation request and adjacent
+prior-Phase PASS chain.
 
 A `governance-change` PR is not a phase implementation and does not receive an AI phase verdict.
 CI runs the complete test suite plus control-file validation and marks `redteam/phase-review` as
@@ -25,13 +28,16 @@ No empty ruleset is created. Pull-request-only changes, human owner review, conv
 resolution, direct-push prohibition, force-push/deletion prohibition and required checks are
 governance requirements, but GitHub does not currently enforce them at the branch boundary.
 
-The local orchestrator, GitHub Actions and Codex never merge or push to `main`. Before a human
-merge, the operator must bind the decision to the current 40-character PR head SHA, verify the
-complete final diff and all five required checks, and record that evidence on the PR. An
-implementation PR additionally requires the current SHA-bound Codex review and phase result; a
-governance PR requires the human owner review and the SHA-bound not-applicable governance status.
-The operator merges only through the GitHub UI. The runbook contains the exact checklist. Direct
-and force pushes to `main` remain prohibited.
+GitHub Actions and Codex never merge or push to `main`. Governance PRs retain the human owner
+review and UI-merge checklist. The long-lived `ai-loop` implementation PR has one narrower path:
+the local orchestrator may call GitHub's merge endpoint only after `ai-project-complete`, while the
+PR remains at Phase 5, and after revalidating the complete exact-SHA Phase chain, five current-head
+checks/statuses, stop-label absence and current `main` ancestry. The request includes the current
+40-character PR head SHA. Before that request, it atomically creates one repository Git ref claim
+for the exact PR/HEAD and persists a claim-bound audit comment. Existing or uncertain claims are
+not retried. It then re-queries the complete chain and every live gate immediately before merge;
+post-claim drift enters reconciliation rather than dispatch. Direct and force pushes to `main`
+remain prohibited.
 
 This manual control has a greater account-compromise and operator-error risk than server-enforced
 protection. When the repository plan supports protection, the same requirements must be configured
@@ -44,21 +50,26 @@ provider-specific Human Gates and CI never connects to a real C2, MCP server or 
 
 | Component | Responsibility | Write access |
 |---|---|---|
-| Local phase orchestrator | Request implementation/review and record validated evidence | PR comments and approved workflow dispatch |
+| Local phase orchestrator | Request implementation/review, record validated evidence, and perform the gated final `ai-loop` merge | PR comments, approved workflow dispatch, one atomic claim ref and one exact-SHA final merge |
 | Codex Cloud | Current-phase implementation/fix requested through GitHub | PR branch only |
 | Codex GitHub Review or ChatGPT | Fresh-context semantic/security review | PR review/comment only |
 | CI | Tests, lint, type check, coverage and protected-path enforcement | Check results and ready comment |
 | Record AI Phase Review | Revalidate reviewer identity, review SHA, base SHA and actual checks | PR labels/comments/status |
-| Human | Start/restart local orchestration, verify manual merge evidence, approve Phase 4/5 and final merge | Explicit approval and GitHub UI merge only |
+| Human | Start/restart local orchestration, approve Phase 4/5 provider governance, review/merge governance PRs | Explicit provider approval and governance UI merge |
 
 The implementer and reviewer must use separate runs and contexts. A review result is evidence only
-when its GitHub permalink resolves to content authored by `AI_REVIEWER_LOGIN` and it is bound to the
-current PR head SHA.
+when its GitHub permalink resolves to native Codex content authored by `AI_REVIEWER_LOGIN`. The
+full-SHA binding is the validated chain of the current-head CI ready marker, operator-authored
+review trigger, unchanged PR timeline, current PR head, native result and required checks. The
+shortened commit ID displayed by Codex is corroborating evidence, never the sole binding.
 
 ## State machine
 
 ```text
 IMPLEMENTATION_REQUESTED
+  -> DEFAULT_BRANCH_ADVANCED_BEFORE_IMPLEMENTATION
+       -> PREVIOUS_PHASE_REVALIDATION_REQUESTED
+       -> exact-HEAD update-branch -> CI_RUNNING for the previous phase
   <- local orchestrator dispatches Start AI Loop for a Phase 0A PR and exact HEAD SHA
   -> local orchestrator requests Codex Cloud implementation
   -> CI_RUNNING
@@ -68,6 +79,7 @@ IMPLEMENTATION_REQUESTED
   -> local orchestrator validates the review and dispatches Record AI Phase Review
        -> CHANGES_REQUESTED -> FIX_REQUESTED
        -> PASS -> NEXT_PHASE_REQUESTED or HUMAN_GATE or PROJECT_COMPLETE
+       -> PROJECT_COMPLETE -> LOCAL_EXACT_SHA_MERGE or BLOCKED
        -> BLOCKED -> HUMAN_GATE
 ```
 
@@ -95,7 +107,7 @@ checks and validates the reviewer permalink. AI-authored markers are not accepte
 
 ```html
 <!-- redteam-phase-gate
-{"schema_version":"1.0","phase":"phase-0a","reviewed_sha":"<sha>","base_sha":"<sha>","verdict":"PASS","summary":"...","review_reference":"https://github.com/...","reviewer_login":"...","recorded_by":"...","finding_key":null,"required_checks":[],"loop_state":"PASS"}
+{"schema_version":"1.0","phase":"phase-0a","reviewed_sha":"<sha>","base_sha":"<sha>","verdict":"PASS","summary":"...","evidence_format":"codex-native-v1","ready_reference":"https://github.com/...","review_trigger_reference":"https://github.com/...","review_reference":"https://github.com/...","reviewer_login":"...","recorded_by":"...","finding_key":null,"required_checks":[],"loop_state":"PASS"}
 -->
 ```
 
@@ -110,21 +122,54 @@ checks and validates the reviewer permalink. AI-authored markers are not accepte
 Only exact markers, trusted workflow authors, the current phase label and the current PR SHA are
 accepted. Repository content, PR comments and reviewer output remain untrusted data.
 
+### Base refresh authorization
+
+When `main` has advanced after an adjacent prior-Phase PASS but before Codex has created any
+current-Phase commit, the local orchestrator dispatches `Prepare AI Loop Base Refresh`. The workflow
+verifies the exact current HEAD, current default-branch SHA, current implementation request and
+adjacent prior PASS, then emits a commit status:
+
+```text
+sha: <old-head>
+state: success
+context: redteam/base-refresh/phase-0b/phase-0a/<current-main>
+description: trusted exact-SHA base refresh authorization
+target_url: <trusted-prior-PASS-permalink>
+creator: github-actions[bot]
+```
+
+The workflow uses `statuses: write` for this evidence and retains only `pull-requests: read`; it has
+neither label-write nor merge authority. After validating the status creator, exact context, state,
+description, prior PASS link and SHA, the local orchestrator re-reads the complete PR state, replaces
+the labels with the exact adjacent-Phase rollback set, and verifies the complete resulting PR state.
+It first rejects multiple source/restart transition identities for the same HEAD and current Phase,
+then re-fetches and compares the trusted PASS/status transition snapshot immediately before and
+after both local side effects. The post-label snapshot uses the rolled-back Phase while retaining
+the authorized source identity, so a newly inserted lower-Phase transition cannot be hidden. It
+calls GitHub's branch-update endpoint with
+`expected_head_sha=<old-head>`. A concurrent status, head, base, label or lifecycle change fails
+closed. The synchronization is not a final PR merge: it
+incorporates `main` into the PR branch. CI then runs the rolled-back Phase on the new HEAD, and every
+PASS tied to the old HEAD remains stale.
+
 ## Review recording
 
 After CI posts the review-ready marker:
 
 1. The local orchestrator posts `@codex review` only after the SHA-bound ready marker exists.
 2. Codex independently checks the current phase prompt, acceptance criteria and prior invariants,
-   then emits exactly one `redteam-ai-review` marker.
-3. The orchestrator validates the JSON Schema, author, current phase, reviewed SHA and phase base
-   SHA. For `CHANGES_REQUESTED`, it derives a stable root-cause key from the first finding.
+   then posts native P0/P1 inline findings or its standard no-major-issues completion and 👍.
+3. The orchestrator validates reviewer identity, current phase/head/base, ready/trigger chain,
+   native output shape and absence of `synchronize` events during review. For
+   `CHANGES_REQUESTED`, it derives a stable root-cause key from priority, path and headline.
 4. The orchestrator dispatches `Record AI Phase Review` as `AI_GATE_APPROVER_LOGIN`.
 
 The workflow rejects a stale SHA, wrong reviewer, wrong phase base, fork PR, missing/failed checks,
-review link outside the PR, or orchestrator input that differs from the review's single
-`redteam-ai-review` marker. It stops after five change cycles in a phase or three occurrences of the
-same root-cause key.
+review link outside the PR, untrusted ready/trigger links, a head change during review, ambiguous
+commit evidence, a PASS without the bot 👍, or orchestrator input that differs from the
+deterministically derived native result. A formal Codex review without retained P0/P1 comments is
+fail-closed. The loop stops after five change cycles in a phase or three occurrences of the same
+root-cause key.
 
 ## Phase progression
 
@@ -132,14 +177,30 @@ Phase 0A through Phase 3 automatically create the next implementation request af
 PASS. Phase 4 and Phase 5 stop at `ai-human-gate`. Provider approval must be made as a separate
 human-reviewed governance change on the default branch before running `Advance AI Loop Phase`.
 After approval, restarting the same local command automatically requests the approved Phase 4 or
-Phase 5 implementation. The next provider gate and final merge remain human-only.
+Phase 5 implementation. Provider choices remain human-only; the final implementation merge uses
+the configured local exact-SHA gate.
 
 The same long-lived implementation PR is used to avoid intermediate automatic merges. Every phase
 PASS comment records the phase boundary SHA; the next review must use that SHA as its base. The
 `redteam/phase-review` status is reset to pending whenever a new phase starts, preventing an earlier
 phase PASS from authorizing merge of later work.
 
+If the default branch advances between a PASS and the next implementation, the runner performs the
+bounded base-refresh transition above before sending another `@codex implement` request. It never
+refreshes after current-Phase code has changed or carries an old PASS across the new merge SHA. The
+base-refresh workflow never calls the final merge endpoint; only the local completion gate can.
+
 ## Completion
 
-`ai-project-complete` means the code and evidence satisfy Phase 0A through Phase 5 on the latest
-branch SHA. It does not merge or deploy code and does not authorize actions against a real target.
+`ai-project-complete` is necessary but not sufficient for merge. The local orchestrator rebuilds
+the Phase 0A→5 PASS chain backward from the current Phase 5 HEAD, verifies the latest workflow
+status and checks, confirms current `main` is already in the PR ancestry, re-reads the live PR, and
+then makes one merge request bound to that exact HEAD. Missing, duplicate, stale, failed or
+ambiguous evidence stops the process. Before dispatch it atomically creates
+`refs/redteam-final-merge-attempts/pr-<PR>-<HEAD>`, then writes a durable PR comment binding the
+attempt to PR, HEAD, current `main`, Phase 5 gate, policy digest, actor and claim ref. Only the
+process that successfully created the ref may dispatch. Any existing/uncertain claim or recorded
+attempt requires explicit live-outcome reconciliation and cannot be retried by a normal restart.
+After confirming the record, the runner re-queries the Phase chain, full PR state, current `main`,
+ancestry, checks and trusted status. Any drift or unknown result requires reconciliation. The runner
+never automatically deletes a claim. Completion never deploys or authorizes a real target.

@@ -32,4 +32,4 @@
 
 ## Human Gate
 
-- [ ] Required only for Phase 4, Phase 5 or final merge
+- [ ] Required only for Phase 4 or Phase 5 provider governance

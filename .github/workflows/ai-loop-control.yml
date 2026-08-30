@@ -37,7 +37,15 @@ on:
           - CHANGES_REQUESTED
           - BLOCKED
       review_reference:
-        description: Permalink to the GitHub PR review or SHA-bound reviewer comment
+        description: Permalink to the native Codex PR review or no-finding comment
+        required: true
+        type: string
+      ready_reference:
+        description: Permalink to the trusted current-head CI ready marker
+        required: true
+        type: string
+      review_trigger_reference:
+        description: Permalink to the operator-authored SHA-bound @codex review request
         required: true
         type: string
       summary:
@@ -61,7 +69,7 @@ permissions:
   checks: read
   contents: read
   issues: write
-  pull-requests: read
+  pull-requests: write
   statuses: write
 
 jobs:
@@ -78,7 +86,9 @@ jobs:
       PHASE: ${{ inputs.phase }}
       PR_NUMBER: ${{ inputs.pull_request_number }}
       REVIEWED_SHA: ${{ inputs.reviewed_sha }}
+      READY_REFERENCE: ${{ inputs.ready_reference }}
       REVIEW_REFERENCE: ${{ inputs.review_reference }}
+      REVIEW_TRIGGER_REFERENCE: ${{ inputs.review_trigger_reference }}
       SUMMARY: ${{ inputs.summary }}
       VERDICT: ${{ inputs.verdict }}
     steps:
@@ -86,6 +96,7 @@ jobs:
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
         with:
           script: |
+            const crypto = require('crypto');
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const pull_number = Number.parseInt(process.env.PR_NUMBER, 10);
@@ -94,6 +105,8 @@ jobs:
             const suppliedBaseSha = process.env.BASE_SHA.trim();
             const verdict = process.env.VERDICT;
             const reviewReference = process.env.REVIEW_REFERENCE.trim();
+            const readyReference = process.env.READY_REFERENCE.trim();
+            const reviewTriggerReference = process.env.REVIEW_TRIGGER_REFERENCE.trim();
             const summary = process.env.SUMMARY.trim();
             const findingKey = process.env.FINDING_KEY.trim();
 
@@ -197,13 +210,92 @@ jobs:
               if (!match) continue;
               try {
                 const record = JSON.parse(match[1].trim());
-                if (record.schema_version === '1.0') priorRecords.push(record);
+                if (record.schema_version === '1.0' && typeof comment.html_url === 'string') {
+                  priorRecords.push({...record, _comment_url: comment.html_url});
+                }
               } catch (_) {}
             }
 
             let expectedBaseSha;
+            let refreshTargetSha = null;
             if (phaseIndex === 0) {
+              const refreshStatusDescription =
+                'trusted exact-SHA base refresh authorization';
+              const refreshStatusPattern =
+                /^redteam\/base-refresh\/(phase-(?:0a|0b|0c|[1-5]))\/(phase-(?:0a|0b|0c|[1-5]))\/([0-9a-f]{40})$/;
+              const refreshes = [];
+              const phaseZeroPasses = priorRecords.filter((record) =>
+                record.phase === 'phase-0a' && record.verdict === 'PASS' &&
+                /^[0-9a-f]{40}$/.test(record.reviewed_sha)
+              );
+              for (const pass of phaseZeroPasses) {
+                const statuses = await github.paginate(
+                  github.rest.repos.listCommitStatusesForRef,
+                  {owner, repo, ref: pass.reviewed_sha, per_page: 100}
+                );
+                for (const status of statuses) {
+                  if (status.creator?.login !== 'github-actions[bot]' ||
+                      !status.context?.startsWith('redteam/base-refresh/')) continue;
+                  const match = status.context.match(refreshStatusPattern);
+                  if (
+                    !match || status.state !== 'success' ||
+                    status.description !== refreshStatusDescription
+                  ) {
+                    core.setFailed('Trusted base-refresh status is malformed.');
+                    return;
+                  }
+                  if (match[2] !== 'phase-0a') continue;
+                  if (
+                    match[1] !== 'phase-0b' || status.sha !== pass.reviewed_sha ||
+                    status.target_url !== pass._comment_url
+                  ) {
+                    core.setFailed('Phase 0A base-refresh status is not bound to its prior PASS.');
+                    return;
+                  }
+                  refreshes.push({
+                    from_phase: match[1],
+                    revalidate_phase: match[2],
+                    head_sha: pass.reviewed_sha,
+                    target_base_sha: match[3],
+                    prior_pass_reference: pass._comment_url,
+                  });
+                }
+              }
               expectedBaseSha = pr.base.sha;
+              if (refreshes.length > 0) {
+                let matchedRefresh = null;
+                const suppliedTargetRefreshes = refreshes.filter(
+                  (refresh) => refresh.target_base_sha === suppliedBaseSha
+                );
+                for (const refresh of suppliedTargetRefreshes) {
+                  const [oldHeadComparison, targetBaseComparison] = await Promise.all([
+                    github.request('GET /repos/{owner}/{repo}/compare/{basehead}', {
+                      owner, repo, basehead: `${refresh.head_sha}...${reviewedSha}`,
+                    }),
+                    github.request('GET /repos/{owner}/{repo}/compare/{basehead}', {
+                      owner, repo, basehead: `${refresh.target_base_sha}...${reviewedSha}`,
+                    }),
+                  ]);
+                  const oldHeadIsAncestor =
+                    oldHeadComparison.data.merge_base_commit?.sha === refresh.head_sha &&
+                    oldHeadComparison.data.behind_by === 0 &&
+                    ['ahead', 'identical'].includes(oldHeadComparison.data.status);
+                  const targetBaseIsAncestor =
+                    targetBaseComparison.data.merge_base_commit?.sha === refresh.target_base_sha &&
+                    targetBaseComparison.data.behind_by === 0 &&
+                    ['ahead', 'identical'].includes(targetBaseComparison.data.status);
+                  if (oldHeadIsAncestor && targetBaseIsAncestor) {
+                    matchedRefresh = refresh;
+                    break;
+                  }
+                }
+                if (!matchedRefresh) {
+                  core.setFailed('Reviewed Phase 0A head is not descended from a trusted base refresh.');
+                  return;
+                }
+                expectedBaseSha = matchedRefresh.target_base_sha;
+                refreshTargetSha = matchedRefresh.target_base_sha;
+              }
             } else {
               const previousPhase = plan.phases[phaseIndex - 1].id;
               const previousPasses = priorRecords.filter(
@@ -242,12 +334,111 @@ jobs:
             }
 
             const expectedPrefix = `https://github.com/${owner}/${repo}/pull/${pull_number}`.toLowerCase();
-            if (!reviewReference.toLowerCase().startsWith(expectedPrefix)) {
-              core.setFailed('review_reference must be a permalink on this pull request.');
+            for (const [name, value] of [
+              ['review_reference', reviewReference],
+              ['ready_reference', readyReference],
+              ['review_trigger_reference', reviewTriggerReference],
+            ]) {
+              if (!value.toLowerCase().startsWith(expectedPrefix)) {
+                core.setFailed(`${name} must be a permalink on this pull request.`);
+                return;
+              }
+            }
+
+            function singleMarker(body, name) {
+              const pattern = new RegExp(`<!--\\s*${name}\\s*([\\s\\S]*?)-->`, 'g');
+              const matches = [...(body || '').matchAll(pattern)];
+              if (matches.length !== 1) throw new Error(`${name} marker must occur exactly once.`);
+              const raw = matches[0][1].trim();
+              const keys = [...raw.matchAll(/"((?:\\.|[^"\\])*)"\\s*:/g)]
+                .map((item) => JSON.parse(`"${item[1]}"`));
+              if (new Set(keys).size !== keys.length) {
+                throw new Error(`${name} marker contains a duplicate JSON key.`);
+              }
+              try {
+                return JSON.parse(raw);
+              } catch (_) {
+                throw new Error(`${name} marker is not valid JSON.`);
+              }
+            }
+            function exactKeys(value, expected) {
+              return value && typeof value === 'object' && !Array.isArray(value) &&
+                JSON.stringify(Object.keys(value).sort()) === JSON.stringify([...expected].sort());
+            }
+            function parseTime(value, name) {
+              const parsed = Date.parse(value || '');
+              if (!Number.isFinite(parsed)) throw new Error(`${name} timestamp is invalid.`);
+              return parsed;
+            }
+
+            const readyEvidence = comments.find((item) => item.html_url === readyReference);
+            if (!readyEvidence || readyEvidence.user?.login !== 'github-actions[bot]') {
+              core.setFailed('ready_reference is not a trusted github-actions[bot] comment.');
               return;
             }
+            const readyMarker = singleMarker(readyEvidence.body, 'redteam-ready-for-review');
+            if (
+              !exactKeys(readyMarker, ['schema_version', 'phase', 'head_sha']) ||
+              readyMarker.schema_version !== '1.0' || readyMarker.phase !== phase ||
+              readyMarker.head_sha !== reviewedSha
+            ) {
+              core.setFailed('Ready marker is not exactly bound to the current phase and head.');
+              return;
+            }
+            const readyTime = parseTime(readyEvidence.created_at, 'ready evidence');
+
+            const triggerEvidence = comments.find(
+              (item) => item.html_url === reviewTriggerReference
+            );
+            if (!triggerEvidence || triggerEvidence.user?.login !== process.env.AI_GATE_APPROVER_LOGIN) {
+              core.setFailed('review_trigger_reference is not authored by the configured operator.');
+              return;
+            }
+            const triggerBody = triggerEvidence.body || '';
+            if (
+              triggerBody.split(/\r?\n/, 1)[0].trim() !== '@codex review' ||
+              !triggerBody.includes(`\`${reviewedSha}\``) ||
+              !triggerBody.includes(`\`${suppliedBaseSha}\``)
+            ) {
+              core.setFailed('Review trigger must use @codex review and contain both full SHAs.');
+              return;
+            }
+            const source = {
+              base_sha: suppliedBaseSha,
+              head_sha: reviewedSha,
+              phase,
+              ready_url: readyReference,
+            };
+            const sourceDigest = crypto.createHash('sha256').update(JSON.stringify(source)).digest('hex');
+            const triggerMarker = singleMarker(triggerBody, 'redteam-local-codex-trigger');
+            if (
+              !exactKeys(triggerMarker, [
+                'schema_version', 'kind', 'phase', 'head_sha', 'source_digest',
+              ]) ||
+              triggerMarker.schema_version !== '1.0' || triggerMarker.kind !== 'review' ||
+              triggerMarker.phase !== phase || triggerMarker.head_sha !== reviewedSha ||
+              triggerMarker.source_digest !== sourceDigest
+            ) {
+              core.setFailed('Review trigger marker is not exactly bound to ready/head/base evidence.');
+              return;
+            }
+            const triggerTime = parseTime(triggerEvidence.created_at, 'review trigger');
+            if (triggerTime <= readyTime) {
+              core.setFailed('Review trigger predates its current-head CI ready marker.');
+              return;
+            }
+
             const reviews = await github.paginate(github.rest.pulls.listReviews, {
               owner, repo, pull_number, per_page: 100,
+            });
+            const reviewComments = await github.paginate(github.rest.pulls.listReviewComments, {
+              owner, repo, pull_number, per_page: 100,
+            });
+            const reactions = await github.paginate(github.rest.reactions.listForIssue, {
+              owner, repo, issue_number: pull_number, per_page: 100,
+            });
+            const timeline = await github.paginate(github.rest.issues.listEventsForTimeline, {
+              owner, repo, issue_number: pull_number, per_page: 100,
             });
             const reviewEvidence = reviews.find((item) => item.html_url === reviewReference);
             const commentEvidence = comments.find((item) => item.html_url === reviewReference);
@@ -260,78 +451,119 @@ jobs:
               core.setFailed(`Unexpected reviewer: ${evidence.user?.login || 'unknown'}`);
               return;
             }
-            if (reviewEvidence && reviewEvidence.commit_id !== reviewedSha) {
-              core.setFailed('The referenced PR review is not bound to reviewed_sha.');
-              return;
+            function codexPriority(body) {
+              const matches = [...(body || '').matchAll(/!\[P([01]) Badge\]/g)];
+              if (matches.length > 1) throw new Error('Codex finding has ambiguous priority badges.');
+              return matches.length === 1 ? matches[0][1] : null;
             }
-            if (commentEvidence && !commentEvidence.body?.includes(reviewedSha)) {
-              core.setFailed('The referenced reviewer comment does not contain reviewed_sha.');
+            function nativeFindingKey(comment) {
+              const priority = codexPriority(comment.body);
+              if (!priority || typeof comment.path !== 'string' || !comment.path) {
+                throw new Error('Codex finding is missing priority or path.');
+              }
+              const headline = (comment.body || '').split(/\r?\n/).map((line) => line.trim())
+                .find((line) => line) || '';
+              const digest = crypto.createHash('sha256')
+                .update(`P${priority}\0${comment.path}\0${headline}`).digest('hex')
+                .slice(0, 16).toUpperCase();
+              return `CODEX-P${priority}-${digest}`;
+            }
+            function rejectSynchronize(start, end) {
+              const changed = timeline.some((item) => item.event === 'synchronize' &&
+                parseTime(item.created_at, 'synchronize event') > start &&
+                parseTime(item.created_at, 'synchronize event') <= end);
+              if (changed) throw new Error('PR head changed while Codex review was running.');
+            }
+
+            const currentFindings = reviewComments.filter((item) =>
+              item.user?.login === process.env.AI_REVIEWER_LOGIN &&
+              item.commit_id === reviewedSha && codexPriority(item.body)
+            ).sort((left, right) => left.id - right.id);
+            const validReviews = new Map();
+            for (const item of reviews) {
+              if (
+                item.user?.login === process.env.AI_REVIEWER_LOGIN &&
+                item.commit_id === reviewedSha && item.state === 'COMMENTED' &&
+                parseTime(item.submitted_at, 'Codex review') > triggerTime
+              ) validReviews.set(item.id, item);
+            }
+            for (const finding of currentFindings) {
+              if (parseTime(finding.created_at, 'Codex finding') <= triggerTime) {
+                core.setFailed('Current-head Codex finding predates the trusted trigger.');
+                return;
+              }
+              if (!validReviews.has(finding.pull_request_review_id)) {
+                core.setFailed('Codex finding is not bound to a trusted current-head review.');
+                return;
+              }
+            }
+            const findingReviewIds = new Set(
+              currentFindings.map((item) => item.pull_request_review_id)
+            );
+            if (
+              validReviews.size !== findingReviewIds.size ||
+              [...validReviews.keys()].some((id) => !findingReviewIds.has(id))
+            ) {
+              core.setFailed('Current-head Codex formal review is missing retained P0/P1 findings.');
               return;
             }
 
-            const evidenceBody = evidence.body || '';
-            const reviewMarkerPattern = /<!--\s*redteam-ai-review\s*([\s\S]*?)-->/g;
-            const reviewMarkers = [...evidenceBody.matchAll(reviewMarkerPattern)];
-            if (reviewMarkers.length !== 1) {
-              core.setFailed('Review evidence must contain exactly one redteam-ai-review marker.');
-              return;
-            }
-            let reviewerResult;
-            try {
-              reviewerResult = JSON.parse(reviewMarkers[0][1].trim());
-            } catch (_) {
-              core.setFailed('The redteam-ai-review marker is not valid JSON.');
-              return;
-            }
-            const expectedReviewKeys = [
-              'base_sha', 'findings', 'phase', 'required_checks', 'reviewed_sha',
-              'schema_version', 'summary', 'verdict',
-            ];
-            const actualReviewKeys = Object.keys(reviewerResult).sort();
-            if (JSON.stringify(actualReviewKeys) !== JSON.stringify(expectedReviewKeys)) {
-              core.setFailed('The redteam-ai-review marker has missing or unknown fields.');
-              return;
-            }
-            if (
-              reviewerResult.schema_version !== '1.0' ||
-              reviewerResult.phase !== phase ||
-              reviewerResult.reviewed_sha !== reviewedSha ||
-              reviewerResult.base_sha !== suppliedBaseSha ||
-              reviewerResult.verdict !== verdict ||
-              reviewerResult.summary !== summary ||
-              !Array.isArray(reviewerResult.findings) ||
-              !Array.isArray(reviewerResult.required_checks)
-            ) {
-              core.setFailed('Recorded inputs do not exactly match the independent review marker.');
-              return;
-            }
-            if (verdict === 'PASS' && reviewerResult.findings.length !== 0) {
-              core.setFailed('A PASS review cannot contain findings.');
-              return;
-            }
-            const reviewerCheckNames = reviewerResult.required_checks.map((item) => item?.name);
-            const reviewerChecksAreExact =
-              reviewerResult.required_checks.length === requiredCheckNames.length &&
-              new Set(reviewerCheckNames).size === requiredCheckNames.length &&
-              requiredCheckNames.every((name) => reviewerCheckNames.includes(name)) &&
-              reviewerResult.required_checks.every((item) => item?.status === 'PASS');
-            if (!reviewerChecksAreExact) {
-              core.setFailed('Reviewer result must report every required check exactly once as PASS.');
-              return;
-            }
-            if (verdict === 'CHANGES_REQUESTED') {
-              if (reviewerResult.findings.length === 0) {
-                core.setFailed('CHANGES_REQUESTED must contain at least one review finding.');
+            let expectedSummary;
+            let completedTime;
+            if (currentFindings.length > 0) {
+              const owningReview = validReviews.get(currentFindings[0].pull_request_review_id);
+              if (verdict !== 'CHANGES_REQUESTED' || reviewEvidence?.id !== owningReview.id) {
+                core.setFailed('P0/P1 findings require their owning native review as evidence.');
                 return;
               }
-              const findingExists = reviewerResult.findings.some(
-                (item) => item?.id === findingKey || item?.requirement_id === findingKey
-              );
-              if (!findingExists) {
-                core.setFailed('finding_key must match a finding id or requirement_id in the review.');
+              const expectedFindingKey = nativeFindingKey(currentFindings[0]);
+              if (findingKey !== expectedFindingKey) {
+                core.setFailed(`Native finding key mismatch: ${findingKey}; expected ${expectedFindingKey}`);
                 return;
               }
+              expectedSummary = `Codex reported ${currentFindings.length} P0/P1 finding(s) for ${reviewedSha.slice(0, 10)}.`;
+              completedTime = parseTime(owningReview.submitted_at, 'Codex review');
+            } else {
+              if (verdict !== 'PASS' || !commentEvidence || reviewEvidence) {
+                core.setFailed('No-finding evidence must be a native Codex PASS comment.');
+                return;
+              }
+              if (findingKey !== '') {
+                core.setFailed('Native PASS evidence cannot contain a finding_key.');
+                return;
+              }
+              const passBody = commentEvidence.body || '';
+              const passPrefix = "Codex Review: Didn't find any major issues.";
+              const commitMatches = [...passBody.matchAll(/^\*\*Reviewed commit:\*\* `([0-9a-f]{10,40})`$/gm)];
+              if (
+                !passBody.startsWith(passPrefix) || commitMatches.length !== 1 ||
+                (passBody.match(/\*\*Reviewed commit:\*\*/g) || []).length !== 1 ||
+                !reviewedSha.startsWith(commitMatches[0][1])
+              ) {
+                core.setFailed('Native Codex PASS comment has stale or ambiguous commit evidence.');
+                return;
+              }
+              const passTime = parseTime(commentEvidence.created_at, 'Codex PASS comment');
+              if (passTime <= triggerTime) {
+                core.setFailed('Codex PASS comment predates the trusted trigger.');
+                return;
+              }
+              const passReactions = reactions.filter((item) =>
+                item.user?.login === process.env.AI_REVIEWER_LOGIN && item.content === '+1' &&
+                parseTime(item.created_at, 'Codex reaction') >= passTime
+              ).sort((left, right) => Date.parse(left.created_at) - Date.parse(right.created_at));
+              if (passReactions.length === 0) {
+                core.setFailed('Native Codex PASS is missing its reviewer thumbs-up reaction.');
+                return;
+              }
+              expectedSummary = `Codex reported no P0/P1 findings for ${reviewedSha.slice(0, 10)}.`;
+              completedTime = parseTime(passReactions[0].created_at, 'Codex reaction');
             }
+            if (summary !== expectedSummary) {
+              core.setFailed('Summary does not match the deterministically derived native review result.');
+              return;
+            }
+            rejectSynchronize(triggerTime, completedTime);
 
             const maximum = Number.parseInt(process.env.AI_LOOP_MAX_ITERATIONS || '5', 10);
             if (!Number.isInteger(maximum) || maximum < 1 || maximum > 20) {
@@ -348,6 +580,26 @@ jobs:
               priorChanges.length + 1 >= maximum || sameFindingCount + 1 >= 3
             );
 
+            const { data: livePr } = await github.rest.pulls.get({owner, repo, pull_number});
+            const livePhases = livePr.labels.map((item) => item.name)
+              .filter((name) => /^phase-(0a|0b|0c|[1-5])$/.test(name));
+            if (
+              livePr.state !== 'open' || livePr.head.sha !== reviewedSha ||
+              livePhases.length !== 1 || livePhases[0] !== phase
+            ) {
+              core.setFailed('Pull request head or phase changed before recording the gate.');
+              return;
+            }
+            if (refreshTargetSha !== null) {
+              const { data: liveDefaultCommit } = await github.rest.repos.getCommit({
+                owner, repo, ref: context.payload.repository.default_branch,
+              });
+              if (liveDefaultCommit.sha !== refreshTargetSha) {
+                core.setFailed('Default branch changed before recording the refreshed Phase 0A gate.');
+                return;
+              }
+            }
+
             const record = {
               schema_version: '1.0',
               phase,
@@ -355,7 +607,10 @@ jobs:
               base_sha: suppliedBaseSha,
               verdict,
               summary,
+              evidence_format: 'codex-native-v1',
               review_reference: reviewReference,
+              ready_reference: readyReference,
+              review_trigger_reference: reviewTriggerReference,
               reviewer_login: process.env.AI_REVIEWER_LOGIN,
               recorded_by: context.actor,
               finding_key: findingKey || null,
@@ -445,7 +700,7 @@ jobs:
                 owner,
                 repo,
                 issue_number: pull_number,
-                body: `All configured phases passed at \`${reviewedSha}\`. Final human review and merge are still required.`,
+                body: `All configured phases passed at \`${reviewedSha}\`. The local orchestrator must independently revalidate the complete exact-SHA evidence chain before its single final merge attempt.`,
               });
               return;
             }

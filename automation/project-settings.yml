@@ -3,7 +3,7 @@ schema_version: "1.0"
 project:
   name: RedTeam_Agent
   base_branch: main
-  development_branch: ai/redteam-agent-build
+  development_branch: ai/redteam-agent-phase-loop
   required_pr_label: ai-loop
 
 repository_setup:
@@ -17,12 +17,17 @@ repository_setup:
 loop:
   max_iterations_per_phase: 5
   same_finding_limit: 3
-  final_merge_requires_human: true
+  final_merge_requires_human: false
+  final_merge_mode: local_orchestrator_exact_sha
   allow_fork_pull_requests: false
   reviewer_status_context: redteam/phase-review
   ai_runs_in_github_actions: false
   implementation_trigger: local_orchestrator
   review_trigger: local_orchestrator_after_ci
+  review_evidence_format: codex-native-v1
+  active_phase_authority: github-sha-bound-marker-chain
+  refresh_default_branch_before_new_phase_implementation: true
+  refresh_revalidates_previous_phase: true
   initial_request_workflow: Start AI Loop
   local_orchestrator:
     command: .venv/bin/python automation/run_phase_loop.py
@@ -46,7 +51,7 @@ cost_controls:
   openai_api_key_secret_allowed: false
   github_actions_spending_limit_required: 0
 
-current_state:
+bootstrap_state:
   phase: phase-0a
   verdict: NO-GO
   phase_0b_allowed: false
@@ -54,7 +59,6 @@ current_state:
 human_gates:
   - phase-4
   - phase-5
-  - final-merge
 
 required_repository_variables:
   - AI_GATE_APPROVER_LOGIN

@@ -1,0 +1,341 @@
+name: Prepare AI Loop Base Refresh
+
+on:
+  workflow_dispatch:
+    inputs:
+      pull_request_number:
+        description: Long-lived AI-loop pull request number
+        required: true
+        type: number
+      source_phase:
+        description: Phase whose implementation was about to begin
+        required: true
+        type: string
+      expected_head_sha:
+        description: Exact current 40-character PR head SHA
+        required: true
+        type: string
+      target_base_sha:
+        description: Exact current default-branch SHA to incorporate
+        required: true
+        type: string
+      prior_pass_reference:
+        description: Trusted previous-phase PASS comment permalink
+        required: true
+        type: string
+      confirmation:
+        description: Type REFRESH_AI_LOOP_BASE
+        required: true
+        type: string
+
+concurrency:
+  group: redteam-base-refresh-${{ inputs.pull_request_number }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pull-requests: read
+  statuses: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      AI_GATE_APPROVER_LOGIN: ${{ vars.AI_GATE_APPROVER_LOGIN }}
+      CONFIRMATION: ${{ inputs.confirmation }}
+      EXPECTED_HEAD_SHA: ${{ inputs.expected_head_sha }}
+      PR_NUMBER: ${{ inputs.pull_request_number }}
+      PRIOR_PASS_REFERENCE: ${{ inputs.prior_pass_reference }}
+      SOURCE_PHASE: ${{ inputs.source_phase }}
+      TARGET_BASE_SHA: ${{ inputs.target_base_sha }}
+    steps:
+      - name: Invalidate stale phase PASS and authorize exact base refresh
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            if (process.env.CONFIRMATION !== 'REFRESH_AI_LOOP_BASE') {
+              core.setFailed('Confirmation text does not match.');
+              return;
+            }
+            if (!process.env.AI_GATE_APPROVER_LOGIN || context.actor !== process.env.AI_GATE_APPROVER_LOGIN) {
+              core.setFailed(`Untrusted base-refresh actor: ${context.actor}`);
+              return;
+            }
+
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const pull_number = Number.parseInt(process.env.PR_NUMBER, 10);
+            const expectedHeadSha = process.env.EXPECTED_HEAD_SHA.trim();
+            const targetBaseSha = process.env.TARGET_BASE_SHA.trim();
+            const priorPassReference = process.env.PRIOR_PASS_REFERENCE.trim();
+            const sourcePhase = process.env.SOURCE_PHASE.trim();
+            if (
+              !Number.isInteger(pull_number) || pull_number < 1 ||
+              !/^[0-9a-f]{40}$/.test(expectedHeadSha) ||
+              !/^[0-9a-f]{40}$/.test(targetBaseSha)
+            ) {
+              core.setFailed('Pull request number or SHA input is invalid.');
+              return;
+            }
+            const expectedPrPrefix = `https://github.com/${owner}/${repo}/pull/${pull_number}`;
+            if (!priorPassReference.startsWith(expectedPrPrefix)) {
+              core.setFailed('Prior PASS reference must be a permalink on this pull request.');
+              return;
+            }
+
+            function singleMarker(body, name) {
+              const pattern = new RegExp(`<!--\\s*${name}\\s*([\\s\\S]*?)-->`, 'g');
+              const matches = [...(body || '').matchAll(pattern)];
+              if (matches.length !== 1) throw new Error(`${name} marker must occur exactly once.`);
+              const raw = matches[0][1].trim();
+              let offset = 0;
+              function fail(message) {
+                throw new Error(`${name} marker ${message}.`);
+              }
+              function skipWhitespace() {
+                while (/\s/.test(raw[offset] || '')) offset += 1;
+              }
+              function parseString() {
+                const start = offset;
+                if (raw[offset] !== '"') fail('is not valid JSON');
+                offset += 1;
+                while (offset < raw.length) {
+                  if (raw[offset] === '"') {
+                    offset += 1;
+                    try {
+                      return JSON.parse(raw.slice(start, offset));
+                    } catch (_) {
+                      fail('is not valid JSON');
+                    }
+                  }
+                  if (raw[offset] === '\\') offset += 2;
+                  else offset += 1;
+                }
+                fail('is not valid JSON');
+              }
+              function parseArray() {
+                const result = [];
+                offset += 1;
+                skipWhitespace();
+                if (raw[offset] === ']') {
+                  offset += 1;
+                  return result;
+                }
+                while (offset < raw.length) {
+                  result.push(parseValue());
+                  skipWhitespace();
+                  if (raw[offset] === ']') {
+                    offset += 1;
+                    return result;
+                  }
+                  if (raw[offset] !== ',') fail('is not valid JSON');
+                  offset += 1;
+                  skipWhitespace();
+                }
+                fail('is not valid JSON');
+              }
+              function parseObject() {
+                const result = Object.create(null);
+                const keys = new Set();
+                offset += 1;
+                skipWhitespace();
+                if (raw[offset] === '}') {
+                  offset += 1;
+                  return result;
+                }
+                while (offset < raw.length) {
+                  const key = parseString();
+                  if (keys.has(key)) fail('contains a duplicate JSON key');
+                  keys.add(key);
+                  skipWhitespace();
+                  if (raw[offset] !== ':') fail('is not valid JSON');
+                  offset += 1;
+                  result[key] = parseValue();
+                  skipWhitespace();
+                  if (raw[offset] === '}') {
+                    offset += 1;
+                    return result;
+                  }
+                  if (raw[offset] !== ',') fail('is not valid JSON');
+                  offset += 1;
+                  skipWhitespace();
+                }
+                fail('is not valid JSON');
+              }
+              function parseValue() {
+                skipWhitespace();
+                if (raw[offset] === '{') return parseObject();
+                if (raw[offset] === '[') return parseArray();
+                if (raw[offset] === '"') return parseString();
+                const start = offset;
+                while (offset < raw.length && !/[\s,}\]]/.test(raw[offset])) offset += 1;
+                if (start === offset) fail('is not valid JSON');
+                try {
+                  return JSON.parse(raw.slice(start, offset));
+                } catch (_) {
+                  fail('is not valid JSON');
+                }
+              }
+              const value = parseValue();
+              skipWhitespace();
+              if (offset !== raw.length) fail('is not valid JSON');
+              return value;
+            }
+            function exactKeys(value, expected) {
+              return value && typeof value === 'object' && !Array.isArray(value) &&
+                JSON.stringify(Object.keys(value).sort()) === JSON.stringify([...expected].sort());
+            }
+            const { data: pr } = await github.rest.pulls.get({owner, repo, pull_number});
+            const defaultBranch = context.payload.repository.default_branch;
+            if (
+              pr.state !== 'open' || pr.head.repo.full_name !== `${owner}/${repo}` ||
+              pr.base.ref !== defaultBranch || pr.head.sha !== expectedHeadSha
+            ) {
+              core.setFailed('The current pull request does not match the exact refresh request.');
+              return;
+            }
+            const { data: defaultCommit } = await github.rest.repos.getCommit({
+              owner, repo, ref: defaultBranch,
+            });
+            if (defaultCommit.sha !== targetBaseSha) {
+              core.setFailed('The target base SHA is no longer the current default branch.');
+              return;
+            }
+            const comparison = await github.request(
+              'GET /repos/{owner}/{repo}/compare/{basehead}',
+              {owner, repo, basehead: `${expectedHeadSha}...${targetBaseSha}`}
+            );
+            if (!Number.isInteger(comparison.data.ahead_by) || comparison.data.ahead_by < 1) {
+              core.setFailed('The default branch has no commit to incorporate.');
+              return;
+            }
+
+            const { data: planFile } = await github.rest.repos.getContent({
+              owner, repo, path: 'automation/phase-plan.json', ref: defaultBranch,
+            });
+            if (Array.isArray(planFile) || planFile.type !== 'file' || !planFile.content) {
+              core.setFailed('Trusted phase plan is unavailable.');
+              return;
+            }
+            const plan = JSON.parse(Buffer.from(planFile.content, 'base64').toString('utf8'));
+            const labels = pr.labels.map((item) => item.name);
+            const phases = labels.filter((name) => /^phase-(0a|0b|0c|[1-5])$/.test(name));
+            if (!labels.includes('ai-loop') || phases.length !== 1) {
+              core.setFailed('The pull request must be an AI loop with exactly one phase.');
+              return;
+            }
+            const currentPhase = phases[0];
+            const sourceIndex = plan.phases?.findIndex((item) => item.id === sourcePhase) ?? -1;
+            if (plan.schema_version !== '1.0' || sourceIndex < 1) {
+              core.setFailed('Only a post-Phase-0A transition can request automatic base refresh.');
+              return;
+            }
+            const previousPhase = plan.phases[sourceIndex - 1].id;
+            const refreshStatusDescription = 'trusted exact-SHA base refresh authorization';
+            const refreshStatusContext =
+              `redteam/base-refresh/${sourcePhase}/${previousPhase}/${targetBaseSha}`;
+            const refreshStatusPattern =
+              /^redteam\/base-refresh\/(phase-(?:0a|0b|0c|[1-5]))\/(phase-(?:0a|0b|0c|[1-5]))\/([0-9a-f]{40})$/;
+            if (refreshStatusContext.length > 100) {
+              core.setFailed('Base-refresh status context exceeds GitHub limits.');
+              return;
+            }
+            if (![sourcePhase, previousPhase].includes(currentPhase)) {
+              core.setFailed('Current Phase is not the source or revalidation Phase.');
+              return;
+            }
+            if (!labels.includes('ai-needs-implementation')) {
+              core.setFailed('Base refresh is allowed only before current-phase implementation.');
+              return;
+            }
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number: pull_number, per_page: 100,
+            });
+            if (currentPhase === previousPhase) {
+              const statuses = await github.paginate(
+                github.rest.repos.listCommitStatusesForRef,
+                {owner, repo, ref: expectedHeadSha, per_page: 100}
+              );
+              let priorRefreshExists = false;
+              for (const status of statuses) {
+                if (status.creator?.login !== 'github-actions[bot]' ||
+                    !status.context?.startsWith('redteam/base-refresh/')) continue;
+                const match = status.context.match(refreshStatusPattern);
+                if (
+                  !match || status.state !== 'success' ||
+                  status.description !== refreshStatusDescription ||
+                  status.target_url !== priorPassReference
+                ) {
+                  core.setFailed('Trusted prior base-refresh status is malformed.');
+                  return;
+                }
+                if (match[1] === sourcePhase && match[2] === previousPhase) {
+                  priorRefreshExists = true;
+                }
+              }
+              if (!priorRefreshExists) {
+                core.setFailed('Reauthorization requires a trusted prior base-refresh status.');
+                return;
+              }
+            }
+            const passComment = comments.find(
+              (item) => item.html_url === priorPassReference &&
+                item.user?.login === 'github-actions[bot]'
+            );
+            if (!passComment) {
+              core.setFailed('Prior PASS reference is not a trusted workflow comment.');
+              return;
+            }
+            const pass = singleMarker(passComment.body, 'redteam-phase-gate');
+            const passKeys = [
+              'schema_version', 'phase', 'reviewed_sha', 'base_sha', 'verdict', 'summary',
+              'evidence_format', 'ready_reference', 'review_trigger_reference',
+              'review_reference', 'reviewer_login', 'recorded_by', 'finding_key',
+              'required_checks', 'loop_state'
+            ];
+            if (
+              !exactKeys(pass, passKeys) || pass.schema_version !== '1.0' ||
+              pass.phase !== previousPhase || pass.reviewed_sha !== expectedHeadSha ||
+              pass.verdict !== 'PASS' || pass.loop_state !== 'PASS' ||
+              pass.evidence_format !== 'codex-native-v1'
+            ) {
+              core.setFailed('Prior phase PASS is malformed, stale, or not adjacent.');
+              return;
+            }
+
+            const requestPattern = /<!--\s*redteam-implementation-request\s*([\s\S]*?)-->/g;
+            const currentRequests = [];
+            for (const comment of comments) {
+              if (comment.user?.login !== 'github-actions[bot]') continue;
+              for (const match of (comment.body || '').matchAll(requestPattern)) {
+                const request = singleMarker(`<!-- redteam-implementation-request\n${match[1]}\n-->`, 'redteam-implementation-request');
+                if (
+                  exactKeys(request, ['schema_version', 'action', 'trigger', 'phase', 'head_sha', 'phase_prompt']) &&
+                  request.schema_version === '1.0' && request.action === 'IMPLEMENT_PHASE' &&
+                  request.phase === sourcePhase && request.head_sha === expectedHeadSha &&
+                  request.phase_prompt === plan.phases[sourceIndex].prompt
+                ) currentRequests.push(request);
+              }
+            }
+            if (currentRequests.length !== 1) {
+              core.setFailed('Exactly one trusted current-phase implementation request is required.');
+              return;
+            }
+
+            await github.rest.repos.createCommitStatus({
+              owner,
+              repo,
+              sha: expectedHeadSha,
+              state: 'success',
+              context: refreshStatusContext,
+              description: refreshStatusDescription,
+              target_url: priorPassReference,
+            });
+
+            await github.rest.repos.createCommitStatus({
+              owner, repo, sha: expectedHeadSha, state: 'pending',
+              context: 'redteam/phase-review',
+              description: `${previousPhase}: base refresh and revalidation pending`.slice(0, 140),
+            });

@@ -21,17 +21,49 @@
 - Local OrchestratorはCurrent default-branch SHAのClean Checkoutでだけ起動する
 - `gh`のCurrent Loginが`AI_GATE_APPROVER_LOGIN`と完全一致しなければ停止する
 - `github-actions[bot]`以外のImplementation/Ready/Phase Gate Markerを無視する
-- Implementation RequestとReview ResultのUnknown Field、Duplicate JSON Keyを拒否する
+- Implementation Request、ready/trigger marker、Trusted Phase Gate recordのUnknown Field、Duplicate JSON Keyを拒否する
 - Implementation RequestをCurrent Phase、Current HEAD SHA、Trusted Phase Promptへ固定する
-- Review Resultを`AI_REVIEWER_LOGIN`、Current Phase、Current HEAD SHA、Expected Base SHAへ固定する
+- Native Reviewを`AI_REVIEWER_LOGIN`、Current Phase、Current HEAD SHA、Expected Base SHA、ready/trigger permalink、Review中のhead不変性へ固定する
+- PASSはCodex標準no-major-issues comment、10文字以上のmatching commit prefix、botの👍、Current HEADのP0/P1/formal finding review不在をすべて要求する
+- CHANGES_REQUESTEDはCurrent HEADへ完全BindingされたCodex formal reviewとP0/P1 inline findingを要求し、root-cause keyを決定論的に導出する
 - Required Check成功前にReview Gateを記録しない
 - 同じRequest/Reviewを再処理せず、停止後にGitHub Evidenceから再開できる
 - Phase 4/5は`ai-human-gate`中に停止し、承認済みProvider Gate遷移後だけ再開する
 - OpenAI API Keyを要求せず、GitHub CredentialをCodex Promptまたは実行環境へ渡さない
+- Active PRのCurrent Phaseは、exact phase label、`github-actions[bot]`のCurrent-HEAD
+  Implementation Request、隣接するPrior-Phase PASSの完全一致でのみ解決する
+- Default BranchをPRへ取り込む前にCurrent Phaseを1つ戻し、旧HEADのPASSを再利用せず、
+  取込み後HEADで同Phase Gateを再実行する
+- Base-refresh Workflowは旧HEAD、Current default-branch SHA、隣接Prior PASSを固定したStatusのみ
+  書込み、PR labelの完全置換はLocal Orchestratorが変更前後の全PR状態を再取得して実行する
+- 同じHEAD/Current Phaseにsource側とrollback済み側の複数Base-refresh遷移Identityが成立する
+  場合は、label置換とbranch updateのどちらも行わずFail Closedにする
+- Local Orchestratorはlabel置換とbranch updateの直前・直後にCurrent PR、Default Branch、
+  trusted PASS/Status遷移Snapshotを再取得し、Driftまたは競合をFail Closedにする
+- label置換後のSnapshotはrollback後Phaseの視点で旧認可Identityを再確認し、さらに下位Phaseへ
+  戻す新しいsource Identityとの競合を拒否する
+- Base refreshは`expected_head_sha`とCurrent default-branch SHAへ固定し、Final merge APIを
+  呼ばない
+- Final mergeはLocal Orchestratorだけが実行し、`phase-5`、`ai-project-complete`、
+  `ai-review-passed`、全Phase PASS Chain、Current-HEAD Check、Trusted Phase Status、
+  Current default-branch ancestryを再検証する
+- Final merge APIへCurrent 40桁HEAD SHAを渡し、不一致、競合、不確実なResponseをFail
+  Closedにして自動Retryしない
+- Final merge dispatch前に同じPR/HEADの既存Attempt Recordがないことを再確認し、Repository
+  Git ref claimを原子的に作成して1プロセスだけが所有する
+- Claim取得後、PR、HEAD、Default Branch、Phase 5 Gate、Policy Digest、Actor、Claim Ref固定の
+  Attempt Recordを永続化してからmerge APIを呼ぶ
+- Attempt Record確認後に全Phase PASS Chain、PR全状態、Default Branch SHA/ancestry、
+  Current-HEAD Checks、Trusted Phase Statusを再取得し、すべて不変かつPASSの場合だけdispatchする
+- Claim/Attempt Recordが存在する、またはClaim作成結果が不明なPR/HEADは、Live GitHub Outcomeを
+  明示的にReconcileするまで再送せず、Claim取得後のGate Drift/Unknownも同様に停止し、通常実行で
+  Claimを削除しない
+- Governance PR、Fork PR、停止Label付きPR、`ai-loop`以外を自動mergeしない
 
 ## Phase 0A: Core Models / Authorization Kernel
 
-Phase 0A Gateは現在NO-GO。次をすべて満たすまでPhase 0Bへ進めない。
+Phase 0A Gateのbootstrap既定値はNO-GO。Active PRでは、次をすべて満たしたCurrent-HEADの
+trusted PASSが存在する場合に限りPhase 0Bへ進める。
 
 ### Blockers
 
@@ -162,7 +194,8 @@ Human GateでMCP Server、Protocol Revision、Transport Identity、Trust Policy�
 
 ## Project Complete
 
-Phase 5 PASS後、次を満たした場合に`ai-project-complete`とする。
+Phase 5 PASS後、次を満たした場合に`ai-project-complete`とし、Local Orchestratorの最終
+merge gateへ進む。
 
 - Phase 0A～5の全Gate ResultがGitHub履歴に存在
 - 最新HEADで全Common GateがPASS
@@ -171,4 +204,6 @@ Phase 5 PASS後、次を満たした場合に`ai-project-complete`とする。
 - README/SystemDesign/Config/Runbookが実装と一致
 - Fresh environment setupとMock end-to-endが再現可能
 - Known limitationsと残存MEDIUM/LOWを明文化
-- Final mergeは人が差分を確認して実施
+- Local Orchestratorが上記AI Loop Control Acceptanceを再検証し、完全HEAD SHA固定の
+  GitHub PR mergeを1回だけ実行
+- Merge未確認、Default Branch drift、競合または不明な結果は自動再試行せず停止
