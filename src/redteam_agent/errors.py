@@ -105,3 +105,47 @@ class CurrentAuthorizationStateError(RedTeamAgentError):
 
 class SandboxRuntimeBindingError(RedTeamAgentError):
     """Sandbox capabilities belong to a different execution runtime."""
+
+
+class ExecutionAuthorizationError(RedTeamAgentError):
+    """A PolicyDecision is not currently executable."""
+
+
+class DuplicateExecutionError(RedTeamAgentError):
+    """A second ExecutionRecord was attempted for one PolicyDecision."""
+
+
+class ExecutionStateTransitionError(RedTeamAgentError):
+    """An execution state transition was stale, invalid, or incomplete."""
+
+
+class PreDispatchBlockedError(RedTeamAgentError):
+    """Current security state blocked execution before any provider call."""
+
+
+class ExternalDispatchOutcomeUnknownError(RedTeamAgentError):
+    """Dispatch may have occurred and must be reconciled without resubmission."""
+
+
+class AdapterDispatchUncertainError(RedTeamAgentError):
+    """An adapter could not confirm whether the external submit was accepted."""
+
+
+class AdapterOperationError(RedTeamAgentError):
+    """A mock adapter operation failed without exposing untrusted provider content."""
+
+
+class ResultIngestionError(RedTeamAgentError):
+    """Result ingestion could not safely complete."""
+
+
+class RawResultStreamingError(ResultIngestionError):
+    """Streaming or quarantine commit failed and requires recovery."""
+
+
+class RawResultQuarantineError(ResultIngestionError):
+    """Raw result quarantine metadata or commit failed closed."""
+
+
+class WorkflowRunBindingError(RedTeamAgentError):
+    """A run_id/thread_id did not bind to the current Mission revision."""

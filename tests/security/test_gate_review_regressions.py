@@ -530,7 +530,7 @@ def test_old_runtime_binding_is_stale_after_new_mission_revision() -> None:
         assert authorize_execution(**persisted_gate_kwargs(kernel)).status == "STALE"
 
 
-def test_existing_v1_database_is_upgraded_to_v2(tmp_path) -> None:
+def test_existing_v1_database_is_upgraded_through_current_schema(tmp_path) -> None:
     path = tmp_path / "phase0a-v1.sqlite"
     connection = sqlite3.connect(path)
     connection.execute(
@@ -547,7 +547,7 @@ def test_existing_v1_database_is_upgraded_to_v2(tmp_path) -> None:
         versions = {
             row[0] for row in upgraded.connection.execute("SELECT version FROM schema_migrations")
         }
-        assert versions == {1, 2}
+        assert versions == {1, 2, 3}
         assert upgraded.connection.execute(
             "SELECT name FROM sqlite_master WHERE name='authorization_runtime_bindings'"
         ).fetchone()

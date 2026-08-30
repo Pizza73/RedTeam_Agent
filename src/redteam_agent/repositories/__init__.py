@@ -1,4 +1,4 @@
-"""Repository interfaces backed by SQLite for Phase 0A."""
+"""Repository interfaces backed by SQLite for implemented phases."""
 
 from .approval import ApprovalRecordRepository, ApprovalRequestRepository
 from .capabilities import (
@@ -8,6 +8,14 @@ from .capabilities import (
     SessionSecurityContextSnapshotRepository,
 )
 from .context import ContextAuthorizationRepository, ContextResourceIndexRepository
+from .execution import (
+    ExecutionRepository,
+    ExecutionResultRepository,
+    RawResultReceiptRepository,
+    RawResultRecoveryRepository,
+    ResultIngestionRepository,
+    WorkflowRunRepository,
+)
 from .llm import LLMProfileRepository
 from .mission import MissionRepository, MissionRevisionRepository, MissionStateRepository
 from .plans import PlanProposalRepository, PlanRepository
@@ -23,6 +31,8 @@ __all__ = [
     "AuthorizationRuntimeBindingRepository",
     "ContextAuthorizationRepository",
     "ContextResourceIndexRepository",
+    "ExecutionRepository",
+    "ExecutionResultRepository",
     "LLMProfileRepository",
     "MissionRepository",
     "MissionRevisionRepository",
@@ -31,8 +41,12 @@ __all__ = [
     "PlanRepository",
     "PolicyDecisionRepository",
     "PolicyStateRepository",
+    "RawResultReceiptRepository",
+    "RawResultRecoveryRepository",
     "RemoteMCPTrustSnapshotRepository",
     "SandboxCapabilitySnapshotRepository",
     "SessionSecurityContextSnapshotRepository",
     "ToolRegistryRepository",
+    "ResultIngestionRepository",
+    "WorkflowRunRepository",
 ]

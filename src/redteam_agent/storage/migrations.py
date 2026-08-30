@@ -1,4 +1,4 @@
-"""Append-only Phase 0A schema migrations."""
+"""Append-only schema migrations for the implemented phases."""
 
 from __future__ import annotations
 
@@ -219,6 +219,83 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             "ALTER TABLE policy_decisions ADD COLUMN issuer TEXT NOT NULL "
             "DEFAULT 'legacy_unverified'",
             "CREATE UNIQUE INDEX policy_decisions_one_per_plan ON policy_decisions(plan_id)",
+        ),
+    ),
+    (
+        3,
+        (
+            """
+            CREATE TABLE workflow_runs (
+                run_id TEXT PRIMARY KEY,
+                run_digest TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                mission_revision INTEGER NOT NULL CHECK (mission_revision >= 1),
+                thread_id TEXT NOT NULL UNIQUE,
+                payload_json TEXT NOT NULL,
+                FOREIGN KEY (mission_id, mission_revision)
+                    REFERENCES mission_revisions(mission_id, mission_revision)
+            )
+            """,
+            """
+            CREATE TABLE execution_records (
+                execution_id TEXT PRIMARY KEY,
+                record_digest TEXT NOT NULL,
+                state_version INTEGER NOT NULL CHECK (state_version >= 0),
+                mission_id TEXT NOT NULL,
+                mission_revision INTEGER NOT NULL CHECK (mission_revision >= 1),
+                plan_id TEXT NOT NULL REFERENCES execution_plans(plan_id),
+                policy_decision_id TEXT NOT NULL UNIQUE
+                    REFERENCES policy_decisions(decision_id),
+                idempotency_key TEXT NOT NULL UNIQUE,
+                provider_execution_state TEXT NOT NULL,
+                result_ingestion_state TEXT NOT NULL,
+                provider_task_id TEXT,
+                payload_json TEXT NOT NULL,
+                FOREIGN KEY (mission_id, mission_revision)
+                    REFERENCES mission_revisions(mission_id, mission_revision)
+            )
+            """,
+            """
+            CREATE TABLE raw_result_receipts (
+                receipt_id TEXT PRIMARY KEY,
+                receipt_digest TEXT NOT NULL,
+                execution_id TEXT NOT NULL UNIQUE
+                    REFERENCES execution_records(execution_id),
+                quarantine_id TEXT NOT NULL UNIQUE,
+                payload_json TEXT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE raw_result_recovery_metadata (
+                recovery_id TEXT PRIMARY KEY,
+                recovery_digest TEXT NOT NULL,
+                execution_id TEXT NOT NULL UNIQUE
+                    REFERENCES execution_records(execution_id),
+                quarantine_id TEXT NOT NULL UNIQUE,
+                state TEXT NOT NULL,
+                payload_json TEXT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE result_ingestions (
+                ingestion_id TEXT PRIMARY KEY,
+                ingestion_digest TEXT NOT NULL,
+                execution_id TEXT NOT NULL UNIQUE
+                    REFERENCES execution_records(execution_id),
+                state_version INTEGER NOT NULL CHECK (state_version >= 0),
+                status TEXT NOT NULL,
+                payload_json TEXT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE execution_results (
+                result_id TEXT PRIMARY KEY,
+                result_digest TEXT NOT NULL,
+                execution_id TEXT NOT NULL UNIQUE
+                    REFERENCES execution_records(execution_id),
+                payload_json TEXT NOT NULL
+            )
+            """,
         ),
     ),
 )
