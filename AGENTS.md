@@ -113,8 +113,10 @@ The final implementation report must include:
   issue one exact-HEAD merge after every configured Phase and final check passes; an uncertain merge
   result is not automatically retried. Before dispatch, the orchestrator must atomically acquire a
   repository Git ref claim for the exact PR/HEAD and persist an attempt record bound to that claim.
-  An existing or uncertain claim/record requires explicit outcome reconciliation before any later
-  dispatch; normal execution never deletes the claim.
+  After those remote writes it must re-query the complete Phase chain, PR state, default branch,
+  ancestry, checks and trusted status immediately before merge. An existing/uncertain claim or any
+  post-claim drift requires explicit outcome reconciliation; normal execution never deletes the
+  claim.
 
 ## Code Review Rules
 

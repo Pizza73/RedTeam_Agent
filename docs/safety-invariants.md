@@ -65,6 +65,6 @@
   SHA-bound PASS Chain、Current-HEAD CI/Status、Stop Label不在、Current Default Branch
   ancestryを再検証し、Expected HEAD SHA固定で1回だけ実行する。Dispatch前に同じPR/HEAD
   固定のRepository Git ref claimを原子的に取得し、ClaimへBindingした永続Attempt Recordを
-  保存する。Claim/Recordの既存・作成結果不明は明示的Reconciliationまで再送を禁止し、通常
-  実行ではClaimを削除しない。Codex、GitHub Actions、Governance PR、Fork PRはこの経路を
-  使用できない。
+  保存する。その後、同じGateを再取得して不変性を確認する。Claim/Recordの既存・作成結果不明
+  または取得後Gate Drift/Unknownは明示的Reconciliationまで再送を禁止し、通常実行ではClaimを
+  削除しない。Codex、GitHub Actions、Governance PR、Fork PRはこの経路を使用できない。

@@ -19,7 +19,7 @@ Codex CloudまたはChatGPTによる独立ReviewとCodexによる実装を、Pha
 | LOOP-009 | Phase GateをPASSするまで次Phaseを開始しない |
 | LOOP-010 | Phase 0A、0B、0C、1、2、3、4、5の順序を固定する |
 | LOOP-011 | Phase 4/5の未設定外部依存はHuman Gateで停止する |
-| LOOP-012 | 最終mergeはLocal Orchestratorだけが、Phase 5のCurrent-HEAD PASS、Phase 0A～5の完全なSHA Chain、必須Check、Trusted Status、Current Default Branch包含を再検証し、PR/完全HEAD固定のGit ref claimを原子的に1回だけ取得した後、Expected HEAD SHA固定で1回だけ実行する |
+| LOOP-012 | 最終mergeはLocal Orchestratorだけが、Phase 5のCurrent-HEAD PASS、Phase 0A～5の完全なSHA Chain、必須Check、Trusted Status、Current Default Branch包含を検証し、PR/完全HEAD固定のGit ref claimとBinding Recordを作成後に同じGateを再取得・再検証してから、Expected HEAD SHA固定で1回だけ実行する |
 | LOOP-013 | Loop停止・再開操作をGitHub Label/Workflowで提供する |
 | LOOP-014 | PR、Review、Test、Finding、Phase遷移の履歴をGitHubへ保持する |
 | LOOP-015 | Codexが仕様・Gate・Workflowを変更して自己合格できないよう保護する |
@@ -30,7 +30,7 @@ Codex CloudまたはChatGPTによる独立ReviewとCodexによる実装を、Pha
 | LOOP-020 | 次Phase実装前にDefault Branchが進んだ場合、Prior PASSと同じExpected HEADに限ってBase Refreshを許可し、Phaseを1つ戻して更新後HEADでGateを再実行する |
 | LOOP-021 | Base RefreshはPR BranchへDefault Branchを取り込む操作に限定し、Final PR Merge APIを呼び出さない |
 | LOOP-022 | Governance PR、Fork PR、Phase未完了、Stop Label、Stale/Unknown/Ambiguous Evidence、Default Branch未包含時は自動mergeしない。CodexとGitHub ActionsにはFinal Merge APIを与えない |
-| LOOP-023 | Final Merge API呼出し前に、PR番号と完全HEAD固定のRepository Git ref claimを原子的に作成し、PR番号、完全HEAD、Default Branch SHA、Phase 5 Gate、Policy Digest、Actor、Claim RefへBindingした永続Attempt RecordをPRへ保存する。同じPR/HEADのClaimまたはRecordが存在・作成結果不明なら、明示的Reconciliationなしに再送しない |
+| LOOP-023 | Final Merge API呼出し前に、PR番号と完全HEAD固定のRepository Git ref claimを原子的に作成し、PR番号、完全HEAD、Default Branch SHA、Phase 5 Gate、Policy Digest、Actor、Claim RefへBindingした永続Attempt RecordをPRへ保存する。同じPR/HEADのClaim/Recordが存在・作成結果不明、または取得後GateにDrift/Unknownがあれば、明示的Reconciliationなしに再送しない |
 
 ## Non-Functional Requirements
 

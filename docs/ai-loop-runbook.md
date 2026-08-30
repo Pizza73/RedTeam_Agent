@@ -109,7 +109,9 @@ digest, actor and claim ref. It then calls the merge endpoint with
 response or unknown claim/merge outcome stops without an automatic retry. GitHub ref creation is
 the atomic winner selection: only one overlapping runner can own it. The same PR/HEAD claim or
 marker blocks every normal restart until explicit reconciliation; the runner never deletes the
-claim. Fork and governance PRs cannot satisfy this policy.
+claim. Immediately before dispatch, it re-queries the complete Phase chain, attempt marker, full PR
+state, current `main`, ancestry, checks and trusted status; any post-claim drift enters
+reconciliation. Fork and governance PRs cannot satisfy this policy.
 
 If GitHub branch protection or rulesets later become available, configure the pull-request,
 CODEOWNERS, stale-review, conversation-resolution, force-push/deletion, and five exact status-check

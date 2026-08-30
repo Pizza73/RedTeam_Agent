@@ -33,8 +33,10 @@ The local orchestrator performs the following fail-closed checks before one merg
    `refs/redteam-final-merge-attempts/pr-<PR>-<FULL_HEAD>`; only the successful creator continues.
 8. Persist one `redteam-final-merge-attempt` marker bound to PR, full HEAD, current `main`, the
    Phase 5 gate, final-merge policy digest, operator identity and the exact claim ref.
-9. Call GitHub's merge endpoint once with `sha=<full-current-head>` and `merge_method=merge`.
-10. Accept completion only when GitHub returns `merged: true` and a full merge commit SHA.
+9. Re-query the attempt marker, complete Phase chain, full PR state, current `main`, ancestry, all
+   current-HEAD checks and trusted Phase status; require them to be unchanged and passing.
+10. Call GitHub's merge endpoint once with `sha=<full-current-head>` and `merge_method=merge`.
+11. Accept completion only when GitHub returns `merged: true` and a full merge commit SHA.
 
 A conflict, drift, malformed/unknown/duplicate evidence, missing Phase, forged status, wrong PR
 permalink, existing/uncertain exact-HEAD claim or attempt, unexpected response or unknown outcome
@@ -53,6 +55,10 @@ claim.
 - Fix: use GitHub's atomic Git ref creation as an exact PR/HEAD claim; only the successful creator
   can write the bound record and dispatch, while an existing or uncertain claim requires explicit
   reconciliation
+- Codex P1: `https://github.com/Pizza73/RedTeam_Agent/pull/9#discussion_r3889262698`
+- Finding: merge gates could drift while the remote claim and marker writes completed
+- Fix: after marker confirmation, re-query and compare the Phase chain, attempt marker, full PR
+  state, default branch/ancestry, checks and trusted status; drift/unknown requires reconciliation
 
 ## Modified files
 
@@ -77,13 +83,15 @@ broken chains, adjacent PR-number prefix confusion, untrusted status authors, st
 `governance-change`, missing current-main ancestry, an unconfirmed merge result and restart after an
 unknown outcome without a second dispatch. A concurrency regression gives two runners the same
 empty comment snapshot and proves that only one claim, record and merge request can be created.
+Post-claim regressions separately mutate PR labels, default branch, checks and trusted status and
+prove that each stops in reconciliation without a merge call.
 
 ## Validation results
 
 - `.venv/bin/python -m pytest -q tests/unit/test_phase_loop.py tests/unit/test_automation_validation.py --strict-markers`
-  - PASS: 75 tests
-- `REDTEAM_COVERAGE_FILE=/tmp/redteam-auto-merge-claim-coverage-2 .venv/bin/python -m coverage run --source=automation,src -m pytest -q tests --strict-markers`
-  - PASS: 227 tests; total coverage 74%
+  - PASS: 79 tests
+- `REDTEAM_COVERAGE_FILE=/tmp/redteam-auto-merge-claim-final .venv/bin/python -m coverage run --source=automation,src -m pytest -q tests --strict-markers`
+  - PASS: 231 tests; total coverage 75%
 - `.venv/bin/python -m ruff check automation/run_phase_loop.py scripts/ci/validate_automation.py tests/unit/test_phase_loop.py tests/unit/test_automation_validation.py`
   - PASS
 - `.venv/bin/python scripts/ci/validate_automation.py`

@@ -1883,9 +1883,9 @@ class PhaseLoop:
             )
         live_state = self.pr_state()
         live_default_sha = self.current_default_branch_sha()
-        if live_state.head_sha != state.head_sha or live_state.labels != state.labels:
+        if live_state != state:
             raise UntrustedEvidenceError(
-                "pull request head or labels changed before automatic final merge"
+                "pull request state changed before automatic final merge"
             )
         if live_default_sha != default_branch_sha or not self.github.is_ancestor(
             live_default_sha, live_state.head_sha
@@ -1941,6 +1941,67 @@ class PhaseLoop:
             raise UntrustedEvidenceError(
                 "GitHub did not confirm the durable final-merge attempt record"
             )
+        try:
+            claimed_comments = self.comments()
+            claimed_attempts = trusted_final_merge_attempts(
+                claimed_comments,
+                actor_login=self.actor_login,
+                pull_request_number=state.number,
+                head_sha=state.head_sha,
+            )
+            if (
+                len(claimed_attempts) != 1
+                or claimed_attempts[0].payload != attempt_payload
+                or claimed_attempts[0].url != recorded_attempts[0].url
+            ):
+                raise UntrustedEvidenceError(
+                    "the claim-bound final-merge attempt record changed after creation"
+                )
+            claimed_phase_records = self.trusted_markers(
+                claimed_comments, "redteam-phase-gate"
+            )
+            claimed_final_record = validate_final_merge_phase_chain(
+                claimed_phase_records,
+                head_sha=state.head_sha,
+                reviewer_login=self.reviewer_login,
+                approver_login=self.approver_login,
+                pull_request_prefix=pull_request_prefix,
+            )
+            if (
+                claimed_final_record.payload != final_record.payload
+                or claimed_final_record.url != final_record.url
+                or claimed_final_record.author != final_record.author
+            ):
+                raise UntrustedEvidenceError(
+                    "the final Phase chain changed after the final-merge claim"
+                )
+            claimed_state = self.pr_state()
+            claimed_default_sha = self.current_default_branch_sha()
+            if claimed_state != live_state:
+                raise UntrustedEvidenceError(
+                    "pull request state changed after the final-merge claim"
+                )
+            if claimed_default_sha != live_default_sha or not self.github.is_ancestor(
+                claimed_default_sha, claimed_state.head_sha
+            ):
+                raise UntrustedEvidenceError(
+                    "default branch changed after the final-merge claim"
+                )
+            validate_final_phase_status(
+                self.github.commit_statuses(claimed_state.head_sha),
+                head_sha=claimed_state.head_sha,
+                final_record_url=final_record.url,
+                context=str(policy["phase_status_context"]),
+            )
+            if self.check_state(claimed_state.head_sha) != "success":
+                raise UntrustedEvidenceError(
+                    "current-HEAD checks changed after the final-merge claim"
+                )
+        except (PrerequisiteError, UntrustedEvidenceError) as error:
+            raise FinalMergeReconciliationRequiredError(
+                "final-merge gates changed or became unknown after the atomic claim; "
+                "reconcile the live GitHub ref and PR state"
+            ) from error
         self.log(f"merging project-complete PR at exact HEAD {state.head_sha}")
         merge_sha = self.github.merge_pull_request(
             state.number,

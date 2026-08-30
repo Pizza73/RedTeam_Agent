@@ -45,6 +45,7 @@ External C2/MCP     --untrusted until approved/bound--> Adapter
 | Forged or stale project-complete state triggers merge | Local runner reconstructs one exact base-linked Phase 0A→5 PASS chain, validates bot status/checks/labels/current main ancestry, re-reads PR state and supplies the exact HEAD to GitHub |
 | Overlapping local runners both attempt final merge | Atomically create one repository Git ref keyed by exact PR/HEAD; only the successful creator may persist the bound marker and dispatch |
 | Claim or merge endpoint returns an unknown outcome | Preserve the exact-PR/HEAD claim and PR/HEAD/default-base/gate/policy/actor/claim marker; any existing or uncertain claim/marker blocks redispatch until explicit live-state reconciliation |
+| Merge gates drift while claim/marker remote writes complete | After confirming the marker, re-query the Phase chain, PR state, default branch/ancestry, checks and trusted status; drift or unknown state enters reconciliation before dispatch |
 | Real offensive action from CI | No external credentials; Mock/Test servers; Human Gate for Phase 4/5 |
 | Secret in logs/artifacts | Reference-only prompts; redaction; no raw output upload |
 | Workflow supply-chain change | Pin third-party actions by commit SHA in production; advisory CODEOWNERS routing; separate human-reviewed governance PR |

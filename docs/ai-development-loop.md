@@ -35,7 +35,9 @@ PR remains at Phase 5, and after revalidating the complete exact-SHA Phase chain
 checks/statuses, stop-label absence and current `main` ancestry. The request includes the current
 40-character PR head SHA. Before that request, it atomically creates one repository Git ref claim
 for the exact PR/HEAD and persists a claim-bound audit comment. Existing or uncertain claims are
-not retried. Direct and force pushes to `main` remain prohibited.
+not retried. It then re-queries the complete chain and every live gate immediately before merge;
+post-claim drift enters reconciliation rather than dispatch. Direct and force pushes to `main`
+remain prohibited.
 
 This manual control has a greater account-compromise and operator-error risk than server-enforced
 protection. When the repository plan supports protection, the same requirements must be configured
@@ -192,5 +194,6 @@ ambiguous evidence stops the process. Before dispatch it atomically creates
 attempt to PR, HEAD, current `main`, Phase 5 gate, policy digest, actor and claim ref. Only the
 process that successfully created the ref may dispatch. Any existing/uncertain claim or recorded
 attempt requires explicit live-outcome reconciliation and cannot be retried by a normal restart.
-The runner never automatically deletes a claim. Completion never deploys or authorizes a real
-target.
+After confirming the record, the runner re-queries the Phase chain, full PR state, current `main`,
+ancestry, checks and trusted status. Any drift or unknown result requires reconciliation. The runner
+never automatically deletes a claim. Completion never deploys or authorizes a real target.

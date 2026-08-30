@@ -209,6 +209,9 @@ def test_final_merge_policy_is_fail_closed_and_local_only() -> None:
     assert merge_gate.index("self.github.claim_final_merge_attempt(") < merge_gate.index(
         "self.github.post_comment("
     ) < merge_gate.index("self.github.merge_pull_request(")
+    assert merge_gate.rindex("validate_final_phase_status(") < merge_gate.index(
+        "self.github.merge_pull_request("
+    )
     for workflow_path in (REPO_ROOT / ".github" / "workflows").glob("*.yml"):
         workflow = workflow_path.read_text(encoding="utf-8")
         assert "github.rest.pulls.merge" not in workflow

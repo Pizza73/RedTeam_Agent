@@ -45,8 +45,11 @@
   Git ref claimを原子的に作成して1プロセスだけが所有する
 - Claim取得後、PR、HEAD、Default Branch、Phase 5 Gate、Policy Digest、Actor、Claim Ref固定の
   Attempt Recordを永続化してからmerge APIを呼ぶ
+- Attempt Record確認後に全Phase PASS Chain、PR全状態、Default Branch SHA/ancestry、
+  Current-HEAD Checks、Trusted Phase Statusを再取得し、すべて不変かつPASSの場合だけdispatchする
 - Claim/Attempt Recordが存在する、またはClaim作成結果が不明なPR/HEADは、Live GitHub Outcomeを
-  明示的にReconcileするまで再送せず、通常実行でClaimを削除しない
+  明示的にReconcileするまで再送せず、Claim取得後のGate Drift/Unknownも同様に停止し、通常実行で
+  Claimを削除しない
 - Governance PR、Fork PR、停止Label付きPR、`ai-loop`以外を自動mergeしない
 
 ## Phase 0A: Core Models / Authorization Kernel
