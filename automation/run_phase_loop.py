@@ -378,18 +378,18 @@ def validate_phase_gate_pass_record(
     return base_sha
 
 
-def validate_final_merge_phase_chain(
+def validated_final_merge_phase_chain(
     records: list[MarkerEvidence],
     *,
     head_sha: str,
     reviewer_login: str,
     approver_login: str,
     pull_request_prefix: str,
-) -> MarkerEvidence:
+) -> tuple[MarkerEvidence, ...]:
     if not SHA_PATTERN.fullmatch(head_sha):
         raise UntrustedEvidenceError("automatic final merge requires a full current HEAD SHA")
     expected_sha = head_sha
-    final_record: MarkerEvidence | None = None
+    reversed_chain: list[MarkerEvidence] = []
     for phase in reversed(PHASES):
         candidates = [
             record
@@ -403,8 +403,7 @@ def validate_final_merge_phase_chain(
                 f"automatic final merge requires exactly one chained PASS for {phase}"
             )
         record = candidates[0]
-        if phase == "phase-5":
-            final_record = record
+        reversed_chain.append(record)
         expected_sha = validate_phase_gate_pass_record(
             record,
             phase=phase,
@@ -413,8 +412,41 @@ def validate_final_merge_phase_chain(
             approver_login=approver_login,
             pull_request_prefix=pull_request_prefix,
         )
-    assert final_record is not None
-    return final_record
+    return tuple(reversed(reversed_chain))
+
+
+def validate_final_merge_phase_chain(
+    records: list[MarkerEvidence],
+    *,
+    head_sha: str,
+    reviewer_login: str,
+    approver_login: str,
+    pull_request_prefix: str,
+) -> MarkerEvidence:
+    return validated_final_merge_phase_chain(
+        records,
+        head_sha=head_sha,
+        reviewer_login=reviewer_login,
+        approver_login=approver_login,
+        pull_request_prefix=pull_request_prefix,
+    )[-1]
+
+
+def final_merge_phase_chain_identity(
+    records: tuple[MarkerEvidence, ...],
+) -> tuple[tuple[str, str, str], ...]:
+    if len(records) != len(PHASES):
+        raise UntrustedEvidenceError(
+            "final-merge Phase chain identity requires every configured Phase"
+        )
+    return tuple(
+        (
+            json.dumps(record.payload, sort_keys=True, separators=(",", ":")),
+            record.url,
+            record.author,
+        )
+        for record in records
+    )
 
 
 def validate_final_phase_status(
@@ -1846,13 +1878,15 @@ class PhaseLoop:
         pull_request_prefix = (
             f"https://github.com/{self.github.repository}/pull/{state.number}"
         )
-        final_record = validate_final_merge_phase_chain(
+        validated_phase_chain = validated_final_merge_phase_chain(
             phase_records,
             head_sha=state.head_sha,
             reviewer_login=self.reviewer_login,
             approver_login=self.approver_login,
             pull_request_prefix=pull_request_prefix,
         )
+        final_record = validated_phase_chain[-1]
+        phase_chain_identity = final_merge_phase_chain_identity(validated_phase_chain)
         prior_attempts = trusted_final_merge_attempts(
             comments,
             actor_login=self.actor_login,
@@ -1960,18 +1994,14 @@ class PhaseLoop:
             claimed_phase_records = self.trusted_markers(
                 claimed_comments, "redteam-phase-gate"
             )
-            claimed_final_record = validate_final_merge_phase_chain(
+            claimed_phase_chain = validated_final_merge_phase_chain(
                 claimed_phase_records,
                 head_sha=state.head_sha,
                 reviewer_login=self.reviewer_login,
                 approver_login=self.approver_login,
                 pull_request_prefix=pull_request_prefix,
             )
-            if (
-                claimed_final_record.payload != final_record.payload
-                or claimed_final_record.url != final_record.url
-                or claimed_final_record.author != final_record.author
-            ):
+            if final_merge_phase_chain_identity(claimed_phase_chain) != phase_chain_identity:
                 raise UntrustedEvidenceError(
                     "the final Phase chain changed after the final-merge claim"
                 )
