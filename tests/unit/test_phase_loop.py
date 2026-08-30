@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from automation.run_phase_loop import (
+    BASE_REFRESH_STATUS_DESCRIPTION,
     PHASES,
     GitHubClient,
     MarkerEvidence,
@@ -14,6 +15,7 @@ from automation.run_phase_loop import (
     PullRequestState,
     ReviewEvidence,
     UntrustedEvidenceError,
+    base_refresh_evidence_from_statuses,
     canonical_digest,
     codex_implementation_blocker,
     evaluate_native_review,
@@ -38,6 +40,7 @@ READY_URL = "https://github.com/example/repo/pull/1#issuecomment-ready"
 TRIGGER_URL = "https://github.com/example/repo/pull/1#issuecomment-trigger"
 NO_FINDINGS_URL = "https://github.com/example/repo/pull/1#issuecomment-no-findings"
 REVIEW_URL = "https://github.com/example/repo/pull/1#pullrequestreview-77"
+PHASE_RECORD_URL = "https://github.com/example/repo/pull/3#issuecomment-record"
 
 
 def load_schema(name: str) -> dict[str, object]:
@@ -477,8 +480,67 @@ def base_refresh_payload() -> dict[str, object]:
         "revalidate_phase": "phase-0a",
         "head_sha": HEAD_SHA,
         "target_base_sha": BASE_SHA,
-        "prior_pass_reference": "https://github.com/example/repo/pull/3#issuecomment-pass",
+        "prior_pass_reference": PHASE_RECORD_URL,
     }
+
+
+def base_refresh_status(
+    *,
+    creator: str = "github-actions[bot]",
+    description: str = BASE_REFRESH_STATUS_DESCRIPTION,
+    state: str = "success",
+) -> dict[str, object]:
+    return {
+        "context": f"redteam/base-refresh/phase-0b/phase-0a/{DEFAULT_BRANCH_SHA}",
+        "state": state,
+        "description": description,
+        "target_url": PHASE_RECORD_URL,
+        "creator": {"login": creator},
+        "url": "https://api.github.com/repos/example/repo/statuses/1",
+    }
+
+
+def test_base_refresh_status_is_strictly_bound_to_workflow_and_sha() -> None:
+    evidence = base_refresh_evidence_from_statuses(
+        [base_refresh_status()], head_sha=HEAD_SHA
+    )
+
+    assert len(evidence) == 1
+    assert evidence[0].payload == {
+        "schema_version": "1.0",
+        "action": "REFRESH_BASE",
+        "from_phase": "phase-0b",
+        "revalidate_phase": "phase-0a",
+        "head_sha": HEAD_SHA,
+        "target_base_sha": DEFAULT_BRANCH_SHA,
+        "prior_pass_reference": PHASE_RECORD_URL,
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("description", "weaker evidence"),
+        ("state", "pending"),
+    ],
+)
+def test_malformed_workflow_base_refresh_status_fails_closed(
+    field: str, value: str
+) -> None:
+    status = base_refresh_status()
+    status[field] = value
+
+    with pytest.raises(UntrustedEvidenceError, match="status is malformed"):
+        base_refresh_evidence_from_statuses([status], head_sha=HEAD_SHA)
+
+
+def test_untrusted_base_refresh_status_is_ignored() -> None:
+    assert (
+        base_refresh_evidence_from_statuses(
+            [base_refresh_status(creator="attacker")], head_sha=HEAD_SHA
+        )
+        == []
+    )
 
 
 def test_base_refresh_is_bound_to_adjacent_phase_head_and_default_branch() -> None:
@@ -495,6 +557,14 @@ class _AncestorGitHub:
         return (ancestor_sha, descendant_sha) in self.ancestors
 
 
+class _StatusGitHub:
+    def __init__(self, statuses: dict[str, list[dict[str, object]]]) -> None:
+        self.statuses = statuses
+
+    def commit_statuses(self, sha: str) -> list[dict[str, object]]:
+        return self.statuses.get(sha, [])
+
+
 def refreshed_phase_state() -> PullRequestState:
     return PullRequestState(
         number=3,
@@ -506,6 +576,36 @@ def refreshed_phase_state() -> PullRequestState:
         state="open",
         head_repository="example/repo",
     )
+
+
+def prior_phase_zero_pass() -> MarkerEvidence:
+    return MarkerEvidence(
+        {"phase": "phase-0a", "verdict": "PASS", "reviewed_sha": HEAD_SHA},
+        PHASE_RECORD_URL,
+        "github-actions[bot]",
+        "",
+    )
+
+
+def test_refreshed_head_discovers_status_from_sha_bound_prior_pass() -> None:
+    loop = PhaseLoop.__new__(PhaseLoop)
+    loop.github = _StatusGitHub({HEAD_SHA: [base_refresh_status()]})  # type: ignore[assignment]
+
+    evidence = loop.trusted_base_refresh_statuses(
+        refreshed_phase_state(), [prior_phase_zero_pass()]
+    )
+
+    assert len(evidence) == 1
+    assert evidence[0].payload["head_sha"] == HEAD_SHA
+    assert evidence[0].payload["target_base_sha"] == DEFAULT_BRANCH_SHA
+
+
+def test_base_refresh_status_without_referenced_prior_pass_fails_closed() -> None:
+    loop = PhaseLoop.__new__(PhaseLoop)
+    loop.github = _StatusGitHub({HEAD_SHA: [base_refresh_status()]})  # type: ignore[assignment]
+
+    with pytest.raises(UntrustedEvidenceError, match="not bound to its trusted prior PASS"):
+        loop.trusted_base_refresh_statuses(phase_state(), [])
 
 
 def base_refresh_record() -> MarkerEvidence:

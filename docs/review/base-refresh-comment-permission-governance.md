@@ -3,14 +3,22 @@
 ## Decision and scope
 
 The approved Phase 0A revalidation loop reached the exact-SHA base-refresh workflow on 2026-08-30
-and failed at its first pull-request timeline comment. This correction changes only the workflow
-permission required for that existing operation:
+and failed at its first pull-request timeline comment. GitHub required `pull_requests=write` for that
+operation. An initial correction granted that permission, but Codex P1
+`https://github.com/Pizza73/RedTeam_Agent/pull/8#discussion_r3888777583` correctly identified that
+the permission also authorizes GitHub's PR merge endpoint.
 
-- Change `pull-requests: read` to `pull-requests: write` in
-  `.github/workflows/refresh-ai-loop-base.yml`.
-- Keep `contents: read`; the workflow cannot push or update the PR branch.
-- Keep `issues: write` for labels and `statuses: write` for the SHA-bound phase status.
-- Do not add approval, merge, force-push, branch-protection, or repository-content write calls.
+The final correction does not accept that broader authority:
+
+- Retain `pull-requests: read` in `.github/workflows/refresh-ai-loop-base.yml`.
+- Replace the workflow-authored PR comment marker with a workflow-authored commit status under the
+  exact context `redteam/base-refresh/<from-phase>/<revalidation-phase>/<target-base-sha>`.
+- Bind that success status to the old full PR HEAD, a fixed description, the workflow-bot creator,
+  and the trusted prior PASS permalink in `target_url`.
+- Keep `issues: write` only for the existing Phase-label rollback and `statuses: write` for evidence
+  and the SHA-bound phase status.
+- Keep `contents: read`; do not add approval, merge, force-push, branch-protection, secret, or
+  repository-content write capabilities.
 
 No OpenAI API key or metered OpenAI API call is used.
 
@@ -28,9 +36,9 @@ No OpenAI API key or metered OpenAI API call is used.
 - GitHub response accepted permissions: `issues=write; pull_requests=write`
 
 All request, actor, PR, default-branch, Phase, prior PASS, implementation request, and exact-SHA
-validations completed before the rejected write. The workflow stopped before creating the
-`redteam-base-refresh` marker, changing labels, or changing phase status. The local runner was
-stopped while waiting for that absent trusted marker; it did not update the PR branch.
+validations completed before the rejected write. The workflow stopped before creating trusted
+refresh evidence, changing labels, or changing phase status. The local runner was stopped while
+waiting for that absent evidence; it did not update the PR branch.
 
 ## Regression control
 
@@ -39,25 +47,32 @@ stopped while waiting for that absent trusted marker; it did not update the PR b
 ```yaml
 contents: read
 issues: write
-pull-requests: write
+pull-requests: read
 statuses: write
 ```
 
-The same test continues rejecting merge API calls and `contents: write`. The exact-head update is
-still performed only by the local operator through GitHub's `update-branch` endpoint after the
-trusted workflow marker exists.
+The test rejects `pull-requests: write`, secrets, PR comment creation, merge API calls and
+`contents: write`. Unit tests reject untrusted, pending, malformed, stale, unrelated and
+prior-PASS-unbound status evidence. The exact-head update is still performed only by the local
+operator through GitHub's `update-branch` endpoint after trusted status evidence exists.
 
 ## Validation results
 
 - `.venv/bin/python -m pytest -q tests/unit/test_automation_validation.py tests/unit/test_governance_check.py tests/unit/test_phase_loop.py --strict-markers`
-  - PASS: 68 tests
+  - PASS: 74 tests
 - `.venv/bin/python -m pytest -q tests --strict-markers`
-  - PASS: 203 tests
+  - PASS: 209 tests
+- `REDTEAM_COVERAGE_FILE=/tmp/redteam-status-evidence-coverage .venv/bin/python -m coverage run --source=automation,src -m pytest -q`
+  - PASS: 209 tests; total coverage 74%
 - `.venv/bin/python -m ruff check automation scripts/ci tests/unit/test_automation_validation.py tests/unit/test_governance_check.py tests/unit/test_phase_loop.py`
   - PASS
 - `.venv/bin/python scripts/ci/validate_automation.py`
   - PASS: `AUTOMATION_VALIDATION=PASS`
 - Ruby YAML parse of all seven `.github/workflows/*.yml` files
+  - PASS
+- Tree-sitter JavaScript parse of both changed workflow script blocks
+  - PASS
+- `git diff --check`
   - PASS
 - `bash scripts/ci/run_phase_gate.sh phase-0a`
   - FAIL at repository-wide Ruff with the unchanged 88 Phase 0A application findings on the

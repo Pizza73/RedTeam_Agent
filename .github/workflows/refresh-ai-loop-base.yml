@@ -35,7 +35,7 @@ concurrency:
 permissions:
   contents: read
   issues: write
-  pull-requests: write
+  pull-requests: read
   statuses: write
 
 jobs:
@@ -233,6 +233,15 @@ jobs:
               return;
             }
             const previousPhase = plan.phases[sourceIndex - 1].id;
+            const refreshStatusDescription = 'trusted exact-SHA base refresh authorization';
+            const refreshStatusContext =
+              `redteam/base-refresh/${sourcePhase}/${previousPhase}/${targetBaseSha}`;
+            const refreshStatusPattern =
+              /^redteam\/base-refresh\/(phase-(?:0a|0b|0c|[1-5]))\/(phase-(?:0a|0b|0c|[1-5]))\/([0-9a-f]{40})$/;
+            if (refreshStatusContext.length > 100) {
+              core.setFailed('Base-refresh status context exceeds GitHub limits.');
+              return;
+            }
             if (![sourcePhase, previousPhase].includes(currentPhase)) {
               core.setFailed('Current Phase is not the source or revalidation Phase.');
               return;
@@ -246,25 +255,29 @@ jobs:
               owner, repo, issue_number: pull_number, per_page: 100,
             });
             if (currentPhase === previousPhase) {
-              const priorRefreshes = [];
-              for (const comment of comments) {
-                if (comment.user?.login !== 'github-actions[bot]' ||
-                    !comment.body?.includes('redteam-base-refresh')) continue;
-                const priorRefresh = singleMarker(comment.body, 'redteam-base-refresh');
+              const statuses = await github.paginate(
+                github.rest.repos.listCommitStatusesForRef,
+                {owner, repo, ref: expectedHeadSha, per_page: 100}
+              );
+              let priorRefreshExists = false;
+              for (const status of statuses) {
+                if (status.creator?.login !== 'github-actions[bot]' ||
+                    !status.context?.startsWith('redteam/base-refresh/')) continue;
+                const match = status.context.match(refreshStatusPattern);
                 if (
-                  exactKeys(priorRefresh, [
-                    'schema_version', 'action', 'from_phase', 'revalidate_phase', 'head_sha',
-                    'target_base_sha', 'prior_pass_reference'
-                  ]) && priorRefresh.schema_version === '1.0' &&
-                  priorRefresh.action === 'REFRESH_BASE' &&
-                  priorRefresh.from_phase === sourcePhase &&
-                  priorRefresh.revalidate_phase === previousPhase &&
-                  priorRefresh.head_sha === expectedHeadSha &&
-                  priorRefresh.prior_pass_reference === priorPassReference
-                ) priorRefreshes.push(priorRefresh);
+                  !match || status.state !== 'success' ||
+                  status.description !== refreshStatusDescription ||
+                  status.target_url !== priorPassReference
+                ) {
+                  core.setFailed('Trusted prior base-refresh status is malformed.');
+                  return;
+                }
+                if (match[1] === sourcePhase && match[2] === previousPhase) {
+                  priorRefreshExists = true;
+                }
               }
-              if (priorRefreshes.length < 1) {
-                core.setFailed('Reauthorization requires a trusted prior base-refresh marker.');
+              if (!priorRefreshExists) {
+                core.setFailed('Reauthorization requires a trusted prior base-refresh status.');
                 return;
               }
             }
@@ -312,25 +325,15 @@ jobs:
               return;
             }
 
-            const refresh = {
-              schema_version: '1.0',
-              action: 'REFRESH_BASE',
-              from_phase: sourcePhase,
-              revalidate_phase: previousPhase,
-              head_sha: expectedHeadSha,
-              target_base_sha: targetBaseSha,
-              prior_pass_reference: priorPassReference,
-            };
-            const marker = `<!-- redteam-base-refresh\n${JSON.stringify(refresh)}\n-->`;
-            const duplicate = comments.some(
-              (item) => item.user?.login === 'github-actions[bot]' && item.body?.includes(marker)
-            );
-            if (!duplicate) {
-              await github.rest.issues.createComment({
-                owner, repo, issue_number: pull_number,
-                body: `Default branch advancement invalidated the transition into \`${sourcePhase}\` at \`${expectedHeadSha}\`. The local orchestrator may incorporate only \`${targetBaseSha}\`; \`${previousPhase}\` must pass again on the resulting HEAD.\n\n${marker}`,
-              });
-            }
+            await github.rest.repos.createCommitStatus({
+              owner,
+              repo,
+              sha: expectedHeadSha,
+              state: 'success',
+              context: refreshStatusContext,
+              description: refreshStatusDescription,
+              target_url: priorPassReference,
+            });
 
             const removedStateLabels = new Set([
               sourcePhase, 'ai-needs-review', 'ai-needs-fix', 'ai-review-passed',

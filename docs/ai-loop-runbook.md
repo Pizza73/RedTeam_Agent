@@ -144,10 +144,13 @@ SHA-bound trigger markers and does not intentionally request the same work twice
 
 The runner may use GitHub's **Update a pull request branch** operation. This merges the current
 default branch into the long-lived PR branch only after the approver-restricted workflow records a
-`redteam-base-refresh` marker. The request includes the old full HEAD as `expected_head_sha`, so a
-concurrent Codex or human commit is rejected. The Phase label is moved back one step first and CI
-must produce a new SHA-bound PASS. This operation does not merge the PR into `main`; final merge
-remains the manual checklist above.
+SHA-bound `redteam/base-refresh/...` commit status. The status is attached to the old full HEAD,
+encodes the adjacent Phase rollback and exact target-base SHA in its context, and links to the prior
+PASS. The workflow token has `statuses: write`, `issues: write` for labels, and only
+`pull-requests: read`; it cannot merge the PR. The branch-update request includes the old full HEAD
+as `expected_head_sha`, so a concurrent Codex or human commit is rejected. The Phase label is moved
+back one step first and CI must produce a new SHA-bound PASS. This operation does not merge the PR
+into `main`; final merge remains the manual checklist above.
 
 Codex Code Review posts standard GitHub evidence rather than repository-defined JSON. For PASS,
 the loop requires the standard no-major-issues comment, a matching 10-or-more-character commit
