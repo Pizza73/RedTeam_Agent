@@ -68,6 +68,9 @@ the Phase 0A implementation fixes and must pass the exact gate after the base re
 
 ## Required handoff
 
+- Governance pull request: `https://github.com/Pizza73/RedTeam_Agent/pull/8`
+- The follow-up documentation commit is pushed after confirming the `governance-change` label, so
+  its `synchronize` event is the current-head CI evidence rather than the unlabeled `opened` event.
 This protected workflow change requires human review and manual merge. After merge, update the
 clean local `main` checkout and restart `automation/run_phase_loop.py` for PR #3. The workflow can
 then retry the unchanged exact-SHA request; Phase 0A must pass again on the refreshed head before
