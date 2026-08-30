@@ -732,6 +732,15 @@ jobs:
               return;
             }
 
+            const transitionTimelineBefore = await github.paginate(
+              github.rest.issues.listEventsForTimeline,
+              { owner, repo, issue_number: pull_number, per_page: 100 },
+            );
+            const transitionEventIdsBefore = new Set(
+              transitionTimelineBefore
+                .filter((item) => item.event === 'labeled' || item.event === 'unlabeled')
+                .map((item) => String(item.id)),
+            );
             const { data: transitionPr } = await github.rest.pulls.get({
               owner, repo, pull_number,
             });
@@ -761,12 +770,43 @@ jobs:
               );
             transitionedLabels.push(next.label, 'ai-needs-implementation');
             const expectedTransitionLabels = [...new Set(transitionedLabels)].sort();
+            const currentTransitionLabels = [...new Set(
+              transitionPr.labels.map((item) => item.name)
+            )].sort();
+            const expectedTransitionEvents = [
+              ...currentTransitionLabels
+                .filter((name) => !expectedTransitionLabels.includes(name))
+                .map((name) => `unlabeled\0${name}\0github-actions[bot]`),
+              ...expectedTransitionLabels
+                .filter((name) => !currentTransitionLabels.includes(name))
+                .map((name) => `labeled\0${name}\0github-actions[bot]`),
+            ].sort();
             await github.rest.issues.setLabels({
               owner,
               repo,
               issue_number: pull_number,
               labels: expectedTransitionLabels,
             });
+            const transitionTimelineAfter = await github.paginate(
+              github.rest.issues.listEventsForTimeline,
+              { owner, repo, issue_number: pull_number, per_page: 100 },
+            );
+            const actualTransitionEvents = transitionTimelineAfter
+              .filter((item) =>
+                (item.event === 'labeled' || item.event === 'unlabeled') &&
+                !transitionEventIdsBefore.has(String(item.id))
+              )
+              .map((item) => `${item.event}\0${item.label?.name || ''}\0${item.actor?.login || ''}`)
+              .sort();
+            if (
+              actualTransitionEvents.length !== expectedTransitionEvents.length ||
+              actualTransitionEvents.some(
+                (event, index) => event !== expectedTransitionEvents[index]
+              )
+            ) {
+              core.setFailed('Concurrent label-event drift detected during the atomic Phase label transition.');
+              return;
+            }
             const { data: transitionedPr } = await github.rest.pulls.get({
               owner, repo, pull_number,
             });

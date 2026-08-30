@@ -188,6 +188,8 @@ the configured local exact-SHA gate.
 
 For an automatic adjacent-Phase transition, the Gate re-fetches the PR after recording the review,
 derives the complete final label set from that snapshot, and replaces it in one API call. It then
+audits every label event since a pre-snapshot watermark and requires the exact event set and actor
+expected from its replacement; a concurrent label writer therefore fails closed. Finally, it
 re-fetches the PR and requires the exact HEAD, next Phase, and complete label set to match. The Gate
 never deliberately exposes an intermediate state with zero or two Phase labels.
 

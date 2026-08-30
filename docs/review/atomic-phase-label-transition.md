@@ -36,13 +36,25 @@ It derives one complete final label set that:
 - adds exactly the next Phase plus `ai-needs-implementation`.
 
 The Gate writes that full set with one `issues.setLabels` call. It then
-re-fetches the PR and requires the open state, reviewed HEAD, exactly one next
-Phase, and byte-for-byte-equivalent sorted label set. Drift fails closed.
+audits every label event since a watermark captured before the PR snapshot. The
+new event multiset, label names, and actor must exactly equal the events the
+Gate replacement should generate; an unrelated, conflicting, or same-label
+write by another actor fails closed. It finally re-fetches the PR and requires
+the open state, reviewed HEAD, exactly one next Phase, and byte-for-byte-equivalent
+sorted label set.
+
+Codex independently identified that the original full replacement could still
+overwrite a label written after the snapshot and then accept its own resulting
+state. The event-delta audit closes that P1 race by detecting the intervening
+write before the Gate records the next implementation status or request.
 
 ## Regression evidence
 
 - Static workflow validation requires the atomic set call and both pre/post
   transition checks.
+- A failure-path regression test requires the label-event watermark to precede
+  the PR snapshot, the event audit to follow the replacement, and the final PR
+  snapshot to follow that audit.
 - Static validation forbids reintroducing separate current-Phase removal and
   next-Phase addition calls.
 - Existing base-refresh workflow tests continue to prohibit label mutation in
@@ -51,8 +63,8 @@ Phase, and byte-for-byte-equivalent sorted label set. Drift fails closed.
 
 ## Validation results
 
-- focused automation and loop tests: PASS, 96 tests.
-- full test suite: PASS, 248 tests.
+- focused automation and loop tests: PASS, 97 tests.
+- full test suite: PASS, 249 tests.
 - branch coverage: PASS, 84% total.
 - focused Ruff, automation validation, compileall, and dependency consistency:
   PASS.

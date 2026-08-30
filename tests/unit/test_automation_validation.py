@@ -95,8 +95,11 @@ def test_phase_gate_uses_fail_closed_native_codex_evidence_chain() -> None:
         "Pull request head or phase changed before recording the gate",
         "github.rest.issues.setLabels",
         "Pull request changed before the atomic Phase label transition",
+        "Concurrent label-event drift detected during the atomic Phase label transition",
         "Pull request changed during the atomic Phase label transition",
         "actualTransitionLabels.length !== expectedTransitionLabels.length",
+        "actualTransitionEvents.length !== expectedTransitionEvents.length",
+        "item.actor?.login || ''",
     ):
         assert required_control in workflow
     assert "liveDefaultCommit.sha !== refreshTargetSha" not in workflow
@@ -105,6 +108,22 @@ def test_phase_gate_uses_fail_closed_native_codex_evidence_chain() -> None:
     assert "await removeLabel(phase)" not in workflow
     assert "await addLabels([next.label, 'ai-needs-implementation'])" not in workflow
     assert "Review evidence must contain exactly one redteam-ai-review marker" not in workflow
+
+
+def test_phase_gate_rejects_label_writes_racing_the_atomic_transition() -> None:
+    workflow = (REPO_ROOT / ".github" / "workflows" / "ai-loop-control.yml").read_text(
+        encoding="utf-8"
+    )
+
+    baseline_index = workflow.index("const transitionTimelineBefore")
+    snapshot_index = workflow.index("const { data: transitionPr }")
+    replace_index = workflow.index("await github.rest.issues.setLabels")
+    audit_index = workflow.index("const transitionTimelineAfter")
+    final_snapshot_index = workflow.index("const { data: transitionedPr }")
+
+    assert baseline_index < snapshot_index < replace_index < audit_index < final_snapshot_index
+    assert "transitionEventIdsBefore.has(String(item.id))" in workflow
+    assert "github-actions[bot]" in workflow
 
 
 def test_phase_gate_has_minimal_permissions_for_pr_state_updates() -> None:
