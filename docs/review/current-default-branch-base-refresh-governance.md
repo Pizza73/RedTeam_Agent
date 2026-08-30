@@ -103,6 +103,11 @@ must pass the exact gate and independent review on its resulting SHA.
 
 ## Remaining constraints
 
+- Governance pull request:
+  `https://github.com/Pizza73/RedTeam_Agent/pull/7`
+- GitHub creates the initial `opened` event before a separately requested label is guaranteed to
+  be present. The follow-up documentation commit was pushed only after `governance-change` was
+  confirmed, so its `synchronize` event is the current-head CI evidence.
 - This protected workflow change requires human review and a manual merge.
 - After merge, the operator must update a clean local `main` checkout and restart the runner for
   PR #3.
