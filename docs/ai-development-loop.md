@@ -52,8 +52,10 @@ provider-specific Human Gates and CI never connects to a real C2, MCP server or 
 | Human | Start/restart local orchestration, verify manual merge evidence, approve Phase 4/5 and final merge | Explicit approval and GitHub UI merge only |
 
 The implementer and reviewer must use separate runs and contexts. A review result is evidence only
-when its GitHub permalink resolves to content authored by `AI_REVIEWER_LOGIN` and it is bound to the
-current PR head SHA.
+when its GitHub permalink resolves to native Codex content authored by `AI_REVIEWER_LOGIN`. The
+full-SHA binding is the validated chain of the current-head CI ready marker, operator-authored
+review trigger, unchanged PR timeline, current PR head, native result and required checks. The
+shortened commit ID displayed by Codex is corroborating evidence, never the sole binding.
 
 ## State machine
 
@@ -95,7 +97,7 @@ checks and validates the reviewer permalink. AI-authored markers are not accepte
 
 ```html
 <!-- redteam-phase-gate
-{"schema_version":"1.0","phase":"phase-0a","reviewed_sha":"<sha>","base_sha":"<sha>","verdict":"PASS","summary":"...","review_reference":"https://github.com/...","reviewer_login":"...","recorded_by":"...","finding_key":null,"required_checks":[],"loop_state":"PASS"}
+{"schema_version":"1.0","phase":"phase-0a","reviewed_sha":"<sha>","base_sha":"<sha>","verdict":"PASS","summary":"...","evidence_format":"codex-native-v1","ready_reference":"https://github.com/...","review_trigger_reference":"https://github.com/...","review_reference":"https://github.com/...","reviewer_login":"...","recorded_by":"...","finding_key":null,"required_checks":[],"loop_state":"PASS"}
 -->
 ```
 
@@ -116,15 +118,18 @@ After CI posts the review-ready marker:
 
 1. The local orchestrator posts `@codex review` only after the SHA-bound ready marker exists.
 2. Codex independently checks the current phase prompt, acceptance criteria and prior invariants,
-   then emits exactly one `redteam-ai-review` marker.
-3. The orchestrator validates the JSON Schema, author, current phase, reviewed SHA and phase base
-   SHA. For `CHANGES_REQUESTED`, it derives a stable root-cause key from the first finding.
+   then posts native P0/P1 inline findings or its standard no-major-issues completion and 👍.
+3. The orchestrator validates reviewer identity, current phase/head/base, ready/trigger chain,
+   native output shape and absence of `synchronize` events during review. For
+   `CHANGES_REQUESTED`, it derives a stable root-cause key from priority, path and headline.
 4. The orchestrator dispatches `Record AI Phase Review` as `AI_GATE_APPROVER_LOGIN`.
 
 The workflow rejects a stale SHA, wrong reviewer, wrong phase base, fork PR, missing/failed checks,
-review link outside the PR, or orchestrator input that differs from the review's single
-`redteam-ai-review` marker. It stops after five change cycles in a phase or three occurrences of the
-same root-cause key.
+review link outside the PR, untrusted ready/trigger links, a head change during review, ambiguous
+commit evidence, a PASS without the bot 👍, or orchestrator input that differs from the
+deterministically derived native result. A formal Codex review without retained P0/P1 comments is
+fail-closed. The loop stops after five change cycles in a phase or three occurrences of the same
+root-cause key.
 
 ## Phase progression
 

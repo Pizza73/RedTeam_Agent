@@ -9,7 +9,8 @@ repeats this sequence:
 2. Post an `@codex` implementation request as the ChatGPT-linked GitHub user.
 3. Wait for Codex to push a normal PR commit and for all required CI checks to pass.
 4. Post `@codex review` for that exact phase, head SHA and phase base SHA.
-5. Validate the reviewer identity and the single machine-readable review marker.
+5. Validate the native Codex reviewer identity, ready/trigger chain, current head, P0/P1 or
+   no-major-issues output, bot 👍 and unchanged review timeline.
 6. Dispatch **Record AI Phase Review**, which independently revalidates the SHA, review and CI.
 7. Request a bounded fix or continue with the next phase.
 
@@ -37,13 +38,13 @@ GitHub comments, labels and checks preserve the state for a later restart.
 
    ```bash
    gh variable set AI_GATE_APPROVER_LOGIN --body '<operator-login>'
-   gh variable set AI_REVIEWER_LOGIN --body '<codex-review-login>'
+   gh variable set AI_REVIEWER_LOGIN --body 'chatgpt-codex-connector[bot]'
    gh variable set AI_LOOP_MAX_ITERATIONS --body '5'
    ```
 
    `AI_GATE_APPROVER_LOGIN` must equal the account returned by `gh api user --jq .login`.
-   `AI_REVIEWER_LOGIN` must equal the author shown on a real Codex PR review/comment; do not guess
-   or use a display name.
+   `AI_REVIEWER_LOGIN` must equal the author shown on a real Codex PR review/comment, including the
+   `[bot]` suffix; do not guess or use a display name.
 5. Do not create an `OPENAI_API_KEY` secret. The local process uses the existing `gh` credential
    store and never passes its token to Codex.
 6. Create the labels through the approved workflow:
@@ -139,6 +140,14 @@ Use `--dry-run` to validate local/GitHub prerequisites and report the next actio
 comment or dispatching a workflow. A normal restart is idempotent: the runner recognizes its own
 SHA-bound trigger markers and does not intentionally request the same work twice.
 
+Codex Code Review posts standard GitHub evidence rather than repository-defined JSON. For PASS,
+the loop requires the standard no-major-issues comment, a matching 10-or-more-character commit
+prefix, a reviewer-authored 👍 reaction, no current-head P0/P1 or formal finding review, and no
+head synchronization between the full-SHA trigger and completion. For `CHANGES_REQUESTED`, it
+requires a formal review bound to the full current SHA and retained P0/P1 inline comments. The
+approver-restricted workflow re-queries and validates the same evidence before producing the
+machine-readable phase record.
+
 ## Human Gates and blocked runs
 
 - `CHANGES_REQUESTED`: the runner automatically requests a same-phase fix. The third occurrence of
@@ -164,6 +173,9 @@ SHA-bound trigger markers and does not intentionally request the same work twice
 - `local governance checkout is not the current default-branch SHA`: run `git pull --ff-only`.
 - No Codex response: verify the GitHub account is connected to ChatGPT/Codex, repository access is
   granted, and `AI_REVIEWER_LOGIN` matches the actual integration author.
+- Native review remains pending: confirm the exact runner-authored `@codex review` trigger follows
+  the current-head ready marker. Manual review comments without `redteam-local-codex-trigger` are
+  intentionally not accepted as phase-gate evidence.
 - `AI_LOOP=BLOCKED`: inspect the latest trusted bot marker and workflow run. Do not bypass labels,
   alter review evidence, or weaken CI to continue.
 

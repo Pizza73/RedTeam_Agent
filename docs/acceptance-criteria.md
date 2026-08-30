@@ -21,9 +21,11 @@
 - Local OrchestratorはCurrent default-branch SHAのClean Checkoutでだけ起動する
 - `gh`のCurrent Loginが`AI_GATE_APPROVER_LOGIN`と完全一致しなければ停止する
 - `github-actions[bot]`以外のImplementation/Ready/Phase Gate Markerを無視する
-- Implementation RequestとReview ResultのUnknown Field、Duplicate JSON Keyを拒否する
+- Implementation Request、ready/trigger marker、Trusted Phase Gate recordのUnknown Field、Duplicate JSON Keyを拒否する
 - Implementation RequestをCurrent Phase、Current HEAD SHA、Trusted Phase Promptへ固定する
-- Review Resultを`AI_REVIEWER_LOGIN`、Current Phase、Current HEAD SHA、Expected Base SHAへ固定する
+- Native Reviewを`AI_REVIEWER_LOGIN`、Current Phase、Current HEAD SHA、Expected Base SHA、ready/trigger permalink、Review中のhead不変性へ固定する
+- PASSはCodex標準no-major-issues comment、10文字以上のmatching commit prefix、botの👍、Current HEADのP0/P1/formal finding review不在をすべて要求する
+- CHANGES_REQUESTEDはCurrent HEADへ完全BindingされたCodex formal reviewとP0/P1 inline findingを要求し、root-cause keyを決定論的に導出する
 - Required Check成功前にReview Gateを記録しない
 - 同じRequest/Reviewを再処理せず、停止後にGitHub Evidenceから再開できる
 - Phase 4/5は`ai-human-gate`中に停止し、承認済みProvider Gate遷移後だけ再開する

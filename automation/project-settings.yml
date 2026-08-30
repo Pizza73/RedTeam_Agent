@@ -3,7 +3,7 @@ schema_version: "1.0"
 project:
   name: RedTeam_Agent
   base_branch: main
-  development_branch: ai/redteam-agent-build
+  development_branch: ai/redteam-agent-phase-loop
   required_pr_label: ai-loop
 
 repository_setup:
@@ -23,6 +23,7 @@ loop:
   ai_runs_in_github_actions: false
   implementation_trigger: local_orchestrator
   review_trigger: local_orchestrator_after_ci
+  review_evidence_format: codex-native-v1
   initial_request_workflow: Start AI Loop
   local_orchestrator:
     command: .venv/bin/python automation/run_phase_loop.py

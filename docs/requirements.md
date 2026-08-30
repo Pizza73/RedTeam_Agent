@@ -9,9 +9,9 @@ Codex CloudまたはChatGPTによる独立ReviewとCodexによる実装を、Pha
 | ID | Requirement |
 |---|---|
 | LOOP-001 | 実装担当とReview担当のContext、権限、出力を分離する |
-| LOOP-002 | 全ReviewをPRの最新40桁commit SHAへBindingする |
+| LOOP-002 | 全ReviewをCI ready marker、Operator trigger、Current PR HEAD、Review中のhead不変性を検証してPRの最新40桁commit SHAへBindingする。Codex表示上の短縮SHAだけをBinding根拠にしない |
 | LOOP-003 | Codexの完了報告ではなく、Git差分、CI、受入条件で判定する |
-| LOOP-004 | `PASS`、`CHANGES_REQUESTED`、`BLOCKED`を機械可読JSONで出力する |
+| LOOP-004 | Codex native reviewを検証後、Trusted Phase Gateが`PASS`、`CHANGES_REQUESTED`、`BLOCKED`を機械可読JSONとして記録する |
 | LOOP-005 | Review Verdictのうち`CHANGES_REQUESTED`だけがCodex修正Requestを生成する。CI failureは同じPhaseの実装Requestを再発行できるが、Review PASSやPhase遷移として扱わない |
 | LOOP-006 | CI成功時だけ独立AI Reviewを要求する |
 | LOOP-007 | 同じSHAを重複Review・重複修正しない |
@@ -24,7 +24,7 @@ Codex CloudまたはChatGPTによる独立ReviewとCodexによる実装を、Pha
 | LOOP-014 | PR、Review、Test、Finding、Phase遷移の履歴をGitHubへ保持する |
 | LOOP-015 | Codexが仕様・Gate・Workflowを変更して自己合格できないよう保護する |
 | LOOP-016 | Local Orchestratorは`github-actions[bot]`が作成したCurrent Phase/HEAD SHA固定Requestだけを受理し、ChatGPT連携済みGitHub UserとしてCodex実装・Reviewを要求する |
-| LOOP-017 | Local OrchestratorはReview Schema、Reviewer Identity、Phase、HEAD SHA、Base SHAを検証してから、承認者制限付きPhase Gate Workflowを起動する |
+| LOOP-017 | Local Orchestratorはnative reviewer identity、P0/P1またはno-finding形式、ready/trigger、Phase、HEAD SHA、Base SHA、Review中のhead不変性を検証してから、承認者制限付きPhase Gate Workflowを起動する |
 | LOOP-018 | Phase 4/5はProvider Human Gate承認前に開始せず、承認後は同じLoopを再起動して当該Phaseを自動実行できる |
 
 ## Non-Functional Requirements

@@ -6,8 +6,13 @@ from pathlib import Path
 import pytest
 
 from automation.run_phase_loop import (
+    MarkerEvidence,
+    ReviewEvidence,
     UntrustedEvidenceError,
+    canonical_digest,
+    evaluate_native_review,
     marker_payloads,
+    native_finding_key,
     select_evidence_action,
     select_finding_key,
     strict_json_loads,
@@ -18,6 +23,12 @@ from automation.run_phase_loop import (
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HEAD_SHA = "a" * 40
 BASE_SHA = "b" * 40
+ACTOR_LOGIN = "operator"
+REVIEWER_LOGIN = "chatgpt-codex-connector[bot]"
+READY_URL = "https://github.com/example/repo/pull/1#issuecomment-ready"
+TRIGGER_URL = "https://github.com/example/repo/pull/1#issuecomment-trigger"
+NO_FINDINGS_URL = "https://github.com/example/repo/pull/1#issuecomment-no-findings"
+REVIEW_URL = "https://github.com/example/repo/pull/1#pullrequestreview-77"
 
 
 def load_schema(name: str) -> dict[str, object]:
@@ -66,6 +77,100 @@ def implementation_request() -> dict[str, object]:
         "head_sha": HEAD_SHA,
         "phase_prompt": "prompts/phases/phase-0a-security-fix.md",
     }
+
+
+def marker(name: str, payload: dict[str, object]) -> str:
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return f"<!-- {name}\n{encoded}\n-->"
+
+
+def native_evidence() -> dict[str, object]:
+    ready_payload: dict[str, object] = {
+        "schema_version": "1.0",
+        "phase": "phase-0a",
+        "head_sha": HEAD_SHA,
+    }
+    source = {
+        "ready_url": READY_URL,
+        "phase": "phase-0a",
+        "head_sha": HEAD_SHA,
+        "base_sha": BASE_SHA,
+    }
+    trigger_payload: dict[str, object] = {
+        "schema_version": "1.0",
+        "kind": "review",
+        "phase": "phase-0a",
+        "head_sha": HEAD_SHA,
+        "source_digest": canonical_digest(source),
+    }
+    ready_body = marker("redteam-ready-for-review", ready_payload)
+    trigger_body = (
+        "@codex review\n\n"
+        f"Review exact PR HEAD `{HEAD_SHA}` against phase base `{BASE_SHA}`.\n\n"
+        f"{marker('redteam-local-codex-trigger', trigger_payload)}"
+    )
+    pass_body = (
+        "Codex Review: Didn't find any major issues. Hooray!\n\n"
+        f"**Reviewed commit:** `{HEAD_SHA[:10]}`"
+    )
+    return {
+        "ready": MarkerEvidence(
+            payload=ready_payload,
+            url=READY_URL,
+            author="github-actions[bot]",
+            body=ready_body,
+        ),
+        "comments": [
+            {
+                "id": 1,
+                "html_url": READY_URL,
+                "user": {"login": "github-actions[bot]"},
+                "created_at": "2026-08-30T00:00:00Z",
+                "body": ready_body,
+            },
+            {
+                "id": 2,
+                "html_url": TRIGGER_URL,
+                "user": {"login": ACTOR_LOGIN},
+                "created_at": "2026-08-30T00:01:00Z",
+                "body": trigger_body,
+            },
+            {
+                "id": 3,
+                "html_url": NO_FINDINGS_URL,
+                "user": {"login": REVIEWER_LOGIN},
+                "created_at": "2026-08-30T00:02:00Z",
+                "body": pass_body,
+            },
+        ],
+        "reviews": [],
+        "review_comments": [],
+        "reactions": [
+            {
+                "id": 4,
+                "user": {"login": REVIEWER_LOGIN},
+                "content": "+1",
+                "created_at": "2026-08-30T00:02:04Z",
+            }
+        ],
+        "timeline": [],
+    }
+
+
+def evaluate_fixture(evidence: dict[str, object]) -> ReviewEvidence | None:
+    return evaluate_native_review(
+        phase="phase-0a",
+        head_sha=HEAD_SHA,
+        base_sha=BASE_SHA,
+        ready=evidence["ready"],  # type: ignore[arg-type]
+        actor_login=ACTOR_LOGIN,
+        reviewer_login=REVIEWER_LOGIN,
+        comments=evidence["comments"],  # type: ignore[arg-type]
+        reviews=evidence["reviews"],  # type: ignore[arg-type]
+        review_comments=evidence["review_comments"],  # type: ignore[arg-type]
+        reactions=evidence["reactions"],  # type: ignore[arg-type]
+        timeline=evidence["timeline"],  # type: ignore[arg-type]
+    )
 
 
 def test_nested_duplicate_marker_key_is_rejected() -> None:
@@ -178,8 +283,8 @@ def test_changes_requested_uses_requirement_id_as_stable_key() -> None:
 def test_changes_requested_without_stable_key_is_rejected() -> None:
     payload = review_result(verdict="CHANGES_REQUESTED")
     finding = payload["findings"][0]  # type: ignore[index]
-    finding["requirement_id"] = "not a stable key"  # type: ignore[index]
-    finding["id"] = "also invalid"  # type: ignore[index]
+    finding["requirement_id"] = "not a stable key"
+    finding["id"] = "also invalid"
 
     with pytest.raises(UntrustedEvidenceError, match="stable finding key"):
         select_finding_key(payload)
@@ -205,3 +310,138 @@ def test_ready_marker_is_reviewed_when_no_implementation_is_pending() -> None:
         )
         == "review"
     )
+
+
+def test_native_codex_no_finding_result_is_sha_bound_pass() -> None:
+    result = evaluate_fixture(native_evidence())
+
+    assert result is not None
+    assert result.url == NO_FINDINGS_URL
+    assert result.trigger_url == TRIGGER_URL
+    assert result.ready_url == READY_URL
+    assert result.result["verdict"] == "PASS"
+    assert result.result["reviewed_sha"] == HEAD_SHA
+    assert result.result["base_sha"] == BASE_SHA
+    assert result.result["findings"] == []
+
+
+def test_native_codex_pass_requires_reviewer_thumbs_up() -> None:
+    evidence = native_evidence()
+    evidence["reactions"] = []
+
+    assert evaluate_fixture(evidence) is None
+
+
+def test_native_review_rejects_ready_marker_unknown_field() -> None:
+    evidence = native_evidence()
+    ready = evidence["ready"]
+    assert isinstance(ready, MarkerEvidence)
+    evidence["ready"] = MarkerEvidence(
+        payload={**ready.payload, "untrusted": True},
+        url=ready.url,
+        author=ready.author,
+        body=ready.body,
+    )
+
+    with pytest.raises(UntrustedEvidenceError, match="unknown fields"):
+        evaluate_fixture(evidence)
+
+
+def test_native_codex_pass_rejects_stale_commit_prefix() -> None:
+    evidence = native_evidence()
+    comments = evidence["comments"]
+    assert isinstance(comments, list)
+    comments[-1]["body"] = (
+        "Codex Review: Didn't find any major issues.\n\n"
+        f"**Reviewed commit:** `{'c' * 10}`"
+    )
+
+    with pytest.raises(UntrustedEvidenceError, match="stale commit"):
+        evaluate_fixture(evidence)
+
+
+def test_native_codex_pass_rejects_head_change_during_review() -> None:
+    evidence = native_evidence()
+    evidence["timeline"] = [
+        {"event": "synchronize", "created_at": "2026-08-30T00:01:30Z"}
+    ]
+
+    with pytest.raises(UntrustedEvidenceError, match="head changed"):
+        evaluate_fixture(evidence)
+
+
+def test_native_codex_p1_becomes_changes_requested() -> None:
+    evidence = native_evidence()
+    comments = evidence["comments"]
+    assert isinstance(comments, list)
+    comments.pop()
+    evidence["reactions"] = []
+    evidence["reviews"] = [
+        {
+            "id": 77,
+            "html_url": REVIEW_URL,
+            "user": {"login": REVIEWER_LOGIN},
+            "commit_id": HEAD_SHA,
+            "state": "COMMENTED",
+            "submitted_at": "2026-08-30T00:02:00Z",
+        }
+    ]
+    finding = {
+        "id": 88,
+        "html_url": f"{REVIEW_URL}#discussion-88",
+        "user": {"login": REVIEWER_LOGIN},
+        "commit_id": HEAD_SHA,
+        "pull_request_review_id": 77,
+        "created_at": "2026-08-30T00:02:00Z",
+        "path": "docs/review/phase-0a-fix-report.md",
+        "line": 10,
+        "body": "![P1 Badge](badge) H-07 evidence is stale",
+    }
+    evidence["review_comments"] = [finding]
+
+    result = evaluate_fixture(evidence)
+
+    assert result is not None
+    assert result.url == REVIEW_URL
+    assert result.commit_id == HEAD_SHA
+    assert result.result["verdict"] == "CHANGES_REQUESTED"
+    assert result.result["findings"] == [
+        {
+            "id": native_finding_key(finding),
+            "severity": "HIGH",
+            "requirement_id": "H-07",
+            "evidence": "docs/review/phase-0a-fix-report.md:10; Codex review comment 88",
+            "required_fix": (
+                "Resolve the referenced Codex P0/P1 finding without weakening controls."
+            ),
+            "retest": ["bash scripts/ci/run_phase_gate.sh phase-0a"],
+        }
+    ]
+
+
+def test_native_codex_formal_review_without_retained_finding_fails_closed() -> None:
+    evidence = native_evidence()
+    evidence["reviews"] = [
+        {
+            "id": 77,
+            "html_url": REVIEW_URL,
+            "user": {"login": REVIEWER_LOGIN},
+            "commit_id": HEAD_SHA,
+            "state": "COMMENTED",
+            "submitted_at": "2026-08-30T00:02:00Z",
+        }
+    ]
+
+    with pytest.raises(UntrustedEvidenceError, match="missing retained"):
+        evaluate_fixture(evidence)
+
+
+def test_native_finding_key_is_stable_when_only_line_number_changes() -> None:
+    finding = {
+        "path": "src/redteam_agent/policy/engine.py",
+        "line": 10,
+        "body": "![P0 Badge](badge) caller can bypass policy",
+    }
+    changed_line = {**finding, "line": 99}
+
+    assert native_finding_key(finding) == native_finding_key(changed_line)

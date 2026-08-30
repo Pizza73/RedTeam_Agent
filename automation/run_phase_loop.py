@@ -4,7 +4,7 @@
 The operator starts this process once with a GitHub account linked to Codex Cloud.
 It never passes GitHub credentials to Codex.  Instead, it posts ``@codex`` requests
 as the linked user, waits for GitHub-native evidence, and dispatches the trusted
-phase-gate workflow only after validating the review marker locally.
+phase-gate workflow only after validating the review evidence locally.
 """
 
 from __future__ import annotations
@@ -36,10 +36,17 @@ PHASES = (
 )
 AUTOMATIC_PHASES = frozenset(PHASES)
 REQUIRED_CHECKS = frozenset({"tests (3.12)", "tests (3.14)", "quality", "governance-integrity"})
+REQUIRED_CHECK_ORDER = ("tests (3.12)", "tests (3.14)", "quality", "governance-integrity")
 TRUSTED_WORKFLOW_LOGIN = "github-actions[bot]"
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 FINDING_KEY_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9._-]{0,63}$")
 TOKEN_PATTERN = re.compile(r"(?:github_pat_|gh[opsu]_|sk-)[A-Za-z0-9_-]+")
+CODEX_NO_FINDINGS_PREFIX = "Codex Review: Didn't find any major issues."
+CODEX_REVIEWED_COMMIT_PATTERN = re.compile(
+    r"^\*\*Reviewed commit:\*\* `([0-9a-f]{10,40})`$", re.MULTILINE
+)
+CODEX_PRIORITY_PATTERN = re.compile(r"!\[P([01]) Badge\]")
+REQUIREMENT_ID_PATTERN = re.compile(r"\b(?:B|H|M|L)-\d{2}\b")
 
 
 class PhaseLoopError(RuntimeError):
@@ -89,6 +96,8 @@ class ReviewEvidence:
     url: str
     author: str
     commit_id: str | None
+    ready_url: str
+    trigger_url: str
 
 
 def _reject_duplicate_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -213,6 +222,315 @@ def select_evidence_action(
     return "wait"
 
 
+def _github_author(item: dict[str, Any]) -> str:
+    user = item.get("user")
+    return str(user.get("login", "")) if isinstance(user, dict) else ""
+
+
+def _github_timestamp(item: dict[str, Any], field: str) -> datetime:
+    raw = item.get(field)
+    if not isinstance(raw, str):
+        raise UntrustedEvidenceError(f"GitHub evidence is missing {field}")
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise UntrustedEvidenceError(f"GitHub evidence has invalid {field}") from exc
+    if parsed.tzinfo is None:
+        raise UntrustedEvidenceError(f"GitHub evidence has timezone-free {field}")
+    return parsed
+
+
+def _native_review_trigger(
+    *,
+    comments: list[dict[str, Any]],
+    ready: MarkerEvidence,
+    actor_login: str,
+    phase: str,
+    head_sha: str,
+    base_sha: str,
+) -> tuple[dict[str, Any], datetime] | None:
+    expected_ready = {
+        "schema_version": "1.0",
+        "phase": phase,
+        "head_sha": head_sha,
+    }
+    if ready.payload != expected_ready:
+        raise UntrustedEvidenceError("review-ready marker has missing or unknown fields")
+    ready_comments = [
+        item
+        for item in comments
+        if item.get("html_url") == ready.url and _github_author(item) == TRUSTED_WORKFLOW_LOGIN
+    ]
+    if len(ready_comments) != 1:
+        raise UntrustedEvidenceError("review-ready reference is missing or ambiguous")
+    ready_payloads = marker_payloads(
+        str(ready_comments[0].get("body", "")), "redteam-ready-for-review"
+    )
+    if len(ready_payloads) != 1 or ready_payloads[0] != ready.payload:
+        raise UntrustedEvidenceError("review-ready marker does not exactly match trusted evidence")
+    ready_time = _github_timestamp(ready_comments[0], "created_at")
+    source = {
+        "ready_url": ready.url,
+        "phase": phase,
+        "head_sha": head_sha,
+        "base_sha": base_sha,
+    }
+    expected = {
+        "schema_version": "1.0",
+        "kind": "review",
+        "phase": phase,
+        "head_sha": head_sha,
+        "source_digest": canonical_digest(source),
+    }
+    matches: list[tuple[dict[str, Any], datetime]] = []
+    for item in comments:
+        if _github_author(item) != actor_login:
+            continue
+        body = item.get("body")
+        if not isinstance(body, str) or "redteam-local-codex-trigger" not in body:
+            continue
+        payloads = marker_payloads(body, "redteam-local-codex-trigger")
+        if len(payloads) != 1:
+            raise UntrustedEvidenceError("review trigger must contain exactly one local marker")
+        if payloads[0] != expected:
+            continue
+        url = item.get("html_url")
+        if not isinstance(url, str):
+            raise UntrustedEvidenceError("review trigger has no permalink")
+        if body.splitlines()[0].strip() != "@codex review":
+            raise UntrustedEvidenceError(
+                "review trigger does not use the exact Codex review command"
+            )
+        if f"`{head_sha}`" not in body or f"`{base_sha}`" not in body:
+            raise UntrustedEvidenceError("review trigger omits the full head or base SHA")
+        created_at = _github_timestamp(item, "created_at")
+        if created_at <= ready_time:
+            raise UntrustedEvidenceError("review trigger predates its review-ready evidence")
+        matches.append((item, created_at))
+    return max(matches, key=lambda value: value[1]) if matches else None
+
+
+def _reject_synchronize_between(
+    timeline: list[dict[str, Any]], *, start: datetime, end: datetime
+) -> None:
+    for event in timeline:
+        if event.get("event") != "synchronize":
+            continue
+        occurred_at = _github_timestamp(event, "created_at")
+        if start < occurred_at <= end:
+            raise UntrustedEvidenceError("PR head changed while Codex review was running")
+
+
+def _codex_priority(body: str) -> str | None:
+    priorities = CODEX_PRIORITY_PATTERN.findall(body)
+    if not priorities:
+        return None
+    if len(priorities) != 1:
+        raise UntrustedEvidenceError("Codex finding has ambiguous priority badges")
+    return str(priorities[0])
+
+
+def native_finding_key(comment: dict[str, Any]) -> str:
+    body = comment.get("body")
+    path = comment.get("path")
+    if not isinstance(body, str) or not isinstance(path, str) or not path:
+        raise UntrustedEvidenceError("Codex finding is missing body or path")
+    priority = _codex_priority(body)
+    if priority is None:
+        raise UntrustedEvidenceError("Codex finding is missing a P0/P1 badge")
+    headline = next((line.strip() for line in body.splitlines() if line.strip()), "")
+    digest_input = f"P{priority}\0{path}\0{headline}".encode()
+    digest = hashlib.sha256(digest_input).hexdigest()[:16].upper()
+    return f"CODEX-P{priority}-{digest}"
+
+
+def _native_finding(comment: dict[str, Any], phase: str) -> dict[str, Any]:
+    key = native_finding_key(comment)
+    body = str(comment["body"])
+    priority = _codex_priority(body)
+    if priority is None:  # pragma: no cover - native_finding_key already enforces this
+        raise UntrustedEvidenceError("Codex finding is missing priority")
+    requirement_match = REQUIREMENT_ID_PATTERN.search(body)
+    requirement_id = requirement_match.group(0) if requirement_match else key
+    line = comment.get("line")
+    location = f"{comment['path']}:{line}" if isinstance(line, int) else str(comment["path"])
+    return {
+        "id": key,
+        "severity": "BLOCKER" if priority == "0" else "HIGH",
+        "requirement_id": requirement_id,
+        "evidence": f"{location}; Codex review comment {comment.get('id')}",
+        "required_fix": "Resolve the referenced Codex P0/P1 finding without weakening controls.",
+        "retest": [f"bash scripts/ci/run_phase_gate.sh {phase}"],
+    }
+
+
+def _native_result(
+    *,
+    phase: str,
+    head_sha: str,
+    base_sha: str,
+    verdict: str,
+    findings: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if verdict == "PASS":
+        summary = f"Codex reported no P0/P1 findings for {head_sha[:10]}."
+    else:
+        summary = f"Codex reported {len(findings)} P0/P1 finding(s) for {head_sha[:10]}."
+    return {
+        "schema_version": "1.0",
+        "phase": phase,
+        "reviewed_sha": head_sha,
+        "base_sha": base_sha,
+        "verdict": verdict,
+        "summary": summary,
+        "findings": findings,
+        "required_checks": [{"name": name, "status": "PASS"} for name in REQUIRED_CHECK_ORDER],
+    }
+
+
+def evaluate_native_review(
+    *,
+    phase: str,
+    head_sha: str,
+    base_sha: str,
+    ready: MarkerEvidence,
+    actor_login: str,
+    reviewer_login: str,
+    comments: list[dict[str, Any]],
+    reviews: list[dict[str, Any]],
+    review_comments: list[dict[str, Any]],
+    reactions: list[dict[str, Any]],
+    timeline: list[dict[str, Any]],
+) -> ReviewEvidence | None:
+    trigger = _native_review_trigger(
+        comments=comments,
+        ready=ready,
+        actor_login=actor_login,
+        phase=phase,
+        head_sha=head_sha,
+        base_sha=base_sha,
+    )
+    if trigger is None:
+        return None
+    trigger_item, trigger_time = trigger
+    trigger_url = str(trigger_item["html_url"])
+
+    review_by_id: dict[int, tuple[dict[str, Any], datetime]] = {}
+    for review in reviews:
+        if (
+            _github_author(review) != reviewer_login
+            or review.get("commit_id") != head_sha
+            or review.get("state") != "COMMENTED"
+            or not isinstance(review.get("id"), int)
+        ):
+            continue
+        submitted_at = _github_timestamp(review, "submitted_at")
+        if submitted_at > trigger_time:
+            review_by_id[int(review["id"])] = (review, submitted_at)
+
+    finding_comments: list[dict[str, Any]] = []
+    for comment in review_comments:
+        body = comment.get("body")
+        if (
+            _github_author(comment) != reviewer_login
+            or comment.get("commit_id") != head_sha
+            or not isinstance(body, str)
+            or _codex_priority(body) is None
+        ):
+            continue
+        created_at = _github_timestamp(comment, "created_at")
+        if created_at <= trigger_time:
+            raise UntrustedEvidenceError("current-head Codex finding predates the trusted trigger")
+        review_id = comment.get("pull_request_review_id")
+        if not isinstance(review_id, int) or review_id not in review_by_id:
+            raise UntrustedEvidenceError(
+                "Codex finding is not bound to a trusted current-head review"
+            )
+        if not isinstance(comment.get("html_url"), str):
+            raise UntrustedEvidenceError("Codex finding has no permalink")
+        finding_comments.append(comment)
+
+    finding_review_ids = {
+        int(comment["pull_request_review_id"]) for comment in finding_comments
+    }
+    if set(review_by_id) != finding_review_ids:
+        raise UntrustedEvidenceError(
+            "current-head Codex formal review is missing retained P0/P1 findings"
+        )
+
+    if finding_comments:
+        finding_comments.sort(key=lambda item: int(item.get("id", 0)))
+        first_review_id = int(finding_comments[0]["pull_request_review_id"])
+        review, completed_at = review_by_id[first_review_id]
+        review_url = review.get("html_url")
+        if not isinstance(review_url, str):
+            raise UntrustedEvidenceError("Codex review has no permalink")
+        _reject_synchronize_between(timeline, start=trigger_time, end=completed_at)
+        findings = [_native_finding(item, phase) for item in finding_comments]
+        return ReviewEvidence(
+            result=_native_result(
+                phase=phase,
+                head_sha=head_sha,
+                base_sha=base_sha,
+                verdict="CHANGES_REQUESTED",
+                findings=findings,
+            ),
+            url=review_url,
+            author=reviewer_login,
+            commit_id=head_sha,
+            ready_url=ready.url,
+            trigger_url=trigger_url,
+        )
+
+    pass_comments: list[tuple[dict[str, Any], datetime]] = []
+    for comment in comments:
+        if _github_author(comment) != reviewer_login:
+            continue
+        body = comment.get("body")
+        if not isinstance(body, str) or not body.startswith(CODEX_NO_FINDINGS_PREFIX):
+            continue
+        matches = CODEX_REVIEWED_COMMIT_PATTERN.findall(body)
+        if len(matches) != 1 or body.count("**Reviewed commit:**") != 1:
+            raise UntrustedEvidenceError("Codex PASS comment has ambiguous commit evidence")
+        if not head_sha.startswith(matches[0]):
+            raise UntrustedEvidenceError("Codex PASS comment refers to a stale commit")
+        created_at = _github_timestamp(comment, "created_at")
+        if created_at <= trigger_time:
+            continue
+        if not isinstance(comment.get("html_url"), str):
+            raise UntrustedEvidenceError("Codex PASS comment has no permalink")
+        pass_comments.append((comment, created_at))
+    if not pass_comments:
+        return None
+    pass_comment, pass_time = max(pass_comments, key=lambda value: value[1])
+
+    reaction_times = [
+        _github_timestamp(reaction, "created_at")
+        for reaction in reactions
+        if _github_author(reaction) == reviewer_login
+        and reaction.get("content") == "+1"
+        and _github_timestamp(reaction, "created_at") >= pass_time
+    ]
+    if not reaction_times:
+        return None
+    completed_at = min(reaction_times)
+    _reject_synchronize_between(timeline, start=trigger_time, end=completed_at)
+    return ReviewEvidence(
+        result=_native_result(
+            phase=phase,
+            head_sha=head_sha,
+            base_sha=base_sha,
+            verdict="PASS",
+            findings=[],
+        ),
+        url=str(pass_comment["html_url"]),
+        author=reviewer_login,
+        commit_id=None,
+        ready_url=ready.url,
+        trigger_url=trigger_url,
+    )
+
+
 def _sanitize_output(value: str) -> str:
     return TOKEN_PATTERN.sub("[REDACTED]", value).strip()
 
@@ -288,6 +606,33 @@ class GitHubClient:
         for page in pages:
             if not isinstance(page, list):
                 raise UntrustedEvidenceError("GitHub review page must be an array")
+            result.extend(item for item in page if isinstance(item, dict))
+        return result
+
+    def review_comments(self, number: int) -> list[dict[str, Any]]:
+        pages = self.api_pages(f"repos/{self.repository}/pulls/{number}/comments?per_page=100")
+        result: list[dict[str, Any]] = []
+        for page in pages:
+            if not isinstance(page, list):
+                raise UntrustedEvidenceError("GitHub review-comment page must be an array")
+            result.extend(item for item in page if isinstance(item, dict))
+        return result
+
+    def issue_reactions(self, number: int) -> list[dict[str, Any]]:
+        pages = self.api_pages(f"repos/{self.repository}/issues/{number}/reactions?per_page=100")
+        result: list[dict[str, Any]] = []
+        for page in pages:
+            if not isinstance(page, list):
+                raise UntrustedEvidenceError("GitHub reaction page must be an array")
+            result.extend(item for item in page if isinstance(item, dict))
+        return result
+
+    def timeline(self, number: int) -> list[dict[str, Any]]:
+        pages = self.api_pages(f"repos/{self.repository}/issues/{number}/timeline?per_page=100")
+        result: list[dict[str, Any]] = []
+        for page in pages:
+            if not isinstance(page, list):
+                raise UntrustedEvidenceError("GitHub timeline page must be an array")
             result.extend(item for item in page if isinstance(item, dict))
         return result
 
@@ -461,8 +806,7 @@ class PhaseLoop:
 
     @staticmethod
     def _author(item: dict[str, Any]) -> str:
-        user = item.get("user")
-        return str(user.get("login", "")) if isinstance(user, dict) else ""
+        return _github_author(item)
 
     def trusted_markers(
         self, comments: list[dict[str, Any]], marker_name: str
@@ -642,55 +986,44 @@ class PhaseLoop:
             "@codex review\n\n"
             f"Independently review `{state.phase}` for exact PR HEAD `{state.head_sha}` against "
             f"phase base `{base_sha}`. CI evidence is at {ready.url}. Follow the root `AGENTS.md` "
-            "Code Review Rules and `automation/chatgpt-event-task-prompt.md`. Re-read HEAD before "
-            "posting. End the review with exactly one `redteam-ai-review` marker whose JSON "
-            "validates against `automation/schemas/review-result.schema.json`. Do not implement, "
+            "Code Review Rules. Re-read HEAD before posting. Use the standard GitHub Codex review "
+            "result: post P0/P1 findings or the no-major-issues completion. Do not implement, "
             f"push, change labels, or merge.\n\n{marker}"
         )
         self.log(f"requesting independent Codex review for {state.phase} at {state.head_sha}")
         if not self.dry_run:
             self.github.post_comment(state.number, body)
 
-    def find_review(self, state: PullRequestState, base_sha: str) -> ReviewEvidence | None:
-        candidates: list[tuple[dict[str, Any], str | None]] = []
-        for review in self.github.reviews(state.number):
-            candidates.append((review, str(review.get("commit_id", ""))))
-        for comment in self.comments():
-            candidates.append((comment, None))
-        for item, commit_id in reversed(candidates):
-            if self._author(item) != self.reviewer_login:
-                continue
-            body = item.get("body")
-            url = item.get("html_url")
-            if not isinstance(body, str) or not isinstance(url, str):
-                continue
-            payloads = marker_payloads(body, "redteam-ai-review")
-            if len(payloads) > 1:
-                raise UntrustedEvidenceError("review evidence contains multiple result markers")
-            if not payloads:
-                continue
-            payload = payloads[0]
-            try:
-                validate_review_result(
-                    payload,
-                    schema=self.review_schema,
-                    phase=state.phase,
-                    reviewed_sha=state.head_sha,
-                    base_sha=base_sha,
-                )
-            except UntrustedEvidenceError:
-                continue
-            if commit_id is not None and commit_id != state.head_sha:
-                continue
-            if commit_id is None and state.head_sha not in body:
-                continue
-            return ReviewEvidence(
-                result=payload,
-                url=url,
-                author=self.reviewer_login,
-                commit_id=commit_id,
-            )
-        return None
+    def find_review(
+        self,
+        state: PullRequestState,
+        base_sha: str,
+        ready: MarkerEvidence,
+        comments: list[dict[str, Any]],
+    ) -> ReviewEvidence | None:
+        evidence = evaluate_native_review(
+            phase=state.phase,
+            head_sha=state.head_sha,
+            base_sha=base_sha,
+            ready=ready,
+            actor_login=self.actor_login,
+            reviewer_login=self.reviewer_login,
+            comments=comments,
+            reviews=self.github.reviews(state.number),
+            review_comments=self.github.review_comments(state.number),
+            reactions=self.github.issue_reactions(state.number),
+            timeline=self.github.timeline(state.number),
+        )
+        if evidence is None:
+            return None
+        validate_review_result(
+            evidence.result,
+            schema=self.review_schema,
+            phase=state.phase,
+            reviewed_sha=state.head_sha,
+            base_sha=base_sha,
+        )
+        return evidence
 
     def dispatch_review_record(self, state: PullRequestState, review: ReviewEvidence) -> None:
         key = f"{state.phase}:{state.head_sha}:{review.url}"
@@ -711,6 +1044,8 @@ class PhaseLoop:
                     "base_sha": str(review.result["base_sha"]),
                     "verdict": verdict,
                     "review_reference": review.url,
+                    "ready_reference": review.ready_url,
+                    "review_trigger_reference": review.trigger_url,
                     "summary": summary,
                     "finding_key": finding_key,
                     "confirmation": "RECORD_PHASE_REVIEW",
@@ -786,7 +1121,7 @@ class PhaseLoop:
                 status = f"waiting for Codex implementation: {state.phase} {state.head_sha[:12]}"
             elif action == "review" and ready is not None:
                 base_sha = self.expected_base_sha(state, phase_records)
-                review = self.find_review(state, base_sha)
+                review = self.find_review(state, base_sha, ready, comments)
                 if review is None:
                     self.request_review(state, ready, base_sha, comments)
                     status = f"waiting for Codex review: {state.phase} {state.head_sha[:12]}"
