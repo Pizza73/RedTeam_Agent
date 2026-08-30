@@ -25,6 +25,8 @@
 - Implementation RequestをCurrent Phase、Current HEAD SHA、Trusted Phase Promptへ固定する
 - Native Reviewを`AI_REVIEWER_LOGIN`、Current Phase、Current HEAD SHA、Expected Base SHA、ready/trigger permalink、Review中のhead不変性へ固定する
 - PASSはCodex標準no-major-issues comment、10文字以上のmatching commit prefix、botの👍、Current HEADのP0/P1/formal finding review不在をすべて要求する
+- Native Review判定はtrusted current-HEAD triggerより後のCodex出力だけを候補とし、trigger前の
+  stale/malformedな履歴は権限として使わず、trigger後のstale evidenceはFail Closedにする
 - CHANGES_REQUESTEDはCurrent HEADへ完全BindingされたCodex formal reviewとP0/P1 inline findingを要求し、root-cause keyを決定論的に導出する
 - Required Check成功前にReview Gateを記録しない
 - 同じRequest/Reviewを再処理せず、停止後にGitHub Evidenceから再開できる

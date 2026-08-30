@@ -505,6 +505,31 @@ def test_native_codex_pass_rejects_stale_commit_prefix() -> None:
         evaluate_fixture(evidence)
 
 
+def test_native_codex_pass_ignores_stale_commit_before_trusted_trigger() -> None:
+    evidence = native_evidence()
+    comments = evidence["comments"]
+    assert isinstance(comments, list)
+    comments.insert(
+        1,
+        {
+            "id": 5,
+            "html_url": "https://github.com/example/repo/pull/1#issuecomment-old-pass",
+            "user": {"login": REVIEWER_LOGIN},
+            "created_at": "2026-08-30T00:00:30Z",
+            "body": (
+                "Codex Review: Didn't find any major issues.\n\n"
+                f"**Reviewed commit:** `{'c' * 10}`"
+            ),
+        },
+    )
+
+    result = evaluate_fixture(evidence)
+
+    assert result is not None
+    assert result.result["reviewed_sha"] == HEAD_SHA
+    assert result.url == NO_FINDINGS_URL
+
+
 def test_native_codex_pass_rejects_head_change_during_review() -> None:
     evidence = native_evidence()
     evidence["timeline"] = [
