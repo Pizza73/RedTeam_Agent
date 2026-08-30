@@ -590,16 +590,6 @@ jobs:
               core.setFailed('Pull request head or phase changed before recording the gate.');
               return;
             }
-            if (refreshTargetSha !== null) {
-              const { data: liveDefaultCommit } = await github.rest.repos.getCommit({
-                owner, repo, ref: context.payload.repository.default_branch,
-              });
-              if (liveDefaultCommit.sha !== refreshTargetSha) {
-                core.setFailed('Default branch changed before recording the refreshed Phase 0A gate.');
-                return;
-              }
-            }
-
             const record = {
               schema_version: '1.0',
               phase,

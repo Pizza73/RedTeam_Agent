@@ -24,6 +24,12 @@ incorporated target for Phase 0A review even if main subsequently advances.
 - The earlier PASS cannot authorize next-Phase implementation across the newer default branch.
 - No workflow, label, branch-update, merge permission or OpenAI API usage changes.
 
+The Phase Gate workflow applies the same rule. It validates the supplied Phase 0A base against a
+trusted status and verifies that both the old HEAD and target base are ancestors of the exact
+reviewed HEAD. It no longer rejects that immutable evidence merely because live main advanced after
+the review began. PR head and Phase are still re-read immediately before Gate recording, and the
+local loop checks current main before any next-Phase implementation request.
+
 ## Regression and validation
 
 - The Phase 0A base test now proves that a later default branch does not replace the trusted target
@@ -48,5 +54,7 @@ pass the complete Gate after the next bounded refresh.
   `docs/acceptance-criteria.md`, `docs/ai-development-loop.md`, `docs/threat-model.md`, and this
   report.
 - Finding addressed: current main incorrectly replaced the exact incorporated review base.
+- Review finding addressed: Codex P1 `discussion_r3889492674`; the Gate workflow now accepts the
+  ancestry-verified incorporated target under the same rule as the local runner.
 - Remaining constraint: after this governance merge, PR #3 intentionally requires another bounded
   refresh and fresh Phase 0A Gate before Phase 0B implementation.
