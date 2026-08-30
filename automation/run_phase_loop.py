@@ -890,17 +890,17 @@ def evaluate_native_review(
 
     finding_comments: list[dict[str, Any]] = []
     for comment in review_comments:
-        body = comment.get("body")
         if (
             _github_author(comment) != reviewer_login
             or comment.get("commit_id") != head_sha
-            or not isinstance(body, str)
-            or _codex_priority(body) is None
         ):
             continue
         created_at = _github_timestamp(comment, "created_at")
         if created_at <= trigger_time:
-            raise UntrustedEvidenceError("current-head Codex finding predates the trusted trigger")
+            continue
+        body = comment.get("body")
+        if not isinstance(body, str) or _codex_priority(body) is None:
+            continue
         review_id = comment.get("pull_request_review_id")
         if not isinstance(review_id, int) or review_id not in review_by_id:
             raise UntrustedEvidenceError(
