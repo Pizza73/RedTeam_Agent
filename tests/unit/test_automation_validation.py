@@ -212,6 +212,8 @@ def test_final_merge_policy_is_fail_closed_and_local_only() -> None:
     assert merge_gate.rindex("validate_final_phase_status(") < merge_gate.index(
         "self.github.merge_pull_request("
     )
+    assert merge_gate.count("validated_final_merge_phase_chain(") == 2
+    assert "final_merge_phase_chain_identity(claimed_phase_chain)" in merge_gate
     for workflow_path in (REPO_ROOT / ".github" / "workflows").glob("*.yml"):
         workflow = workflow_path.read_text(encoding="utf-8")
         assert "github.rest.pulls.merge" not in workflow

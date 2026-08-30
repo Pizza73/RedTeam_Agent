@@ -59,6 +59,11 @@ claim.
 - Finding: merge gates could drift while the remote claim and marker writes completed
 - Fix: after marker confirmation, re-query and compare the Phase chain, attempt marker, full PR
   state, default branch/ancestry, checks and trusted status; drift/unknown requires reconciliation
+- Codex P1: `https://github.com/Pizza73/RedTeam_Agent/pull/9#discussion_r3889284896`
+- Finding: post-claim comparison covered only the Phase 5 record, allowing an earlier valid PASS
+  record to change without detection
+- Fix: snapshot and compare the payload, permalink and trusted author identity of every validated
+  Phase 0A through Phase 5 record; any difference requires reconciliation before merge
 
 ## Modified files
 
@@ -84,14 +89,16 @@ broken chains, adjacent PR-number prefix confusion, untrusted status authors, st
 unknown outcome without a second dispatch. A concurrency regression gives two runners the same
 empty comment snapshot and proves that only one claim, record and merge request can be created.
 Post-claim regressions separately mutate PR labels, default branch, checks and trusted status and
-prove that each stops in reconciliation without a merge call.
+prove that each stops in reconciliation without a merge call. The complete-chain regression
+replaces only Phase 0A with a different otherwise-valid PASS after claim and proves that the full
+eight-record identity comparison stops before merge.
 
 ## Validation results
 
 - `.venv/bin/python -m pytest -q tests/unit/test_phase_loop.py tests/unit/test_automation_validation.py --strict-markers`
-  - PASS: 79 tests
-- `REDTEAM_COVERAGE_FILE=/tmp/redteam-auto-merge-claim-final .venv/bin/python -m coverage run --source=automation,src -m pytest -q tests --strict-markers`
-  - PASS: 231 tests; total coverage 75%
+  - PASS: 80 tests
+- `REDTEAM_COVERAGE_FILE=/tmp/redteam-full-chain-drift .venv/bin/python -m coverage run --source=automation,src -m pytest -q tests --strict-markers`
+  - PASS: 232 tests; total coverage 75%
 - `.venv/bin/python -m ruff check automation/run_phase_loop.py scripts/ci/validate_automation.py tests/unit/test_phase_loop.py tests/unit/test_automation_validation.py`
   - PASS
 - `.venv/bin/python scripts/ci/validate_automation.py`

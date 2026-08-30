@@ -1417,6 +1417,31 @@ def test_post_claim_status_drift_requires_reconciliation_without_merge() -> None
     assert len(github.issue_comments) == 1
     assert github.merge_calls == []
 
+
+def test_post_claim_earlier_phase_record_drift_requires_reconciliation() -> None:
+    records = chained_phase_passes()
+    state = final_merge_state()
+    github = _FinalMergeGitHub(records)
+    loop = configured_final_merge_loop(state, github)
+    original_post_comment = github.post_comment
+
+    def post_comment_and_replace_phase_0a(
+        number: int, body: str
+    ) -> dict[str, object]:
+        result = original_post_comment(number, body)
+        replacement = {**records[0].payload, "summary": "replacement valid Phase 0A PASS"}
+        github.phase_comments[0]["body"] = marker("redteam-phase-gate", replacement)
+        return result
+
+    github.post_comment = post_comment_and_replace_phase_0a  # type: ignore[method-assign]
+
+    with pytest.raises(FinalMergeReconciliationRequiredError, match="reconcile"):
+        loop.automatic_final_merge(state, [], records, DEFAULT_BRANCH_SHA)
+
+    assert len(github.claims) == 1
+    assert len(github.issue_comments) == 1
+    assert github.merge_calls == []
+
 class _ComparisonGitHub:
     is_ancestor = GitHubClient.is_ancestor
 
