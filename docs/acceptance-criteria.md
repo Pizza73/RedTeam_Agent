@@ -40,6 +40,8 @@
   場合は、label置換とbranch updateのどちらも行わずFail Closedにする
 - Local Orchestratorはlabel置換とbranch updateの直前・直後にCurrent PR、Default Branch、
   trusted PASS/Status遷移Snapshotを再取得し、Driftまたは競合をFail Closedにする
+- label置換後のSnapshotはrollback後Phaseの視点で旧認可Identityを再確認し、さらに下位Phaseへ
+  戻す新しいsource Identityとの競合を拒否する
 - Base refreshは`expected_head_sha`とCurrent default-branch SHAへ固定し、Final merge APIを
   呼ばない
 - Final mergeはLocal Orchestratorだけが実行し、`phase-5`、`ai-project-complete`、

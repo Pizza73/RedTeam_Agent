@@ -144,7 +144,9 @@ description, prior PASS link and SHA, the local orchestrator re-reads the comple
 the labels with the exact adjacent-Phase rollback set, and verifies the complete resulting PR state.
 It first rejects multiple source/restart transition identities for the same HEAD and current Phase,
 then re-fetches and compares the trusted PASS/status transition snapshot immediately before and
-after both local side effects. It calls GitHub's branch-update endpoint with
+after both local side effects. The post-label snapshot uses the rolled-back Phase while retaining
+the authorized source identity, so a newly inserted lower-Phase transition cannot be hidden. It
+calls GitHub's branch-update endpoint with
 `expected_head_sha=<old-head>`. A concurrent status, head, base, label or lifecycle change fails
 closed. The synchronization is not a final PR merge: it
 incorporates `main` into the PR branch. CI then runs the rolled-back Phase on the new HEAD, and every

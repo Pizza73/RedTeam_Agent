@@ -47,6 +47,8 @@ NO_FINDINGS_URL = "https://github.com/example/repo/pull/1#issuecomment-no-findin
 REVIEW_URL = "https://github.com/example/repo/pull/1#pullrequestreview-77"
 PHASE_RECORD_URL = "https://github.com/example/repo/pull/3#issuecomment-record"
 PHASE_ONE_RECORD_URL = "https://github.com/example/repo/pull/3#issuecomment-phase-one"
+PHASE_ZERO_B_RECORD_URL = "https://github.com/example/repo/pull/3#issuecomment-phase-zero-b"
+PHASE_ZERO_C_RECORD_URL = "https://github.com/example/repo/pull/3#issuecomment-phase-zero-c"
 PULL_REQUEST_PREFIX = "https://github.com/example/repo/pull/3"
 
 
@@ -934,6 +936,70 @@ def test_base_refresh_status_race_fails_closed_around_local_side_effects(
         expected_writes if operation_name == "update" else 0
     )
     assert initial_snapshot
+
+
+def test_higher_phase_post_label_snapshot_uses_rolled_back_phase() -> None:
+    state = phase_state(phase="phase-1")
+    expected_state = phase_state(phase="phase-0c")
+    authorized_records = base_refresh_evidence_from_statuses(
+        [
+            base_refresh_status(
+                from_phase="phase-1",
+                revalidate_phase="phase-0c",
+                target_url=PHASE_ZERO_C_RECORD_URL,
+            )
+        ],
+        head_sha=HEAD_SHA,
+    )
+    lower_source_records = base_refresh_evidence_from_statuses(
+        [
+            base_refresh_status(
+                from_phase="phase-0c",
+                revalidate_phase="phase-0b",
+                target_url=PHASE_ZERO_B_RECORD_URL,
+            )
+        ],
+        head_sha=HEAD_SHA,
+    )
+    transition_snapshot = PhaseLoop.require_unique_base_refresh_transition_identity(
+        state, authorized_records
+    )
+    github = _BaseTransitionGitHub({})
+    loop = PhaseLoop.__new__(PhaseLoop)
+    loop.github = github  # type: ignore[assignment]
+    loop.started_base_label_transitions = set()
+    loop.dispatched_base_refreshes = set()
+    loop.dry_run = False
+    loop.log = lambda _message: None  # type: ignore[method-assign]
+    observed_states = iter((state, expected_state))
+    loop.pr_state = lambda: next(observed_states)  # type: ignore[method-assign]
+    loop.current_default_branch_sha = (  # type: ignore[method-assign]
+        lambda: DEFAULT_BRANCH_SHA
+    )
+    observed_snapshot_phases: list[str] = []
+
+    def live_snapshot(snapshot_state: PullRequestState) -> frozenset[str]:
+        observed_snapshot_phases.append(snapshot_state.phase)
+        records = (
+            authorized_records
+            if snapshot_state.phase == state.phase
+            else authorized_records + lower_source_records
+        )
+        return loop.require_unique_base_refresh_transition_identity(
+            snapshot_state, records
+        )
+
+    loop.live_base_refresh_transition_snapshot = live_snapshot  # type: ignore[method-assign]
+
+    with pytest.raises(UntrustedEvidenceError, match="conflicting"):
+        loop.perform_base_refresh_label_transition(
+            state, authorized_records, DEFAULT_BRANCH_SHA
+        )
+
+    assert github.label_calls == [(3, expected_state.labels)]
+    assert observed_snapshot_phases == ["phase-1", "phase-0c"]
+    assert transition_snapshot
+    assert loop.started_base_label_transitions == set()
 
 
 def test_base_refresh_rejects_post_update_pr_state_drift() -> None:

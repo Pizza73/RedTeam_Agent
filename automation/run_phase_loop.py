@@ -1673,7 +1673,7 @@ class PhaseLoop:
                         "default branch changed during the base-refresh label transition"
                     )
                 self.revalidate_base_refresh_transition_snapshot(
-                    state, transition_snapshot
+                    expected_state, transition_snapshot
                 )
             self.started_base_label_transitions.add(digest)
         return True
