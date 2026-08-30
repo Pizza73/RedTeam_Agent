@@ -1506,8 +1506,9 @@ class PhaseLoop:
     def require_unique_base_refresh_transition_identity(
         state: PullRequestState,
         refresh_records: list[MarkerEvidence],
-    ) -> None:
+    ) -> frozenset[str]:
         identities: set[tuple[str, str, str, str]] = set()
+        payload_digests: set[str] = set()
         for record in refresh_records:
             payload = record.payload
             if payload.get("head_sha") != state.head_sha:
@@ -1525,9 +1526,67 @@ class PhaseLoop:
                     str(payload["prior_pass_reference"]),
                 )
             )
+            payload_digests.add(canonical_digest(payload))
         if len(identities) > 1:
             raise UntrustedEvidenceError(
                 "conflicting base-refresh transition identities exist for the current PR state"
+            )
+        return frozenset(payload_digests)
+
+    def live_base_refresh_transition_snapshot(
+        self,
+        state: PullRequestState,
+    ) -> frozenset[str]:
+        comments = self.comments()
+        phase_records = self.trusted_markers(comments, "redteam-phase-gate")
+        refresh_records = self.trusted_base_refresh_statuses(state, phase_records)
+        return self.require_unique_base_refresh_transition_identity(
+            state, refresh_records
+        )
+
+    def revalidate_base_refresh_transition_snapshot(
+        self,
+        state: PullRequestState,
+        expected_snapshot: frozenset[str],
+    ) -> None:
+        if self.live_base_refresh_transition_snapshot(state) != expected_snapshot:
+            raise UntrustedEvidenceError(
+                "base-refresh transition evidence changed around a local side effect"
+            )
+
+    def validate_post_base_refresh_pr_state(
+        self,
+        previous_state: PullRequestState,
+        current_state: PullRequestState,
+        default_branch_sha: str,
+    ) -> None:
+        if current_state.head_sha == previous_state.head_sha:
+            if current_state != previous_state:
+                raise UntrustedEvidenceError(
+                    "pull request metadata changed during the exact-HEAD base refresh"
+                )
+            return
+        unchanged_fields = (
+            "number",
+            "base_ref",
+            "phase",
+            "labels",
+            "state",
+            "head_repository",
+        )
+        if any(
+            getattr(current_state, field) != getattr(previous_state, field)
+            for field in unchanged_fields
+        ):
+            raise UntrustedEvidenceError(
+                "pull request state changed unexpectedly during the exact-HEAD base refresh"
+            )
+        if current_state.base_sha != default_branch_sha or not (
+            self.github.is_ancestor(previous_state.head_sha, current_state.head_sha)
+            and self.github.is_ancestor(default_branch_sha, current_state.head_sha)
+        ):
+            raise UntrustedEvidenceError(
+                "refreshed pull request head lacks the authorized ancestry"
             )
 
     def perform_base_refresh_label_transition(
@@ -1536,7 +1595,9 @@ class PhaseLoop:
         refresh_records: list[MarkerEvidence],
         default_branch_sha: str,
     ) -> bool:
-        self.require_unique_base_refresh_transition_identity(state, refresh_records)
+        transition_snapshot = self.require_unique_base_refresh_transition_identity(
+            state, refresh_records
+        )
         phase_index = PHASES.index(state.phase)
         if phase_index == 0 or "ai-needs-implementation" not in state.labels:
             return False
@@ -1595,11 +1656,25 @@ class PhaseLoop:
                     raise UntrustedEvidenceError(
                         "pull request changed before the base-refresh label transition"
                     )
+                if self.current_default_branch_sha() != default_branch_sha:
+                    raise UntrustedEvidenceError(
+                        "default branch changed before the base-refresh label transition"
+                    )
+                self.revalidate_base_refresh_transition_snapshot(
+                    state, transition_snapshot
+                )
                 self.github.set_pull_request_labels(state.number, expected_labels)
                 if self.pr_state() != expected_state:
                     raise UntrustedEvidenceError(
                         "pull request changed during the base-refresh label transition"
                     )
+                if self.current_default_branch_sha() != default_branch_sha:
+                    raise UntrustedEvidenceError(
+                        "default branch changed during the base-refresh label transition"
+                    )
+                self.revalidate_base_refresh_transition_snapshot(
+                    state, transition_snapshot
+                )
             self.started_base_label_transitions.add(digest)
         return True
 
@@ -1737,7 +1812,9 @@ class PhaseLoop:
         refresh_records: list[MarkerEvidence],
         default_branch_sha: str,
     ) -> bool:
-        self.require_unique_base_refresh_transition_identity(state, refresh_records)
+        transition_snapshot = self.require_unique_base_refresh_transition_identity(
+            state, refresh_records
+        )
         matches = [
             item
             for item in refresh_records
@@ -1778,7 +1855,28 @@ class PhaseLoop:
                 f"{state.phase} must pass again on the resulting SHA"
             )
             if not self.dry_run:
+                if self.pr_state() != state:
+                    raise UntrustedEvidenceError(
+                        "pull request changed before the exact-HEAD base refresh"
+                    )
+                if self.current_default_branch_sha() != default_branch_sha:
+                    raise UntrustedEvidenceError(
+                        "default branch changed before the exact-HEAD base refresh"
+                    )
+                self.revalidate_base_refresh_transition_snapshot(
+                    state, transition_snapshot
+                )
                 self.github.update_pull_request_branch(state.number, state.head_sha)
+                self.validate_post_base_refresh_pr_state(
+                    state, self.pr_state(), default_branch_sha
+                )
+                if self.current_default_branch_sha() != default_branch_sha:
+                    raise UntrustedEvidenceError(
+                        "default branch changed during the exact-HEAD base refresh"
+                    )
+                self.revalidate_base_refresh_transition_snapshot(
+                    state, transition_snapshot
+                )
             self.started_base_updates.add(digest)
         return True
 

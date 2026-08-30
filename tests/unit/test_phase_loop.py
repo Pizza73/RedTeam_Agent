@@ -742,6 +742,7 @@ class _BaseTransitionGitHub(_StatusGitHub):
         super().__init__(statuses)
         self.label_calls: list[tuple[int, frozenset[str]]] = []
         self.update_calls: list[tuple[int, str]] = []
+        self.ancestors: set[tuple[str, str]] = set()
 
     def set_pull_request_labels(
         self, number: int, labels: frozenset[str]
@@ -751,6 +752,9 @@ class _BaseTransitionGitHub(_StatusGitHub):
 
     def update_pull_request_branch(self, number: int, expected_head_sha: str) -> None:
         self.update_calls.append((number, expected_head_sha))
+
+    def is_ancestor(self, ancestor_sha: str, descendant_sha: str) -> bool:
+        return (ancestor_sha, descendant_sha) in self.ancestors
 
 
 def test_trusted_status_drives_exact_local_phase_label_rollback() -> None:
@@ -767,6 +771,14 @@ def test_trusted_status_drives_exact_local_phase_label_rollback() -> None:
     loop.pr_state = lambda: next(observed_states)  # type: ignore[method-assign]
     evidence = loop.trusted_base_refresh_statuses(
         source_state, [prior_phase_zero_pass()]
+    )
+    loop.current_default_branch_sha = (  # type: ignore[method-assign]
+        lambda: DEFAULT_BRANCH_SHA
+    )
+    loop.live_base_refresh_transition_snapshot = (  # type: ignore[method-assign]
+        lambda _state: loop.require_unique_base_refresh_transition_identity(
+            source_state, evidence
+        )
     )
 
     assert loop.perform_base_refresh_label_transition(
@@ -787,6 +799,16 @@ def test_rolled_back_phase_uses_pending_transition_without_another_rollback() ->
     loop.dry_run = False
     loop.log = lambda _message: None  # type: ignore[method-assign]
     evidence = loop.trusted_base_refresh_statuses(state, [prior_phase_zero_pass()])
+    observed_states = iter((state, state))
+    loop.pr_state = lambda: next(observed_states)  # type: ignore[method-assign]
+    loop.current_default_branch_sha = (  # type: ignore[method-assign]
+        lambda: DEFAULT_BRANCH_SHA
+    )
+    loop.live_base_refresh_transition_snapshot = (  # type: ignore[method-assign]
+        lambda _state: loop.require_unique_base_refresh_transition_identity(
+            state, evidence
+        )
+    )
 
     assert loop.perform_base_refresh_label_transition(
         state, evidence, DEFAULT_BRANCH_SHA
@@ -835,6 +857,183 @@ def test_conflicting_source_and_restart_transitions_fail_closed() -> None:
 
     assert github.label_calls == []
     assert github.update_calls == []
+
+
+@pytest.mark.parametrize("operation_name", ["label", "update"])
+@pytest.mark.parametrize("drift_stage", ["before", "after"])
+def test_base_refresh_status_race_fails_closed_around_local_side_effects(
+    operation_name: str, drift_stage: str
+) -> None:
+    state = phase_state(phase="phase-0b")
+    source_records = base_refresh_evidence_from_statuses(
+        [base_refresh_status()], head_sha=HEAD_SHA
+    )
+    restart_records = base_refresh_evidence_from_statuses(
+        [
+            base_refresh_status(
+                from_phase="phase-0c",
+                revalidate_phase="phase-0b",
+                target_url=PHASE_ONE_RECORD_URL,
+            )
+        ],
+        head_sha=HEAD_SHA,
+    )
+    initial_records = (
+        source_records if operation_name == "label" else restart_records
+    )
+    conflicting_records = source_records + restart_records
+    initial_snapshot = PhaseLoop.require_unique_base_refresh_transition_identity(
+        state, initial_records
+    )
+    snapshots = (
+        iter((conflicting_records,))
+        if drift_stage == "before"
+        else iter((initial_records, conflicting_records))
+    )
+    github = _BaseTransitionGitHub({})
+    loop = PhaseLoop.__new__(PhaseLoop)
+    loop.github = github  # type: ignore[assignment]
+    loop.started_base_label_transitions = set()
+    loop.started_base_updates = set()
+    loop.dispatched_base_refreshes = set()
+    loop.dry_run = False
+    loop.log = lambda _message: None  # type: ignore[method-assign]
+    expected_label_state = phase_state(phase="phase-0a")
+    states = (
+        iter((state,))
+        if drift_stage == "before"
+        else (
+            iter((state, expected_label_state))
+            if operation_name == "label"
+            else iter((state, state))
+        )
+    )
+    loop.pr_state = lambda: next(states)  # type: ignore[method-assign]
+    loop.current_default_branch_sha = (  # type: ignore[method-assign]
+        lambda: DEFAULT_BRANCH_SHA
+    )
+    loop.live_base_refresh_transition_snapshot = (  # type: ignore[method-assign]
+        lambda _state: loop.require_unique_base_refresh_transition_identity(
+            state, next(snapshots)
+        )
+    )
+    operation = (
+        loop.perform_base_refresh_label_transition
+        if operation_name == "label"
+        else loop.perform_pending_base_refresh
+    )
+
+    with pytest.raises(UntrustedEvidenceError, match="conflicting"):
+        operation(state, initial_records, DEFAULT_BRANCH_SHA)
+
+    expected_writes = 0 if drift_stage == "before" else 1
+    assert len(github.label_calls) == (
+        expected_writes if operation_name == "label" else 0
+    )
+    assert len(github.update_calls) == (
+        expected_writes if operation_name == "update" else 0
+    )
+    assert initial_snapshot
+
+
+def test_base_refresh_rejects_post_update_pr_state_drift() -> None:
+    state = phase_state(phase="phase-0b")
+    drifted_state = PullRequestState(
+        number=state.number,
+        head_sha=state.head_sha,
+        base_sha=state.base_sha,
+        base_ref=state.base_ref,
+        phase="phase-0a",
+        labels=frozenset({"ai-loop", "ai-needs-implementation", "phase-0a"}),
+        state=state.state,
+        head_repository=state.head_repository,
+    )
+    records = base_refresh_evidence_from_statuses(
+        [
+            base_refresh_status(
+                from_phase="phase-0c",
+                revalidate_phase="phase-0b",
+                target_url=PHASE_ONE_RECORD_URL,
+            )
+        ],
+        head_sha=HEAD_SHA,
+    )
+    snapshot = PhaseLoop.require_unique_base_refresh_transition_identity(
+        state, records
+    )
+    github = _BaseTransitionGitHub({})
+    loop = PhaseLoop.__new__(PhaseLoop)
+    loop.github = github  # type: ignore[assignment]
+    loop.started_base_updates = set()
+    loop.dispatched_base_refreshes = set()
+    loop.dry_run = False
+    loop.log = lambda _message: None  # type: ignore[method-assign]
+    observed_states = iter((state, drifted_state))
+    loop.pr_state = lambda: next(observed_states)  # type: ignore[method-assign]
+    loop.current_default_branch_sha = (  # type: ignore[method-assign]
+        lambda: DEFAULT_BRANCH_SHA
+    )
+    loop.live_base_refresh_transition_snapshot = (  # type: ignore[method-assign]
+        lambda _state: snapshot
+    )
+
+    with pytest.raises(UntrustedEvidenceError, match="metadata changed"):
+        loop.perform_pending_base_refresh(state, records, DEFAULT_BRANCH_SHA)
+
+    assert github.update_calls == [(3, HEAD_SHA)]
+    assert loop.started_base_updates == set()
+
+
+def test_base_refresh_accepts_exact_authorized_refreshed_ancestry() -> None:
+    state = phase_state(phase="phase-0b")
+    refreshed_state = PullRequestState(
+        number=state.number,
+        head_sha=REFRESHED_HEAD_SHA,
+        base_sha=DEFAULT_BRANCH_SHA,
+        base_ref=state.base_ref,
+        phase=state.phase,
+        labels=state.labels,
+        state=state.state,
+        head_repository=state.head_repository,
+    )
+    records = base_refresh_evidence_from_statuses(
+        [
+            base_refresh_status(
+                from_phase="phase-0c",
+                revalidate_phase="phase-0b",
+                target_url=PHASE_ONE_RECORD_URL,
+            )
+        ],
+        head_sha=HEAD_SHA,
+    )
+    snapshot = PhaseLoop.require_unique_base_refresh_transition_identity(
+        state, records
+    )
+    github = _BaseTransitionGitHub({})
+    github.ancestors = {
+        (HEAD_SHA, REFRESHED_HEAD_SHA),
+        (DEFAULT_BRANCH_SHA, REFRESHED_HEAD_SHA),
+    }
+    loop = PhaseLoop.__new__(PhaseLoop)
+    loop.github = github  # type: ignore[assignment]
+    loop.started_base_updates = set()
+    loop.dispatched_base_refreshes = set()
+    loop.dry_run = False
+    loop.log = lambda _message: None  # type: ignore[method-assign]
+    observed_states = iter((state, refreshed_state))
+    loop.pr_state = lambda: next(observed_states)  # type: ignore[method-assign]
+    loop.current_default_branch_sha = (  # type: ignore[method-assign]
+        lambda: DEFAULT_BRANCH_SHA
+    )
+    loop.live_base_refresh_transition_snapshot = (  # type: ignore[method-assign]
+        lambda _state: snapshot
+    )
+
+    assert loop.perform_pending_base_refresh(
+        state, records, DEFAULT_BRANCH_SHA
+    ) is True
+    assert github.update_calls == [(3, HEAD_SHA)]
+    assert len(loop.started_base_updates) == 1
 
 
 def test_local_phase_label_rollback_fails_closed_on_concurrent_pr_drift() -> None:
@@ -893,6 +1092,14 @@ def test_local_phase_label_rollback_fails_closed_on_post_write_pr_drift() -> Non
     loop.pr_state = lambda: next(observed_states)  # type: ignore[method-assign]
     evidence = loop.trusted_base_refresh_statuses(
         source_state, [prior_phase_zero_pass()]
+    )
+    loop.current_default_branch_sha = (  # type: ignore[method-assign]
+        lambda: DEFAULT_BRANCH_SHA
+    )
+    loop.live_base_refresh_transition_snapshot = (  # type: ignore[method-assign]
+        lambda _state: loop.require_unique_base_refresh_transition_identity(
+            source_state, evidence
+        )
     )
 
     with pytest.raises(UntrustedEvidenceError, match="changed during"):

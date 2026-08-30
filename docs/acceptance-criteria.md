@@ -38,6 +38,8 @@
   書込み、PR labelの完全置換はLocal Orchestratorが変更前後の全PR状態を再取得して実行する
 - 同じHEAD/Current Phaseにsource側とrollback済み側の複数Base-refresh遷移Identityが成立する
   場合は、label置換とbranch updateのどちらも行わずFail Closedにする
+- Local Orchestratorはlabel置換とbranch updateの直前・直後にCurrent PR、Default Branch、
+  trusted PASS/Status遷移Snapshotを再取得し、Driftまたは競合をFail Closedにする
 - Base refreshは`expected_head_sha`とCurrent default-branch SHAへ固定し、Final merge APIを
   呼ばない
 - Final mergeはLocal Orchestratorだけが実行し、`phase-5`、`ai-project-complete`、
