@@ -45,8 +45,8 @@ generated current-HEAD Phase 0B request do.
   SHA; shortened display IDs are corroborating evidence only.
 - Repository control mode: the current private-repository plan does not expose branch protection
   or rulesets. Direct/force pushes remain prohibited. Final merge is performed only by the local
-  orchestrator after its exact-SHA Phase 0A–5 evidence-chain gate; Codex and GitHub Actions retain
-  no final-merge path.
+  orchestrator after its exact-SHA Phase 0A–5 evidence-chain gate and an atomic exact-PR/HEAD Git
+  ref claim; Codex and GitHub Actions retain no final-merge path.
 
 ## Next allowed action
 

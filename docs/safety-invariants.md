@@ -63,6 +63,8 @@
 - Phase 4/5の外部選択はHuman Gateを通す。
 - 最終mergeは、承認済みDefault Branch上のLocal OrchestratorだけがPhase 0A～5の
   SHA-bound PASS Chain、Current-HEAD CI/Status、Stop Label不在、Current Default Branch
-  ancestryを再検証し、Expected HEAD SHA固定で1回だけ実行する。Dispatch前に永続Attempt
-  Recordを保存し、同じPR/HEADのRecordは明示的Reconciliationまで再送を禁止する。
-  Codex、GitHub Actions、Governance PR、Fork PRはこの経路を使用できない。
+  ancestryを再検証し、Expected HEAD SHA固定で1回だけ実行する。Dispatch前に同じPR/HEAD
+  固定のRepository Git ref claimを原子的に取得し、ClaimへBindingした永続Attempt Recordを
+  保存する。Claim/Recordの既存・作成結果不明は明示的Reconciliationまで再送を禁止し、通常
+  実行ではClaimを削除しない。Codex、GitHub Actions、Governance PR、Fork PRはこの経路を
+  使用できない。

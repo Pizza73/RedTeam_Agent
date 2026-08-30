@@ -86,6 +86,7 @@ FINAL_MERGE_ATTEMPT_KEYS = frozenset(
         "phase_gate_reference",
         "policy_digest",
         "attempted_by",
+        "claim_reference",
     }
 )
 
@@ -449,6 +450,7 @@ def final_merge_attempt_payload(
     phase_gate_reference: str,
     policy_digest: str,
     attempted_by: str,
+    claim_reference: str,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "schema_version": "1.0",
@@ -459,6 +461,7 @@ def final_merge_attempt_payload(
         "phase_gate_reference": phase_gate_reference,
         "policy_digest": policy_digest,
         "attempted_by": attempted_by,
+        "claim_reference": claim_reference,
     }
     validate_final_merge_attempt_payload(payload)
     return payload
@@ -488,6 +491,17 @@ def validate_final_merge_attempt_payload(payload: dict[str, Any]) -> None:
     attempted_by = payload.get("attempted_by")
     if not isinstance(attempted_by, str) or not attempted_by:
         raise UntrustedEvidenceError("final-merge attempt has an invalid actor")
+    claim_reference = payload.get("claim_reference")
+    expected_claim_reference = (
+        f"refs/redteam-final-merge-attempts/pr-{number}-{payload.get('head_sha')}"
+    )
+    if (
+        not isinstance(claim_reference, str)
+        or claim_reference != expected_claim_reference
+    ):
+        raise UntrustedEvidenceError(
+            "final-merge attempt claim is not bound to its exact PR and HEAD"
+        )
 
 
 def trusted_final_merge_attempts(
@@ -1128,6 +1142,54 @@ class GitHubClient:
                 "GitHub did not confirm the exact-SHA automatic final merge"
             )
         return merge_sha
+
+    def claim_final_merge_attempt(
+        self,
+        number: int,
+        expected_head_sha: str,
+        *,
+        claim_ref_prefix: str,
+    ) -> str:
+        if (
+            number < 1
+            or not SHA_PATTERN.fullmatch(expected_head_sha)
+            or claim_ref_prefix != "refs/redteam-final-merge-attempts"
+        ):
+            raise UntrustedEvidenceError(
+                "final-merge claim requires a PR, exact HEAD SHA, and trusted ref prefix"
+            )
+        claim_reference = f"{claim_ref_prefix}/pr-{number}-{expected_head_sha}"
+        try:
+            raw = self.command.run(
+                [
+                    "api",
+                    "--method",
+                    "POST",
+                    f"repos/{self.repository}/git/refs",
+                    "--raw-field",
+                    f"ref={claim_reference}",
+                    "--raw-field",
+                    f"sha={expected_head_sha}",
+                ]
+            )
+        except PrerequisiteError as error:
+            raise FinalMergeReconciliationRequiredError(
+                "the atomic final-merge claim already exists or its creation outcome is "
+                "unknown; reconcile the live GitHub ref and PR state"
+            ) from error
+        value = strict_json_loads(raw)
+        target = value.get("object") if isinstance(value, dict) else None
+        if (
+            not isinstance(value, dict)
+            or value.get("ref") != claim_reference
+            or not isinstance(target, dict)
+            or target.get("type") != "commit"
+            or target.get("sha") != expected_head_sha
+        ):
+            raise FinalMergeReconciliationRequiredError(
+                "GitHub did not confirm ownership of the atomic final-merge claim"
+            )
+        return claim_reference
 
     def post_comment(self, number: int, body: str) -> dict[str, Any]:
         raw = self.command.run(
@@ -1843,6 +1905,11 @@ class PhaseLoop:
             raise FinalMergeReconciliationRequiredError(
                 "a concurrent durable final-merge attempt exists for this exact PR HEAD"
             )
+        claim_reference = self.github.claim_final_merge_attempt(
+            state.number,
+            state.head_sha,
+            claim_ref_prefix=str(policy["claim_ref_prefix"]),
+        )
         policy_digest = canonical_digest(policy)
         attempt_payload = final_merge_attempt_payload(
             pull_request_number=state.number,
@@ -1851,6 +1918,7 @@ class PhaseLoop:
             phase_gate_reference=final_record.url,
             policy_digest=policy_digest,
             attempted_by=self.actor_login,
+            claim_reference=claim_reference,
         )
         attempt_marker = (
             "<!-- redteam-final-merge-attempt\n"

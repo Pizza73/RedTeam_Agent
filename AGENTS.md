@@ -111,9 +111,10 @@ The final implementation report must include:
 - External side-effect dispatch is absent in Phase 0A and uses no automatic retry in later phases.
 - Final PR merge is unavailable to Codex and GitHub Actions. Only the trusted local orchestrator may
   issue one exact-HEAD merge after every configured Phase and final check passes; an uncertain merge
-  result is not automatically retried. The orchestrator must persist an exact PR/HEAD attempt
-  record before dispatch, and a recorded attempt requires explicit outcome reconciliation before
-  any later dispatch.
+  result is not automatically retried. Before dispatch, the orchestrator must atomically acquire a
+  repository Git ref claim for the exact PR/HEAD and persist an attempt record bound to that claim.
+  An existing or uncertain claim/record requires explicit outcome reconciliation before any later
+  dispatch; normal execution never deletes the claim.
 
 ## Code Review Rules
 

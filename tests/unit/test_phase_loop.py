@@ -27,6 +27,7 @@ from automation.run_phase_loop import (
     select_finding_key,
     strict_json_loads,
     validate_base_refresh,
+    validate_final_merge_attempt_payload,
     validate_final_merge_phase_chain,
     validate_final_phase_status,
     validate_implementation_request,
@@ -1018,6 +1019,11 @@ class _MergeCommand:
         return self.response
 
 
+class _ClaimFailureCommand:
+    def run(self, arguments: list[str]) -> str:
+        raise PrerequisiteError("GitHub rejected or did not confirm the atomic ref creation")
+
+
 def test_github_final_merge_uses_one_exact_head_request() -> None:
     client = GitHubClient.__new__(GitHubClient)
     client.repository = "example/repo"
@@ -1052,6 +1058,69 @@ def test_github_final_merge_does_not_accept_an_uncertain_result() -> None:
         client.merge_pull_request(3, "8" * 40, merge_method="merge")
 
 
+def test_github_final_merge_claim_is_an_atomic_exact_head_ref_creation() -> None:
+    client = GitHubClient.__new__(GitHubClient)
+    client.repository = "example/repo"
+    claim_reference = f"refs/redteam-final-merge-attempts/pr-3-{'8' * 40}"
+    command = _MergeCommand(
+        json.dumps(
+            {
+                "ref": claim_reference,
+                "object": {"type": "commit", "sha": "8" * 40},
+            }
+        )
+    )
+    client.command = command  # type: ignore[assignment]
+
+    result = client.claim_final_merge_attempt(
+        3,
+        "8" * 40,
+        claim_ref_prefix="refs/redteam-final-merge-attempts",
+    )
+
+    assert result == claim_reference
+    assert command.arguments == [
+        "api",
+        "--method",
+        "POST",
+        "repos/example/repo/git/refs",
+        "--raw-field",
+        f"ref={claim_reference}",
+        "--raw-field",
+        f"sha={'8' * 40}",
+    ]
+
+
+def test_github_final_merge_claim_failure_requires_reconciliation() -> None:
+    client = GitHubClient.__new__(GitHubClient)
+    client.repository = "example/repo"
+    client.command = _ClaimFailureCommand()  # type: ignore[assignment]
+
+    with pytest.raises(FinalMergeReconciliationRequiredError, match="reconcile"):
+        client.claim_final_merge_attempt(
+            3,
+            "8" * 40,
+            claim_ref_prefix="refs/redteam-final-merge-attempts",
+        )
+
+
+def test_final_merge_attempt_rejects_claim_for_a_different_pr_head() -> None:
+    with pytest.raises(UntrustedEvidenceError, match="exact PR and HEAD"):
+        validate_final_merge_attempt_payload(
+            {
+                "schema_version": "1.0",
+                "action": "ATTEMPT_FINAL_MERGE",
+                "pull_request_number": 3,
+                "head_sha": "8" * 40,
+                "default_branch_sha": DEFAULT_BRANCH_SHA,
+                "phase_gate_reference": PHASE_RECORD_URL,
+                "policy_digest": "a" * 64,
+                "attempted_by": ACTOR_LOGIN,
+                "claim_reference": f"refs/redteam-final-merge-attempts/pr-30-{'8' * 40}",
+            }
+        )
+
+
 class _FinalMergeGitHub:
     repository = "example/repo"
 
@@ -1067,6 +1136,8 @@ class _FinalMergeGitHub:
         self.merge_is_confirmed = merge_is_confirmed
         self.merge_calls: list[tuple[int, str, str]] = []
         self.issue_comments: list[dict[str, object]] = []
+        self.claims: set[str] = set()
+        self.hide_comments = False
 
     def commit_statuses(self, sha: str) -> list[dict[str, object]]:
         assert sha == "8" * 40
@@ -1086,6 +1157,8 @@ class _FinalMergeGitHub:
 
     def comments(self, number: int) -> list[dict[str, object]]:
         assert number == 3
+        if self.hide_comments:
+            return []
         return self.issue_comments
 
     def post_comment(self, number: int, body: str) -> dict[str, object]:
@@ -1097,6 +1170,21 @@ class _FinalMergeGitHub:
         }
         self.issue_comments.append(comment)
         return comment
+
+    def claim_final_merge_attempt(
+        self,
+        number: int,
+        expected_head_sha: str,
+        *,
+        claim_ref_prefix: str,
+    ) -> str:
+        claim_reference = f"{claim_ref_prefix}/pr-{number}-{expected_head_sha}"
+        if claim_reference in self.claims:
+            raise FinalMergeReconciliationRequiredError(
+                "atomic final-merge claim already exists; reconcile"
+            )
+        self.claims.add(claim_reference)
+        return claim_reference
 
     def merge_pull_request(
         self, number: int, expected_head_sha: str, *, merge_method: str
@@ -1130,6 +1218,7 @@ def configured_final_merge_loop(
     loop.final_merge_policy = {
         "enabled": True,
         "merge_method": "merge",
+        "claim_ref_prefix": "refs/redteam-final-merge-attempts",
         "required_phase": "phase-5",
         "required_labels": ["ai-loop", "ai-project-complete", "ai-review-passed", "phase-5"],
         "forbidden_labels": [
@@ -1165,6 +1254,7 @@ def test_automatic_final_merge_revalidates_and_merges_exact_head_once() -> None:
     assert github.merge_calls == [(3, "8" * 40, "merge")]
     assert len(github.issue_comments) == 1
     assert "redteam-final-merge-attempt" in str(github.issue_comments[0]["body"])
+    assert len(github.claims) == 1
 
 
 def test_automatic_final_merge_rejects_stop_label_without_calling_merge() -> None:
@@ -1225,6 +1315,26 @@ def test_uncertain_final_merge_attempt_is_durable_and_never_retried() -> None:
 
     assert github.merge_calls == [(3, "8" * 40, "merge")]
 
+
+def test_concurrent_final_merge_runners_share_one_atomic_claim() -> None:
+    records = chained_phase_passes()
+    state = final_merge_state()
+    github = _FinalMergeGitHub(records[-1])
+    # Both runners observed the same empty comment snapshot before either persisted
+    # its audit comment; only the Git ref claim can serialize this interleaving.
+    github.hide_comments = True
+    first_loop = configured_final_merge_loop(state, github)
+    second_loop = configured_final_merge_loop(state, github)
+
+    assert first_loop.automatic_final_merge(state, [], records, DEFAULT_BRANCH_SHA) == (
+        f"PROJECT_MERGED:{'9' * 40}"
+    )
+    with pytest.raises(FinalMergeReconciliationRequiredError, match="reconcile"):
+        second_loop.automatic_final_merge(state, [], records, DEFAULT_BRANCH_SHA)
+
+    assert len(github.claims) == 1
+    assert len(github.issue_comments) == 1
+    assert github.merge_calls == [(3, "8" * 40, "merge")]
 
 class _ComparisonGitHub:
     is_ancestor = GitHubClient.is_ancestor

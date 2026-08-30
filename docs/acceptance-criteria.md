@@ -41,9 +41,12 @@
   Current default-branch ancestryを再検証する
 - Final merge APIへCurrent 40桁HEAD SHAを渡し、不一致、競合、不確実なResponseをFail
   Closedにして自動Retryしない
-- Final merge dispatch前に同じPR/HEADの既存Attempt Recordがないことを再確認し、PR、HEAD、
-  Default Branch、Phase 5 Gate、Policy Digest、Actor固定のAttempt Recordを永続化する
-- Attempt Recordが存在するPR/HEADは、Live GitHub Outcomeを明示的にReconcileするまで再送しない
+- Final merge dispatch前に同じPR/HEADの既存Attempt Recordがないことを再確認し、Repository
+  Git ref claimを原子的に作成して1プロセスだけが所有する
+- Claim取得後、PR、HEAD、Default Branch、Phase 5 Gate、Policy Digest、Actor、Claim Ref固定の
+  Attempt Recordを永続化してからmerge APIを呼ぶ
+- Claim/Attempt Recordが存在する、またはClaim作成結果が不明なPR/HEADは、Live GitHub Outcomeを
+  明示的にReconcileするまで再送せず、通常実行でClaimを削除しない
 - Governance PR、Fork PR、停止Label付きPR、`ai-loop`以外を自動mergeしない
 
 ## Phase 0A: Core Models / Authorization Kernel

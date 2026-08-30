@@ -6,6 +6,7 @@
     "schema_version": {"const": "1.0"},
     "enabled": {"type": "boolean"},
     "merge_method": {"const": "merge"},
+    "claim_ref_prefix": {"const": "refs/redteam-final-merge-attempts"},
     "required_phase": {"const": "phase-5"},
     "required_labels": {
       "const": ["ai-loop", "ai-project-complete", "ai-review-passed", "phase-5"]
@@ -32,6 +33,7 @@
     "schema_version",
     "enabled",
     "merge_method",
+    "claim_ref_prefix",
     "required_phase",
     "required_labels",
     "forbidden_labels",

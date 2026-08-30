@@ -101,11 +101,15 @@ The long-lived implementation PR is merged differently. `automation/final-merge-
 enables only the local orchestrator, Phase 5, `ai-loop` plus completion/PASS labels, absence of all
 stop labels, one exact `base_sha`-linked PASS per Phase, the latest trusted Phase status, all four
 current-head Check Runs, and current `main` ancestry. The orchestrator re-reads live state and calls
-GitHub only after persisting a `redteam-final-merge-attempt` PR marker bound to PR, full HEAD,
-current `main`, Phase 5 gate, policy digest and actor. It then calls the merge endpoint with
+GitHub only after atomically creating
+`refs/redteam-final-merge-attempts/pr-<PR>-<FULL_HEAD>`, and then persisting a
+`redteam-final-merge-attempt` PR marker bound to PR, full HEAD, current `main`, Phase 5 gate, policy
+digest, actor and claim ref. It then calls the merge endpoint with
 `sha=<current-40-character-head>` and `merge_method=merge`. A 409, conflict, drift, malformed
-response or unknown outcome stops without an automatic retry. The same PR/HEAD marker blocks every
-normal restart until explicit reconciliation. Fork and governance PRs cannot satisfy this policy.
+response or unknown claim/merge outcome stops without an automatic retry. GitHub ref creation is
+the atomic winner selection: only one overlapping runner can own it. The same PR/HEAD claim or
+marker blocks every normal restart until explicit reconciliation; the runner never deletes the
+claim. Fork and governance PRs cannot satisfy this policy.
 
 If GitHub branch protection or rulesets later become available, configure the pull-request,
 CODEOWNERS, stale-review, conversation-resolution, force-push/deletion, and five exact status-check
@@ -210,8 +214,10 @@ machine-readable phase record.
   A changed HEAD causes the request to fail closed; restart from current clean `main` and inspect
   the PR evidence rather than forcing an update.
 - Automatic final merge blocked: inspect the Phase 0A→5 PASS chain, latest
-  `redteam/phase-review`, four Check Runs, stop labels and current `main` ancestry. Do not retry an
-  uncertain merge response until the PR's live merged/open state has been reconciled.
+  `redteam/phase-review`, four Check Runs, stop labels, current `main` ancestry, the exact-HEAD
+  attempt comment and `refs/redteam-final-merge-attempts/pr-<PR>-<HEAD>`. Do not retry an uncertain
+  claim or merge response, and do not delete the claim, until the PR's live merged/open state and
+  claim ownership have been explicitly reconciled.
 
 ## CI/CD boundary
 

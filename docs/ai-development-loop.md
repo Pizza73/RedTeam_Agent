@@ -33,8 +33,9 @@ review and UI-merge checklist. The long-lived `ai-loop` implementation PR has on
 the local orchestrator may call GitHub's merge endpoint only after `ai-project-complete`, while the
 PR remains at Phase 5, and after revalidating the complete exact-SHA Phase chain, five current-head
 checks/statuses, stop-label absence and current `main` ancestry. The request includes the current
-40-character PR head SHA and is not retried after an uncertain result. Direct and force pushes to
-`main` remain prohibited.
+40-character PR head SHA. Before that request, it atomically creates one repository Git ref claim
+for the exact PR/HEAD and persists a claim-bound audit comment. Existing or uncertain claims are
+not retried. Direct and force pushes to `main` remain prohibited.
 
 This manual control has a greater account-compromise and operator-error risk than server-enforced
 protection. When the repository plan supports protection, the same requirements must be configured
@@ -47,7 +48,7 @@ provider-specific Human Gates and CI never connects to a real C2, MCP server or 
 
 | Component | Responsibility | Write access |
 |---|---|---|
-| Local phase orchestrator | Request implementation/review, record validated evidence, and perform the gated final `ai-loop` merge | PR comments, approved workflow dispatch, one exact-SHA final merge |
+| Local phase orchestrator | Request implementation/review, record validated evidence, and perform the gated final `ai-loop` merge | PR comments, approved workflow dispatch, one atomic claim ref and one exact-SHA final merge |
 | Codex Cloud | Current-phase implementation/fix requested through GitHub | PR branch only |
 | Codex GitHub Review or ChatGPT | Fresh-context semantic/security review | PR review/comment only |
 | CI | Tests, lint, type check, coverage and protected-path enforcement | Check results and ready comment |
@@ -186,7 +187,10 @@ base-refresh workflow never calls the final merge endpoint; only the local compl
 the Phase 0A→5 PASS chain backward from the current Phase 5 HEAD, verifies the latest workflow
 status and checks, confirms current `main` is already in the PR ancestry, re-reads the live PR, and
 then makes one merge request bound to that exact HEAD. Missing, duplicate, stale, failed or
-ambiguous evidence stops the process. Before dispatch it writes a durable PR comment binding the
-attempt to PR, HEAD, current `main`, Phase 5 gate, policy digest and actor. Any recorded attempt on
-that exact PR/HEAD requires explicit live-outcome reconciliation and cannot be retried by a normal
-restart. Completion never deploys or authorizes a real target.
+ambiguous evidence stops the process. Before dispatch it atomically creates
+`refs/redteam-final-merge-attempts/pr-<PR>-<HEAD>`, then writes a durable PR comment binding the
+attempt to PR, HEAD, current `main`, Phase 5 gate, policy digest, actor and claim ref. Only the
+process that successfully created the ref may dispatch. Any existing/uncertain claim or recorded
+attempt requires explicit live-outcome reconciliation and cannot be retried by a normal restart.
+The runner never automatically deletes a claim. Completion never deploys or authorizes a real
+target.

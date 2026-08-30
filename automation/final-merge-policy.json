@@ -2,6 +2,7 @@
   "schema_version": "1.0",
   "enabled": true,
   "merge_method": "merge",
+  "claim_ref_prefix": "refs/redteam-final-merge-attempts",
   "required_phase": "phase-5",
   "required_labels": [
     "ai-loop",
