@@ -29,6 +29,13 @@ class FinalizationCoordinator:
     def request_finalizing(self, mission_id: str, *, now: datetime) -> None:
         self.missions.finalize(mission_id, now=now)
 
+    def pause_for_result_ingestion_failure(
+        self, mission_id: str, *, now: datetime
+    ) -> Mission:
+        """Route ingestion-failure lifecycle changes through the Mission Manager."""
+
+        return self.missions.pause_for_result_ingestion_failure(mission_id, now=now)
+
     def unresolved_execution_ids(self, mission_id: str) -> tuple[str, ...]:
         return tuple(
             record.execution_id for record in self.executions.list_unresolved(mission_id)

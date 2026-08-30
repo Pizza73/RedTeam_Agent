@@ -12,6 +12,7 @@ from redteam_agent.errors import (
     ExecutionAuthorizationError,
     ExternalDispatchOutcomeUnknownError,
     MissionStateVersionConflictError,
+    ResultIngestionError,
     ResultIngestionLeaseError,
     TrustedDependencyUnavailableError,
 )
@@ -40,6 +41,7 @@ from redteam_agent.seeds import FIXED_TIME
 from tests.phase0b_helpers import (
     build_execution_harness,
     executor_with_adapter,
+    prepare_additional_execution,
     prepare_execution,
 )
 
@@ -391,6 +393,104 @@ def test_result_repository_rejects_result_before_secure_ingestion_starts() -> No
     )
     with pytest.raises(DigestIntegrityError):
         harness.results.add(forged)
+
+
+def test_ingestion_failure_pauses_mission_and_blocks_later_dispatch() -> None:
+    harness = build_execution_harness()
+    prepared = prepare_execution(harness)
+    later = prepare_additional_execution(harness)
+    running = asyncio.run(
+        harness.executor.dispatch(
+            prepared.execution_id,
+            now=FIXED_TIME + timedelta(minutes=3),
+        )
+    )
+    ingester = MockSecureResultIngester(
+        summary=SecureIngestionSummary(secure_ingestion_id="secure-failure"),
+        fail=True,
+    )
+    with pytest.raises(ResultIngestionError):
+        asyncio.run(
+            harness.executor.ingest_result(
+                running.execution_id,
+                ingester=ingester,
+                now=FIXED_TIME + timedelta(minutes=4),
+            )
+        )
+
+    mission = harness.finalization.missions.current(running.mission_id)
+    assert mission.state == "PAUSED"
+    blocked = asyncio.run(
+        harness.executor.dispatch(
+            later.execution_id,
+            now=FIXED_TIME + timedelta(minutes=5),
+        )
+    )
+    assert blocked.provider_execution_state == "BLOCKED"
+    assert blocked.pre_dispatch_block_reason == "AUTHORIZATION_EPOCH_MISMATCH"
+    assert harness.adapter.submit_calls == 1
+
+
+def test_existing_result_converges_split_ingestion_success_commit() -> None:
+    harness = build_execution_harness()
+    prepared = prepare_execution(harness)
+    running = asyncio.run(
+        harness.executor.dispatch(
+            prepared.execution_id,
+            now=FIXED_TIME + timedelta(minutes=3),
+        )
+    )
+    metadata = asyncio.run(
+        harness.executor.collect_result(
+            running.execution_id,
+            now=FIXED_TIME + timedelta(minutes=4),
+        )
+    )
+    ingestion = harness.ingestions.get_by_execution(running.execution_id)
+    record = harness.executions.get(running.execution_id)
+    assert ingestion is not None and record is not None
+    active = harness.ingestions.transition(
+        ingestion.ingestion_id,
+        expected_state_version=ingestion.state_version,
+        status="INGESTING",
+        lease_id="lease-before-split-commit-crash",
+        lease_expires_at=FIXED_TIME + timedelta(minutes=6),
+        now=FIXED_TIME + timedelta(minutes=5),
+    )
+    processing = harness.executions.transition_ingestion(
+        record.execution_id,
+        expected_state_version=record.state_version,
+        new_state="INGESTING",
+        now=FIXED_TIME + timedelta(minutes=5),
+    )
+    summary = SecureIngestionSummary(secure_ingestion_id="secure-split-commit")
+    expected = harness.executor._normalize_result(processing, metadata, summary)
+    harness.results.add(expected)
+    harness.ingestions.transition(
+        active.ingestion_id,
+        expected_state_version=active.state_version,
+        status="SUCCEEDED",
+        now=FIXED_TIME + timedelta(minutes=5, seconds=1),
+    )
+    split = harness.executions.get(running.execution_id)
+    assert split is not None and split.result_ingestion_state == "INGESTING"
+
+    unused_ingester = MockSecureResultIngester(summary=summary)
+    recovered = asyncio.run(
+        harness.executor.resume_result_ingestion(
+            running.execution_id,
+            ingester=unused_ingester,
+            now=FIXED_TIME + timedelta(minutes=6),
+        )
+    )
+    final_ingestion = harness.ingestions.get_by_execution(running.execution_id)
+    final_execution = harness.executions.get(running.execution_id)
+    assert recovered == expected
+    assert final_ingestion is not None and final_ingestion.status == "SUCCEEDED"
+    assert final_execution is not None
+    assert final_execution.result_ingestion_state == "SUCCEEDED"
+    assert unused_ingester.calls == 0
+    assert harness.adapter.submit_calls == 1
 
 
 def test_expired_ingestion_lease_is_taken_over_without_action_resubmit() -> None:

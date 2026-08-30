@@ -10,7 +10,7 @@
 
 ## Resulting working-tree diff
 
-The implementation changes 6 tracked files and adds 12 source/test files plus this report.
+The implementation changes 7 tracked files and adds 12 source/test files plus this report.
 No protected governance file listed in `AGENTS.md` was modified. In particular,
 `SystemDesign.md`, `.github/**`, `automation/**`, requirements, acceptance criteria,
 safety invariants, threat model, and phase prompts are unchanged.
@@ -19,6 +19,7 @@ Modified files:
 
 - `src/redteam_agent/errors.py`
 - `src/redteam_agent/executor/__init__.py`
+- `src/redteam_agent/mission/manager.py`
 - `src/redteam_agent/models/__init__.py`
 - `src/redteam_agent/repositories/__init__.py`
 - `src/redteam_agent/storage/migrations.py`
@@ -96,6 +97,23 @@ The correction also removed caller-supplied `AdapterRawResult` from the ingestio
 re-collects metadata through the trusted registered adapter and the committed quarantine sink,
 without submitting the external action again.
 
+## Second independent review correction cycle
+
+The independent review for correction SHA
+`3ec3cbb8007b3d04e9d1a1130163693c1ea4d0cc` returned two P1 findings. Both were addressed within
+Phase 0B:
+
+- [`discussion_r3890552732`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3890552732):
+  a secure-ingestion failure now routes immediately through a dedicated Mission Manager safety
+  transition to `PAUSED` before recording the ingestion/execution failure. The pause invalidates the
+  authorization epoch, so a separately authorized later action is blocked before adapter submit.
+  Repeated ingestion recovery failures keep an already-PAUSED Mission paused.
+- [`discussion_r3890552734`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3890552734):
+  an existing normalized result now converges both ingestion records across the legal
+  `INGESTING`/`SUCCEEDED` crash states. A restart after the ingestion record commits `SUCCEEDED` but
+  before the Execution record does so advances the latter without calling the ingester or
+  resubmitting the external action. Inconsistent existing-result states fail closed.
+
 ## Regression tests added
 
 The Phase 0B test set covers positive, negative, and failure paths, including:
@@ -115,10 +133,13 @@ The Phase 0B test set covers positive, negative, and failure paths, including:
 - recomputed self-digest with a reduced parent authorization binding being rejected;
 - normalized result persistence before secure ingestion being rejected;
 - revision-specific run/thread identities and checkpoint mismatch rejection;
-- FINALIZING entry and direct-completion rejection.
+- FINALIZING entry and direct-completion rejection;
 - caller adapter replacement rejection and missing live-probe/finalization dependency rejection;
 - cancellation crash recovery, provider task-ID replacement rejection, and expired-ingestion-lease
-  takeover without action resubmit.
+  takeover without action resubmit;
+- secure-ingestion failure pausing the Mission and blocking a separately authorized later dispatch;
+  and
+- split ingestion-success commit recovery without an ingester call or external action resubmit.
 
 No test was skipped, weakened, deleted, or marked as an expected failure.
 
@@ -138,8 +159,8 @@ ruff: All checks passed
 mypy: Success: no issues found in 69 source files
 unit: 172 passed
 integration: 7 passed
-security: 130 passed
-full/coverage run: 309 passed
+security: 132 passed
+full/coverage run: 311 passed
 skipped=0, errors=0, failures=0
 coverage: 82% total (branch coverage enabled)
 pip check: No broken requirements found
@@ -154,7 +175,7 @@ Additional focused command executed during development:
   tests/security/test_phase0b_execution_safety.py --strict-markers
 ```
 
-Focused result: `28 passed`.
+Focused result: `30 passed`.
 
 ## Remaining findings and constraints
 

@@ -504,20 +504,26 @@ class Executor:
             raise ExecutionStateTransitionError("result ingestion does not exist")
         existing = self.results.get_by_execution(execution_id)
         if existing is not None:
+            if ingestion.status not in {"INGESTING", "SUCCEEDED"} or (
+                record.result_ingestion_state not in {"INGESTING", "SUCCEEDED"}
+            ):
+                raise ExecutionStateTransitionError(
+                    "existing result has inconsistent ingestion state"
+                )
             if ingestion.status == "INGESTING":
-                self.ingestions.transition(
+                ingestion = self.ingestions.transition(
                     ingestion.ingestion_id,
                     expected_state_version=ingestion.state_version,
                     status="SUCCEEDED",
                     now=now,
                 )
-                if record.result_ingestion_state == "INGESTING":
-                    self.executions.transition_ingestion(
-                        record.execution_id,
-                        expected_state_version=record.state_version,
-                        new_state="SUCCEEDED",
-                        now=now,
-                    )
+            if record.result_ingestion_state == "INGESTING":
+                self.executions.transition_ingestion(
+                    record.execution_id,
+                    expected_state_version=record.state_version,
+                    new_state="SUCCEEDED",
+                    now=now,
+                )
             return existing
         if ingestion.status not in {"PENDING", "FAILED", "INGESTING"}:
             raise ExecutionStateTransitionError("result ingestion is not resumable")
@@ -565,6 +571,9 @@ class Executor:
         try:
             summary = await ingester.ingest(adapter_result.receipt)
         except ResultIngestionError:
+            self.finalization_requester.pause_for_result_ingestion_failure(
+                record.mission_id, now=now
+            )
             self.ingestions.transition(
                 active.ingestion_id,
                 expected_state_version=active.state_version,

@@ -106,6 +106,20 @@ class MissionManager:
     def pause(self, mission_id: str, *, now: datetime) -> Mission:
         return self._lifecycle_transition(mission_id, "RUNNING", "PAUSED", now)
 
+    def pause_for_result_ingestion_failure(
+        self, mission_id: str, *, now: datetime
+    ) -> Mission:
+        """Fail closed after secure ingestion fails, including repeated recovery attempts."""
+
+        mission = self.current(mission_id)
+        if mission.state == "PAUSED":
+            return mission
+        if mission.state != "RUNNING":
+            raise MissionLifecycleAuthorizationError(
+                "result-ingestion failure can pause only a RUNNING mission"
+            )
+        return self.pause(mission_id, now=now)
+
     def resume(self, mission_id: str, *, now: datetime) -> Mission:
         mission = self.current(mission_id)
         if mission.state != "PAUSED":

@@ -192,6 +192,7 @@ def test_failed_ingestion_resumes_without_external_action_resubmit() -> None:
     assert failed.provider_execution_state == "SUCCEEDED"
     assert failed.result_ingestion_state == "FAILED"
     assert harness.results.get_by_execution(running.execution_id) is None
+    assert harness.finalization.missions.current(running.mission_id).state == "PAUSED"
 
     result = asyncio.run(
         harness.executor.resume_result_ingestion(
