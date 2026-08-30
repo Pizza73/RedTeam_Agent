@@ -39,6 +39,14 @@ REQUIRED_CHECKS = frozenset({"tests (3.12)", "tests (3.14)", "quality", "governa
 REQUIRED_CHECK_ORDER = ("tests (3.12)", "tests (3.14)", "quality", "governance-integrity")
 TRUSTED_WORKFLOW_LOGIN = "github-actions[bot]"
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
+BASE_REFRESH_STATUS_PREFIX = "redteam/base-refresh/"
+BASE_REFRESH_STATUS_DESCRIPTION = "trusted exact-SHA base refresh authorization"
+BASE_REFRESH_STATUS_PATTERN = re.compile(
+    r"^redteam/base-refresh/"
+    r"(phase-(?:0a|0b|0c|[1-5]))/"
+    r"(phase-(?:0a|0b|0c|[1-5]))/"
+    r"([0-9a-f]{40})$"
+)
 FINDING_KEY_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9._-]{0,63}$")
 TOKEN_PATTERN = re.compile(r"(?:github_pat_|gh[opsu]_|sk-)[A-Za-z0-9_-]+")
 CODEX_NO_FINDINGS_PREFIX = "Codex Review: Didn't find any major issues."
@@ -234,25 +242,25 @@ def validate_base_refresh_payload(payload: dict[str, Any]) -> None:
         "prior_pass_reference",
     }
     if set(payload) != expected_keys:
-        raise UntrustedEvidenceError("base-refresh marker has missing or unknown fields")
+        raise UntrustedEvidenceError("base-refresh evidence has missing or unknown fields")
     if payload.get("schema_version") != "1.0" or payload.get("action") != "REFRESH_BASE":
-        raise UntrustedEvidenceError("base-refresh marker has an invalid version or action")
+        raise UntrustedEvidenceError("base-refresh evidence has an invalid version or action")
     revalidate_phase = payload.get("revalidate_phase")
     if not isinstance(revalidate_phase, str) or revalidate_phase not in PHASES:
-        raise UntrustedEvidenceError("base-refresh marker has an invalid revalidation phase")
+        raise UntrustedEvidenceError("base-refresh evidence has an invalid revalidation phase")
     from_phase = payload.get("from_phase")
     if not isinstance(from_phase, str) or from_phase not in PHASES:
-        raise UntrustedEvidenceError("base-refresh marker has an invalid source phase")
+        raise UntrustedEvidenceError("base-refresh evidence has an invalid source phase")
     source_index = PHASES.index(from_phase)
     if source_index == 0 or PHASES[source_index - 1] != revalidate_phase:
-        raise UntrustedEvidenceError("base-refresh marker does not roll back exactly one phase")
+        raise UntrustedEvidenceError("base-refresh evidence does not roll back exactly one phase")
     if not SHA_PATTERN.fullmatch(str(payload.get("head_sha", ""))):
-        raise UntrustedEvidenceError("base-refresh marker has a malformed old head SHA")
+        raise UntrustedEvidenceError("base-refresh evidence has a malformed old head SHA")
     if not SHA_PATTERN.fullmatch(str(payload.get("target_base_sha", ""))):
-        raise UntrustedEvidenceError("base-refresh marker has a malformed target base SHA")
+        raise UntrustedEvidenceError("base-refresh evidence has a malformed target base SHA")
     reference = payload.get("prior_pass_reference")
     if not isinstance(reference, str) or not reference.startswith("https://github.com/"):
-        raise UntrustedEvidenceError("base-refresh marker has an invalid PASS reference")
+        raise UntrustedEvidenceError("base-refresh evidence has an invalid PASS reference")
 
 
 def validate_base_refresh(
@@ -263,11 +271,57 @@ def validate_base_refresh(
 ) -> None:
     validate_base_refresh_payload(payload)
     if payload.get("revalidate_phase") != state.phase:
-        raise UntrustedEvidenceError("base-refresh marker has the wrong revalidation phase")
+        raise UntrustedEvidenceError("base-refresh evidence has the wrong revalidation phase")
     if payload.get("head_sha") != state.head_sha:
-        raise UntrustedEvidenceError("base-refresh marker is stale for the current PR head")
+        raise UntrustedEvidenceError("base-refresh evidence is stale for the current PR head")
     if payload.get("target_base_sha") != target_base_sha:
-        raise UntrustedEvidenceError("base-refresh marker is stale for the default branch")
+        raise UntrustedEvidenceError("base-refresh evidence is stale for the default branch")
+
+
+def base_refresh_evidence_from_statuses(
+    statuses: list[dict[str, Any]], *, head_sha: str
+) -> list[MarkerEvidence]:
+    if not SHA_PATTERN.fullmatch(head_sha):
+        raise UntrustedEvidenceError("base-refresh status lookup requires a full commit SHA")
+    result: list[MarkerEvidence] = []
+    for status in reversed(statuses):
+        context = status.get("context")
+        if not isinstance(context, str) or not context.startswith(BASE_REFRESH_STATUS_PREFIX):
+            continue
+        creator = status.get("creator")
+        if not isinstance(creator, dict) or creator.get("login") != TRUSTED_WORKFLOW_LOGIN:
+            continue
+        match = BASE_REFRESH_STATUS_PATTERN.fullmatch(context)
+        target_url = status.get("target_url")
+        if (
+            match is None
+            or status.get("state") != "success"
+            or status.get("description") != BASE_REFRESH_STATUS_DESCRIPTION
+            or not isinstance(target_url, str)
+            or not target_url.startswith("https://github.com/")
+        ):
+            raise UntrustedEvidenceError("trusted base-refresh status is malformed")
+        payload: dict[str, Any] = {
+            "schema_version": "1.0",
+            "action": "REFRESH_BASE",
+            "from_phase": match.group(1),
+            "revalidate_phase": match.group(2),
+            "head_sha": head_sha,
+            "target_base_sha": match.group(3),
+            "prior_pass_reference": target_url,
+        }
+        validate_base_refresh_payload(payload)
+        status_url = status.get("url")
+        result.append(
+            MarkerEvidence(
+                payload=payload,
+                url=status_url if isinstance(status_url, str) else target_url,
+                author=TRUSTED_WORKFLOW_LOGIN,
+                body=context,
+                commit_id=head_sha,
+            )
+        )
+    return result
 
 
 def codex_implementation_blocker(
@@ -748,6 +802,19 @@ class GitHubClient:
             result.extend(item for item in runs if isinstance(item, dict))
         return result
 
+    def commit_statuses(self, sha: str) -> list[dict[str, Any]]:
+        if not SHA_PATTERN.fullmatch(sha):
+            raise UntrustedEvidenceError("status lookup requires a full commit SHA")
+        pages = self.api_pages(
+            f"repos/{self.repository}/commits/{sha}/statuses?per_page=100"
+        )
+        result: list[dict[str, Any]] = []
+        for page in pages:
+            if not isinstance(page, list):
+                raise UntrustedEvidenceError("GitHub commit-status page must be an array")
+            result.extend(item for item in page if isinstance(item, dict))
+        return result
+
     def default_branch_sha(self, branch: str) -> str:
         return self.command.run(
             ["api", f"repos/{self.repository}/commits/{branch}", "--jq", ".sha"]
@@ -967,6 +1034,45 @@ class PhaseLoop:
                         payload=payload, url=url, author=TRUSTED_WORKFLOW_LOGIN, body=body
                     )
                 )
+        return result
+
+    def trusted_base_refresh_statuses(
+        self,
+        state: PullRequestState,
+        phase_records: list[MarkerEvidence],
+    ) -> list[MarkerEvidence]:
+        prior_passes = [
+            record
+            for record in phase_records
+            if record.payload.get("phase") == state.phase
+            and record.payload.get("verdict") == "PASS"
+            and SHA_PATTERN.fullmatch(str(record.payload.get("reviewed_sha", "")))
+        ]
+        candidate_heads = {state.head_sha}
+        candidate_heads.update(str(record.payload["reviewed_sha"]) for record in prior_passes)
+        result: list[MarkerEvidence] = []
+        for head_sha in sorted(candidate_heads):
+            evidence = base_refresh_evidence_from_statuses(
+                self.github.commit_statuses(head_sha), head_sha=head_sha
+            )
+            for item in evidence:
+                if item.payload.get("revalidate_phase") != state.phase:
+                    continue
+                prior_reference = item.payload.get("prior_pass_reference")
+                matching_pass = next(
+                    (
+                        record
+                        for record in prior_passes
+                        if record.url == prior_reference
+                        and record.payload.get("reviewed_sha") == head_sha
+                    ),
+                    None,
+                )
+                if matching_pass is None:
+                    raise UntrustedEvidenceError(
+                        "base-refresh status is not bound to its trusted prior PASS"
+                    )
+                result.append(item)
         return result
 
     @staticmethod
@@ -1384,7 +1490,7 @@ class PhaseLoop:
             )
             ready_records = self.trusted_markers(comments, "redteam-ready-for-review")
             phase_records = self.trusted_markers(comments, "redteam-phase-gate")
-            refresh_records = self.trusted_markers(comments, "redteam-base-refresh")
+            refresh_records = self.trusted_base_refresh_statuses(state, phase_records)
 
             if self.perform_pending_base_refresh(
                 state, refresh_records, default_branch_sha

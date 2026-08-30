@@ -69,7 +69,9 @@ def test_phase_gate_uses_fail_closed_native_codex_evidence_chain() -> None:
         "missing its reviewer thumbs-up reaction",
         "missing retained P0/P1 findings",
         "duplicate JSON key",
-        "redteam-base-refresh",
+        "redteam/base-refresh/",
+        "listCommitStatusesForRef",
+        "status.target_url !== pass._comment_url",
         "target_base_sha",
         "merge_base_commit?.sha === refresh.target_base_sha",
         "Reviewed Phase 0A head is not descended from a trusted base refresh",
@@ -124,10 +126,13 @@ def test_base_refresh_is_sha_bound_and_cannot_merge_the_pull_request() -> None:
         "expected_head_sha",
         "target_base_sha",
         "prior_pass_reference",
-        "redteam-base-refresh",
+        "redteam/base-refresh/",
         "setLabels",
+        "createCommitStatus",
+        "listCommitStatusesForRef",
+        "trusted exact-SHA base refresh authorization",
         "contains a duplicate JSON key",
-        "Reauthorization requires a trusted prior base-refresh marker",
+        "Reauthorization requires a trusted prior base-refresh status",
     ):
         assert required_control in workflow or required_control in runner
     permissions = workflow.split("\npermissions:\n", maxsplit=1)[1].split(
@@ -144,6 +149,9 @@ def test_base_refresh_is_sha_bound_and_cannot_merge_the_pull_request() -> None:
     assert r"!/[\s,}\]]/.test" in workflow
     assert "pr.base.sha !== targetBaseSha" not in workflow
     assert "contents: write" not in workflow
+    assert "pull-requests: write" not in workflow
+    assert "github.rest.issues.createComment" not in workflow
+    assert "secrets." not in workflow
     assert "update-branch" in runner
     for forbidden_operation in (
         "github.rest.pulls.merge",

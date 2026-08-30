@@ -35,12 +35,14 @@ refresh.
   inputs use the independently fetched current default-branch SHA.
 - The refresh workflow verifies `target_base_sha` directly against the current default-branch
   commit and no longer requires the stale Pulls API `base.sha` to equal it.
-- A refreshed Phase 0A review uses the SHA from trusted `redteam-base-refresh` evidence only when
-  both the pre-refresh PR head and the refresh target are exact ancestors of the reviewed head.
+- A refreshed Phase 0A review uses the target SHA from trusted `redteam/base-refresh/...` commit
+  status evidence only when both the pre-refresh PR head and the refresh target are exact ancestors
+  of the reviewed head.
 - The GitHub phase-gate workflow performs the same two ancestor checks before accepting the
   refreshed Phase 0A review base.
-- Refresh records have exact fields, adjacent `phase-0b` to `phase-0a` rollback semantics, full
-  lowercase SHAs, and a GitHub PASS permalink. Malformed, unrelated, or stale history fails closed.
+- Refresh statuses bind the old commit, adjacent `phase-0b` to `phase-0a` rollback, full lowercase
+  target SHA, fixed description, workflow-bot creator, success state and prior PASS permalink.
+  Malformed, unrelated, or stale history fails closed.
 - The final merge API remains absent. Final merge remains human-only.
 
 ## Resulting working-tree diff

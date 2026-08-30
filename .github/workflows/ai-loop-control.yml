@@ -210,57 +210,64 @@ jobs:
               if (!match) continue;
               try {
                 const record = JSON.parse(match[1].trim());
-                if (record.schema_version === '1.0') priorRecords.push(record);
+                if (record.schema_version === '1.0' && typeof comment.html_url === 'string') {
+                  priorRecords.push({...record, _comment_url: comment.html_url});
+                }
               } catch (_) {}
             }
 
             let expectedBaseSha;
             let refreshTargetSha = null;
             if (phaseIndex === 0) {
-              const refreshPattern = /<!--\s*redteam-base-refresh\s*([\s\S]*?)-->/g;
-              const refreshKeys = [
-                'schema_version', 'action', 'from_phase', 'revalidate_phase', 'head_sha',
-                'target_base_sha', 'prior_pass_reference'
-              ];
+              const refreshStatusDescription =
+                'trusted exact-SHA base refresh authorization';
+              const refreshStatusPattern =
+                /^redteam\/base-refresh\/(phase-(?:0a|0b|0c|[1-5]))\/(phase-(?:0a|0b|0c|[1-5]))\/([0-9a-f]{40})$/;
               const refreshes = [];
-              for (const comment of comments) {
-                if (comment.user?.login !== 'github-actions[bot]') continue;
-                for (const match of (comment.body || '').matchAll(refreshPattern)) {
-                  const raw = match[1].trim();
-                  const keys = [...raw.matchAll(/"((?:\\.|[^"\\])*)"\s*:/g)]
-                    .map((item) => JSON.parse(`"${item[1]}"`));
-                  if (new Set(keys).size !== keys.length) {
-                    core.setFailed('Base-refresh marker contains a duplicate JSON key.');
-                    return;
-                  }
-                  let refresh;
-                  try {
-                    refresh = JSON.parse(raw);
-                  } catch (_) {
-                    core.setFailed('Base-refresh marker is not valid JSON.');
-                    return;
-                  }
+              const phaseZeroPasses = priorRecords.filter((record) =>
+                record.phase === 'phase-0a' && record.verdict === 'PASS' &&
+                /^[0-9a-f]{40}$/.test(record.reviewed_sha)
+              );
+              for (const pass of phaseZeroPasses) {
+                const statuses = await github.paginate(
+                  github.rest.repos.listCommitStatusesForRef,
+                  {owner, repo, ref: pass.reviewed_sha, per_page: 100}
+                );
+                for (const status of statuses) {
+                  if (status.creator?.login !== 'github-actions[bot]' ||
+                      !status.context?.startsWith('redteam/base-refresh/')) continue;
+                  const match = status.context.match(refreshStatusPattern);
                   if (
-                    JSON.stringify(Object.keys(refresh).sort()) !==
-                      JSON.stringify([...refreshKeys].sort()) ||
-                    refresh.schema_version !== '1.0' || refresh.action !== 'REFRESH_BASE' ||
-                    refresh.from_phase !== 'phase-0b' ||
-                    refresh.revalidate_phase !== 'phase-0a' ||
-                    !/^[0-9a-f]{40}$/.test(refresh.head_sha) ||
-                    !/^[0-9a-f]{40}$/.test(refresh.target_base_sha) ||
-                    typeof refresh.prior_pass_reference !== 'string' ||
-                    !refresh.prior_pass_reference.startsWith('https://github.com/')
+                    !match || status.state !== 'success' ||
+                    status.description !== refreshStatusDescription
                   ) {
-                    core.setFailed('Base-refresh marker is malformed or not a Phase 0A rollback.');
+                    core.setFailed('Trusted base-refresh status is malformed.');
                     return;
                   }
-                  refreshes.push(refresh);
+                  if (match[2] !== 'phase-0a') continue;
+                  if (
+                    match[1] !== 'phase-0b' || status.sha !== pass.reviewed_sha ||
+                    status.target_url !== pass._comment_url
+                  ) {
+                    core.setFailed('Phase 0A base-refresh status is not bound to its prior PASS.');
+                    return;
+                  }
+                  refreshes.push({
+                    from_phase: match[1],
+                    revalidate_phase: match[2],
+                    head_sha: pass.reviewed_sha,
+                    target_base_sha: match[3],
+                    prior_pass_reference: pass._comment_url,
+                  });
                 }
               }
               expectedBaseSha = pr.base.sha;
               if (refreshes.length > 0) {
                 let matchedRefresh = null;
-                for (const refresh of [...refreshes].reverse()) {
+                const suppliedTargetRefreshes = refreshes.filter(
+                  (refresh) => refresh.target_base_sha === suppliedBaseSha
+                );
+                for (const refresh of suppliedTargetRefreshes) {
                   const [oldHeadComparison, targetBaseComparison] = await Promise.all([
                     github.request('GET /repos/{owner}/{repo}/compare/{basehead}', {
                       owner, repo, basehead: `${refresh.head_sha}...${reviewedSha}`,
