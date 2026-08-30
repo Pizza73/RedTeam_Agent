@@ -92,7 +92,13 @@ jobs:
       SUMMARY: ${{ inputs.summary }}
       VERDICT: ${{ inputs.verdict }}
     steps:
+      - name: Check out trusted workflow helpers
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
       - name: Validate evidence and record phase result
+        id: record
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
         with:
           script: |
@@ -732,101 +738,6 @@ jobs:
               return;
             }
 
-            const transitionTimelineBefore = await github.paginate(
-              github.rest.issues.listEventsForTimeline,
-              { owner, repo, issue_number: pull_number, per_page: 100 },
-            );
-            const transitionEventIdsBefore = new Set(
-              transitionTimelineBefore
-                .filter((item) => item.event === 'labeled' || item.event === 'unlabeled')
-                .map((item) => String(item.id)),
-            );
-            const { data: transitionPr } = await github.rest.pulls.get({
-              owner, repo, pull_number,
-            });
-            const transitionPhases = transitionPr.labels.map((item) => item.name)
-              .filter((name) => /^phase-(0a|0b|0c|[1-5])$/.test(name));
-            if (
-              transitionPr.state !== 'open' || transitionPr.head.sha !== reviewedSha ||
-              transitionPhases.length !== 1 || transitionPhases[0] !== phase
-            ) {
-              core.setFailed('Pull request changed before the atomic Phase label transition.');
-              return;
-            }
-            const managedStateLabels = new Set([
-              'ai-needs-review',
-              'ai-review-passed',
-              'ai-needs-fix',
-              'ai-loop-blocked',
-              'ai-human-gate',
-              'ai-project-complete',
-              'ai-needs-implementation',
-            ]);
-            const transitionedLabels = transitionPr.labels
-              .map((item) => item.name)
-              .filter((name) =>
-                !/^phase-(0a|0b|0c|[1-5])$/.test(name) &&
-                !managedStateLabels.has(name)
-              );
-            transitionedLabels.push(next.label, 'ai-needs-implementation');
-            const expectedTransitionLabels = [...new Set(transitionedLabels)].sort();
-            const currentTransitionLabels = [...new Set(
-              transitionPr.labels.map((item) => item.name)
-            )].sort();
-            const expectedTransitionEvents = [
-              ...currentTransitionLabels
-                .filter((name) => !expectedTransitionLabels.includes(name))
-                .map((name) => `unlabeled\0${name}\0github-actions[bot]`),
-              ...expectedTransitionLabels
-                .filter((name) => !currentTransitionLabels.includes(name))
-                .map((name) => `labeled\0${name}\0github-actions[bot]`),
-            ].sort();
-            await github.rest.issues.setLabels({
-              owner,
-              repo,
-              issue_number: pull_number,
-              labels: expectedTransitionLabels,
-            });
-            const transitionTimelineAfter = await github.paginate(
-              github.rest.issues.listEventsForTimeline,
-              { owner, repo, issue_number: pull_number, per_page: 100 },
-            );
-            const actualTransitionEvents = transitionTimelineAfter
-              .filter((item) =>
-                (item.event === 'labeled' || item.event === 'unlabeled') &&
-                !transitionEventIdsBefore.has(String(item.id))
-              )
-              .map((item) => `${item.event}\0${item.label?.name || ''}\0${item.actor?.login || ''}`)
-              .sort();
-            if (
-              actualTransitionEvents.length !== expectedTransitionEvents.length ||
-              actualTransitionEvents.some(
-                (event, index) => event !== expectedTransitionEvents[index]
-              )
-            ) {
-              core.setFailed('Concurrent label-event drift detected during the atomic Phase label transition.');
-              return;
-            }
-            const { data: transitionedPr } = await github.rest.pulls.get({
-              owner, repo, pull_number,
-            });
-            const actualTransitionLabels = transitionedPr.labels
-              .map((item) => item.name)
-              .sort();
-            const transitionedPhases = actualTransitionLabels
-              .filter((name) => /^phase-(0a|0b|0c|[1-5])$/.test(name));
-            if (
-              transitionedPr.state !== 'open' || transitionedPr.head.sha !== reviewedSha ||
-              transitionedPhases.length !== 1 || transitionedPhases[0] !== next.label ||
-              actualTransitionLabels.length !== expectedTransitionLabels.length ||
-              actualTransitionLabels.some(
-                (name, index) => name !== expectedTransitionLabels[index]
-              )
-            ) {
-              core.setFailed('Pull request changed during the atomic Phase label transition.');
-              return;
-            }
-            await setReviewStatus('pending', `${next.id}: implementation pending`);
             const request = {
               schema_version: '1.0',
               action: 'IMPLEMENT_PHASE',
@@ -836,9 +747,23 @@ jobs:
               phase_prompt: next.prompt,
             };
             const requestMarker = `<!-- redteam-implementation-request\n${JSON.stringify(request)}\n-->`;
-            await github.rest.issues.createComment({
+            const transition = {
+              schema_version: '1.0',
               owner,
               repo,
-              issue_number: pull_number,
-              body: `\`${phase}\` passed. The local phase orchestrator will request the Codex implementation for \`${next.id}\`; the AI does not run inside GitHub Actions.\n\n${requestMarker}`,
-            });
+              pull_number,
+              reviewed_sha: reviewedSha,
+              current_phase: phase,
+              next_phase: next.label,
+              request_body: `\`${phase}\` passed. The local phase orchestrator will request the Codex implementation for \`${next.id}\`; the AI does not run inside GitHub Actions.\n\n${requestMarker}`,
+            };
+            core.setOutput(
+              'phase_transition',
+              Buffer.from(JSON.stringify(transition), 'utf8').toString('base64url'),
+            );
+      - name: Perform marked adjacent-Phase transition
+        if: ${{ steps.record.outputs.phase_transition != '' }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REDTEAM_PHASE_TRANSITION: ${{ steps.record.outputs.phase_transition }}
+        run: python automation/transition_phase.py

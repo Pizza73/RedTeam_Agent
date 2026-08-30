@@ -93,13 +93,8 @@ def test_phase_gate_uses_fail_closed_native_codex_evidence_chain() -> None:
         "Incorporated Phase 0A base-refresh evidence is ambiguous",
         "maximalRefreshes.length !== 1",
         "Pull request head or phase changed before recording the gate",
-        "github.rest.issues.setLabels",
-        "Pull request changed before the atomic Phase label transition",
-        "Concurrent label-event drift detected during the atomic Phase label transition",
-        "Pull request changed during the atomic Phase label transition",
-        "actualTransitionLabels.length !== expectedTransitionLabels.length",
-        "actualTransitionEvents.length !== expectedTransitionEvents.length",
-        "item.actor?.login || ''",
+        "phase_transition",
+        "automation/transition_phase.py",
     ):
         assert required_control in workflow
     assert "liveDefaultCommit.sha !== refreshTargetSha" not in workflow
@@ -110,20 +105,25 @@ def test_phase_gate_uses_fail_closed_native_codex_evidence_chain() -> None:
     assert "Review evidence must contain exactly one redteam-ai-review marker" not in workflow
 
 
-def test_phase_gate_rejects_label_writes_racing_the_atomic_transition() -> None:
+def test_phase_gate_uses_the_marker_transition_protocol() -> None:
     workflow = (REPO_ROOT / ".github" / "workflows" / "ai-loop-control.yml").read_text(
         encoding="utf-8"
     )
+    helper = (REPO_ROOT / "automation" / "transition_phase.py").read_text(
+        encoding="utf-8"
+    )
 
-    baseline_index = workflow.index("const transitionTimelineBefore")
-    snapshot_index = workflow.index("const { data: transitionPr }")
-    replace_index = workflow.index("await github.rest.issues.setLabels")
-    audit_index = workflow.index("const transitionTimelineAfter")
-    final_snapshot_index = workflow.index("const { data: transitionedPr }")
-
-    assert baseline_index < snapshot_index < replace_index < audit_index < final_snapshot_index
-    assert "transitionEventIdsBefore.has(String(item.id))" in workflow
-    assert "github-actions[bot]" in workflow
+    assert "issues.setLabels" not in workflow
+    assert "issues.setLabels" not in helper
+    assert 'TRANSITION_MARKER = "ai-review-passed"' in helper
+    add_next = helper.index("client.add_label(request, request.next_phase)")
+    remove_current = helper.index("client.remove_label(request, request.current_phase)")
+    add_implementation = helper.index("client.add_label(request, IMPLEMENTATION_LABEL)")
+    create_request = helper.index("    client.create_request_comment(request)")
+    remove_marker = helper.index("client.remove_label(request, TRANSITION_MARKER)")
+    assert add_next < remove_current < add_implementation < create_request < remove_marker
+    assert "released_labels = _label_names" in helper
+    assert '"PUT"' not in helper
 
 
 def test_phase_gate_has_minimal_permissions_for_pr_state_updates() -> None:

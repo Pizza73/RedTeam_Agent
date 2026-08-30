@@ -20,6 +20,7 @@ from automation.run_phase_loop import (
     base_refresh_evidence_from_statuses,
     canonical_digest,
     codex_implementation_blocker,
+    current_phase_from_labels,
     evaluate_native_review,
     marker_payloads,
     native_finding_key,
@@ -455,6 +456,40 @@ def test_ready_marker_is_reviewed_when_no_implementation_is_pending() -> None:
         )
         == "review"
     )
+
+
+@pytest.mark.parametrize("phase", PHASES)
+def test_single_phase_is_accepted_with_or_without_transition_marker(phase: str) -> None:
+    assert current_phase_from_labels(frozenset({phase})) == phase
+    assert current_phase_from_labels(frozenset({phase, "ai-review-passed"})) == phase
+
+
+@pytest.mark.parametrize(
+    ("current_phase", "next_phase"),
+    tuple(zip(PHASES[:-1], PHASES[1:], strict=True)),
+)
+def test_marked_adjacent_dual_phase_is_treated_as_in_progress(
+    current_phase: str, next_phase: str
+) -> None:
+    labels = frozenset({current_phase, next_phase, "ai-review-passed"})
+
+    assert current_phase_from_labels(labels) == next_phase
+
+
+@pytest.mark.parametrize(
+    "labels",
+    [
+        frozenset(),
+        frozenset({"phase-0a", "phase-0b"}),
+        frozenset({"phase-0a", "phase-1", "ai-review-passed"}),
+        frozenset({"phase-0a", "phase-0b", "phase-0c", "ai-review-passed"}),
+    ],
+)
+def test_unmarked_or_non_adjacent_phase_ambiguity_fails_closed(
+    labels: frozenset[str],
+) -> None:
+    with pytest.raises(UntrustedEvidenceError):
+        current_phase_from_labels(labels)
 
 
 def test_native_codex_no_finding_result_is_sha_bound_pass() -> None:
