@@ -152,6 +152,12 @@ closed. The synchronization is not a final PR merge: it
 incorporates `main` into the PR branch. CI then runs the rolled-back Phase on the new HEAD, and every
 PASS tied to the old HEAD remains stale.
 
+If `main` advances again while that fresh rolled-back review is running, the review remains bound to
+the trusted refresh target that is actually incorporated in its HEAD. After recording that exact
+Gate, the adjacent next-Phase state detects the newer `main`, rolls back again, and requires another
+Gate on another refreshed HEAD. A later default-branch SHA is never substituted into an earlier
+review, and the earlier PASS never authorizes implementation across the new base.
+
 ## Review recording
 
 After CI posts the review-ready marker:

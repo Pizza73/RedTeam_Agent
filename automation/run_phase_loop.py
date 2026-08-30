@@ -928,14 +928,14 @@ def evaluate_native_review(
         body = comment.get("body")
         if not isinstance(body, str) or not body.startswith(CODEX_NO_FINDINGS_PREFIX):
             continue
+        created_at = _github_timestamp(comment, "created_at")
+        if created_at <= trigger_time:
+            continue
         matches = CODEX_REVIEWED_COMMIT_PATTERN.findall(body)
         if len(matches) != 1 or body.count("**Reviewed commit:**") != 1:
             raise UntrustedEvidenceError("Codex PASS comment has ambiguous commit evidence")
         if not head_sha.startswith(matches[0]):
             raise UntrustedEvidenceError("Codex PASS comment refers to a stale commit")
-        created_at = _github_timestamp(comment, "created_at")
-        if created_at <= trigger_time:
-            continue
         if not isinstance(comment.get("html_url"), str):
             raise UntrustedEvidenceError("Codex PASS comment has no permalink")
         pass_comments.append((comment, created_at))
@@ -1707,10 +1707,6 @@ class PhaseLoop:
                 validate_base_refresh_payload(record.payload)
                 old_head = str(record.payload["head_sha"])
                 target_base = str(record.payload["target_base_sha"])
-                if target_base != default_branch_sha:
-                    raise UntrustedEvidenceError(
-                        "trusted base refresh is stale for the current default branch"
-                    )
                 if self.github.is_ancestor(
                     old_head, state.head_sha
                 ) and self.github.is_ancestor(target_base, state.head_sha):

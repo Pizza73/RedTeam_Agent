@@ -505,6 +505,31 @@ def test_native_codex_pass_rejects_stale_commit_prefix() -> None:
         evaluate_fixture(evidence)
 
 
+def test_native_codex_pass_ignores_stale_commit_before_trusted_trigger() -> None:
+    evidence = native_evidence()
+    comments = evidence["comments"]
+    assert isinstance(comments, list)
+    comments.insert(
+        1,
+        {
+            "id": 5,
+            "html_url": "https://github.com/example/repo/pull/1#issuecomment-old-pass",
+            "user": {"login": REVIEWER_LOGIN},
+            "created_at": "2026-08-30T00:00:30Z",
+            "body": (
+                "Codex Review: Didn't find any major issues.\n\n"
+                f"**Reviewed commit:** `{'c' * 10}`"
+            ),
+        },
+    )
+
+    result = evaluate_fixture(evidence)
+
+    assert result is not None
+    assert result.result["reviewed_sha"] == HEAD_SHA
+    assert result.url == NO_FINDINGS_URL
+
+
 def test_native_codex_pass_rejects_head_change_during_review() -> None:
     evidence = native_evidence()
     evidence["timeline"] = [
@@ -1225,7 +1250,7 @@ def test_phase_zero_a_review_rejects_unrelated_refreshed_head() -> None:
         )
 
 
-def test_phase_zero_a_review_rejects_refresh_when_default_branch_advanced() -> None:
+def test_phase_zero_a_review_keeps_incorporated_base_when_default_branch_advanced() -> None:
     loop = PhaseLoop.__new__(PhaseLoop)
     loop.github = _AncestorGitHub(  # type: ignore[assignment]
         {
@@ -1234,10 +1259,12 @@ def test_phase_zero_a_review_rejects_refresh_when_default_branch_advanced() -> N
         }
     )
 
-    with pytest.raises(UntrustedEvidenceError, match="stale for the current default branch"):
+    assert (
         loop.expected_base_sha(
             refreshed_phase_state(), [], [base_refresh_record()], "f" * 40
         )
+        == DEFAULT_BRANCH_SHA
+    )
 
 
 def test_initial_phase_zero_a_review_keeps_original_pr_base_sha() -> None:

@@ -84,15 +84,17 @@ def test_phase_gate_uses_fail_closed_native_codex_evidence_chain() -> None:
         "duplicate JSON key",
         "redteam/base-refresh/",
         "listCommitStatusesForRef",
+        "ref: pass.reviewed_sha",
         "status.target_url !== pass._comment_url",
         "target_base_sha",
         "merge_base_commit?.sha === refresh.target_base_sha",
         "Reviewed Phase 0A head is not descended from a trusted base refresh",
-        "liveDefaultCommit.sha !== refreshTargetSha",
-        "Default branch changed before recording the refreshed Phase 0A gate",
         "Pull request head or phase changed before recording the gate",
     ):
         assert required_control in workflow
+    assert "liveDefaultCommit.sha !== refreshTargetSha" not in workflow
+    assert "Default branch changed before recording the refreshed Phase 0A gate" not in workflow
+    assert "status.sha !== pass.reviewed_sha" not in workflow
     assert "Review evidence must contain exactly one redteam-ai-review marker" not in workflow
 
 
