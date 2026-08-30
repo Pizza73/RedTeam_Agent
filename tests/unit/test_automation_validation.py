@@ -51,3 +51,30 @@ def test_approved_but_incomplete_provider_gate_is_rejected(tmp_path: Path) -> No
 
     with pytest.raises(AutomationValidationError, match="approved provider gate is incomplete"):
         validate_automation(repo)
+
+
+def test_phase_gate_uses_fail_closed_native_codex_evidence_chain() -> None:
+    workflow = (REPO_ROOT / ".github" / "workflows" / "ai-loop-control.yml").read_text(
+        encoding="utf-8"
+    )
+
+    for required_control in (
+        "ready_reference",
+        "review_trigger_reference",
+        "codex-native-v1",
+        "listEventsForTimeline",
+        "listReviewComments",
+        "listForIssue",
+        "PR head changed while Codex review was running",
+        "missing its reviewer thumbs-up reaction",
+        "missing retained P0/P1 findings",
+        "duplicate JSON key",
+    ):
+        assert required_control in workflow
+    assert "Review evidence must contain exactly one redteam-ai-review marker" not in workflow
+
+
+def test_documented_reviewer_login_includes_bot_suffix() -> None:
+    runbook = (REPO_ROOT / "docs" / "ai-loop-runbook.md").read_text(encoding="utf-8")
+
+    assert "AI_REVIEWER_LOGIN --body 'chatgpt-codex-connector[bot]'" in runbook

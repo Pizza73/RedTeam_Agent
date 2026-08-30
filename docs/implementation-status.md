@@ -17,12 +17,15 @@ Review baseline:
 - Governance input revision: `66e86918e19a1304334e872ed62c0ffc489c9c44`
 - AI loop controls: governance bootstrap PR merged; local phase orchestrator implemented without
   OpenAI API; `AI_GATE_APPROVER_LOGIN`, `AI_REVIEWER_LOGIN`, and iteration limit configured;
-  label bootstrap and the long-lived Phase 0A pull request remain pending
+  labels bootstrapped and long-lived implementation PR #3 is active
 - Repository control mode: the current private-repository plan does not expose branch protection
   or rulesets; direct/force pushes and automated merges are prohibited by manual governance but
   are not server-enforced
-- Phase 0A fix candidate: `94f6a2d` on `ai/redteam-agent-build`; the independent SHA-bound Phase 0A
-  review is still required before Phase 0B
+- Phase 0A fix candidate: `8ab811eaba39848fd2804c6e9ed815235362ac4c` on
+  `ai/redteam-agent-phase-loop`; local and GitHub deterministic checks pass and native Codex review
+  reports no P0/P1 findings, but the trusted Phase 0A record remains pending until native-evidence
+  governance is merged and re-runs the full-SHA review chain
+- Review bot identity: `chatgpt-codex-connector[bot]` (exact GitHub login, including suffix)
 - Review identity: all new implementation and review results must be bound to the pull request HEAD SHA
 - BLOCKER: 6
 - HIGH: 7

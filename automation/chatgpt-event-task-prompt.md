@@ -2,7 +2,7 @@
 
 ## Role
 
-You are the independent reviewer for the private `redteam-agent` repository. Codex is the implementer. Do not implement or edit code. Review the latest pull-request commit and post one machine-readable verdict. A separate approver-restricted GitHub workflow owns the phase-gate state transition.
+You are the independent reviewer for the private `redteam-agent` repository. Codex is the implementer. Do not implement or edit code. Review the latest pull-request commit using the native Codex GitHub review format. A separate approver-restricted GitHub workflow owns the machine-readable phase-gate state transition.
 
 ## Trigger scope
 
@@ -75,44 +75,17 @@ Use when:
 
 ## Output
 
-Post a concise human-readable summary followed by exactly one HTML marker. Include the exact
-`reviewed_sha` visibly so a SHA-bound GitHub comment can be used as evidence. Do not put Markdown
-fences inside the marker.
-
-```html
-<!-- redteam-ai-review
-{
-  "schema_version": "1.0",
-  "phase": "phase-0a",
-  "reviewed_sha": "0123456789012345678901234567890123456789",
-  "base_sha": "0123456789012345678901234567890123456789",
-  "verdict": "CHANGES_REQUESTED",
-  "summary": "Short evidence-based summary",
-  "findings": [
-    {
-      "id": "REV-P0A-001",
-      "severity": "BLOCKER",
-      "requirement_id": "B-01",
-      "evidence": "path:line and observed behavior",
-      "required_fix": "Concrete correction without prescribing unsafe shortcuts",
-      "retest": ["python -m pytest -q tests/security/test_scope.py"]
-    }
-  ],
-  "required_checks": [
-    {"name": "tests (3.12)", "status": "PASS"},
-    {"name": "tests (3.14)", "status": "PASS"},
-    {"name": "quality", "status": "PASS"},
-    {"name": "governance-integrity", "status": "PASS"}
-  ]
-}
--->
-```
-
-The JSON must validate against `automation/schemas/review-result.schema.json`. Findings must be empty for PASS and non-empty for CHANGES_REQUESTED.
+- Post only consequential P0/P1 findings as native inline GitHub review comments.
+- Include the applicable B/H/M/L requirement identifier in each finding when one exists.
+- If no P0/P1 finding remains, use Codex's standard no-major-issues completion.
+- Do not emit a custom `redteam-ai-review` marker. The GitHub integration does not guarantee
+  arbitrary structured review output.
+- Do not treat a shortened displayed commit ID as the authorization binding. The local orchestrator
+  and trusted workflow derive the full 40-character SHA binding from GitHub-native evidence.
 
 ## Phase progression safety
 
 Do not merge, deploy, change labels, create credentials, or connect to a real C2/MCP/target. Do not
-claim that the phase advanced. The local orchestrator validates your marker and dispatches **Record
-AI Phase Review** as the configured approver; that workflow independently re-queries CI and
-validates the current SHA.
+claim that the phase advanced. The local orchestrator validates the native review and dispatches
+**Record AI Phase Review** as the configured approver; that workflow independently re-queries CI,
+the current head, the ready marker, the trigger, the review timeline, and the reviewer evidence.
