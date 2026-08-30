@@ -1210,9 +1210,16 @@ def test_base_refresh_status_without_referenced_prior_pass_fails_closed() -> Non
         loop.trusted_base_refresh_statuses(phase_state(), [])
 
 
-def base_refresh_record() -> MarkerEvidence:
+def base_refresh_record(
+    *,
+    head_sha: str = HEAD_SHA,
+    target_base_sha: str = DEFAULT_BRANCH_SHA,
+    prior_pass_reference: str = PHASE_RECORD_URL,
+) -> MarkerEvidence:
     payload = base_refresh_payload()
-    payload["target_base_sha"] = DEFAULT_BRANCH_SHA
+    payload["head_sha"] = head_sha
+    payload["target_base_sha"] = target_base_sha
+    payload["prior_pass_reference"] = prior_pass_reference
     return MarkerEvidence(
         payload,
         "https://github.com/example/repo/pull/3#issuecomment-refresh",
@@ -1265,6 +1272,64 @@ def test_phase_zero_a_review_keeps_incorporated_base_when_default_branch_advance
         )
         == DEFAULT_BRANCH_SHA
     )
+
+
+def test_phase_zero_a_review_selects_unique_maximal_incorporated_refresh() -> None:
+    later_head = "1" * 40
+    later_base = "2" * 40
+    loop = PhaseLoop.__new__(PhaseLoop)
+    loop.github = _AncestorGitHub(  # type: ignore[assignment]
+        {
+            (HEAD_SHA, REFRESHED_HEAD_SHA),
+            (DEFAULT_BRANCH_SHA, REFRESHED_HEAD_SHA),
+            (later_head, REFRESHED_HEAD_SHA),
+            (later_base, REFRESHED_HEAD_SHA),
+            (HEAD_SHA, later_head),
+            (DEFAULT_BRANCH_SHA, later_base),
+        }
+    )
+    refreshes = [
+        base_refresh_record(
+            head_sha=later_head,
+            target_base_sha=later_base,
+            prior_pass_reference=f"{PULL_REQUEST_PREFIX}#issuecomment-later-pass",
+        ),
+        base_refresh_record(),
+    ]
+
+    assert (
+        loop.expected_base_sha(
+            refreshed_phase_state(), [], refreshes, DEFAULT_BRANCH_SHA
+        )
+        == later_base
+    )
+
+
+def test_phase_zero_a_review_rejects_incomparable_incorporated_refreshes() -> None:
+    other_head = "1" * 40
+    other_base = "2" * 40
+    loop = PhaseLoop.__new__(PhaseLoop)
+    loop.github = _AncestorGitHub(  # type: ignore[assignment]
+        {
+            (HEAD_SHA, REFRESHED_HEAD_SHA),
+            (DEFAULT_BRANCH_SHA, REFRESHED_HEAD_SHA),
+            (other_head, REFRESHED_HEAD_SHA),
+            (other_base, REFRESHED_HEAD_SHA),
+        }
+    )
+    refreshes = [
+        base_refresh_record(),
+        base_refresh_record(
+            head_sha=other_head,
+            target_base_sha=other_base,
+            prior_pass_reference=f"{PULL_REQUEST_PREFIX}#issuecomment-other-pass",
+        ),
+    ]
+
+    with pytest.raises(UntrustedEvidenceError, match="evidence is ambiguous"):
+        loop.expected_base_sha(
+            refreshed_phase_state(), [], refreshes, DEFAULT_BRANCH_SHA
+        )
 
 
 def test_initial_phase_zero_a_review_keeps_original_pr_base_sha() -> None:

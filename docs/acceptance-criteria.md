@@ -46,6 +46,8 @@
   戻す新しいsource Identityとの競合を拒否する
 - Refresh後Phase 0AのReview BaseはReviewed HEADに実際に包含されたtrusted target SHAへ固定し、
   Review中にDefault Branchが進んでもそのGateを記録した後、次Phase実装前に再度rollbackする
+- 複数の履歴Base-refreshがReviewed HEADに包含される場合、旧HEADとtarget baseの両方が後続候補へ
+  祖先となるPartial Orderで唯一の最大候補だけをReview Baseにし、最大候補が複数ならFail Closedにする
 - Base refreshは`expected_head_sha`とCurrent default-branch SHAへ固定し、Final merge APIを
   呼ばない
 - Final mergeはLocal Orchestratorだけが実行し、`phase-5`、`ai-project-complete`、

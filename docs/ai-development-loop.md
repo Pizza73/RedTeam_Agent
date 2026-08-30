@@ -196,6 +196,12 @@ bounded base-refresh transition above before sending another `@codex implement` 
 refreshes after current-Phase code has changed or carries an old PASS across the new merge SHA. The
 base-refresh workflow never calls the final merge endpoint; only the local completion gate can.
 
+When a refreshed HEAD contains more than one historical base-refresh status, neither status API
+order nor SHA lexical order decides the review base. The runner and Gate independently retain only
+statuses whose old HEAD and target base are both ancestors of the reviewed HEAD, order those pairs
+by ancestry on both axes, and require exactly one maximal transition. Incomparable maxima stop the
+loop as ambiguous evidence.
+
 ## Completion
 
 `ai-project-complete` is necessary but not sufficient for merge. The local orchestrator rebuilds
