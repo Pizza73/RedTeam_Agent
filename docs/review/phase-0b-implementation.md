@@ -132,6 +132,21 @@ Phase 0B:
   Mission enters `PAUSED` for human recovery, and neither result collection nor the external action
   is automatically retried.
 
+## Fourth independent review correction cycle
+
+The independent review for correction SHA
+`f33cbee59f5bc130a9efa9d1abe3e2bbcef9d9ed` returned two P1 findings. Both were addressed within
+Phase 0B:
+
+- [`discussion_r3890879791`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3890879791):
+  after Adapter collection returns, Executor now calls `commit()` idempotently on the exact bound
+  sink and requires the Adapter receipt to equal that trusted receipt in full. A self-consistent
+  receipt for another sink/quarantine is rejected before receipt or ingestion persistence.
+- [`discussion_r3890879792`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3890879792):
+  execution-ID, provider-task-ID, or receipt mismatch after sink commit now routes through the same
+  Mission `PAUSED` and raw-result recovery path. The bound sink's `COMMITTED` recovery metadata is
+  persisted, while the mismatched Adapter metadata never enters the normal receipt repository.
+
 ## Regression tests added
 
 The Phase 0B test set covers positive, negative, and failure paths, including:
@@ -158,8 +173,10 @@ The Phase 0B test set covers positive, negative, and failure paths, including:
 - secure-ingestion failure pausing the Mission and blocking a separately authorized later dispatch;
 - split ingestion-success commit recovery without an ingester call or external action resubmit;
 - integrated quarantine quota failure with durable recovery metadata, Mission pause, and later
-  dispatch rejection; and
-- mid-artifact interruption with partial sequence evidence and PAUSED human recovery.
+  dispatch rejection;
+- mid-artifact interruption with partial sequence evidence and PAUSED human recovery;
+- self-consistent but unbound Adapter receipt rejection against the exact sink commit; and
+- committed-sink task metadata mismatch routing to PAUSED recovery without receipt persistence.
 
 No test was skipped, weakened, deleted, or marked as an expected failure.
 
@@ -179,8 +196,8 @@ ruff: All checks passed
 mypy: Success: no issues found in 69 source files
 unit: 172 passed
 integration: 7 passed
-security: 134 passed
-full/coverage run: 313 passed
+security: 136 passed
+full/coverage run: 315 passed
 skipped=0, errors=0, failures=0
 coverage: 83% total (branch coverage enabled)
 pip check: No broken requirements found
@@ -195,7 +212,7 @@ Additional focused command executed during development:
   tests/security/test_phase0b_execution_safety.py --strict-markers
 ```
 
-Focused result: `32 passed`.
+Focused result: `34 passed`.
 
 ## Remaining findings and constraints
 

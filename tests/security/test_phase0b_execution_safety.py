@@ -5,7 +5,7 @@ from datetime import timedelta
 
 import pytest
 
-from redteam_agent.canonical import stable_id
+from redteam_agent.canonical import digest_model, stable_id
 from redteam_agent.errors import (
     AdapterOperationError,
     DigestIntegrityError,
@@ -25,12 +25,18 @@ from redteam_agent.executor import (
     MockExecutionAdapter,
     MockRawResultSinkFactory,
     MockSecureResultIngester,
+    RawResultSink,
     StaticPreDispatchCapabilityProbe,
     require_known_outcome,
 )
 from redteam_agent.mission import MissionManager
 from redteam_agent.models.capabilities import AdapterCapabilities
-from redteam_agent.models.execution import RawArtifactMetadata, SecureIngestionSummary
+from redteam_agent.models.execution import (
+    AdapterRawResult,
+    RawArtifactMetadata,
+    RawResultReceipt,
+    SecureIngestionSummary,
+)
 from redteam_agent.policy.approval import ApprovalService
 from redteam_agent.repositories import (
     ExecutionRepository,
@@ -48,6 +54,51 @@ from tests.phase0b_helpers import (
     prepare_additional_execution,
     prepare_execution,
 )
+
+
+class _MismatchedReceiptAdapter(MockExecutionAdapter):
+    async def collect_result(
+        self,
+        task_id: str,
+        sink: RawResultSink,
+    ) -> AdapterRawResult:
+        metadata = await super().collect_result(task_id, sink)
+        identity = {
+            "schema_version": "raw-result-receipt-v1",
+            "execution_id": metadata.execution_id,
+            "quarantine_id": "quarantine-not-bound-to-executor-sink",
+            "sink_id": "sink-not-bound-to-executor",
+        }
+        provisional = RawResultReceipt(
+            **{
+                **metadata.receipt.model_dump(mode="python"),
+                "receipt_id": stable_id("receipt", identity),
+                "receipt_digest": "pending",
+                "quarantine_id": identity["quarantine_id"],
+                "sink_id": identity["sink_id"],
+                "ciphertext_digest": "sha256:unbound-receipt",
+            }
+        )
+        mismatched = provisional.model_copy(
+            update={
+                "receipt_digest": digest_model(
+                    provisional, exclude={"receipt_digest"}
+                )
+            }
+        )
+        return metadata.model_copy(update={"receipt": mismatched})
+
+
+class _MismatchedTaskMetadataAdapter(MockExecutionAdapter):
+    async def collect_result(
+        self,
+        task_id: str,
+        sink: RawResultSink,
+    ) -> AdapterRawResult:
+        metadata = await super().collect_result(task_id, sink)
+        return metadata.model_copy(
+            update={"provider_task_id": "provider-task-not-bound-to-execution"}
+        )
 
 
 @pytest.mark.parametrize("reconcile_status", ["UNKNOWN", "UNSUPPORTED", "NOT_FOUND"])
@@ -590,6 +641,86 @@ def test_mid_artifact_interruption_pauses_for_human_recovery() -> None:
     assert recovery.last_chunk_sequence == 0
     assert harness.finalization.missions.current(running.mission_id).state == "PAUSED"
     assert harness.receipts.get_by_execution(running.execution_id) is None
+    assert adapter.submit_calls == 1
+    assert adapter.collect_calls == 1
+
+
+def test_adapter_receipt_must_exactly_match_bound_sink_commit() -> None:
+    harness = build_execution_harness()
+    adapter = _MismatchedReceiptAdapter(
+        capabilities=harness.environment.adapter_snapshot.adapters[0],
+        now=FIXED_TIME + timedelta(minutes=3),
+        stdout_chunks=(b"bound-result",),
+    )
+    harness.executor = executor_with_adapter(harness, adapter)
+    prepared = prepare_execution(harness)
+    later = prepare_additional_execution(harness)
+    running = asyncio.run(
+        harness.executor.dispatch(
+            prepared.execution_id,
+            now=FIXED_TIME + timedelta(minutes=3),
+        )
+    )
+    with pytest.raises(RawResultStreamingError, match="metadata binding mismatch"):
+        asyncio.run(
+            harness.executor.collect_result(
+                running.execution_id,
+                now=FIXED_TIME + timedelta(minutes=4),
+            )
+        )
+
+    sink = harness.sink_factory.mock_sink(running.execution_id)
+    assert sink is not None
+    recovery = harness.recovery.get(
+        sink.recovery_metadata(updated_at=FIXED_TIME + timedelta(minutes=4)).recovery_id
+    )
+    assert recovery is not None and recovery.state == "COMMITTED"
+    assert harness.receipts.get_by_execution(running.execution_id) is None
+    assert harness.finalization.missions.current(running.mission_id).state == "PAUSED"
+    blocked = asyncio.run(
+        harness.executor.dispatch(
+            later.execution_id,
+            now=FIXED_TIME + timedelta(minutes=5),
+        )
+    )
+    assert blocked.provider_execution_state == "BLOCKED"
+    assert blocked.pre_dispatch_block_reason == "AUTHORIZATION_EPOCH_MISMATCH"
+    assert adapter.submit_calls == 1
+
+
+def test_committed_sink_metadata_mismatch_uses_raw_result_recovery() -> None:
+    harness = build_execution_harness()
+    adapter = _MismatchedTaskMetadataAdapter(
+        capabilities=harness.environment.adapter_snapshot.adapters[0],
+        now=FIXED_TIME + timedelta(minutes=3),
+        stdout_chunks=(b"committed-result",),
+    )
+    harness.executor = executor_with_adapter(harness, adapter)
+    prepared = prepare_execution(harness)
+    running = asyncio.run(
+        harness.executor.dispatch(
+            prepared.execution_id,
+            now=FIXED_TIME + timedelta(minutes=3),
+        )
+    )
+    with pytest.raises(RawResultStreamingError, match="metadata binding mismatch"):
+        asyncio.run(
+            harness.executor.collect_result(
+                running.execution_id,
+                now=FIXED_TIME + timedelta(minutes=4),
+            )
+        )
+
+    sink = harness.sink_factory.mock_sink(running.execution_id)
+    assert sink is not None and sink.committed
+    recovery = harness.recovery.get(
+        sink.recovery_metadata(updated_at=FIXED_TIME + timedelta(minutes=4)).recovery_id
+    )
+    assert recovery is not None
+    assert recovery.state == "COMMITTED"
+    assert recovery.receipt_id is not None
+    assert harness.receipts.get_by_execution(running.execution_id) is None
+    assert harness.finalization.missions.current(running.mission_id).state == "PAUSED"
     assert adapter.submit_calls == 1
     assert adapter.collect_calls == 1
 

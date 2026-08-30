@@ -431,6 +431,7 @@ class Executor:
         sink = self.sink_factory.for_execution(record.execution_id)
         try:
             metadata = await adapter.collect_result(record.provider_task_id, sink)
+            bound_receipt = await sink.commit()
         except (
             AdapterOperationError,
             RawResultQuarantineError,
@@ -443,7 +444,9 @@ class Executor:
         if not (
             metadata.execution_id == record.execution_id
             and metadata.provider_task_id == record.provider_task_id
+            and metadata.receipt == bound_receipt
         ):
+            self._record_raw_result_failure(record, sink=sink, now=now)
             raise RawResultStreamingError("adapter result metadata binding mismatch")
         self.receipts.add(metadata.receipt)
         if isinstance(sink, MockRawResultSink):
