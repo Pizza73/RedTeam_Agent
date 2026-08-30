@@ -46,6 +46,7 @@ TRIGGER_URL = "https://github.com/example/repo/pull/1#issuecomment-trigger"
 NO_FINDINGS_URL = "https://github.com/example/repo/pull/1#issuecomment-no-findings"
 REVIEW_URL = "https://github.com/example/repo/pull/1#pullrequestreview-77"
 PHASE_RECORD_URL = "https://github.com/example/repo/pull/3#issuecomment-record"
+PHASE_ONE_RECORD_URL = "https://github.com/example/repo/pull/3#issuecomment-phase-one"
 PULL_REQUEST_PREFIX = "https://github.com/example/repo/pull/3"
 
 
@@ -619,12 +620,18 @@ def base_refresh_status(
     creator: str = "github-actions[bot]",
     description: str = BASE_REFRESH_STATUS_DESCRIPTION,
     state: str = "success",
+    from_phase: str = "phase-0b",
+    revalidate_phase: str = "phase-0a",
+    target_url: str = PHASE_RECORD_URL,
 ) -> dict[str, object]:
     return {
-        "context": f"redteam/base-refresh/phase-0b/phase-0a/{DEFAULT_BRANCH_SHA}",
+        "context": (
+            f"redteam/base-refresh/{from_phase}/{revalidate_phase}/"
+            f"{DEFAULT_BRANCH_SHA}"
+        ),
         "state": state,
         "description": description,
-        "target_url": PHASE_RECORD_URL,
+        "target_url": target_url,
         "creator": {"login": creator},
         "url": "https://api.github.com/repos/example/repo/statuses/1",
     }
@@ -734,12 +741,16 @@ class _BaseTransitionGitHub(_StatusGitHub):
     def __init__(self, statuses: dict[str, list[dict[str, object]]]) -> None:
         super().__init__(statuses)
         self.label_calls: list[tuple[int, frozenset[str]]] = []
+        self.update_calls: list[tuple[int, str]] = []
 
     def set_pull_request_labels(
         self, number: int, labels: frozenset[str]
     ) -> frozenset[str]:
         self.label_calls.append((number, labels))
         return labels
+
+    def update_pull_request_branch(self, number: int, expected_head_sha: str) -> None:
+        self.update_calls.append((number, expected_head_sha))
 
 
 def test_trusted_status_drives_exact_local_phase_label_rollback() -> None:
@@ -763,6 +774,67 @@ def test_trusted_status_drives_exact_local_phase_label_rollback() -> None:
     ) is True
     assert github.label_calls == [(3, expected_state.labels)]
     assert len(loop.started_base_label_transitions) == 1
+
+
+def test_rolled_back_phase_uses_pending_transition_without_another_rollback() -> None:
+    state = phase_state(phase="phase-0a")
+    github = _BaseTransitionGitHub({HEAD_SHA: [base_refresh_status()]})
+    loop = PhaseLoop.__new__(PhaseLoop)
+    loop.github = github  # type: ignore[assignment]
+    loop.started_base_label_transitions = set()
+    loop.started_base_updates = set()
+    loop.dispatched_base_refreshes = set()
+    loop.dry_run = False
+    loop.log = lambda _message: None  # type: ignore[method-assign]
+    evidence = loop.trusted_base_refresh_statuses(state, [prior_phase_zero_pass()])
+
+    assert loop.perform_base_refresh_label_transition(
+        state, evidence, DEFAULT_BRANCH_SHA
+    ) is False
+    assert loop.perform_pending_base_refresh(
+        state, evidence, DEFAULT_BRANCH_SHA
+    ) is True
+    assert github.label_calls == []
+    assert github.update_calls == [(3, HEAD_SHA)]
+
+
+def test_conflicting_source_and_restart_transitions_fail_closed() -> None:
+    state = phase_state(phase="phase-0b")
+    statuses = [
+        base_refresh_status(),
+        base_refresh_status(
+            from_phase="phase-0c",
+            revalidate_phase="phase-0b",
+            target_url=PHASE_ONE_RECORD_URL,
+        ),
+    ]
+    github = _BaseTransitionGitHub({HEAD_SHA: statuses})
+    loop = PhaseLoop.__new__(PhaseLoop)
+    loop.github = github  # type: ignore[assignment]
+    loop.started_base_label_transitions = set()
+    loop.started_base_updates = set()
+    loop.dispatched_base_refreshes = set()
+    loop.dry_run = False
+    loop.log = lambda _message: None  # type: ignore[method-assign]
+    phase_one_pass = MarkerEvidence(
+        {"phase": "phase-0b", "verdict": "PASS", "reviewed_sha": HEAD_SHA},
+        PHASE_ONE_RECORD_URL,
+        "github-actions[bot]",
+        "",
+    )
+    evidence = loop.trusted_base_refresh_statuses(
+        state, [prior_phase_zero_pass(), phase_one_pass]
+    )
+
+    for operation in (
+        loop.perform_base_refresh_label_transition,
+        loop.perform_pending_base_refresh,
+    ):
+        with pytest.raises(UntrustedEvidenceError, match="conflicting"):
+            operation(state, evidence, DEFAULT_BRANCH_SHA)
+
+    assert github.label_calls == []
+    assert github.update_calls == []
 
 
 def test_local_phase_label_rollback_fails_closed_on_concurrent_pr_drift() -> None:

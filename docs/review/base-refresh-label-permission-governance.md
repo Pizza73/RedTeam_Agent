@@ -55,8 +55,8 @@ not call the final pull-request merge endpoint.
 ## Validation results
 
 - Focused Ruff for the runner, validator and changed tests: PASS.
-- Focused unit tests: PASS, 84 tests.
-- Full tests: PASS, 236 tests; no skip or xfail was added.
+- Focused unit tests: PASS, 86 tests.
+- Full tests: PASS, 238 tests; no skip or xfail was added.
 - Branch coverage: PASS, 75% total.
 - Automation validator: PASS, `AUTOMATION_VALIDATION=PASS`.
 - Python `compileall`: PASS.
@@ -84,6 +84,8 @@ Phase 0A implementation fixes and must pass the exact gate after the bounded bas
 - Finding addressed: Actions label replacement failed with HTTP 403, without granting the workflow
   pull-request merge authority.
 - Regression tests added: exact local label request, trusted-status transition, pre-write drift and
-  post-write drift.
+  post-write drift, rolled-back restart, and conflicting source/restart transition identities.
+- Review finding addressed: Codex P1 `discussion_r3889395110`; the runner now requires one
+  unambiguous transition identity before either label replacement or branch update.
 - Remaining constraint: the local operator login must retain permission to replace PR labels and
   update the PR branch; all changes remain exact-state and exact-HEAD bound.

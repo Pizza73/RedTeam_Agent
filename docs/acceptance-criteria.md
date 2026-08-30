@@ -36,6 +36,8 @@
   取込み後HEADで同Phase Gateを再実行する
 - Base-refresh Workflowは旧HEAD、Current default-branch SHA、隣接Prior PASSを固定したStatusのみ
   書込み、PR labelの完全置換はLocal Orchestratorが変更前後の全PR状態を再取得して実行する
+- 同じHEAD/Current Phaseにsource側とrollback済み側の複数Base-refresh遷移Identityが成立する
+  場合は、label置換とbranch updateのどちらも行わずFail Closedにする
 - Base refreshは`expected_head_sha`とCurrent default-branch SHAへ固定し、Final merge APIを
   呼ばない
 - Final mergeはLocal Orchestratorだけが実行し、`phase-5`、`ai-project-complete`、

@@ -1502,12 +1502,41 @@ class PhaseLoop:
                 result.append(item)
         return result
 
+    @staticmethod
+    def require_unique_base_refresh_transition_identity(
+        state: PullRequestState,
+        refresh_records: list[MarkerEvidence],
+    ) -> None:
+        identities: set[tuple[str, str, str, str]] = set()
+        for record in refresh_records:
+            payload = record.payload
+            if payload.get("head_sha") != state.head_sha:
+                continue
+            validate_base_refresh_payload(payload)
+            from_phase = payload.get("from_phase")
+            revalidation_phase = payload.get("revalidate_phase")
+            if state.phase not in {from_phase, revalidation_phase}:
+                continue
+            identities.add(
+                (
+                    str(from_phase),
+                    str(revalidation_phase),
+                    state.head_sha,
+                    str(payload["prior_pass_reference"]),
+                )
+            )
+        if len(identities) > 1:
+            raise UntrustedEvidenceError(
+                "conflicting base-refresh transition identities exist for the current PR state"
+            )
+
     def perform_base_refresh_label_transition(
         self,
         state: PullRequestState,
         refresh_records: list[MarkerEvidence],
         default_branch_sha: str,
     ) -> bool:
+        self.require_unique_base_refresh_transition_identity(state, refresh_records)
         phase_index = PHASES.index(state.phase)
         if phase_index == 0 or "ai-needs-implementation" not in state.labels:
             return False
@@ -1708,6 +1737,7 @@ class PhaseLoop:
         refresh_records: list[MarkerEvidence],
         default_branch_sha: str,
     ) -> bool:
+        self.require_unique_base_refresh_transition_identity(state, refresh_records)
         matches = [
             item
             for item in refresh_records
@@ -1716,10 +1746,13 @@ class PhaseLoop:
         ]
         if not matches:
             return False
-        record = matches[-1]
-        recorded_target = str(record.payload.get("target_base_sha", ""))
-        validate_base_refresh(record.payload, state=state, target_base_sha=recorded_target)
-        if recorded_target != default_branch_sha:
+        current_matches = [
+            item
+            for item in matches
+            if item.payload.get("target_base_sha") == default_branch_sha
+        ]
+        if not current_matches:
+            record = matches[-1]
             source_phase = str(record.payload["from_phase"])
             prior_pass = MarkerEvidence(
                 payload={},
@@ -1734,6 +1767,10 @@ class PhaseLoop:
                 source_phase=source_phase,
             )
             return True
+        record = current_matches[-1]
+        validate_base_refresh(
+            record.payload, state=state, target_base_sha=default_branch_sha
+        )
         digest = canonical_digest(record.payload)
         if digest not in self.started_base_updates:
             self.log(
