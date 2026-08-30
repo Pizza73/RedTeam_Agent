@@ -529,7 +529,9 @@ def test_phase_zero_a_review_uses_trusted_refreshed_base_not_pr_base_sha() -> No
     )
 
     assert (
-        loop.expected_base_sha(refreshed_phase_state(), [], [base_refresh_record()])
+        loop.expected_base_sha(
+            refreshed_phase_state(), [], [base_refresh_record()], DEFAULT_BRANCH_SHA
+        )
         == DEFAULT_BRANCH_SHA
     )
 
@@ -541,13 +543,30 @@ def test_phase_zero_a_review_rejects_unrelated_refreshed_head() -> None:
     )
 
     with pytest.raises(UntrustedEvidenceError, match="not descended"):
-        loop.expected_base_sha(refreshed_phase_state(), [], [base_refresh_record()])
+        loop.expected_base_sha(
+            refreshed_phase_state(), [], [base_refresh_record()], DEFAULT_BRANCH_SHA
+        )
+
+
+def test_phase_zero_a_review_rejects_refresh_when_default_branch_advanced() -> None:
+    loop = PhaseLoop.__new__(PhaseLoop)
+    loop.github = _AncestorGitHub(  # type: ignore[assignment]
+        {
+            (HEAD_SHA, REFRESHED_HEAD_SHA),
+            (DEFAULT_BRANCH_SHA, REFRESHED_HEAD_SHA),
+        }
+    )
+
+    with pytest.raises(UntrustedEvidenceError, match="stale for the current default branch"):
+        loop.expected_base_sha(
+            refreshed_phase_state(), [], [base_refresh_record()], "f" * 40
+        )
 
 
 def test_initial_phase_zero_a_review_keeps_original_pr_base_sha() -> None:
     loop = PhaseLoop.__new__(PhaseLoop)
 
-    assert loop.expected_base_sha(phase_state(), [], []) == BASE_SHA
+    assert loop.expected_base_sha(phase_state(), [], [], DEFAULT_BRANCH_SHA) == BASE_SHA
 
 
 @pytest.mark.parametrize(

@@ -985,6 +985,7 @@ class PhaseLoop:
         state: PullRequestState,
         phase_records: list[MarkerEvidence],
         refresh_records: list[MarkerEvidence],
+        default_branch_sha: str,
     ) -> str:
         index = PHASES.index(state.phase)
         if index == 0:
@@ -997,6 +998,10 @@ class PhaseLoop:
                 validate_base_refresh_payload(record.payload)
                 old_head = str(record.payload["head_sha"])
                 target_base = str(record.payload["target_base_sha"])
+                if target_base != default_branch_sha:
+                    raise UntrustedEvidenceError(
+                        "trusted base refresh is stale for the current default branch"
+                    )
                 if self.github.is_ancestor(
                     old_head, state.head_sha
                 ) and self.github.is_ancestor(target_base, state.head_sha):
@@ -1447,7 +1452,10 @@ class PhaseLoop:
                 status = f"waiting for Codex implementation: {state.phase} {state.head_sha[:12]}"
             elif action == "review" and ready is not None:
                 base_sha = self.expected_base_sha(
-                    state, phase_records, refresh_records
+                    state,
+                    phase_records,
+                    refresh_records,
+                    default_branch_sha,
                 )
                 review = self.find_review(state, base_sha, ready, comments)
                 if review is None:

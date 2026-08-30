@@ -63,6 +63,10 @@ criterion, and no external-action adapter changed.
 - A default-branch race after runner startup raises a typed prerequisite error.
 - Phase 0A review selects the trusted refreshed base rather than the stale PR base SHA.
 - A refreshed head unrelated to either the old head or target base is rejected.
+- Codex P1 `https://github.com/Pizza73/RedTeam_Agent/pull/7#discussion_r3888729311`
+  found that `main` could advance after the local runner check but before the dispatched phase-gate
+  execution. The gate now re-fetches the live PR and default branch immediately before recording
+  the result, and the local evaluator rejects a refresh target that is no longer current.
 - Initial, non-refreshed Phase 0A review retains the original PR base behavior.
 - Exact merge-base, behind-count, and compare-status semantics are tested for ancestor checks.
 - Workflow tests require refreshed-base ancestry controls and reject the obsolete equality check.
@@ -70,7 +74,9 @@ criterion, and no external-action adapter changed.
 ## Validation results
 
 - `.venv/bin/python -m pytest -q tests/unit/test_phase_loop.py tests/unit/test_automation_validation.py tests/unit/test_governance_check.py --strict-markers`
-  - PASS: 67 tests
+  - PASS: 68 tests
+- `.venv/bin/python -m pytest -q tests/unit/test_phase_loop.py tests/unit/test_automation_validation.py --strict-markers`
+  - PASS: 51 tests; exact Codex P1 retest request
 - `.venv/bin/python -m pytest -q tests/unit --strict-markers`
   - PASS: 91 tests
 - `.venv/bin/python -m pytest -q tests/integration --strict-markers`
@@ -80,7 +86,7 @@ criterion, and no external-action adapter changed.
 - Phase-specific test directory `tests/phases/phase_0a`
   - Not present; `scripts/ci/run_phase_gate.sh` conditionally skips it
 - Branch coverage run over `tests`
-  - PASS: 202 tests; 84% total branch coverage
+  - PASS: 203 tests; 84% total branch coverage
 - `.venv/bin/python -m ruff check automation scripts/ci tests/unit/test_phase_loop.py tests/unit/test_automation_validation.py tests/unit/test_governance_check.py`
   - PASS
 - `.venv/bin/python scripts/ci/validate_automation.py`
