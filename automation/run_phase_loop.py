@@ -223,12 +223,7 @@ def select_evidence_action(
     return "wait"
 
 
-def validate_base_refresh(
-    payload: dict[str, Any],
-    *,
-    state: PullRequestState,
-    target_base_sha: str,
-) -> None:
+def validate_base_refresh_payload(payload: dict[str, Any]) -> None:
     expected_keys = {
         "schema_version",
         "action",
@@ -242,23 +237,37 @@ def validate_base_refresh(
         raise UntrustedEvidenceError("base-refresh marker has missing or unknown fields")
     if payload.get("schema_version") != "1.0" or payload.get("action") != "REFRESH_BASE":
         raise UntrustedEvidenceError("base-refresh marker has an invalid version or action")
-    if payload.get("revalidate_phase") != state.phase:
-        raise UntrustedEvidenceError("base-refresh marker has the wrong revalidation phase")
+    revalidate_phase = payload.get("revalidate_phase")
+    if not isinstance(revalidate_phase, str) or revalidate_phase not in PHASES:
+        raise UntrustedEvidenceError("base-refresh marker has an invalid revalidation phase")
     from_phase = payload.get("from_phase")
     if not isinstance(from_phase, str) or from_phase not in PHASES:
         raise UntrustedEvidenceError("base-refresh marker has an invalid source phase")
     source_index = PHASES.index(from_phase)
-    if source_index == 0 or PHASES[source_index - 1] != state.phase:
+    if source_index == 0 or PHASES[source_index - 1] != revalidate_phase:
         raise UntrustedEvidenceError("base-refresh marker does not roll back exactly one phase")
-    if payload.get("head_sha") != state.head_sha:
-        raise UntrustedEvidenceError("base-refresh marker is stale for the current PR head")
+    if not SHA_PATTERN.fullmatch(str(payload.get("head_sha", ""))):
+        raise UntrustedEvidenceError("base-refresh marker has a malformed old head SHA")
     if not SHA_PATTERN.fullmatch(str(payload.get("target_base_sha", ""))):
         raise UntrustedEvidenceError("base-refresh marker has a malformed target base SHA")
-    if payload.get("target_base_sha") != target_base_sha:
-        raise UntrustedEvidenceError("base-refresh marker is stale for the default branch")
     reference = payload.get("prior_pass_reference")
     if not isinstance(reference, str) or not reference.startswith("https://github.com/"):
         raise UntrustedEvidenceError("base-refresh marker has an invalid PASS reference")
+
+
+def validate_base_refresh(
+    payload: dict[str, Any],
+    *,
+    state: PullRequestState,
+    target_base_sha: str,
+) -> None:
+    validate_base_refresh_payload(payload)
+    if payload.get("revalidate_phase") != state.phase:
+        raise UntrustedEvidenceError("base-refresh marker has the wrong revalidation phase")
+    if payload.get("head_sha") != state.head_sha:
+        raise UntrustedEvidenceError("base-refresh marker is stale for the current PR head")
+    if payload.get("target_base_sha") != target_base_sha:
+        raise UntrustedEvidenceError("base-refresh marker is stale for the default branch")
 
 
 def codex_implementation_blocker(
@@ -749,6 +758,16 @@ class GitHubClient:
             raise UntrustedEvidenceError("compare requires two full commit SHAs")
         return self.api_object(f"repos/{self.repository}/compare/{base_sha}...{head_sha}")
 
+    def is_ancestor(self, ancestor_sha: str, descendant_sha: str) -> bool:
+        comparison = self.compare(ancestor_sha, descendant_sha)
+        merge_base = comparison.get("merge_base_commit")
+        return (
+            isinstance(merge_base, dict)
+            and merge_base.get("sha") == ancestor_sha
+            and comparison.get("behind_by") == 0
+            and comparison.get("status") in {"ahead", "identical"}
+        )
+
     def update_pull_request_branch(self, number: int, expected_head_sha: str) -> None:
         if number < 1 or not SHA_PATTERN.fullmatch(expected_head_sha):
             raise UntrustedEvidenceError("branch update requires a PR and exact expected HEAD SHA")
@@ -810,6 +829,7 @@ class PhaseLoop:
         self.approver_login = github.variable("AI_GATE_APPROVER_LOGIN")
         self.reviewer_login = github.variable("AI_REVIEWER_LOGIN")
         self.default_branch = "main"
+        self.trusted_default_branch_sha = ""
         self.review_schema = self._load_json(
             repo_root / "automation" / "schemas" / "review-result.schema.json"
         )
@@ -863,12 +883,21 @@ class PhaseLoop:
             raise PrerequisiteError(
                 "local governance checkout is not the current default-branch SHA"
             )
+        self.trusted_default_branch_sha = local_sha
         if self.actor_login != self.approver_login:
             raise PrerequisiteError(
                 "gh login must exactly match repository variable AI_GATE_APPROVER_LOGIN"
             )
         if not self.reviewer_login:
             raise PrerequisiteError("AI_REVIEWER_LOGIN is empty")
+
+    def current_default_branch_sha(self) -> str:
+        current_sha = self.github.default_branch_sha(self.default_branch)
+        if current_sha != self.trusted_default_branch_sha:
+            raise PrerequisiteError(
+                "default branch changed after startup; update the clean local checkout and restart"
+            )
+        return current_sha
 
     def pr_state(self) -> PullRequestState:
         raw = self.github.pull_request(self.pull_request_number)
@@ -952,10 +981,30 @@ class PhaseLoop:
         return matches[-1] if matches else None
 
     def expected_base_sha(
-        self, state: PullRequestState, phase_records: list[MarkerEvidence]
+        self,
+        state: PullRequestState,
+        phase_records: list[MarkerEvidence],
+        refresh_records: list[MarkerEvidence],
     ) -> str:
         index = PHASES.index(state.phase)
         if index == 0:
+            candidates = [
+                record
+                for record in refresh_records
+                if record.payload.get("revalidate_phase") == state.phase
+            ]
+            for record in reversed(candidates):
+                validate_base_refresh_payload(record.payload)
+                old_head = str(record.payload["head_sha"])
+                target_base = str(record.payload["target_base_sha"])
+                if self.github.is_ancestor(
+                    old_head, state.head_sha
+                ) and self.github.is_ancestor(target_base, state.head_sha):
+                    return target_base
+            if candidates:
+                raise UntrustedEvidenceError(
+                    "current Phase 0A head is not descended from its trusted base refresh"
+                )
             return state.base_sha
         previous = PHASES[index - 1]
         passes = [
@@ -974,6 +1023,7 @@ class PhaseLoop:
         state: PullRequestState,
         requests: list[MarkerEvidence],
         phase_records: list[MarkerEvidence],
+        default_branch_sha: str,
     ) -> MarkerEvidence | None:
         phase_index = PHASES.index(state.phase)
         if phase_index == 0 or "ai-needs-implementation" not in state.labels:
@@ -1003,7 +1053,7 @@ class PhaseLoop:
         ]
         if not passes:
             return None
-        comparison = self.github.compare(state.head_sha, state.base_sha)
+        comparison = self.github.compare(state.head_sha, default_branch_sha)
         ahead_by = comparison.get("ahead_by")
         if not isinstance(ahead_by, int) or ahead_by < 0:
             raise UntrustedEvidenceError("GitHub comparison has an invalid ahead_by value")
@@ -1014,15 +1064,18 @@ class PhaseLoop:
         state: PullRequestState,
         prior_pass: MarkerEvidence,
         *,
+        target_base_sha: str,
         source_phase: str | None = None,
     ) -> None:
         requested_source = source_phase or state.phase
-        key = f"{requested_source}:{state.head_sha}:{state.base_sha}"
+        if not SHA_PATTERN.fullmatch(target_base_sha):
+            raise UntrustedEvidenceError("base refresh requires the full default-branch SHA")
+        key = f"{requested_source}:{state.head_sha}:{target_base_sha}"
         if key in self.dispatched_base_refreshes:
             return
         self.log(
             f"requesting base refresh before {requested_source}: "
-            f"{state.head_sha[:12]} -> {state.base_sha[:12]}"
+            f"{state.head_sha[:12]} -> {target_base_sha[:12]}"
         )
         if not self.dry_run:
             self.github.dispatch_workflow(
@@ -1032,7 +1085,7 @@ class PhaseLoop:
                     "pull_request_number": str(state.number),
                     "source_phase": requested_source,
                     "expected_head_sha": state.head_sha,
-                    "target_base_sha": state.base_sha,
+                    "target_base_sha": target_base_sha,
                     "prior_pass_reference": prior_pass.url,
                     "confirmation": "REFRESH_AI_LOOP_BASE",
                 },
@@ -1043,6 +1096,7 @@ class PhaseLoop:
         self,
         state: PullRequestState,
         refresh_records: list[MarkerEvidence],
+        default_branch_sha: str,
     ) -> bool:
         matches = [
             item
@@ -1055,7 +1109,7 @@ class PhaseLoop:
         record = matches[-1]
         recorded_target = str(record.payload.get("target_base_sha", ""))
         validate_base_refresh(record.payload, state=state, target_base_sha=recorded_target)
-        if recorded_target != state.base_sha:
+        if recorded_target != default_branch_sha:
             source_phase = str(record.payload["from_phase"])
             prior_pass = MarkerEvidence(
                 payload={},
@@ -1066,6 +1120,7 @@ class PhaseLoop:
             self.request_base_refresh(
                 state,
                 prior_pass,
+                target_base_sha=default_branch_sha,
                 source_phase=source_phase,
             )
             return True
@@ -1309,6 +1364,7 @@ class PhaseLoop:
         start_dispatched = False
         while True:
             self.fail_if_expired()
+            default_branch_sha = self.current_default_branch_sha()
             state = self.pr_state()
             if "ai-project-complete" in state.labels:
                 return "PROJECT_COMPLETE_HUMAN_MERGE_REQUIRED"
@@ -1325,7 +1381,9 @@ class PhaseLoop:
             phase_records = self.trusted_markers(comments, "redteam-phase-gate")
             refresh_records = self.trusted_markers(comments, "redteam-base-refresh")
 
-            if self.perform_pending_base_refresh(state, refresh_records):
+            if self.perform_pending_base_refresh(
+                state, refresh_records, default_branch_sha
+            ):
                 status = f"waiting for refreshed PR head: {state.phase} {state.head_sha[:12]}"
                 if status != last_status:
                     self.log(status)
@@ -1336,10 +1394,17 @@ class PhaseLoop:
                 continue
 
             refresh_candidate = self.base_refresh_candidate(
-                state, implementation_requests, phase_records
+                state,
+                implementation_requests,
+                phase_records,
+                default_branch_sha,
             )
             if refresh_candidate is not None:
-                self.request_base_refresh(state, refresh_candidate)
+                self.request_base_refresh(
+                    state,
+                    refresh_candidate,
+                    target_base_sha=default_branch_sha,
+                )
                 status = f"waiting for trusted base-refresh transition: {state.phase}"
                 if status != last_status:
                     self.log(status)
@@ -1381,7 +1446,9 @@ class PhaseLoop:
                 self.request_implementation(state, request, comments)
                 status = f"waiting for Codex implementation: {state.phase} {state.head_sha[:12]}"
             elif action == "review" and ready is not None:
-                base_sha = self.expected_base_sha(state, phase_records)
+                base_sha = self.expected_base_sha(
+                    state, phase_records, refresh_records
+                )
                 review = self.find_review(state, base_sha, ready, comments)
                 if review is None:
                     self.request_review(state, ready, base_sha, comments)

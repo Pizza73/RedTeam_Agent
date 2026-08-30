@@ -10,6 +10,7 @@ from automation.run_phase_loop import (
     GitHubClient,
     MarkerEvidence,
     PhaseLoop,
+    PrerequisiteError,
     PullRequestState,
     ReviewEvidence,
     UntrustedEvidenceError,
@@ -29,6 +30,8 @@ from automation.run_phase_loop import (
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HEAD_SHA = "a" * 40
 BASE_SHA = "b" * 40
+DEFAULT_BRANCH_SHA = "d" * 40
+REFRESHED_HEAD_SHA = "e" * 40
 ACTOR_LOGIN = "operator"
 REVIEWER_LOGIN = "chatgpt-codex-connector[bot]"
 READY_URL = "https://github.com/example/repo/pull/1#issuecomment-ready"
@@ -484,6 +487,69 @@ def test_base_refresh_is_bound_to_adjacent_phase_head_and_default_branch() -> No
     )
 
 
+class _AncestorGitHub:
+    def __init__(self, ancestors: set[tuple[str, str]]) -> None:
+        self.ancestors = ancestors
+
+    def is_ancestor(self, ancestor_sha: str, descendant_sha: str) -> bool:
+        return (ancestor_sha, descendant_sha) in self.ancestors
+
+
+def refreshed_phase_state() -> PullRequestState:
+    return PullRequestState(
+        number=3,
+        head_sha=REFRESHED_HEAD_SHA,
+        base_sha=BASE_SHA,
+        base_ref="main",
+        phase="phase-0a",
+        labels=frozenset({"ai-loop", "ai-ready-for-review", "phase-0a"}),
+        state="open",
+        head_repository="example/repo",
+    )
+
+
+def base_refresh_record() -> MarkerEvidence:
+    payload = base_refresh_payload()
+    payload["target_base_sha"] = DEFAULT_BRANCH_SHA
+    return MarkerEvidence(
+        payload,
+        "https://github.com/example/repo/pull/3#issuecomment-refresh",
+        "github-actions[bot]",
+        "",
+    )
+
+
+def test_phase_zero_a_review_uses_trusted_refreshed_base_not_pr_base_sha() -> None:
+    loop = PhaseLoop.__new__(PhaseLoop)
+    loop.github = _AncestorGitHub(  # type: ignore[assignment]
+        {
+            (HEAD_SHA, REFRESHED_HEAD_SHA),
+            (DEFAULT_BRANCH_SHA, REFRESHED_HEAD_SHA),
+        }
+    )
+
+    assert (
+        loop.expected_base_sha(refreshed_phase_state(), [], [base_refresh_record()])
+        == DEFAULT_BRANCH_SHA
+    )
+
+
+def test_phase_zero_a_review_rejects_unrelated_refreshed_head() -> None:
+    loop = PhaseLoop.__new__(PhaseLoop)
+    loop.github = _AncestorGitHub(  # type: ignore[assignment]
+        {(HEAD_SHA, REFRESHED_HEAD_SHA)}
+    )
+
+    with pytest.raises(UntrustedEvidenceError, match="not descended"):
+        loop.expected_base_sha(refreshed_phase_state(), [], [base_refresh_record()])
+
+
+def test_initial_phase_zero_a_review_keeps_original_pr_base_sha() -> None:
+    loop = PhaseLoop.__new__(PhaseLoop)
+
+    assert loop.expected_base_sha(phase_state(), [], []) == BASE_SHA
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
@@ -517,7 +583,9 @@ def test_stale_base_refresh_is_reauthorized_for_new_default_head() -> None:
         "",
     )
 
-    assert loop.perform_pending_base_refresh(phase_state(), [stale_record]) is True
+    assert loop.perform_pending_base_refresh(
+        phase_state(), [stale_record], BASE_SHA
+    ) is True
     assert loop.dispatched_base_refreshes == {f"phase-0b:{HEAD_SHA}:{BASE_SHA}"}
     assert loop.started_base_updates == set()
 
@@ -600,7 +668,7 @@ class _CompareGitHub:
         self.ahead_by = ahead_by
 
     def compare(self, base_sha: str, head_sha: str) -> dict[str, object]:
-        assert (base_sha, head_sha) == (HEAD_SHA, BASE_SHA)
+        assert (base_sha, head_sha) == (HEAD_SHA, DEFAULT_BRANCH_SHA)
         return {"ahead_by": self.ahead_by}
 
 
@@ -627,7 +695,10 @@ def test_base_refresh_candidate_requires_prior_pass_on_current_head() -> None:
     )
 
     assert loop.base_refresh_candidate(
-        phase_state(phase="phase-0b"), [request], [prior_pass]
+        phase_state(phase="phase-0b"),
+        [request],
+        [prior_pass],
+        DEFAULT_BRANCH_SHA,
     ) == prior_pass
 
 
@@ -657,8 +728,27 @@ def test_base_refresh_candidate_is_absent_when_main_has_not_advanced() -> None:
     )
 
     assert loop.base_refresh_candidate(
-        phase_state(phase="phase-0b"), [request], [prior_pass]
+        phase_state(phase="phase-0b"),
+        [request],
+        [prior_pass],
+        DEFAULT_BRANCH_SHA,
     ) is None
+
+
+class _DefaultBranchGitHub:
+    def default_branch_sha(self, branch: str) -> str:
+        assert branch == "main"
+        return DEFAULT_BRANCH_SHA
+
+
+def test_runner_stops_if_default_branch_changes_after_startup() -> None:
+    loop = PhaseLoop.__new__(PhaseLoop)
+    loop.github = _DefaultBranchGitHub()  # type: ignore[assignment]
+    loop.default_branch = "main"
+    loop.trusted_default_branch_sha = BASE_SHA
+
+    with pytest.raises(PrerequisiteError, match="changed after startup"):
+        loop.current_default_branch_sha()
 
 
 class _RecordingCommand:
@@ -668,6 +758,62 @@ class _RecordingCommand:
     def run(self, arguments: list[str]) -> str:
         self.arguments = arguments
         return '{"message":"Updating pull request branch."}'
+
+
+class _ComparisonGitHub:
+    is_ancestor = GitHubClient.is_ancestor
+
+    def __init__(self, comparison: dict[str, object]) -> None:
+        self.comparison = comparison
+
+    def compare(self, base_sha: str, head_sha: str) -> dict[str, object]:
+        assert (base_sha, head_sha) == (HEAD_SHA, REFRESHED_HEAD_SHA)
+        return self.comparison
+
+
+@pytest.mark.parametrize(
+    ("comparison", "expected"),
+    [
+        (
+            {
+                "merge_base_commit": {"sha": HEAD_SHA},
+                "behind_by": 0,
+                "status": "ahead",
+            },
+            True,
+        ),
+        (
+            {
+                "merge_base_commit": {"sha": HEAD_SHA},
+                "behind_by": 0,
+                "status": "identical",
+            },
+            True,
+        ),
+        (
+            {
+                "merge_base_commit": {"sha": HEAD_SHA},
+                "behind_by": 1,
+                "status": "diverged",
+            },
+            False,
+        ),
+        (
+            {
+                "merge_base_commit": {"sha": BASE_SHA},
+                "behind_by": 0,
+                "status": "ahead",
+            },
+            False,
+        ),
+    ],
+)
+def test_ancestor_check_requires_exact_merge_base_and_forward_history(
+    comparison: dict[str, object], expected: bool
+) -> None:
+    github = _ComparisonGitHub(comparison)
+
+    assert github.is_ancestor(HEAD_SHA, REFRESHED_HEAD_SHA) is expected
 
 
 def test_branch_update_uses_expected_head_and_never_final_merge_endpoint() -> None:
