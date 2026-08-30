@@ -27,7 +27,7 @@ Codex CloudまたはChatGPTによる独立ReviewとCodexによる実装を、Pha
 | LOOP-017 | Local Orchestratorはnative reviewer identity、P0/P1またはno-finding形式、ready/trigger、Phase、HEAD SHA、Base SHA、Review中のhead不変性を検証してから、承認者制限付きPhase Gate Workflowを起動する |
 | LOOP-018 | Phase 4/5はProvider Human Gate承認前に開始せず、承認後は同じLoopを再起動して当該Phaseを自動実行できる |
 | LOOP-019 | Active PRのCurrent Phaseはexact phase label、`github-actions[bot]`のCurrent-HEAD実装Request、隣接Prior-Phase PASSの一致から解決し、Default Branch上のStatus Snapshotを遷移権限として使用しない |
-| LOOP-020 | 次Phase実装前にDefault Branchが進んだ場合、Prior PASSと同じExpected HEADに限ってBase Refreshを許可し、Phaseを1つ戻して更新後HEADでGateを再実行する |
+| LOOP-020 | 次Phase実装前にDefault Branchが進んだ場合、Approver限定WorkflowがPrior PASSと同じExpected HEADへ固定したStatusを記録し、Local Orchestratorだけが全PR状態を前後検証してPhaseを1つ戻し、Expected HEAD固定でBase Refreshした後の新HEADでGateを再実行する |
 | LOOP-021 | Base RefreshはPR BranchへDefault Branchを取り込む操作に限定し、Final PR Merge APIを呼び出さない |
 | LOOP-022 | Governance PR、Fork PR、Phase未完了、Stop Label、Stale/Unknown/Ambiguous Evidence、Default Branch未包含時は自動mergeしない。CodexとGitHub ActionsにはFinal Merge APIを与えない |
 | LOOP-023 | Final Merge API呼出し前に、PR番号と完全HEAD固定のRepository Git ref claimを原子的に作成し、PR番号、完全HEAD、Default Branch SHA、Phase 5 Gate、Policy Digest、Actor、Claim RefへBindingした永続Attempt RecordをPRへ保存する。同じPR/HEADのClaim/Recordが存在・作成結果不明、または取得後GateにDrift/Unknownがあれば、明示的Reconciliationなしに再送しない |

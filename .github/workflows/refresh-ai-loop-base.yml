@@ -34,7 +34,6 @@ concurrency:
 
 permissions:
   contents: read
-  issues: write
   pull-requests: read
   statuses: write
 
@@ -335,15 +334,6 @@ jobs:
               target_url: priorPassReference,
             });
 
-            const removedStateLabels = new Set([
-              sourcePhase, 'ai-needs-review', 'ai-needs-fix', 'ai-review-passed',
-              'ai-loop-blocked', 'ai-human-gate'
-            ]);
-            const nextLabels = labels.filter((name) => !removedStateLabels.has(name));
-            nextLabels.push(previousPhase, 'ai-needs-implementation');
-            await github.rest.issues.setLabels({
-              owner, repo, issue_number: pull_number, labels: [...new Set(nextLabels)],
-            });
             await github.rest.repos.createCommitStatus({
               owner, repo, sha: expectedHeadSha, state: 'pending',
               context: 'redteam/phase-review',

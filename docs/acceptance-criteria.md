@@ -34,6 +34,8 @@
   Implementation Request、隣接するPrior-Phase PASSの完全一致でのみ解決する
 - Default BranchをPRへ取り込む前にCurrent Phaseを1つ戻し、旧HEADのPASSを再利用せず、
   取込み後HEADで同Phase Gateを再実行する
+- Base-refresh Workflowは旧HEAD、Current default-branch SHA、隣接Prior PASSを固定したStatusのみ
+  書込み、PR labelの完全置換はLocal Orchestratorが変更前後の全PR状態を再取得して実行する
 - Base refreshは`expected_head_sha`とCurrent default-branch SHAへ固定し、Final merge APIを
   呼ばない
 - Final mergeはLocal Orchestratorだけが実行し、`phase-5`、`ai-project-complete`、

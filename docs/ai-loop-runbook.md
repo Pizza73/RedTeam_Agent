@@ -164,11 +164,12 @@ The runner may use GitHub's **Update a pull request branch** operation. This mer
 default branch into the long-lived PR branch only after the approver-restricted workflow records a
 SHA-bound `redteam/base-refresh/...` commit status. The status is attached to the old full HEAD,
 encodes the adjacent Phase rollback and exact target-base SHA in its context, and links to the prior
-PASS. The workflow token has `statuses: write`, `issues: write` for labels, and only
-`pull-requests: read`; it cannot merge the PR. The branch-update request includes the old full HEAD
-as `expected_head_sha`, so a concurrent Codex or human commit is rejected. The Phase label is moved
-back one step first and CI must produce a new SHA-bound PASS. This operation does not merge the PR
-into `main`; it is distinct from the local Phase 5 final merge gate above.
+PASS. The workflow token has `statuses: write` and only `pull-requests: read`; it cannot write labels
+or merge the PR. The local runner verifies that status, re-reads the full PR state, replaces the
+labels with the exact adjacent-Phase rollback set, and verifies the full resulting state. The
+branch-update request includes the old full HEAD as `expected_head_sha`, so a concurrent Codex or
+human commit is rejected. CI must then produce a new SHA-bound PASS. This operation does not merge
+the PR into `main`; it is distinct from the local Phase 5 final merge gate above.
 
 Codex Code Review posts standard GitHub evidence rather than repository-defined JSON. For PASS,
 the loop requires the standard no-major-issues comment, a matching 10-or-more-character commit

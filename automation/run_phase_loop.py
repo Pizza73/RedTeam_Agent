@@ -17,7 +17,7 @@ import shutil
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, NoReturn
@@ -1139,6 +1139,40 @@ class GitHubClient:
         if not isinstance(value, dict) or not isinstance(value.get("message"), str):
             raise UntrustedEvidenceError("GitHub branch-update response is invalid")
 
+    def set_pull_request_labels(
+        self, number: int, labels: frozenset[str]
+    ) -> frozenset[str]:
+        if number < 1 or not labels:
+            raise UntrustedEvidenceError("label transition requires a PR and non-empty label set")
+        if any(
+            not isinstance(label, str)
+            or not label
+            or len(label) > 50
+            or any(ord(character) < 32 for character in label)
+            for label in labels
+        ):
+            raise UntrustedEvidenceError("label transition contains an invalid label")
+        arguments = [
+            "api",
+            "--method",
+            "PUT",
+            f"repos/{self.repository}/issues/{number}/labels",
+        ]
+        for label in sorted(labels):
+            arguments.extend(["--raw-field", f"labels[]={label}"])
+        raw = self.command.run(arguments)
+        value = strict_json_loads(raw)
+        if not isinstance(value, list):
+            raise UntrustedEvidenceError("GitHub label response must be an array")
+        actual = frozenset(
+            item["name"]
+            for item in value
+            if isinstance(item, dict) and isinstance(item.get("name"), str)
+        )
+        if actual != labels or len(value) != len(actual):
+            raise UntrustedEvidenceError("GitHub did not confirm the exact PR label transition")
+        return actual
+
     def merge_pull_request(
         self, number: int, expected_head_sha: str, *, merge_method: str
     ) -> str:
@@ -1300,6 +1334,7 @@ class PhaseLoop:
         }
         self.dispatched_review_records: set[str] = set()
         self.dispatched_base_refreshes: set[str] = set()
+        self.started_base_label_transitions: set[str] = set()
         self.started_base_updates: set[str] = set()
 
     @staticmethod
@@ -1427,10 +1462,14 @@ class PhaseLoop:
         state: PullRequestState,
         phase_records: list[MarkerEvidence],
     ) -> list[MarkerEvidence]:
+        revalidation_phases = {state.phase}
+        phase_index = PHASES.index(state.phase)
+        if phase_index > 0:
+            revalidation_phases.add(PHASES[phase_index - 1])
         prior_passes = [
             record
             for record in phase_records
-            if record.payload.get("phase") == state.phase
+            if record.payload.get("phase") in revalidation_phases
             and record.payload.get("verdict") == "PASS"
             and SHA_PATTERN.fullmatch(str(record.payload.get("reviewed_sha", "")))
         ]
@@ -1442,14 +1481,16 @@ class PhaseLoop:
                 self.github.commit_statuses(head_sha), head_sha=head_sha
             )
             for item in evidence:
-                if item.payload.get("revalidate_phase") != state.phase:
+                revalidation_phase = item.payload.get("revalidate_phase")
+                if revalidation_phase not in revalidation_phases:
                     continue
                 prior_reference = item.payload.get("prior_pass_reference")
                 matching_pass = next(
                     (
                         record
                         for record in prior_passes
-                        if record.url == prior_reference
+                        if record.payload.get("phase") == revalidation_phase
+                        and record.url == prior_reference
                         and record.payload.get("reviewed_sha") == head_sha
                     ),
                     None,
@@ -1460,6 +1501,78 @@ class PhaseLoop:
                     )
                 result.append(item)
         return result
+
+    def perform_base_refresh_label_transition(
+        self,
+        state: PullRequestState,
+        refresh_records: list[MarkerEvidence],
+        default_branch_sha: str,
+    ) -> bool:
+        phase_index = PHASES.index(state.phase)
+        if phase_index == 0 or "ai-needs-implementation" not in state.labels:
+            return False
+        previous_phase = PHASES[phase_index - 1]
+        matches = [
+            item
+            for item in refresh_records
+            if item.payload.get("from_phase") == state.phase
+            and item.payload.get("revalidate_phase") == previous_phase
+            and item.payload.get("head_sha") == state.head_sha
+        ]
+        if not matches:
+            return False
+        current_matches = [
+            item
+            for item in matches
+            if item.payload.get("target_base_sha") == default_branch_sha
+        ]
+        if not current_matches:
+            stale = matches[0]
+            self.request_base_refresh(
+                state,
+                MarkerEvidence(
+                    payload={},
+                    url=str(stale.payload["prior_pass_reference"]),
+                    author=stale.author,
+                    body=stale.body,
+                ),
+                target_base_sha=default_branch_sha,
+            )
+            return True
+        record = current_matches[0]
+        validate_base_refresh_payload(record.payload)
+        desired_labels = set(state.labels)
+        desired_labels.difference_update(
+            {
+                state.phase,
+                "ai-needs-review",
+                "ai-needs-fix",
+                "ai-review-passed",
+                "ai-loop-blocked",
+                "ai-human-gate",
+            }
+        )
+        desired_labels.update({previous_phase, "ai-needs-implementation"})
+        expected_labels = frozenset(desired_labels)
+        expected_state = replace(state, phase=previous_phase, labels=expected_labels)
+        digest = canonical_digest(record.payload)
+        if digest not in self.started_base_label_transitions:
+            self.log(
+                f"rolling base-refresh Phase label back at exact HEAD "
+                f"{state.head_sha[:12]}: {state.phase} -> {previous_phase}"
+            )
+            if not self.dry_run:
+                if self.pr_state() != state:
+                    raise UntrustedEvidenceError(
+                        "pull request changed before the base-refresh label transition"
+                    )
+                self.github.set_pull_request_labels(state.number, expected_labels)
+                if self.pr_state() != expected_state:
+                    raise UntrustedEvidenceError(
+                        "pull request changed during the base-refresh label transition"
+                    )
+            self.started_base_label_transitions.add(digest)
+        return True
 
     @staticmethod
     def matching_payload(
@@ -2074,6 +2187,18 @@ class PhaseLoop:
             )
             ready_records = self.trusted_markers(comments, "redteam-ready-for-review")
             refresh_records = self.trusted_base_refresh_statuses(state, phase_records)
+
+            if self.perform_base_refresh_label_transition(
+                state, refresh_records, default_branch_sha
+            ):
+                status = f"waiting for base-refresh Phase rollback: {state.phase}"
+                if status != last_status:
+                    self.log(status)
+                    last_status = status
+                if self.dry_run:
+                    return f"DRY_RUN:{status}"
+                self.sleep()
+                continue
 
             if self.perform_pending_base_refresh(
                 state, refresh_records, default_branch_sha

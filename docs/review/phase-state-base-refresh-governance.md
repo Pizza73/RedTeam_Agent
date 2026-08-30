@@ -1,5 +1,10 @@
 # Phase State and Base Refresh Governance Report
 
+> Historical note: the workflow-side label transition described below was superseded after live
+> permission validation. The current design is recorded in
+> `docs/review/base-refresh-label-permission-governance.md`: the workflow writes exact-SHA status
+> evidence and the local orchestrator performs the fully revalidated label rollback.
+
 ## Scope
 
 - Current boundary: Phase 0A -> Phase 0B governance transition
