@@ -17,7 +17,8 @@ repository_setup:
 loop:
   max_iterations_per_phase: 5
   same_finding_limit: 3
-  final_merge_requires_human: true
+  final_merge_requires_human: false
+  final_merge_mode: local_orchestrator_exact_sha
   allow_fork_pull_requests: false
   reviewer_status_context: redteam/phase-review
   ai_runs_in_github_actions: false
@@ -58,7 +59,6 @@ bootstrap_state:
 human_gates:
   - phase-4
   - phase-5
-  - final-merge
 
 required_repository_variables:
   - AI_GATE_APPROVER_LOGIN

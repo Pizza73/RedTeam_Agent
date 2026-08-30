@@ -56,6 +56,25 @@ CODEX_REVIEWED_COMMIT_PATTERN = re.compile(
 CODEX_PRIORITY_PATTERN = re.compile(r"!\[P([01]) Badge\]")
 REQUIREMENT_ID_PATTERN = re.compile(r"\b(?:B|H|M|L)-\d{2}\b")
 CODEX_BLOCKED_PREFIX = "## BLOCKED"
+PHASE_GATE_RECORD_KEYS = frozenset(
+    {
+        "schema_version",
+        "phase",
+        "reviewed_sha",
+        "base_sha",
+        "verdict",
+        "summary",
+        "evidence_format",
+        "review_reference",
+        "ready_reference",
+        "review_trigger_reference",
+        "reviewer_login",
+        "recorded_by",
+        "finding_key",
+        "required_checks",
+        "loop_state",
+    }
+)
 
 
 class PhaseLoopError(RuntimeError):
@@ -76,6 +95,10 @@ class LoopBlockedError(PhaseLoopError):
 
 class LoopTimeoutError(PhaseLoopError):
     """Raised when the bounded local runtime expires."""
+
+
+class FinalMergeRejectedError(PhaseLoopError):
+    """Raised when GitHub does not confirm an exact-SHA final merge."""
 
 
 @dataclass(frozen=True)
@@ -276,6 +299,129 @@ def validate_base_refresh(
         raise UntrustedEvidenceError("base-refresh evidence is stale for the current PR head")
     if payload.get("target_base_sha") != target_base_sha:
         raise UntrustedEvidenceError("base-refresh evidence is stale for the default branch")
+
+
+def validate_phase_gate_pass_record(
+    record: MarkerEvidence,
+    *,
+    phase: str,
+    reviewed_sha: str,
+    reviewer_login: str,
+    approver_login: str,
+    pull_request_prefix: str,
+) -> str:
+    payload = record.payload
+    if record.author != TRUSTED_WORKFLOW_LOGIN:
+        raise UntrustedEvidenceError("final-merge phase record has an untrusted author")
+    if set(payload) != PHASE_GATE_RECORD_KEYS:
+        raise UntrustedEvidenceError("final-merge phase record has missing or unknown fields")
+    if (
+        payload.get("schema_version") != "1.0"
+        or payload.get("phase") != phase
+        or payload.get("reviewed_sha") != reviewed_sha
+        or payload.get("verdict") != "PASS"
+        or payload.get("loop_state") != "PASS"
+        or payload.get("evidence_format") != "codex-native-v1"
+    ):
+        raise UntrustedEvidenceError("final-merge phase record is stale or not a PASS")
+    base_sha = payload.get("base_sha")
+    if not isinstance(base_sha, str) or not SHA_PATTERN.fullmatch(base_sha):
+        raise UntrustedEvidenceError("final-merge phase record has an invalid base SHA")
+    if payload.get("reviewer_login") != reviewer_login:
+        raise UntrustedEvidenceError("final-merge phase record has the wrong reviewer")
+    if payload.get("recorded_by") != approver_login:
+        raise UntrustedEvidenceError("final-merge phase record has the wrong recorder")
+    if payload.get("finding_key") is not None:
+        raise UntrustedEvidenceError("final-merge PASS record unexpectedly has a finding key")
+    summary = payload.get("summary")
+    if not isinstance(summary, str) or not summary.strip() or len(summary.strip()) > 500:
+        raise UntrustedEvidenceError("final-merge phase record has an invalid summary")
+    permalink_prefix = f"{pull_request_prefix}#"
+    for field in ("review_reference", "ready_reference", "review_trigger_reference"):
+        reference = payload.get(field)
+        if not isinstance(reference, str) or not reference.startswith(permalink_prefix):
+            raise UntrustedEvidenceError(
+                f"final-merge phase record has an invalid {field.replace('_', ' ')}"
+            )
+    if not record.url.startswith(permalink_prefix):
+        raise UntrustedEvidenceError(
+            "final-merge phase record permalink is outside the pull request"
+        )
+    checks = payload.get("required_checks")
+    if not isinstance(checks, list) or len(checks) != len(REQUIRED_CHECK_ORDER):
+        raise UntrustedEvidenceError("final-merge phase record has an invalid required-check set")
+    normalized_checks = []
+    for item in checks:
+        if not isinstance(item, dict) or set(item) != {"name", "status"}:
+            raise UntrustedEvidenceError("final-merge phase record has a malformed required check")
+        normalized_checks.append((item.get("name"), item.get("status")))
+    if tuple(normalized_checks) != tuple((name, "PASS") for name in REQUIRED_CHECK_ORDER):
+        raise UntrustedEvidenceError("final-merge phase record contains a non-passing check")
+    return base_sha
+
+
+def validate_final_merge_phase_chain(
+    records: list[MarkerEvidence],
+    *,
+    head_sha: str,
+    reviewer_login: str,
+    approver_login: str,
+    pull_request_prefix: str,
+) -> MarkerEvidence:
+    if not SHA_PATTERN.fullmatch(head_sha):
+        raise UntrustedEvidenceError("automatic final merge requires a full current HEAD SHA")
+    expected_sha = head_sha
+    final_record: MarkerEvidence | None = None
+    for phase in reversed(PHASES):
+        candidates = [
+            record
+            for record in records
+            if record.payload.get("phase") == phase
+            and record.payload.get("reviewed_sha") == expected_sha
+            and record.payload.get("verdict") == "PASS"
+        ]
+        if len(candidates) != 1:
+            raise UntrustedEvidenceError(
+                f"automatic final merge requires exactly one chained PASS for {phase}"
+            )
+        record = candidates[0]
+        if phase == "phase-5":
+            final_record = record
+        expected_sha = validate_phase_gate_pass_record(
+            record,
+            phase=phase,
+            reviewed_sha=expected_sha,
+            reviewer_login=reviewer_login,
+            approver_login=approver_login,
+            pull_request_prefix=pull_request_prefix,
+        )
+    assert final_record is not None
+    return final_record
+
+
+def validate_final_phase_status(
+    statuses: list[dict[str, Any]],
+    *,
+    head_sha: str,
+    final_record_url: str,
+    context: str,
+) -> None:
+    matching = [status for status in statuses if status.get("context") == context]
+    if not matching:
+        raise UntrustedEvidenceError("automatic final merge is missing the phase-review status")
+    latest = matching[0]
+    creator = latest.get("creator")
+    if (
+        not isinstance(creator, dict)
+        or creator.get("login") != TRUSTED_WORKFLOW_LOGIN
+        or latest.get("sha") != head_sha
+        or latest.get("state") != "success"
+        or latest.get("description") != "phase-5: independent review PASS"
+        or latest.get("target_url") != final_record_url
+    ):
+        raise UntrustedEvidenceError(
+            "automatic final merge phase-review status is untrusted, stale, or non-passing"
+        )
 
 
 def base_refresh_evidence_from_statuses(
@@ -852,6 +998,42 @@ class GitHubClient:
         if not isinstance(value, dict) or not isinstance(value.get("message"), str):
             raise UntrustedEvidenceError("GitHub branch-update response is invalid")
 
+    def merge_pull_request(
+        self, number: int, expected_head_sha: str, *, merge_method: str
+    ) -> str:
+        if (
+            number < 1
+            or not SHA_PATTERN.fullmatch(expected_head_sha)
+            or merge_method != "merge"
+        ):
+            raise UntrustedEvidenceError(
+                "automatic final merge requires a PR, exact HEAD SHA, and merge method"
+            )
+        raw = self.command.run(
+            [
+                "api",
+                "--method",
+                "PUT",
+                f"repos/{self.repository}/pulls/{number}/merge",
+                "--raw-field",
+                f"sha={expected_head_sha}",
+                "--raw-field",
+                f"merge_method={merge_method}",
+            ]
+        )
+        value = strict_json_loads(raw)
+        merge_sha = value.get("sha") if isinstance(value, dict) else None
+        if (
+            not isinstance(value, dict)
+            or value.get("merged") is not True
+            or not isinstance(merge_sha, str)
+            or not SHA_PATTERN.fullmatch(merge_sha)
+        ):
+            raise FinalMergeRejectedError(
+                "GitHub did not confirm the exact-SHA automatic final merge"
+            )
+        return merge_sha
+
     def post_comment(self, number: int, body: str) -> dict[str, Any]:
         raw = self.command.run(
             [
@@ -903,6 +1085,21 @@ class PhaseLoop:
         self.implementation_schema = self._load_json(
             repo_root / "automation" / "schemas" / "implementation-request.schema.json"
         )
+        final_merge_schema = self._load_json(
+            repo_root / "automation" / "schemas" / "final-merge-policy.schema.json"
+        )
+        self.final_merge_policy = self._load_json(
+            repo_root / "automation" / "final-merge-policy.json"
+        )
+        merge_policy_errors = sorted(
+            Draft202012Validator(final_merge_schema).iter_errors(self.final_merge_policy),
+            key=lambda item: item.json_path,
+        )
+        if merge_policy_errors:
+            first = merge_policy_errors[0]
+            raise PrerequisiteError(
+                f"final-merge policy failure at {first.json_path}: {first.message}"
+            )
         plan = self._load_json(repo_root / "automation" / "phase-plan.json")
         phases = plan.get("phases")
         if not isinstance(phases, list) or tuple(item.get("id") for item in phases) != PHASES:
@@ -1469,6 +1666,74 @@ class PhaseLoop:
             return "success"
         return "failure"
 
+    def automatic_final_merge(
+        self,
+        state: PullRequestState,
+        phase_records: list[MarkerEvidence],
+        default_branch_sha: str,
+    ) -> str | None:
+        policy = self.final_merge_policy
+        if policy.get("enabled") is not True:
+            return "PROJECT_COMPLETE_HUMAN_MERGE_REQUIRED"
+        required_labels = frozenset(str(item) for item in policy["required_labels"])
+        forbidden_labels = frozenset(str(item) for item in policy["forbidden_labels"])
+        if state.phase != policy.get("required_phase"):
+            raise UntrustedEvidenceError(
+                "automatic final merge requires the configured final phase"
+            )
+        if not required_labels.issubset(state.labels):
+            raise UntrustedEvidenceError("automatic final merge is missing required PR labels")
+        if state.labels.intersection(forbidden_labels):
+            raise UntrustedEvidenceError("automatic final merge is blocked by a stop-state label")
+        pull_request_prefix = (
+            f"https://github.com/{self.github.repository}/pull/{state.number}"
+        )
+        final_record = validate_final_merge_phase_chain(
+            phase_records,
+            head_sha=state.head_sha,
+            reviewer_login=self.reviewer_login,
+            approver_login=self.approver_login,
+            pull_request_prefix=pull_request_prefix,
+        )
+        validate_final_phase_status(
+            self.github.commit_statuses(state.head_sha),
+            head_sha=state.head_sha,
+            final_record_url=final_record.url,
+            context=str(policy["phase_status_context"]),
+        )
+        checks = self.check_state(state.head_sha)
+        if checks == "waiting":
+            return None
+        if checks != "success":
+            raise UntrustedEvidenceError(
+                "automatic final merge requires every current-HEAD check to pass"
+            )
+        if not self.github.is_ancestor(default_branch_sha, state.head_sha):
+            raise UntrustedEvidenceError(
+                "automatic final merge requires the current default branch in PR HEAD ancestry"
+            )
+        live_state = self.pr_state()
+        live_default_sha = self.current_default_branch_sha()
+        if live_state.head_sha != state.head_sha or live_state.labels != state.labels:
+            raise UntrustedEvidenceError(
+                "pull request head or labels changed before automatic final merge"
+            )
+        if live_default_sha != default_branch_sha or not self.github.is_ancestor(
+            live_default_sha, live_state.head_sha
+        ):
+            raise UntrustedEvidenceError(
+                "default branch changed before automatic final merge"
+            )
+        if self.dry_run:
+            return f"DRY_RUN:automatic final merge ready: {state.head_sha}"
+        self.log(f"merging project-complete PR at exact HEAD {state.head_sha}")
+        merge_sha = self.github.merge_pull_request(
+            state.number,
+            state.head_sha,
+            merge_method=str(policy["merge_method"]),
+        )
+        return f"PROJECT_MERGED:{merge_sha}"
+
     def run(self) -> str:
         self.validate_local_checkout()
         last_status = ""
@@ -1477,19 +1742,31 @@ class PhaseLoop:
             self.fail_if_expired()
             default_branch_sha = self.current_default_branch_sha()
             state = self.pr_state()
-            if "ai-project-complete" in state.labels:
-                return "PROJECT_COMPLETE_HUMAN_MERGE_REQUIRED"
             if "ai-human-gate" in state.labels or state.phase not in AUTOMATIC_PHASES:
                 return f"HUMAN_GATE_REQUIRED:{state.phase}"
             if "ai-loop-blocked" in state.labels:
                 raise LoopBlockedError(f"GitHub marked the loop blocked in {state.phase}")
 
             comments = self.comments()
+            phase_records = self.trusted_markers(comments, "redteam-phase-gate")
+            if "ai-project-complete" in state.labels:
+                merge_result = self.automatic_final_merge(
+                    state, phase_records, default_branch_sha
+                )
+                if merge_result is not None:
+                    return merge_result
+                status = f"waiting for final merge checks: {state.phase} {state.head_sha[:12]}"
+                if status != last_status:
+                    self.log(status)
+                    last_status = status
+                if self.dry_run:
+                    return f"DRY_RUN:{status}"
+                self.sleep()
+                continue
             implementation_requests = self.trusted_markers(
                 comments, "redteam-implementation-request"
             )
             ready_records = self.trusted_markers(comments, "redteam-ready-for-review")
-            phase_records = self.trusted_markers(comments, "redteam-phase-gate")
             refresh_records = self.trusted_base_refresh_statuses(state, phase_records)
 
             if self.perform_pending_base_refresh(

@@ -44,8 +44,9 @@ generated current-HEAD Phase 0B request do.
 - Required review identity: every implementation and review result is bound to the full PR HEAD
   SHA; shortened display IDs are corroborating evidence only.
 - Repository control mode: the current private-repository plan does not expose branch protection
-  or rulesets. Direct/force pushes and automated final merges are prohibited by governance but are
-  not server-enforced.
+  or rulesets. Direct/force pushes remain prohibited. Final merge is performed only by the local
+  orchestrator after its exact-SHA Phase 0A–5 evidence-chain gate; Codex and GitHub Actions retain
+  no final-merge path.
 
 ## Next allowed action
 
@@ -58,4 +59,7 @@ and restart `automation/run_phase_loop.py` for PR #3. It will:
 4. require Phase 0A CI and independent review again on the resulting HEAD; and
 5. create a new Phase 0B request only after that fresh PASS.
 
-Final merge remains a human action after all configured phases and checks pass.
+After Phase 5 PASS, the local orchestrator revalidates all configured Phase records, the latest
+Phase status, current-HEAD checks, stop labels and current `main` ancestry. It then submits one
+GitHub merge request bound to the current 40-character PR HEAD. A conflict, drift, malformed record
+or uncertain response stops without automatic retry. Governance and fork PRs never qualify.
