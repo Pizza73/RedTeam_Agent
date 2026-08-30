@@ -114,6 +114,11 @@ The full Phase gate failures are not changed or suppressed here. PR #3 contains 
 
 ## Remaining constraints
 
+- Governance pull request: `https://github.com/Pizza73/RedTeam_Agent/pull/6`
+- Its initial `opened` CI event was created before `gh pr create --label governance-change`
+  completed applying the label, so run `33285693925` correctly failed with `PR_LABELS_JSON: []`.
+  This documentation commit creates a `synchronize` event after the label is present; only that
+  current-HEAD run is eligible evidence.
 - The governance PR must be manually reviewed and merged because the repository plan has no
   server-enforced branch protection and automated final merge is prohibited.
 - After merge, the operator must update a clean local `main` checkout and restart the runner.
