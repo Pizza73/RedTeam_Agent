@@ -700,7 +700,7 @@ jobs:
                 owner,
                 repo,
                 issue_number: pull_number,
-                body: `All configured phases passed at \`${reviewedSha}\`. The local orchestrator must independently revalidate the complete exact-SHA evidence chain before its single final merge attempt.`,
+                body: `All configured phases passed at \`${reviewedSha}\`. Final human review and merge are still required.`,
               });
               return;
             }

@@ -35,4 +35,4 @@ Read the approved non-secret metadata from `automation/provider-gates.json`. Nev
 
 ## Final project evidence
 
-After Phase 5 implementation, update README/runbook/config documentation and produce a final traceability report covering Phase 0A–5, all test/check results, remaining limitations and fresh-environment reproduction. Do not merge or deploy. The trusted local orchestrator alone performs the separately configured exact-SHA final merge after independent review and every deterministic gate passes.
+After Phase 5 implementation, update README/runbook/config documentation and produce a final traceability report covering Phase 0A–5, all test/check results, remaining limitations and fresh-environment reproduction. Do not merge or deploy; the human final gate remains.

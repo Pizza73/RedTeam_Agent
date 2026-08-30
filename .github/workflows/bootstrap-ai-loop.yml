@@ -40,7 +40,7 @@ jobs:
               ['ai-review-passed', '0e8a16', 'Current phase has a trusted PASS record'],
               ['ai-loop-blocked', 'b60205', 'AI loop stopped fail closed'],
               ['ai-human-gate', 'd4c5f9', 'Explicit provider or product decision required'],
-              ['ai-project-complete', '006b75', 'All phase gates passed; local exact-SHA merge gate pending'],
+              ['ai-project-complete', '006b75', 'All phase gates passed; human merge still required'],
               ['governance-change', 'c5def5', 'Human-reviewed change to protected control files'],
               ['phase-0a', 'bfdadc', 'Core Models and Authorization Kernel'],
               ['phase-0b', 'bfdadc', 'Execution Safety'],

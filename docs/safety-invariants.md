@@ -60,11 +60,4 @@
 - 独立AI Reviewは最新HEAD SHAへBindingする。
 - Stale Reviewは無効。
 - Loop回数を制限し、同じ失敗を無限反復しない。
-- Phase 4/5の外部選択はHuman Gateを通す。
-- 最終mergeは、承認済みDefault Branch上のLocal OrchestratorだけがPhase 0A～5の
-  SHA-bound PASS Chain、Current-HEAD CI/Status、Stop Label不在、Current Default Branch
-  ancestryを再検証し、Expected HEAD SHA固定で1回だけ実行する。Dispatch前に同じPR/HEAD
-  固定のRepository Git ref claimを原子的に取得し、ClaimへBindingした永続Attempt Recordを
-  保存する。その後、同じGateを再取得して不変性を確認する。Claim/Recordの既存・作成結果不明
-  または取得後Gate Drift/Unknownは明示的Reconciliationまで再送を禁止し、通常実行ではClaimを
-  削除しない。Codex、GitHub Actions、Governance PR、Fork PRはこの経路を使用できない。
+- Phase 4/5の外部選択と最終mergeはHuman Gateを通す。
