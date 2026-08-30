@@ -74,6 +74,30 @@ def test_phase_gate_uses_fail_closed_native_codex_evidence_chain() -> None:
     assert "Review evidence must contain exactly one redteam-ai-review marker" not in workflow
 
 
+def test_phase_gate_has_minimal_permissions_for_pr_state_updates() -> None:
+    workflow = (REPO_ROOT / ".github" / "workflows" / "ai-loop-control.yml").read_text(
+        encoding="utf-8"
+    )
+    permissions = workflow.split("\npermissions:\n", maxsplit=1)[1].split(
+        "\njobs:\n", maxsplit=1
+    )[0]
+
+    assert permissions.strip().splitlines() == [
+        "checks: read",
+        "  contents: read",
+        "  issues: write",
+        "  pull-requests: write",
+        "  statuses: write",
+    ]
+    for forbidden_operation in (
+        "github.rest.pulls.merge",
+        "mergePullRequest",
+        "event: 'APPROVE'",
+        'event: "APPROVE"',
+    ):
+        assert forbidden_operation not in workflow
+
+
 def test_documented_reviewer_login_includes_bot_suffix() -> None:
     runbook = (REPO_ROOT / "docs" / "ai-loop-runbook.md").read_text(encoding="utf-8")
 
