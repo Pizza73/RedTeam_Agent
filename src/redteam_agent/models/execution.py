@@ -238,6 +238,7 @@ class ResultIngestionRecord(StrictImmutableBoundaryModel):
     quarantine_id: str | None = None
     adapter_metadata_digest: str | None = None
     lease_id: str | None = None
+    lease_expires_at: UtcDatetime | None = None
     attempt_count: int = Field(default=0, ge=0)
     failure_code: str | None = None
     created_at: UtcDatetime
@@ -262,7 +263,17 @@ class ResultIngestionRecord(StrictImmutableBoundaryModel):
             raise ValueError("available ingestion requires receipt and quarantine bindings")
         if self.status == "INGESTING" and self.lease_id is None:
             raise ValueError("INGESTING requires a lease")
-        if self.status != "INGESTING" and self.lease_id is not None:
+        if self.status == "INGESTING" and self.lease_expires_at is None:
+            raise ValueError("INGESTING requires a lease expiry")
+        if (
+            self.status == "INGESTING"
+            and self.lease_expires_at is not None
+            and self.lease_expires_at <= self.updated_at
+        ):
+            raise ValueError("ingestion lease expiry must follow its update time")
+        if self.status != "INGESTING" and (
+            self.lease_id is not None or self.lease_expires_at is not None
+        ):
             raise ValueError("ingestion lease is valid only while INGESTING")
         if self.status in {"FAILED", "QUARANTINED"} and self.failure_code is None:
             raise ValueError("failed ingestion requires a typed failure code")

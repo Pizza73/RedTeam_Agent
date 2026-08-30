@@ -3,37 +3,28 @@ from __future__ import annotations
 import asyncio
 from datetime import timedelta
 
-from redteam_agent.executor import (
-    Executor,
-    MockExecutionAdapter,
-    MockRawResultSinkFactory,
-    MockSecureResultIngester,
-)
+from redteam_agent.executor import Executor, MockExecutionAdapter, MockSecureResultIngester
 from redteam_agent.models.execution import SecureIngestionSummary
 from redteam_agent.seeds import FIXED_TIME
-from tests.phase0b_helpers import ExecutionHarness, build_execution_harness, prepare_execution
+from tests.phase0b_helpers import (
+    ExecutionHarness,
+    build_execution_harness,
+    executor_with_adapter,
+    prepare_execution,
+)
 
 
-def _restart_executor(harness: ExecutionHarness, *, now) -> Executor:
+def _restart_executor(
+    harness: ExecutionHarness, adapter: MockExecutionAdapter, *, now
+) -> Executor:
+    from redteam_agent.executor import MockRawResultSinkFactory
+
     restarted_factory = MockRawResultSinkFactory(
         now=now,
         max_bytes=harness.environment.tool.max_output_bytes,
         store=harness.sink_factory.store,
     )
-    return Executor(
-        runtime_resolver=harness.kernel.runtime_resolver,
-        plans=harness.kernel.plans,
-        decisions=harness.kernel.decisions,
-        resources=harness.kernel.resources,
-        approval_requests=harness.kernel.approval_requests,
-        approvals=harness.kernel.approvals,
-        executions=harness.executions,
-        receipts=harness.receipts,
-        recovery=harness.recovery,
-        ingestions=harness.ingestions,
-        results=harness.results,
-        sink_factory=restarted_factory,
-    )
+    return executor_with_adapter(harness, adapter, sink_factory=restarted_factory)
 
 
 def test_mock_execution_streams_to_quarantine_and_application_normalizes_result() -> None:
@@ -45,11 +36,11 @@ def test_mock_execution_streams_to_quarantine_and_application_normalizes_result(
         stdout_chunks=(raw_marker[:12], raw_marker[12:24], raw_marker[24:]),
         stderr_chunks=(b"mock stderr",),
     )
+    harness.executor = executor_with_adapter(harness, adapter)
     prepared = prepare_execution(harness)
     running = asyncio.run(
         harness.executor.dispatch(
             prepared.execution_id,
-            adapter=adapter,
             now=FIXED_TIME + timedelta(minutes=3),
         )
     )
@@ -57,12 +48,11 @@ def test_mock_execution_streams_to_quarantine_and_application_normalizes_result(
     assert running.dispatch_attempts == 1
 
     restarted_executor = _restart_executor(
-        harness, now=FIXED_TIME + timedelta(minutes=5)
+        harness, adapter, now=FIXED_TIME + timedelta(minutes=5)
     )
     metadata = asyncio.run(
         restarted_executor.collect_result(
             running.execution_id,
-            adapter=adapter,
             now=FIXED_TIME + timedelta(minutes=4),
         )
     )
@@ -78,7 +68,6 @@ def test_mock_execution_streams_to_quarantine_and_application_normalizes_result(
     result = asyncio.run(
         harness.executor.ingest_result(
             running.execution_id,
-            adapter_result=metadata,
             ingester=ingester,
             now=FIXED_TIME + timedelta(minutes=5),
         )
@@ -93,7 +82,6 @@ def test_mock_execution_streams_to_quarantine_and_application_normalizes_result(
     retried = asyncio.run(
         harness.executor.ingest_result(
             running.execution_id,
-            adapter_result=metadata,
             ingester=ingester,
             now=FIXED_TIME + timedelta(minutes=6),
         )
@@ -123,11 +111,11 @@ def test_stream_collection_resumes_without_resubmitting_action() -> None:
         stdout_chunks=(b"one", b"two", b"three"),
         fail_collection_after_chunks=1,
     )
+    harness.executor = executor_with_adapter(harness, adapter)
     prepared = prepare_execution(harness)
     running = asyncio.run(
         harness.executor.dispatch(
             prepared.execution_id,
-            adapter=adapter,
             now=FIXED_TIME + timedelta(minutes=3),
         )
     )
@@ -137,7 +125,6 @@ def test_stream_collection_resumes_without_resubmitting_action() -> None:
         asyncio.run(
             harness.executor.collect_result(
                 running.execution_id,
-                adapter=adapter,
                 now=FIXED_TIME + timedelta(minutes=4),
             )
         )
@@ -147,12 +134,11 @@ def test_stream_collection_resumes_without_resubmitting_action() -> None:
         raise AssertionError("mock interruption must fail closed")
 
     restarted_executor = _restart_executor(
-        harness, now=FIXED_TIME + timedelta(minutes=5)
+        harness, adapter, now=FIXED_TIME + timedelta(minutes=5)
     )
     metadata = asyncio.run(
         restarted_executor.collect_result(
             running.execution_id,
-            adapter=adapter,
             now=FIXED_TIME + timedelta(minutes=5),
         )
     )
@@ -168,18 +154,17 @@ def test_failed_ingestion_resumes_without_external_action_resubmit() -> None:
         now=FIXED_TIME + timedelta(minutes=3),
         stdout_chunks=(b"raw",),
     )
+    harness.executor = executor_with_adapter(harness, adapter)
     prepared = prepare_execution(harness)
     running = asyncio.run(
         harness.executor.dispatch(
             prepared.execution_id,
-            adapter=adapter,
             now=FIXED_TIME + timedelta(minutes=3),
         )
     )
-    metadata = asyncio.run(
+    asyncio.run(
         harness.executor.collect_result(
             running.execution_id,
-            adapter=adapter,
             now=FIXED_TIME + timedelta(minutes=4),
         )
     )
@@ -193,8 +178,7 @@ def test_failed_ingestion_resumes_without_external_action_resubmit() -> None:
         asyncio.run(
             harness.executor.ingest_result(
                 running.execution_id,
-                adapter_result=metadata,
-                ingester=failing,
+                    ingester=failing,
                 now=FIXED_TIME + timedelta(minutes=5),
             )
         )
@@ -212,7 +196,6 @@ def test_failed_ingestion_resumes_without_external_action_resubmit() -> None:
     result = asyncio.run(
         harness.executor.resume_result_ingestion(
             running.execution_id,
-            adapter=adapter,
             ingester=failing,
             now=FIXED_TIME + timedelta(minutes=6),
         )

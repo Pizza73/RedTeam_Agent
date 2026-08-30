@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Protocol
 
 from redteam_agent.authorization_runtime import AuthorizationRuntimeContextResolver
@@ -10,6 +10,7 @@ from redteam_agent.canonical import digest_model, sha256_digest, stable_id
 from redteam_agent.errors import (
     AdapterDispatchUncertainError,
     AdapterOperationError,
+    AdapterResolutionError,
     CurrentAuthorizationStateError,
     DigestIntegrityError,
     ExecutionAuthorizationError,
@@ -18,6 +19,8 @@ from redteam_agent.errors import (
     RawResultQuarantineError,
     RawResultStreamingError,
     ResultIngestionError,
+    ResultIngestionLeaseError,
+    TrustedDependencyUnavailableError,
 )
 from redteam_agent.models.execution import (
     AdapterRawResult,
@@ -49,8 +52,9 @@ from redteam_agent.repositories.execution import (
 from redteam_agent.repositories.plans import PlanRepository
 from redteam_agent.repositories.policy import PolicyDecisionRepository
 
-from .adapter import ExecutionAdapter
+from .adapter import ExecutionAdapter, TrustedExecutionAdapterRegistry
 from .authorization_gate import authorize_execution
+from .finalization import FinalizationCoordinator
 from .ingestion import SecureResultIngester
 from .raw_results import MockRawResultSink, RawResultSinkFactory
 
@@ -63,10 +67,6 @@ class PreDispatchCapabilityProbe(Protocol):
     async def sandbox_capabilities_digest(self, adapter_id: str) -> str: ...
 
     async def remote_mcp_trust_policy_digest(self, adapter_id: str) -> str: ...
-
-
-class FinalizationRequester(Protocol):
-    def request_finalizing(self, mission_id: str, *, now: datetime) -> None: ...
 
 
 class StaticPreDispatchCapabilityProbe:
@@ -113,9 +113,16 @@ class Executor:
         ingestions: ResultIngestionRepository,
         results: ExecutionResultRepository,
         sink_factory: RawResultSinkFactory,
-        capability_probe: PreDispatchCapabilityProbe | None = None,
-        finalization_requester: FinalizationRequester | None = None,
+        adapter_registry: TrustedExecutionAdapterRegistry,
+        capability_probe: PreDispatchCapabilityProbe,
+        finalization_requester: FinalizationCoordinator,
     ) -> None:
+        if capability_probe is None or not isinstance(
+            finalization_requester, FinalizationCoordinator
+        ):
+            raise TrustedDependencyUnavailableError(
+                "live capability and finalization dependencies are mandatory"
+            )
         self.runtime_resolver = runtime_resolver
         self.plans = plans
         self.decisions = decisions
@@ -128,6 +135,7 @@ class Executor:
         self.ingestions = ingestions
         self.results = results
         self.sink_factory = sink_factory
+        self.adapter_registry = adapter_registry
         self.capability_probe = capability_probe
         self.finalization_requester = finalization_requester
         self.retry_policy = ExecutionRetryPolicy()
@@ -229,13 +237,18 @@ class Executor:
         self,
         execution_id: str,
         *,
-        adapter: ExecutionAdapter,
         now: datetime,
     ) -> ExecutionRecord:
         record = self._require_execution(execution_id)
+        adapter = self._resolve_adapter(record)
         if record.provider_execution_state != "AUTHORIZED":
-            if record.provider_execution_state in {"DISPATCHED", "RUNNING", "RECONCILING"}:
-                return await self.resume_execution(execution_id, adapter=adapter, now=now)
+            if record.provider_execution_state in {
+                "DISPATCHED",
+                "RUNNING",
+                "CANCEL_REQUESTED",
+                "RECONCILING",
+            }:
+                return await self.resume_execution(execution_id, now=now)
             return record
         reason = await self._pre_dispatch_block_reason(record, adapter=adapter, now=now)
         if reason is None:
@@ -252,7 +265,7 @@ class Executor:
                 dispatch_attempts=0,
                 now=now,
             )
-            if reason == "MISSION_EXPIRED" and self.finalization_requester is not None:
+            if reason == "MISSION_EXPIRED":
                 self.finalization_requester.request_finalizing(record.mission_id, now=now)
             return blocked
         dispatched = self.executions.transition_provider(
@@ -292,13 +305,18 @@ class Executor:
         self,
         execution_id: str,
         *,
-        adapter: ExecutionAdapter,
         now: datetime,
     ) -> ExecutionRecord:
         record = self._require_execution(execution_id)
-        if record.provider_execution_state not in {"DISPATCHED", "RUNNING", "RECONCILING"}:
+        if record.provider_execution_state not in {
+            "DISPATCHED",
+            "RUNNING",
+            "CANCEL_REQUESTED",
+            "RECONCILING",
+        }:
             return record
-        if record.provider_execution_state != "RECONCILING":
+        adapter = self._resolve_adapter(record)
+        if record.provider_execution_state in {"DISPATCHED", "RUNNING"}:
             record = self.executions.transition_provider(
                 record.execution_id,
                 expected_state_version=record.state_version,
@@ -311,10 +329,10 @@ class Executor:
         self,
         execution_id: str,
         *,
-        adapter: ExecutionAdapter,
         now: datetime,
     ) -> ExecutionRecord:
         record = self._require_execution(execution_id)
+        adapter = self._resolve_adapter(record)
         if record.provider_execution_state not in {"DISPATCHED", "RUNNING"}:
             raise ExecutionStateTransitionError("execution is not cancellable")
         if record.provider_task_id is None:
@@ -374,6 +392,13 @@ class Executor:
             "UNSUPPORTED": "OUTCOME_UNKNOWN",
         }
         target = targets[outcome.status]
+        task_id_mismatch = (
+            record.provider_task_id is not None
+            and outcome.provider_task_id is not None
+            and outcome.provider_task_id != record.provider_task_id
+        )
+        if task_id_mismatch:
+            target = "OUTCOME_UNKNOWN"
         if record.provider_execution_state == "CANCEL_REQUESTED" and target not in {
             "RUNNING",
             "CANCELLED",
@@ -384,7 +409,7 @@ class Executor:
             record.execution_id,
             expected_state_version=record.state_version,
             new_state=target,
-            provider_task_id=outcome.provider_task_id,
+            provider_task_id=(None if task_id_mismatch else outcome.provider_task_id),
             now=now,
         )
 
@@ -392,10 +417,10 @@ class Executor:
         self,
         execution_id: str,
         *,
-        adapter: ExecutionAdapter,
         now: datetime,
     ) -> AdapterRawResult:
         record = self._require_execution(execution_id)
+        adapter = self._resolve_adapter(record)
         if record.provider_execution_state not in {
             "RUNNING",
             "SUCCEEDED",
@@ -469,30 +494,32 @@ class Executor:
         self,
         execution_id: str,
         *,
-        adapter_result: AdapterRawResult,
         ingester: SecureResultIngester,
         now: datetime,
     ) -> ExecutionResult:
+        adapter_result = await self.collect_result(execution_id, now=now)
         record = self._require_execution(execution_id)
         ingestion = self.ingestions.get_by_execution(execution_id)
-        if ingestion is None or ingestion.status not in {"PENDING", "FAILED"}:
-            existing = self.results.get_by_execution(execution_id)
-            if existing is not None:
-                if ingestion is not None and ingestion.status == "INGESTING":
-                    self.ingestions.transition(
-                        ingestion.ingestion_id,
-                        expected_state_version=ingestion.state_version,
-                        status="SUCCEEDED",
+        if ingestion is None:
+            raise ExecutionStateTransitionError("result ingestion does not exist")
+        existing = self.results.get_by_execution(execution_id)
+        if existing is not None:
+            if ingestion.status == "INGESTING":
+                self.ingestions.transition(
+                    ingestion.ingestion_id,
+                    expected_state_version=ingestion.state_version,
+                    status="SUCCEEDED",
+                    now=now,
+                )
+                if record.result_ingestion_state == "INGESTING":
+                    self.executions.transition_ingestion(
+                        record.execution_id,
+                        expected_state_version=record.state_version,
+                        new_state="SUCCEEDED",
                         now=now,
                     )
-                    if record.result_ingestion_state == "INGESTING":
-                        self.executions.transition_ingestion(
-                            record.execution_id,
-                            expected_state_version=record.state_version,
-                            new_state="SUCCEEDED",
-                            now=now,
-                        )
-                return existing
+            return existing
+        if ingestion.status not in {"PENDING", "FAILED", "INGESTING"}:
             raise ExecutionStateTransitionError("result ingestion is not resumable")
         lease_id = stable_id(
             "lease",
@@ -502,19 +529,39 @@ class Executor:
                 "attempt": ingestion.attempt_count + 1,
             },
         )
-        active = self.ingestions.transition(
-            ingestion.ingestion_id,
-            expected_state_version=ingestion.state_version,
-            status="INGESTING",
-            lease_id=lease_id,
-            now=now,
-        )
-        record = self.executions.transition_ingestion(
-            record.execution_id,
-            expected_state_version=record.state_version,
-            new_state="INGESTING",
-            now=now,
-        )
+        lease_expires_at = now + timedelta(minutes=1)
+        if ingestion.status == "INGESTING":
+            if ingestion.lease_expires_at is None or now < ingestion.lease_expires_at:
+                raise ResultIngestionLeaseError("result-ingestion lease is still active")
+            active = self.ingestions.take_over_expired_lease(
+                ingestion.ingestion_id,
+                expected_state_version=ingestion.state_version,
+                lease_id=lease_id,
+                lease_expires_at=lease_expires_at,
+                now=now,
+            )
+            if record.result_ingestion_state != "INGESTING":
+                record = self.executions.transition_ingestion(
+                    record.execution_id,
+                    expected_state_version=record.state_version,
+                    new_state="INGESTING",
+                    now=now,
+                )
+        else:
+            active = self.ingestions.transition(
+                ingestion.ingestion_id,
+                expected_state_version=ingestion.state_version,
+                status="INGESTING",
+                lease_id=lease_id,
+                lease_expires_at=lease_expires_at,
+                now=now,
+            )
+            record = self.executions.transition_ingestion(
+                record.execution_id,
+                expected_state_version=record.state_version,
+                new_state="INGESTING",
+                now=now,
+            )
         try:
             summary = await ingester.ingest(adapter_result.receipt)
         except ResultIngestionError:
@@ -553,14 +600,11 @@ class Executor:
         self,
         execution_id: str,
         *,
-        adapter: ExecutionAdapter,
         ingester: SecureResultIngester,
         now: datetime,
     ) -> ExecutionResult:
-        metadata = await self.collect_result(execution_id, adapter=adapter, now=now)
         return await self.ingest_result(
             execution_id,
-            adapter_result=metadata,
             ingester=ingester,
             now=now,
         )
@@ -656,26 +700,25 @@ class Executor:
             != runtime.remote_trust_snapshot.snapshot_digest
         ):
             return "REMOTE_MCP_TRUST_MISMATCH"
-        if self.capability_probe is not None:
-            if (
-                await self.capability_probe.session_security_context_digest()
-                != runtime.session_snapshot.snapshot_digest
-            ):
-                return "SESSION_STALE"
-            if (
-                await self.capability_probe.sandbox_capabilities_digest(
-                    record.resolved_adapter_id
-                )
-                != record.sandbox_capabilities_digest
-            ):
-                return "SANDBOX_CAPABILITY_MISMATCH"
-            if (
-                await self.capability_probe.remote_mcp_trust_policy_digest(
-                    record.resolved_adapter_id
-                )
-                != record.remote_mcp_trust_policy_digest
-            ):
-                return "REMOTE_MCP_TRUST_MISMATCH"
+        if (
+            await self.capability_probe.session_security_context_digest()
+            != runtime.session_snapshot.snapshot_digest
+        ):
+            return "SESSION_STALE"
+        if (
+            await self.capability_probe.sandbox_capabilities_digest(
+                record.resolved_adapter_id
+            )
+            != record.sandbox_capabilities_digest
+        ):
+            return "SANDBOX_CAPABILITY_MISMATCH"
+        if (
+            await self.capability_probe.remote_mcp_trust_policy_digest(
+                record.resolved_adapter_id
+            )
+            != record.remote_mcp_trust_policy_digest
+        ):
+            return "REMOTE_MCP_TRUST_MISMATCH"
         expected_adapter = next(
             (
                 item
@@ -797,6 +840,15 @@ class Executor:
         if record is None:
             raise ExecutionStateTransitionError("execution does not exist")
         return record
+
+    def _resolve_adapter(self, record: ExecutionRecord) -> ExecutionAdapter:
+        decision = self.decisions.get(record.policy_decision_id)
+        if decision is None or decision.resolved_adapter_id != record.resolved_adapter_id:
+            raise AdapterResolutionError("execution adapter authorization is unavailable")
+        return self.adapter_registry.resolve(
+            decision.resolved_adapter,
+            decision.resolved_adapter_id,
+        )
 
 
 def require_known_outcome(record: ExecutionRecord) -> None:

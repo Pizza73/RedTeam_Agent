@@ -8,7 +8,11 @@ from datetime import datetime
 from typing import Literal, Protocol
 
 from redteam_agent.canonical import stable_id
-from redteam_agent.errors import AdapterDispatchUncertainError, AdapterOperationError
+from redteam_agent.errors import (
+    AdapterDispatchUncertainError,
+    AdapterOperationError,
+    AdapterResolutionError,
+)
 from redteam_agent.models.capabilities import AdapterCapabilities
 from redteam_agent.models.execution import (
     AdapterRawResult,
@@ -47,6 +51,39 @@ class ExecutionAdapter(Protocol):
 
 
 @dataclass(frozen=True)
+class ExecutionAdapterRegistration:
+    adapter_type: Literal["c2", "mcp", "local"]
+    adapter_id: str
+    adapter: ExecutionAdapter
+
+
+class TrustedExecutionAdapterRegistry:
+    """Immutable composition-root registry; callers cannot replace dispatch adapters."""
+
+    def __init__(self, registrations: tuple[ExecutionAdapterRegistration, ...]) -> None:
+        bindings = tuple(
+            (registration.adapter_type, registration.adapter_id)
+            for registration in registrations
+        )
+        if not registrations or len(bindings) != len(set(bindings)):
+            raise AdapterResolutionError("trusted adapter registrations must be unique")
+        self._registrations = {
+            (registration.adapter_type, registration.adapter_id): registration.adapter
+            for registration in registrations
+        }
+
+    def resolve(
+        self,
+        adapter_type: Literal["c2", "mcp", "local"],
+        adapter_id: str,
+    ) -> ExecutionAdapter:
+        adapter = self._registrations.get((adapter_type, adapter_id))
+        if adapter is None:
+            raise AdapterResolutionError("authorized adapter is not registered")
+        return adapter
+
+
+@dataclass(frozen=True)
 class MockArtifact:
     metadata: RawArtifactMetadata
     chunks: tuple[bytes, ...]
@@ -66,7 +103,9 @@ class MockExecutionAdapter:
         provider_status: Literal["SUCCEEDED", "FAILED", "CANCELLED"] = "SUCCEEDED",
         submit_uncertain: bool = False,
         reconcile_status: ReconciliationStatus = "RUNNING",
+        reconcile_provider_task_id: str | None = None,
         fail_collection_after_chunks: int | None = None,
+        cancel_error: bool = False,
     ) -> None:
         self._capabilities = capabilities
         self._now = now
@@ -76,7 +115,9 @@ class MockExecutionAdapter:
         self._provider_status = provider_status
         self._submit_uncertain = submit_uncertain
         self._reconcile_status = reconcile_status
+        self._reconcile_provider_task_id = reconcile_provider_task_id
         self._fail_collection_after_chunks = fail_collection_after_chunks
+        self._cancel_error = cancel_error
         self._handles_by_execution: dict[str, TaskHandle] = {}
         self._execution_by_task: dict[str, str] = {}
         self._collection_offsets: dict[str, int] = {}
@@ -184,6 +225,9 @@ class MockExecutionAdapter:
         )
 
     async def cancel_task(self, task_id: str) -> CancelResult:
+        if self._cancel_error:
+            self._cancel_error = False
+            raise AdapterOperationError("mock cancellation outcome was intentionally interrupted")
         known = task_id in self._execution_by_task
         return CancelResult(task_id=task_id, requested=known, confirmed=known)
 
@@ -195,7 +239,13 @@ class MockExecutionAdapter:
         del idempotency_key
         self.reconcile_calls += 1
         handle = self._handles_by_execution.get(execution_id)
-        provider_task_id = None if handle is None else handle.provider_task_id
+        provider_task_id = (
+            self._reconcile_provider_task_id
+            if self._reconcile_provider_task_id is not None
+            else None
+            if handle is None
+            else handle.provider_task_id
+        )
         return ReconciliationResult(
             execution_id=execution_id,
             status=self._reconcile_status,

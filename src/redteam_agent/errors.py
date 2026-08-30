@@ -135,6 +135,14 @@ class AdapterOperationError(RedTeamAgentError):
     """A mock adapter operation failed without exposing untrusted provider content."""
 
 
+class AdapterResolutionError(RedTeamAgentError):
+    """A trusted registry could not resolve the adapter bound by authorization."""
+
+
+class TrustedDependencyUnavailableError(RedTeamAgentError):
+    """A mandatory trusted runtime dependency was absent."""
+
+
 class ResultIngestionError(RedTeamAgentError):
     """Result ingestion could not safely complete."""
 
@@ -149,3 +157,7 @@ class RawResultQuarantineError(ResultIngestionError):
 
 class WorkflowRunBindingError(RedTeamAgentError):
     """A run_id/thread_id did not bind to the current Mission revision."""
+
+
+class ResultIngestionLeaseError(ResultIngestionError):
+    """A result-ingestion lease is still active, absent, or not safely recoverable."""

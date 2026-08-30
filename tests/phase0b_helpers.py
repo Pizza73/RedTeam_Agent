@@ -4,15 +4,26 @@ from dataclasses import dataclass
 from datetime import timedelta
 
 from redteam_agent.executor import (
+    ExecutionAdapter,
+    ExecutionAdapterRegistration,
     Executor,
+    FinalizationCoordinator,
     MockExecutionAdapter,
     MockRawResultSinkFactory,
+    PreDispatchCapabilityProbe,
+    StaticPreDispatchCapabilityProbe,
+    TrustedExecutionAdapterRegistry,
     create_workflow_run,
 )
+from redteam_agent.mission import MissionManager
 from redteam_agent.models.execution import WorkflowRunBinding
 from redteam_agent.repositories import (
     ExecutionRepository,
     ExecutionResultRepository,
+    LLMProfileRepository,
+    MissionRepository,
+    MissionRevisionRepository,
+    MissionStateRepository,
     RawResultReceiptRepository,
     RawResultRecoveryRepository,
     ResultIngestionRepository,
@@ -38,6 +49,9 @@ class ExecutionHarness:
     recovery: RawResultRecoveryRepository
     ingestions: ResultIngestionRepository
     results: ExecutionResultRepository
+    capability_probe: PreDispatchCapabilityProbe
+    finalization: FinalizationCoordinator
+    adapter_registry: TrustedExecutionAdapterRegistry
 
 
 def build_execution_harness(*, approval_rule: str = "policy") -> ExecutionHarness:
@@ -60,6 +74,34 @@ def build_execution_harness(*, approval_rule: str = "policy") -> ExecutionHarnes
         now=FIXED_TIME + timedelta(minutes=3),
         max_bytes=environment.tool.max_output_bytes,
     )
+    capabilities = environment.adapter_snapshot.adapters[0]
+    adapter = MockExecutionAdapter(
+        capabilities=capabilities,
+        now=FIXED_TIME + timedelta(minutes=3),
+    )
+    capability_probe = StaticPreDispatchCapabilityProbe(
+        session_digest=environment.session_snapshot.snapshot_digest,
+        sandbox_digest=environment.sandbox_snapshot.snapshot_digest,
+        remote_trust_digest=environment.remote_snapshot.snapshot_digest,
+    )
+    finalization = FinalizationCoordinator(
+        missions=MissionManager(
+            MissionRepository(database),
+            MissionRevisionRepository(database),
+            MissionStateRepository(database),
+            LLMProfileRepository(database),
+        ),
+        executions=executions,
+    )
+    adapter_registry = TrustedExecutionAdapterRegistry(
+        (
+            ExecutionAdapterRegistration(
+                adapter_type=capabilities.adapter_type,
+                adapter_id=capabilities.adapter_id,
+                adapter=adapter,
+            ),
+        )
+    )
     executor = Executor(
         runtime_resolver=kernel.runtime_resolver,
         plans=kernel.plans,
@@ -73,11 +115,9 @@ def build_execution_harness(*, approval_rule: str = "policy") -> ExecutionHarnes
         ingestions=ingestions,
         results=results,
         sink_factory=sink_factory,
-    )
-    capabilities = environment.adapter_snapshot.adapters[0]
-    adapter = MockExecutionAdapter(
-        capabilities=capabilities,
-        now=FIXED_TIME + timedelta(minutes=3),
+        adapter_registry=adapter_registry,
+        capability_probe=capability_probe,
+        finalization_requester=finalization,
     )
     return ExecutionHarness(
         database=database,
@@ -92,6 +132,44 @@ def build_execution_harness(*, approval_rule: str = "policy") -> ExecutionHarnes
         recovery=recovery,
         ingestions=ingestions,
         results=results,
+        capability_probe=capability_probe,
+        finalization=finalization,
+        adapter_registry=adapter_registry,
+    )
+
+
+def executor_with_adapter(
+    harness: ExecutionHarness,
+    adapter: ExecutionAdapter,
+    *,
+    sink_factory: MockRawResultSinkFactory | None = None,
+    capability_probe: PreDispatchCapabilityProbe | None = None,
+) -> Executor:
+    capabilities = harness.environment.adapter_snapshot.adapters[0]
+    return Executor(
+        runtime_resolver=harness.kernel.runtime_resolver,
+        plans=harness.kernel.plans,
+        decisions=harness.kernel.decisions,
+        resources=harness.kernel.resources,
+        approval_requests=harness.kernel.approval_requests,
+        approvals=harness.kernel.approvals,
+        executions=harness.executions,
+        receipts=harness.receipts,
+        recovery=harness.recovery,
+        ingestions=harness.ingestions,
+        results=harness.results,
+        sink_factory=sink_factory or harness.sink_factory,
+        adapter_registry=TrustedExecutionAdapterRegistry(
+            (
+                ExecutionAdapterRegistration(
+                    adapter_type=capabilities.adapter_type,
+                    adapter_id=capabilities.adapter_id,
+                    adapter=adapter,
+                ),
+            )
+        ),
+        capability_probe=capability_probe or harness.capability_probe,
+        finalization_requester=harness.finalization,
     )
 
 

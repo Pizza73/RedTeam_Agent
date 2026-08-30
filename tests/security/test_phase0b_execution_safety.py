@@ -7,14 +7,19 @@ import pytest
 
 from redteam_agent.canonical import stable_id
 from redteam_agent.errors import (
+    AdapterOperationError,
     DigestIntegrityError,
     ExecutionAuthorizationError,
     ExternalDispatchOutcomeUnknownError,
     MissionStateVersionConflictError,
+    ResultIngestionLeaseError,
+    TrustedDependencyUnavailableError,
 )
 from redteam_agent.executor import (
+    Executor,
     FinalizationCoordinator,
     MockExecutionAdapter,
+    MockSecureResultIngester,
     StaticPreDispatchCapabilityProbe,
     require_known_outcome,
 )
@@ -32,7 +37,11 @@ from redteam_agent.repositories import (
 from redteam_agent.repositories.base import model_json
 from redteam_agent.repositories.execution import execution_record_digest
 from redteam_agent.seeds import FIXED_TIME
-from tests.phase0b_helpers import build_execution_harness, prepare_execution
+from tests.phase0b_helpers import (
+    build_execution_harness,
+    executor_with_adapter,
+    prepare_execution,
+)
 
 
 @pytest.mark.parametrize("reconcile_status", ["UNKNOWN", "UNSUPPORTED", "NOT_FOUND"])
@@ -44,11 +53,11 @@ def test_uncertain_reconciliation_stops_without_duplicate_dispatch(reconcile_sta
         submit_uncertain=True,
         reconcile_status=reconcile_status,  # type: ignore[arg-type]
     )
+    harness.executor = executor_with_adapter(harness, adapter)
     prepared = prepare_execution(harness)
     unknown = asyncio.run(
         harness.executor.dispatch(
             prepared.execution_id,
-            adapter=adapter,
             now=FIXED_TIME + timedelta(minutes=3),
         )
     )
@@ -57,7 +66,6 @@ def test_uncertain_reconciliation_stops_without_duplicate_dispatch(reconcile_sta
     resumed = asyncio.run(
         harness.executor.dispatch(
             unknown.execution_id,
-            adapter=adapter,
             now=FIXED_TIME + timedelta(minutes=4),
         )
     )
@@ -73,7 +81,6 @@ def test_resume_after_provider_task_id_reconciles_without_submit() -> None:
     running = asyncio.run(
         harness.executor.dispatch(
             prepared.execution_id,
-            adapter=harness.adapter,
             now=FIXED_TIME + timedelta(minutes=3),
         )
     )
@@ -81,7 +88,6 @@ def test_resume_after_provider_task_id_reconciles_without_submit() -> None:
     reconciled = asyncio.run(
         harness.executor.resume_execution(
             running.execution_id,
-            adapter=harness.adapter,
             now=FIXED_TIME + timedelta(minutes=4),
         )
     )
@@ -91,20 +97,44 @@ def test_resume_after_provider_task_id_reconciles_without_submit() -> None:
     assert harness.adapter.reconcile_calls == 1
 
 
+def test_reconciliation_rejects_provider_task_id_replacement() -> None:
+    harness = build_execution_harness()
+    adapter = MockExecutionAdapter(
+        capabilities=harness.environment.adapter_snapshot.adapters[0],
+        now=FIXED_TIME + timedelta(minutes=3),
+        reconcile_provider_task_id="provider-task-from-another-execution",
+    )
+    harness.executor = executor_with_adapter(harness, adapter)
+    prepared = prepare_execution(harness)
+    running = asyncio.run(
+        harness.executor.dispatch(
+            prepared.execution_id,
+            now=FIXED_TIME + timedelta(minutes=3),
+        )
+    )
+    unknown = asyncio.run(
+        harness.executor.resume_execution(
+            running.execution_id,
+            now=FIXED_TIME + timedelta(minutes=4),
+        )
+    )
+    assert unknown.provider_execution_state == "OUTCOME_UNKNOWN"
+    assert unknown.provider_task_id == running.provider_task_id
+    assert adapter.submit_calls == 1
+
+
 def test_confirmed_cancel_uses_existing_task_without_resubmit() -> None:
     harness = build_execution_harness()
     prepared = prepare_execution(harness)
     running = asyncio.run(
         harness.executor.dispatch(
             prepared.execution_id,
-            adapter=harness.adapter,
             now=FIXED_TIME + timedelta(minutes=3),
         )
     )
     cancelled = asyncio.run(
         harness.executor.request_cancel(
             running.execution_id,
-            adapter=harness.adapter,
             now=FIXED_TIME + timedelta(minutes=4),
         )
     )
@@ -113,13 +143,49 @@ def test_confirmed_cancel_uses_existing_task_without_resubmit() -> None:
     assert harness.adapter.submit_calls == 1
 
 
+def test_cancel_requested_restart_reconciles_after_adapter_interruption() -> None:
+    harness = build_execution_harness()
+    adapter = MockExecutionAdapter(
+        capabilities=harness.environment.adapter_snapshot.adapters[0],
+        now=FIXED_TIME + timedelta(minutes=3),
+        cancel_error=True,
+    )
+    harness.executor = executor_with_adapter(harness, adapter)
+    prepared = prepare_execution(harness)
+    running = asyncio.run(
+        harness.executor.dispatch(
+            prepared.execution_id,
+            now=FIXED_TIME + timedelta(minutes=3),
+        )
+    )
+    with pytest.raises(AdapterOperationError):
+        asyncio.run(
+            harness.executor.request_cancel(
+                running.execution_id,
+                now=FIXED_TIME + timedelta(minutes=4),
+            )
+        )
+    interrupted = harness.executions.get(running.execution_id)
+    assert interrupted is not None
+    assert interrupted.provider_execution_state == "CANCEL_REQUESTED"
+
+    recovered = asyncio.run(
+        harness.executor.resume_execution(
+            running.execution_id,
+            now=FIXED_TIME + timedelta(minutes=5),
+        )
+    )
+    assert recovered.provider_execution_state == "RUNNING"
+    assert recovered.provider_task_id == running.provider_task_id
+    assert adapter.submit_calls == 1
+
+
 def test_expired_authorization_blocks_before_provider_and_creates_no_result() -> None:
     harness = build_execution_harness()
     prepared = prepare_execution(harness)
     blocked = asyncio.run(
         harness.executor.dispatch(
             prepared.execution_id,
-            adapter=harness.adapter,
             now=FIXED_TIME + timedelta(minutes=31),
         )
     )
@@ -134,20 +200,10 @@ def test_expired_authorization_blocks_before_provider_and_creates_no_result() ->
 def test_expired_mission_blocks_and_requests_finalizing() -> None:
     harness = build_execution_harness()
     prepared = prepare_execution(harness)
-    manager = MissionManager(
-        MissionRepository(harness.database),
-        MissionRevisionRepository(harness.database),
-        MissionStateRepository(harness.database),
-        LLMProfileRepository(harness.database),
-    )
-    harness.executor.finalization_requester = FinalizationCoordinator(
-        missions=manager,
-        executions=ExecutionRepository(harness.database),
-    )
+    manager = harness.finalization.missions
     blocked = asyncio.run(
         harness.executor.dispatch(
             prepared.execution_id,
-            adapter=harness.adapter,
             now=FIXED_TIME + timedelta(hours=4),
         )
     )
@@ -172,7 +228,6 @@ def test_epoch_change_blocks_before_provider() -> None:
     blocked = asyncio.run(
         harness.executor.dispatch(
             prepared.execution_id,
-            adapter=harness.adapter,
             now=FIXED_TIME + timedelta(minutes=3),
         )
     )
@@ -195,15 +250,64 @@ def test_live_adapter_capability_mismatch_blocks_before_provider() -> None:
         capabilities=mismatched,
         now=FIXED_TIME + timedelta(minutes=3),
     )
+    harness.executor = executor_with_adapter(harness, adapter)
     blocked = asyncio.run(
         harness.executor.dispatch(
             prepared.execution_id,
-            adapter=adapter,
             now=FIXED_TIME + timedelta(minutes=3),
         )
     )
     assert blocked.pre_dispatch_block_reason == "ADAPTER_CAPABILITY_MISMATCH"
     assert adapter.submit_calls == 0
+
+
+def test_dispatch_adapter_cannot_be_replaced_by_the_caller() -> None:
+    harness = build_execution_harness()
+    replacement = MockExecutionAdapter(
+        capabilities=harness.environment.adapter_snapshot.adapters[0],
+        now=FIXED_TIME + timedelta(minutes=3),
+    )
+    prepared = prepare_execution(harness)
+    with pytest.raises(TypeError):
+        harness.executor.dispatch(  # type: ignore[call-arg]
+            prepared.execution_id,
+            adapter=replacement,
+            now=FIXED_TIME + timedelta(minutes=3),
+        )
+    running = asyncio.run(
+        harness.executor.dispatch(
+            prepared.execution_id,
+            now=FIXED_TIME + timedelta(minutes=3),
+        )
+    )
+    assert running.provider_execution_state == "RUNNING"
+    assert harness.adapter.submit_calls == 1
+    assert replacement.submit_calls == 0
+
+
+@pytest.mark.parametrize("missing", ["capability_probe", "finalization_requester"])
+def test_executor_rejects_missing_trusted_runtime_dependency(missing: str) -> None:
+    harness = build_execution_harness()
+    dependencies: dict[str, object] = {
+        "runtime_resolver": harness.kernel.runtime_resolver,
+        "plans": harness.kernel.plans,
+        "decisions": harness.kernel.decisions,
+        "resources": harness.kernel.resources,
+        "approval_requests": harness.kernel.approval_requests,
+        "approvals": harness.kernel.approvals,
+        "executions": harness.executions,
+        "receipts": harness.receipts,
+        "recovery": harness.recovery,
+        "ingestions": harness.ingestions,
+        "results": harness.results,
+        "sink_factory": harness.sink_factory,
+        "adapter_registry": harness.adapter_registry,
+        "capability_probe": harness.capability_probe,
+        "finalization_requester": harness.finalization,
+    }
+    dependencies[missing] = None
+    with pytest.raises(TrustedDependencyUnavailableError):
+        Executor(**dependencies)  # type: ignore[arg-type]
 
 
 def test_live_sandbox_capability_mismatch_blocks_before_provider() -> None:
@@ -217,7 +321,6 @@ def test_live_sandbox_capability_mismatch_blocks_before_provider() -> None:
     blocked = asyncio.run(
         harness.executor.dispatch(
             prepared.execution_id,
-            adapter=harness.adapter,
             now=FIXED_TIME + timedelta(minutes=3),
         )
     )
@@ -270,14 +373,12 @@ def test_result_repository_rejects_result_before_secure_ingestion_starts() -> No
     running = asyncio.run(
         harness.executor.dispatch(
             prepared.execution_id,
-            adapter=harness.adapter,
             now=FIXED_TIME + timedelta(minutes=3),
         )
     )
     metadata = asyncio.run(
         harness.executor.collect_result(
             running.execution_id,
-            adapter=harness.adapter,
             now=FIXED_TIME + timedelta(minutes=4),
         )
     )
@@ -290,6 +391,64 @@ def test_result_repository_rejects_result_before_secure_ingestion_starts() -> No
     )
     with pytest.raises(DigestIntegrityError):
         harness.results.add(forged)
+
+
+def test_expired_ingestion_lease_is_taken_over_without_action_resubmit() -> None:
+    harness = build_execution_harness()
+    prepared = prepare_execution(harness)
+    running = asyncio.run(
+        harness.executor.dispatch(
+            prepared.execution_id,
+            now=FIXED_TIME + timedelta(minutes=3),
+        )
+    )
+    asyncio.run(
+        harness.executor.collect_result(
+            running.execution_id,
+            now=FIXED_TIME + timedelta(minutes=4),
+        )
+    )
+    ingestion = harness.ingestions.get_by_execution(running.execution_id)
+    record = harness.executions.get(running.execution_id)
+    assert ingestion is not None and record is not None
+    leased = harness.ingestions.transition(
+        ingestion.ingestion_id,
+        expected_state_version=ingestion.state_version,
+        status="INGESTING",
+        lease_id="lease-before-process-crash",
+        lease_expires_at=FIXED_TIME + timedelta(minutes=5),
+        now=FIXED_TIME + timedelta(minutes=4),
+    )
+    harness.executions.transition_ingestion(
+        record.execution_id,
+        expected_state_version=record.state_version,
+        new_state="INGESTING",
+        now=FIXED_TIME + timedelta(minutes=4),
+    )
+    ingester = MockSecureResultIngester(
+        summary=SecureIngestionSummary(secure_ingestion_id="lease-recovered")
+    )
+    with pytest.raises(ResultIngestionLeaseError):
+        asyncio.run(
+            harness.executor.ingest_result(
+                running.execution_id,
+                ingester=ingester,
+                now=FIXED_TIME + timedelta(minutes=4, seconds=30),
+            )
+        )
+    result = asyncio.run(
+        harness.executor.ingest_result(
+            running.execution_id,
+            ingester=ingester,
+            now=FIXED_TIME + timedelta(minutes=6),
+        )
+    )
+    recovered = harness.ingestions.get(leased.ingestion_id)
+    assert recovered is not None
+    assert recovered.status == "SUCCEEDED"
+    assert recovered.attempt_count == 2
+    assert result.secure_ingestion_id == "lease-recovered"
+    assert harness.adapter.submit_calls == 1
 
 
 def test_require_approval_has_no_execution_until_exact_approval_exists() -> None:
@@ -366,7 +525,6 @@ def test_approved_execution_is_blocked_if_approval_expires_before_dispatch() -> 
     blocked = asyncio.run(
         harness.executor.dispatch(
             prepared.execution_id,
-            adapter=harness.adapter,
             now=FIXED_TIME + timedelta(minutes=6),
         )
     )

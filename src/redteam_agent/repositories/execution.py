@@ -674,6 +674,7 @@ class ResultIngestionRepository(ImmutableJsonRepository[ResultIngestionRecord]):
         status: ResultIngestionStatus,
         now: datetime,
         lease_id: str | None = None,
+        lease_expires_at: datetime | None = None,
         failure_code: str | None = None,
     ) -> ResultIngestionRecord:
         current = self.get(ingestion_id)
@@ -687,6 +688,7 @@ class ResultIngestionRepository(ImmutableJsonRepository[ResultIngestionRecord]):
                 "state_version": current.state_version + 1,
                 "status": status,
                 "lease_id": lease_id,
+                "lease_expires_at": lease_expires_at,
                 "attempt_count": current.attempt_count + (1 if status == "INGESTING" else 0),
                 "failure_code": failure_code,
                 "updated_at": now,
@@ -712,6 +714,55 @@ class ResultIngestionRepository(ImmutableJsonRepository[ResultIngestionRecord]):
         )
         if cursor.rowcount != 1:
             raise ExecutionStateTransitionError("ingestion OCC update failed")
+        return updated
+
+    def take_over_expired_lease(
+        self,
+        ingestion_id: str,
+        *,
+        expected_state_version: int,
+        lease_id: str,
+        lease_expires_at: datetime,
+        now: datetime,
+    ) -> ResultIngestionRecord:
+        current = self.get(ingestion_id)
+        if (
+            current is None
+            or current.state_version != expected_state_version
+            or current.status != "INGESTING"
+            or current.lease_expires_at is None
+            or now < current.lease_expires_at
+        ):
+            raise ExecutionStateTransitionError("ingestion lease is not safely recoverable")
+        updated = ResultIngestionRecord.model_validate(
+            {
+                **current.model_dump(mode="python"),
+                "state_version": current.state_version + 1,
+                "lease_id": lease_id,
+                "lease_expires_at": lease_expires_at,
+                "attempt_count": current.attempt_count + 1,
+                "updated_at": now,
+                "ingestion_digest": "pending",
+            }
+        )
+        updated = updated.model_copy(
+            update={"ingestion_digest": ingestion_record_digest(updated)}
+        )
+        cursor = self.database.connection.execute(
+            "UPDATE result_ingestions SET ingestion_digest = ?, state_version = ?, "
+            "payload_json = ? WHERE ingestion_id = ? AND state_version = ? "
+            "AND ingestion_digest = ? AND status = 'INGESTING'",
+            (
+                updated.ingestion_digest,
+                updated.state_version,
+                model_json(updated),
+                ingestion_id,
+                current.state_version,
+                current.ingestion_digest,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise ExecutionStateTransitionError("ingestion lease takeover OCC failed")
         return updated
 
 

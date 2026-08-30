@@ -67,6 +67,35 @@ Added files:
   dispatch and requests FINALIZING, and the Mission state machine continues to reject a direct
   `RUNNING -> COMPLETED` transition.
 
+## Independent review correction cycle
+
+The independent review for implementation SHA
+`c2ec88545bc0e31dafde1e0d3d72c8ea4f46f99c` returned six P1 findings. All six were addressed in
+the same Phase 0B scope:
+
+- [`discussion_r3889834343`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3889834343):
+  removed caller-supplied adapters from public dispatch/reconcile/collect/cancel APIs. Executor now
+  resolves the exact adapter type and ID from an immutable trusted composition-root registry.
+- [`discussion_r3889834345`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3889834345):
+  made the live session/sandbox/remote-trust capability probe a mandatory Executor dependency;
+  construction fails closed if it is absent.
+- [`discussion_r3889834349`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3889834349):
+  made `CANCEL_REQUESTED` a public restart/reconciliation state so a crash after durable cancel intent
+  never leaves an execution without a recovery path or causes a resubmit.
+- [`discussion_r3889834352`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3889834352):
+  added expiration-bound ingestion leases and OCC lease takeover. An active lease blocks takeover;
+  an expired lease can resume ingestion without resubmitting the provider action.
+- [`discussion_r3889834356`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3889834356):
+  reconciliation now treats a changed provider task ID as `OUTCOME_UNKNOWN` and preserves the
+  original immutable task binding.
+- [`discussion_r3889834360`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3889834360):
+  made a Mission-Manager-backed `FinalizationCoordinator` mandatory. Mission expiry always routes
+  through FINALIZING after the pre-dispatch BLOCKED record is committed.
+
+The correction also removed caller-supplied `AdapterRawResult` from the ingestion API. Ingestion
+re-collects metadata through the trusted registered adapter and the committed quarantine sink,
+without submitting the external action again.
+
 ## Regression tests added
 
 The Phase 0B test set covers positive, negative, and failure paths, including:
@@ -87,6 +116,9 @@ The Phase 0B test set covers positive, negative, and failure paths, including:
 - normalized result persistence before secure ingestion being rejected;
 - revision-specific run/thread identities and checkpoint mismatch rejection;
 - FINALIZING entry and direct-completion rejection.
+- caller adapter replacement rejection and missing live-probe/finalization dependency rejection;
+- cancellation crash recovery, provider task-ID replacement rejection, and expired-ingestion-lease
+  takeover without action resubmit.
 
 No test was skipped, weakened, deleted, or marked as an expected failure.
 
@@ -106,8 +138,8 @@ ruff: All checks passed
 mypy: Success: no issues found in 69 source files
 unit: 172 passed
 integration: 7 passed
-security: 124 passed
-full/coverage run: 303 passed
+security: 130 passed
+full/coverage run: 309 passed
 skipped=0, errors=0, failures=0
 coverage: 82% total (branch coverage enabled)
 pip check: No broken requirements found
@@ -122,7 +154,7 @@ Additional focused command executed during development:
   tests/security/test_phase0b_execution_safety.py --strict-markers
 ```
 
-Focused result: `22 passed`.
+Focused result: `28 passed`.
 
 ## Remaining findings and constraints
 
