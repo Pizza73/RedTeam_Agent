@@ -38,6 +38,7 @@ AUTOMATIC_PHASES = frozenset(PHASES)
 REQUIRED_CHECKS = frozenset({"tests (3.12)", "tests (3.14)", "quality", "governance-integrity"})
 REQUIRED_CHECK_ORDER = ("tests (3.12)", "tests (3.14)", "quality", "governance-integrity")
 TRUSTED_WORKFLOW_LOGIN = "github-actions[bot]"
+PHASE_TRANSITION_MARKER = "ai-review-passed"
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 BASE_REFRESH_STATUS_PREFIX = "redteam/base-refresh/"
@@ -270,6 +271,26 @@ def select_evidence_action(
     if ready_exists:
         return "review"
     return "wait"
+
+
+def current_phase_from_labels(labels: frozenset[str]) -> str:
+    phase_labels = sorted(labels.intersection(PHASES), key=PHASES.index)
+    if PHASE_TRANSITION_MARKER not in labels:
+        if len(phase_labels) != 1:
+            raise UntrustedEvidenceError(
+                f"pull request must have exactly one phase label, got {phase_labels}"
+            )
+        return phase_labels[0]
+    if len(phase_labels) == 1:
+        return phase_labels[0]
+    if len(phase_labels) == 2:
+        current_index = PHASES.index(phase_labels[0])
+        if current_index + 1 < len(PHASES) and PHASES[current_index + 1] == phase_labels[1]:
+            return phase_labels[1]
+    raise UntrustedEvidenceError(
+        "marked Phase transition must contain one Phase or exactly two adjacent Phases, "
+        f"got {phase_labels}"
+    )
 
 
 def validate_base_refresh_payload(payload: dict[str, Any]) -> None:
@@ -1397,11 +1418,7 @@ class PhaseLoop:
             for item in labels_raw
             if isinstance(item, dict) and isinstance(item.get("name"), str)
         )
-        phase_labels = sorted(labels.intersection(PHASES))
-        if len(phase_labels) != 1:
-            raise UntrustedEvidenceError(
-                f"pull request must have exactly one phase label, got {phase_labels}"
-            )
+        current_phase = current_phase_from_labels(labels)
         head = raw.get("head")
         base = raw.get("base")
         if not isinstance(head, dict) or not isinstance(base, dict):
@@ -1414,7 +1431,7 @@ class PhaseLoop:
             head_sha=str(head.get("sha", "")),
             base_sha=str(base.get("sha", "")),
             base_ref=str(base.get("ref", "")),
-            phase=phase_labels[0],
+            phase=current_phase,
             labels=labels,
             state=str(raw.get("state", "")),
             head_repository=str(head_repo.get("full_name", "")),
@@ -2334,6 +2351,15 @@ class PhaseLoop:
                 if merge_result is not None:
                     return merge_result
                 status = f"waiting for final merge checks: {state.phase} {state.head_sha[:12]}"
+                if status != last_status:
+                    self.log(status)
+                    last_status = status
+                if self.dry_run:
+                    return f"DRY_RUN:{status}"
+                self.sleep()
+                continue
+            if PHASE_TRANSITION_MARKER in state.labels:
+                status = f"waiting for marked Phase transition: {state.phase}"
                 if status != last_status:
                     self.log(status)
                     last_status = status

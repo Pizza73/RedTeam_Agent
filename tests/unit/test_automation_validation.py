@@ -93,12 +93,37 @@ def test_phase_gate_uses_fail_closed_native_codex_evidence_chain() -> None:
         "Incorporated Phase 0A base-refresh evidence is ambiguous",
         "maximalRefreshes.length !== 1",
         "Pull request head or phase changed before recording the gate",
+        "phase_transition",
+        "automation/transition_phase.py",
     ):
         assert required_control in workflow
     assert "liveDefaultCommit.sha !== refreshTargetSha" not in workflow
     assert "Default branch changed before recording the refreshed Phase 0A gate" not in workflow
     assert "status.sha !== pass.reviewed_sha" not in workflow
+    assert "await removeLabel(phase)" not in workflow
+    assert "await addLabels([next.label, 'ai-needs-implementation'])" not in workflow
     assert "Review evidence must contain exactly one redteam-ai-review marker" not in workflow
+
+
+def test_phase_gate_uses_the_marker_transition_protocol() -> None:
+    workflow = (REPO_ROOT / ".github" / "workflows" / "ai-loop-control.yml").read_text(
+        encoding="utf-8"
+    )
+    helper = (REPO_ROOT / "automation" / "transition_phase.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert "issues.setLabels" not in workflow
+    assert "issues.setLabels" not in helper
+    assert 'TRANSITION_MARKER = "ai-review-passed"' in helper
+    add_next = helper.index("client.add_label(request, request.next_phase)")
+    remove_current = helper.index("client.remove_label(request, request.current_phase)")
+    add_implementation = helper.index("client.add_label(request, IMPLEMENTATION_LABEL)")
+    create_request = helper.index("    client.create_request_comment(request)")
+    remove_marker = helper.index("client.remove_label(request, TRANSITION_MARKER)")
+    assert add_next < remove_current < add_implementation < create_request < remove_marker
+    assert "released_labels = _label_names" in helper
+    assert '"PUT"' not in helper
 
 
 def test_phase_gate_has_minimal_permissions_for_pr_state_updates() -> None:

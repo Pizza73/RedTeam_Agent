@@ -186,6 +186,14 @@ After approval, restarting the same local command automatically requests the app
 Phase 5 implementation. Provider choices remain human-only; the final implementation merge uses
 the configured local exact-SHA gate.
 
+For an automatic adjacent-Phase transition, `ai-review-passed` is the transition marker. The Gate
+adds the next Phase before removing the current Phase, mutates only its named managed labels, and
+removes the marker only after the next implementation status and request exist. The Runner waits
+while the marker accompanies one Phase or exactly two adjacent Phases, so the intentional dual-Phase
+window is not interpreted as ambiguous authority. Every mutation boundary revalidates the open PR,
+exact HEAD, marker, and Phase set. GitHub does not offer compare-and-swap for unsafe label updates,
+so full-label replacement is forbidden: unrelated concurrent labels remain untouched.
+
 The same long-lived implementation PR is used to avoid intermediate automatic merges. Every phase
 PASS comment records the phase boundary SHA; the next review must use that SHA as its base. The
 `redteam/phase-review` status is reset to pending whenever a new phase starts, preventing an earlier
