@@ -38,6 +38,7 @@ External C2/MCP     --untrusted until approved/bound--> Adapter
 | Malicious test exfiltration | No unrelated credentials in test jobs; CI egress should be organization-restricted where possible |
 | Review actor compromised | Independent Phase-chain revalidation; audit trail; emergency stop labels/workflow disable |
 | Phase gate bypass | Ordered phase plan; label/current phase match; prior PASS marker; required Check Runs queried from GitHub |
+| Runner observes a zero/multiple-Phase transition window | Replace the complete managed label set atomically from a fresh PR snapshot, then re-fetch and compare the exact HEAD, next Phase and full label set |
 | Stale static Phase status blocks or authorizes work | Active PR authority requires an exact label + workflow-authored current-HEAD request + adjacent prior PASS; the status document is bootstrap-only |
 | Default-branch refresh reuses an old PASS | Approver-restricted workflow binds old HEAD/current base/prior PASS in a status; the local orchestrator verifies full PR state before and after an exact one-Phase label rollback and requires a new gate after synchronization |
 | Base-refresh status changes around a local write | Re-fetch and compare the unique PASS/status transition snapshot, PR state and default branch immediately before and after label replacement and expected-HEAD branch update |

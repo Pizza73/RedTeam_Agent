@@ -186,6 +186,11 @@ After approval, restarting the same local command automatically requests the app
 Phase 5 implementation. Provider choices remain human-only; the final implementation merge uses
 the configured local exact-SHA gate.
 
+For an automatic adjacent-Phase transition, the Gate re-fetches the PR after recording the review,
+derives the complete final label set from that snapshot, and replaces it in one API call. It then
+re-fetches the PR and requires the exact HEAD, next Phase, and complete label set to match. The Gate
+never deliberately exposes an intermediate state with zero or two Phase labels.
+
 The same long-lived implementation PR is used to avoid intermediate automatic merges. Every phase
 PASS comment records the phase boundary SHA; the next review must use that SHA as its base. The
 `redteam/phase-review` status is reset to pending whenever a new phase starts, preventing an earlier

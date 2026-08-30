@@ -29,6 +29,8 @@
   stale/malformedな履歴は権限として使わず、trigger後のstale evidenceはFail Closedにする
 - CHANGES_REQUESTEDはCurrent HEADへ完全BindingされたCodex formal reviewとP0/P1 inline findingを要求し、root-cause keyを決定論的に導出する
 - Required Check成功前にReview Gateを記録しない
+- 自動Phase遷移はfreshなPR HEAD/Phase/全Label snapshotから最終Label集合を計算して単一API呼出しで
+  完全置換し、直後の再取得でHEAD、次Phase、全Label集合の一致を確認する
 - 同じRequest/Reviewを再処理せず、停止後にGitHub Evidenceから再開できる
 - Phase 4/5は`ai-human-gate`中に停止し、承認済みProvider Gate遷移後だけ再開する
 - OpenAI API Keyを要求せず、GitHub CredentialをCodex Promptまたは実行環境へ渡さない

@@ -732,9 +732,60 @@ jobs:
               return;
             }
 
-            await removeLabel(phase);
-            await removeLabel('ai-review-passed');
-            await addLabels([next.label, 'ai-needs-implementation']);
+            const { data: transitionPr } = await github.rest.pulls.get({
+              owner, repo, pull_number,
+            });
+            const transitionPhases = transitionPr.labels.map((item) => item.name)
+              .filter((name) => /^phase-(0a|0b|0c|[1-5])$/.test(name));
+            if (
+              transitionPr.state !== 'open' || transitionPr.head.sha !== reviewedSha ||
+              transitionPhases.length !== 1 || transitionPhases[0] !== phase
+            ) {
+              core.setFailed('Pull request changed before the atomic Phase label transition.');
+              return;
+            }
+            const managedStateLabels = new Set([
+              'ai-needs-review',
+              'ai-review-passed',
+              'ai-needs-fix',
+              'ai-loop-blocked',
+              'ai-human-gate',
+              'ai-project-complete',
+              'ai-needs-implementation',
+            ]);
+            const transitionedLabels = transitionPr.labels
+              .map((item) => item.name)
+              .filter((name) =>
+                !/^phase-(0a|0b|0c|[1-5])$/.test(name) &&
+                !managedStateLabels.has(name)
+              );
+            transitionedLabels.push(next.label, 'ai-needs-implementation');
+            const expectedTransitionLabels = [...new Set(transitionedLabels)].sort();
+            await github.rest.issues.setLabels({
+              owner,
+              repo,
+              issue_number: pull_number,
+              labels: expectedTransitionLabels,
+            });
+            const { data: transitionedPr } = await github.rest.pulls.get({
+              owner, repo, pull_number,
+            });
+            const actualTransitionLabels = transitionedPr.labels
+              .map((item) => item.name)
+              .sort();
+            const transitionedPhases = actualTransitionLabels
+              .filter((name) => /^phase-(0a|0b|0c|[1-5])$/.test(name));
+            if (
+              transitionedPr.state !== 'open' || transitionedPr.head.sha !== reviewedSha ||
+              transitionedPhases.length !== 1 || transitionedPhases[0] !== next.label ||
+              actualTransitionLabels.length !== expectedTransitionLabels.length ||
+              actualTransitionLabels.some(
+                (name, index) => name !== expectedTransitionLabels[index]
+              )
+            ) {
+              core.setFailed('Pull request changed during the atomic Phase label transition.');
+              return;
+            }
             await setReviewStatus('pending', `${next.id}: implementation pending`);
             const request = {
               schema_version: '1.0',

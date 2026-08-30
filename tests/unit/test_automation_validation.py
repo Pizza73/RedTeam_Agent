@@ -93,11 +93,17 @@ def test_phase_gate_uses_fail_closed_native_codex_evidence_chain() -> None:
         "Incorporated Phase 0A base-refresh evidence is ambiguous",
         "maximalRefreshes.length !== 1",
         "Pull request head or phase changed before recording the gate",
+        "github.rest.issues.setLabels",
+        "Pull request changed before the atomic Phase label transition",
+        "Pull request changed during the atomic Phase label transition",
+        "actualTransitionLabels.length !== expectedTransitionLabels.length",
     ):
         assert required_control in workflow
     assert "liveDefaultCommit.sha !== refreshTargetSha" not in workflow
     assert "Default branch changed before recording the refreshed Phase 0A gate" not in workflow
     assert "status.sha !== pass.reviewed_sha" not in workflow
+    assert "await removeLabel(phase)" not in workflow
+    assert "await addLabels([next.label, 'ai-needs-implementation'])" not in workflow
     assert "Review evidence must contain exactly one redteam-ai-review marker" not in workflow
 
 
