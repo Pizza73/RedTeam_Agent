@@ -506,10 +506,14 @@ jobs:
               if (changed) throw new Error('PR head changed while Codex review was running.');
             }
 
-            const currentFindings = reviewComments.filter((item) =>
-              item.user?.login === process.env.AI_REVIEWER_LOGIN &&
-              item.commit_id === reviewedSha && codexPriority(item.body)
-            ).sort((left, right) => left.id - right.id);
+            const currentFindings = reviewComments.filter((item) => {
+              if (
+                item.user?.login !== process.env.AI_REVIEWER_LOGIN ||
+                item.commit_id !== reviewedSha
+              ) return false;
+              if (parseTime(item.created_at, 'Codex finding') <= triggerTime) return false;
+              return codexPriority(item.body);
+            }).sort((left, right) => left.id - right.id);
             const validReviews = new Map();
             for (const item of reviews) {
               if (
@@ -519,10 +523,6 @@ jobs:
               ) validReviews.set(item.id, item);
             }
             for (const finding of currentFindings) {
-              if (parseTime(finding.created_at, 'Codex finding') <= triggerTime) {
-                core.setFailed('Current-head Codex finding predates the trusted trigger.');
-                return;
-              }
               if (!validReviews.has(finding.pull_request_review_id)) {
                 core.setFailed('Codex finding is not bound to a trusted current-head review.');
                 return;

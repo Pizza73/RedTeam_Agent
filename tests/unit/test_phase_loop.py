@@ -565,6 +565,78 @@ def test_native_codex_pass_ignores_stale_commit_before_trusted_trigger() -> None
     assert result.url == NO_FINDINGS_URL
 
 
+def test_native_codex_pass_ignores_remapped_finding_before_trusted_trigger() -> None:
+    evidence = native_evidence()
+    review_comments = evidence["review_comments"]
+    assert isinstance(review_comments, list)
+    review_comments.append(
+        {
+            "id": 6,
+            "html_url": f"{REVIEW_URL}#discussion-old",
+            "user": {"login": REVIEWER_LOGIN},
+            "commit_id": HEAD_SHA,
+            "original_commit_id": "c" * 40,
+            "pull_request_review_id": 66,
+            "created_at": "2026-08-30T00:00:30Z",
+            "path": "src/redteam_agent/executor/service.py",
+            "line": 10,
+            "body": "![P1 Badge](badge) historical finding remapped to current head",
+        }
+    )
+
+    result = evaluate_fixture(evidence)
+
+    assert result is not None
+    assert result.result["verdict"] == "PASS"
+    assert result.url == NO_FINDINGS_URL
+
+
+def test_native_codex_pass_ignores_malformed_finding_before_trusted_trigger() -> None:
+    evidence = native_evidence()
+    review_comments = evidence["review_comments"]
+    assert isinstance(review_comments, list)
+    review_comments.append(
+        {
+            "id": 7,
+            "html_url": f"{REVIEW_URL}#discussion-old-malformed",
+            "user": {"login": REVIEWER_LOGIN},
+            "commit_id": HEAD_SHA,
+            "pull_request_review_id": 67,
+            "created_at": "2026-08-30T00:00:30Z",
+            "path": "src/redteam_agent/executor/service.py",
+            "line": 11,
+            "body": "![P0 Badge](badge) ![P1 Badge](badge) ambiguous historical finding",
+        }
+    )
+
+    result = evaluate_fixture(evidence)
+
+    assert result is not None
+    assert result.result["verdict"] == "PASS"
+
+
+def test_native_codex_finding_after_trigger_requires_trusted_review() -> None:
+    evidence = native_evidence()
+    review_comments = evidence["review_comments"]
+    assert isinstance(review_comments, list)
+    review_comments.append(
+        {
+            "id": 8,
+            "html_url": f"{REVIEW_URL}#discussion-unbound",
+            "user": {"login": REVIEWER_LOGIN},
+            "commit_id": HEAD_SHA,
+            "pull_request_review_id": 68,
+            "created_at": "2026-08-30T00:01:30Z",
+            "path": "src/redteam_agent/executor/service.py",
+            "line": 12,
+            "body": "![P1 Badge](badge) unbound post-trigger finding",
+        }
+    )
+
+    with pytest.raises(UntrustedEvidenceError, match="not bound to a trusted"):
+        evaluate_fixture(evidence)
+
+
 def test_native_codex_pass_rejects_head_change_during_review() -> None:
     evidence = native_evidence()
     evidence["timeline"] = [

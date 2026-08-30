@@ -81,6 +81,7 @@ def test_phase_gate_uses_fail_closed_native_codex_evidence_chain() -> None:
         "PR head changed while Codex review was running",
         "missing its reviewer thumbs-up reaction",
         "missing retained P0/P1 findings",
+        "parseTime(item.created_at, 'Codex finding') <= triggerTime) return false",
         "duplicate JSON key",
         "redteam/base-refresh/",
         "listCommitStatusesForRef",
@@ -103,6 +104,7 @@ def test_phase_gate_uses_fail_closed_native_codex_evidence_chain() -> None:
     assert "await removeLabel(phase)" not in workflow
     assert "await addLabels([next.label, 'ai-needs-implementation'])" not in workflow
     assert "Review evidence must contain exactly one redteam-ai-review marker" not in workflow
+    assert "Current-head Codex finding predates the trusted trigger" not in workflow
 
 
 def test_phase_gate_uses_the_marker_transition_protocol() -> None:
