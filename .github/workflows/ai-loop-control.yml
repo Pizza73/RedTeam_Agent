@@ -217,7 +217,6 @@ jobs:
             }
 
             let expectedBaseSha;
-            let refreshTargetSha = null;
             if (phaseIndex === 0) {
               const refreshStatusDescription =
                 'trusted exact-SHA base refresh authorization';
@@ -263,38 +262,64 @@ jobs:
               }
               expectedBaseSha = pr.base.sha;
               if (refreshes.length > 0) {
-                let matchedRefresh = null;
-                const suppliedTargetRefreshes = refreshes.filter(
-                  (refresh) => refresh.target_base_sha === suppliedBaseSha
-                );
-                for (const refresh of suppliedTargetRefreshes) {
-                  const [oldHeadComparison, targetBaseComparison] = await Promise.all([
-                    github.request('GET /repos/{owner}/{repo}/compare/{basehead}', {
-                      owner, repo, basehead: `${refresh.head_sha}...${reviewedSha}`,
-                    }),
-                    github.request('GET /repos/{owner}/{repo}/compare/{basehead}', {
-                      owner, repo, basehead: `${refresh.target_base_sha}...${reviewedSha}`,
-                    }),
+                const ancestry = new Map();
+                async function isAncestor(ancestorSha, descendantSha) {
+                  if (ancestorSha === descendantSha) return true;
+                  const key = `${ancestorSha}:${descendantSha}`;
+                  if (!ancestry.has(key)) {
+                    ancestry.set(key, (async () => {
+                      const comparison = await github.request(
+                        'GET /repos/{owner}/{repo}/compare/{basehead}',
+                        {owner, repo, basehead: `${ancestorSha}...${descendantSha}`}
+                      );
+                      return comparison.data.merge_base_commit?.sha === ancestorSha &&
+                        comparison.data.behind_by === 0 &&
+                        ['ahead', 'identical'].includes(comparison.data.status);
+                    })());
+                  }
+                  return await ancestry.get(key);
+                }
+
+                const uniqueRefreshes = [...new Map(
+                  refreshes.map((refresh) => [JSON.stringify(refresh), refresh])
+                ).values()];
+                const incorporatedRefreshes = [];
+                for (const refresh of uniqueRefreshes) {
+                  const [oldHeadIsAncestor, targetBaseIsAncestor] = await Promise.all([
+                    isAncestor(refresh.head_sha, reviewedSha),
+                    isAncestor(refresh.target_base_sha, reviewedSha),
                   ]);
-                  const oldHeadIsAncestor =
-                    oldHeadComparison.data.merge_base_commit?.sha === refresh.head_sha &&
-                    oldHeadComparison.data.behind_by === 0 &&
-                    ['ahead', 'identical'].includes(oldHeadComparison.data.status);
-                  const targetBaseIsAncestor =
-                    targetBaseComparison.data.merge_base_commit?.sha === refresh.target_base_sha &&
-                    targetBaseComparison.data.behind_by === 0 &&
-                    ['ahead', 'identical'].includes(targetBaseComparison.data.status);
                   if (oldHeadIsAncestor && targetBaseIsAncestor) {
-                    matchedRefresh = refresh;
-                    break;
+                    incorporatedRefreshes.push(refresh);
                   }
                 }
-                if (!matchedRefresh) {
+                if (incorporatedRefreshes.length === 0) {
                   core.setFailed('Reviewed Phase 0A head is not descended from a trusted base refresh.');
                   return;
                 }
+
+                const maximalRefreshes = [];
+                for (const candidate of incorporatedRefreshes) {
+                  let dominated = false;
+                  for (const other of incorporatedRefreshes) {
+                    if (candidate === other) continue;
+                    const strictlyAdvances = candidate.head_sha !== other.head_sha ||
+                      candidate.target_base_sha !== other.target_base_sha;
+                    if (strictlyAdvances &&
+                        await isAncestor(candidate.head_sha, other.head_sha) &&
+                        await isAncestor(candidate.target_base_sha, other.target_base_sha)) {
+                      dominated = true;
+                      break;
+                    }
+                  }
+                  if (!dominated) maximalRefreshes.push(candidate);
+                }
+                if (maximalRefreshes.length !== 1) {
+                  core.setFailed('Incorporated Phase 0A base-refresh evidence is ambiguous.');
+                  return;
+                }
+                const matchedRefresh = maximalRefreshes[0];
                 expectedBaseSha = matchedRefresh.target_base_sha;
-                refreshTargetSha = matchedRefresh.target_base_sha;
               }
             } else {
               const previousPhase = plan.phases[phaseIndex - 1].id;
