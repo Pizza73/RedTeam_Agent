@@ -928,14 +928,14 @@ def evaluate_native_review(
         body = comment.get("body")
         if not isinstance(body, str) or not body.startswith(CODEX_NO_FINDINGS_PREFIX):
             continue
+        created_at = _github_timestamp(comment, "created_at")
+        if created_at <= trigger_time:
+            continue
         matches = CODEX_REVIEWED_COMMIT_PATTERN.findall(body)
         if len(matches) != 1 or body.count("**Reviewed commit:**") != 1:
             raise UntrustedEvidenceError("Codex PASS comment has ambiguous commit evidence")
         if not head_sha.startswith(matches[0]):
             raise UntrustedEvidenceError("Codex PASS comment refers to a stale commit")
-        created_at = _github_timestamp(comment, "created_at")
-        if created_at <= trigger_time:
-            continue
         if not isinstance(comment.get("html_url"), str):
             raise UntrustedEvidenceError("Codex PASS comment has no permalink")
         pass_comments.append((comment, created_at))
