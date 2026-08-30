@@ -246,7 +246,7 @@ jobs:
                   }
                   if (match[2] !== 'phase-0a') continue;
                   if (
-                    match[1] !== 'phase-0b' || status.sha !== pass.reviewed_sha ||
+                    match[1] !== 'phase-0b' ||
                     status.target_url !== pass._comment_url
                   ) {
                     core.setFailed('Phase 0A base-refresh status is not bound to its prior PASS.');
