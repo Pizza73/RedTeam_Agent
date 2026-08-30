@@ -127,7 +127,7 @@ accepted. Repository content, PR comments and reviewer output remain untrusted d
 When `main` has advanced after an adjacent prior-Phase PASS but before Codex has created any
 current-Phase commit, the local orchestrator dispatches `Prepare AI Loop Base Refresh`. The workflow
 verifies the exact current HEAD, current default-branch SHA, current implementation request and
-adjacent prior PASS, then moves the Phase label back exactly one step and emits a commit status:
+adjacent prior PASS, then emits a commit status:
 
 ```text
 sha: <old-head>
@@ -138,12 +138,19 @@ target_url: <trusted-prior-PASS-permalink>
 creator: github-actions[bot]
 ```
 
-The workflow uses `statuses: write` for this evidence and `issues: write` for labels while retaining
-only `pull-requests: read`; it does not receive merge authority. Only after validating the status
-creator, exact context, state, description, prior PASS link and SHA does the local orchestrator call
-GitHub's branch-update endpoint with `expected_head_sha=<old-head>`. A concurrent head change fails
-closed. The synchronization is not a final PR merge: it incorporates `main` into the PR branch. CI
-then runs the rolled-back Phase on the new HEAD, and every PASS tied to the old HEAD remains stale.
+The workflow uses `statuses: write` for this evidence and retains only `pull-requests: read`; it has
+neither label-write nor merge authority. After validating the status creator, exact context, state,
+description, prior PASS link and SHA, the local orchestrator re-reads the complete PR state, replaces
+the labels with the exact adjacent-Phase rollback set, and verifies the complete resulting PR state.
+It first rejects multiple source/restart transition identities for the same HEAD and current Phase,
+then re-fetches and compares the trusted PASS/status transition snapshot immediately before and
+after both local side effects. The post-label snapshot uses the rolled-back Phase while retaining
+the authorized source identity, so a newly inserted lower-Phase transition cannot be hidden. It
+calls GitHub's branch-update endpoint with
+`expected_head_sha=<old-head>`. A concurrent status, head, base, label or lifecycle change fails
+closed. The synchronization is not a final PR merge: it
+incorporates `main` into the PR branch. CI then runs the rolled-back Phase on the new HEAD, and every
+PASS tied to the old HEAD remains stale.
 
 ## Review recording
 

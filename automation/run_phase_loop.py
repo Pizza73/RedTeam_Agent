@@ -17,7 +17,7 @@ import shutil
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, NoReturn
@@ -1139,6 +1139,40 @@ class GitHubClient:
         if not isinstance(value, dict) or not isinstance(value.get("message"), str):
             raise UntrustedEvidenceError("GitHub branch-update response is invalid")
 
+    def set_pull_request_labels(
+        self, number: int, labels: frozenset[str]
+    ) -> frozenset[str]:
+        if number < 1 or not labels:
+            raise UntrustedEvidenceError("label transition requires a PR and non-empty label set")
+        if any(
+            not isinstance(label, str)
+            or not label
+            or len(label) > 50
+            or any(ord(character) < 32 for character in label)
+            for label in labels
+        ):
+            raise UntrustedEvidenceError("label transition contains an invalid label")
+        arguments = [
+            "api",
+            "--method",
+            "PUT",
+            f"repos/{self.repository}/issues/{number}/labels",
+        ]
+        for label in sorted(labels):
+            arguments.extend(["--raw-field", f"labels[]={label}"])
+        raw = self.command.run(arguments)
+        value = strict_json_loads(raw)
+        if not isinstance(value, list):
+            raise UntrustedEvidenceError("GitHub label response must be an array")
+        actual = frozenset(
+            item["name"]
+            for item in value
+            if isinstance(item, dict) and isinstance(item.get("name"), str)
+        )
+        if actual != labels or len(value) != len(actual):
+            raise UntrustedEvidenceError("GitHub did not confirm the exact PR label transition")
+        return actual
+
     def merge_pull_request(
         self, number: int, expected_head_sha: str, *, merge_method: str
     ) -> str:
@@ -1300,6 +1334,7 @@ class PhaseLoop:
         }
         self.dispatched_review_records: set[str] = set()
         self.dispatched_base_refreshes: set[str] = set()
+        self.started_base_label_transitions: set[str] = set()
         self.started_base_updates: set[str] = set()
 
     @staticmethod
@@ -1427,10 +1462,14 @@ class PhaseLoop:
         state: PullRequestState,
         phase_records: list[MarkerEvidence],
     ) -> list[MarkerEvidence]:
+        revalidation_phases = {state.phase}
+        phase_index = PHASES.index(state.phase)
+        if phase_index > 0:
+            revalidation_phases.add(PHASES[phase_index - 1])
         prior_passes = [
             record
             for record in phase_records
-            if record.payload.get("phase") == state.phase
+            if record.payload.get("phase") in revalidation_phases
             and record.payload.get("verdict") == "PASS"
             and SHA_PATTERN.fullmatch(str(record.payload.get("reviewed_sha", "")))
         ]
@@ -1442,14 +1481,16 @@ class PhaseLoop:
                 self.github.commit_statuses(head_sha), head_sha=head_sha
             )
             for item in evidence:
-                if item.payload.get("revalidate_phase") != state.phase:
+                revalidation_phase = item.payload.get("revalidate_phase")
+                if revalidation_phase not in revalidation_phases:
                     continue
                 prior_reference = item.payload.get("prior_pass_reference")
                 matching_pass = next(
                     (
                         record
                         for record in prior_passes
-                        if record.url == prior_reference
+                        if record.payload.get("phase") == revalidation_phase
+                        and record.url == prior_reference
                         and record.payload.get("reviewed_sha") == head_sha
                     ),
                     None,
@@ -1460,6 +1501,182 @@ class PhaseLoop:
                     )
                 result.append(item)
         return result
+
+    @staticmethod
+    def require_unique_base_refresh_transition_identity(
+        state: PullRequestState,
+        refresh_records: list[MarkerEvidence],
+    ) -> frozenset[str]:
+        identities: set[tuple[str, str, str, str]] = set()
+        payload_digests: set[str] = set()
+        for record in refresh_records:
+            payload = record.payload
+            if payload.get("head_sha") != state.head_sha:
+                continue
+            validate_base_refresh_payload(payload)
+            from_phase = payload.get("from_phase")
+            revalidation_phase = payload.get("revalidate_phase")
+            if state.phase not in {from_phase, revalidation_phase}:
+                continue
+            identities.add(
+                (
+                    str(from_phase),
+                    str(revalidation_phase),
+                    state.head_sha,
+                    str(payload["prior_pass_reference"]),
+                )
+            )
+            payload_digests.add(canonical_digest(payload))
+        if len(identities) > 1:
+            raise UntrustedEvidenceError(
+                "conflicting base-refresh transition identities exist for the current PR state"
+            )
+        return frozenset(payload_digests)
+
+    def live_base_refresh_transition_snapshot(
+        self,
+        state: PullRequestState,
+    ) -> frozenset[str]:
+        comments = self.comments()
+        phase_records = self.trusted_markers(comments, "redteam-phase-gate")
+        refresh_records = self.trusted_base_refresh_statuses(state, phase_records)
+        return self.require_unique_base_refresh_transition_identity(
+            state, refresh_records
+        )
+
+    def revalidate_base_refresh_transition_snapshot(
+        self,
+        state: PullRequestState,
+        expected_snapshot: frozenset[str],
+    ) -> None:
+        if self.live_base_refresh_transition_snapshot(state) != expected_snapshot:
+            raise UntrustedEvidenceError(
+                "base-refresh transition evidence changed around a local side effect"
+            )
+
+    def validate_post_base_refresh_pr_state(
+        self,
+        previous_state: PullRequestState,
+        current_state: PullRequestState,
+        default_branch_sha: str,
+    ) -> None:
+        if current_state.head_sha == previous_state.head_sha:
+            if current_state != previous_state:
+                raise UntrustedEvidenceError(
+                    "pull request metadata changed during the exact-HEAD base refresh"
+                )
+            return
+        unchanged_fields = (
+            "number",
+            "base_ref",
+            "phase",
+            "labels",
+            "state",
+            "head_repository",
+        )
+        if any(
+            getattr(current_state, field) != getattr(previous_state, field)
+            for field in unchanged_fields
+        ):
+            raise UntrustedEvidenceError(
+                "pull request state changed unexpectedly during the exact-HEAD base refresh"
+            )
+        if current_state.base_sha != default_branch_sha or not (
+            self.github.is_ancestor(previous_state.head_sha, current_state.head_sha)
+            and self.github.is_ancestor(default_branch_sha, current_state.head_sha)
+        ):
+            raise UntrustedEvidenceError(
+                "refreshed pull request head lacks the authorized ancestry"
+            )
+
+    def perform_base_refresh_label_transition(
+        self,
+        state: PullRequestState,
+        refresh_records: list[MarkerEvidence],
+        default_branch_sha: str,
+    ) -> bool:
+        transition_snapshot = self.require_unique_base_refresh_transition_identity(
+            state, refresh_records
+        )
+        phase_index = PHASES.index(state.phase)
+        if phase_index == 0 or "ai-needs-implementation" not in state.labels:
+            return False
+        previous_phase = PHASES[phase_index - 1]
+        matches = [
+            item
+            for item in refresh_records
+            if item.payload.get("from_phase") == state.phase
+            and item.payload.get("revalidate_phase") == previous_phase
+            and item.payload.get("head_sha") == state.head_sha
+        ]
+        if not matches:
+            return False
+        current_matches = [
+            item
+            for item in matches
+            if item.payload.get("target_base_sha") == default_branch_sha
+        ]
+        if not current_matches:
+            stale = matches[0]
+            self.request_base_refresh(
+                state,
+                MarkerEvidence(
+                    payload={},
+                    url=str(stale.payload["prior_pass_reference"]),
+                    author=stale.author,
+                    body=stale.body,
+                ),
+                target_base_sha=default_branch_sha,
+            )
+            return True
+        record = current_matches[0]
+        validate_base_refresh_payload(record.payload)
+        desired_labels = set(state.labels)
+        desired_labels.difference_update(
+            {
+                state.phase,
+                "ai-needs-review",
+                "ai-needs-fix",
+                "ai-review-passed",
+                "ai-loop-blocked",
+                "ai-human-gate",
+            }
+        )
+        desired_labels.update({previous_phase, "ai-needs-implementation"})
+        expected_labels = frozenset(desired_labels)
+        expected_state = replace(state, phase=previous_phase, labels=expected_labels)
+        digest = canonical_digest(record.payload)
+        if digest not in self.started_base_label_transitions:
+            self.log(
+                f"rolling base-refresh Phase label back at exact HEAD "
+                f"{state.head_sha[:12]}: {state.phase} -> {previous_phase}"
+            )
+            if not self.dry_run:
+                if self.pr_state() != state:
+                    raise UntrustedEvidenceError(
+                        "pull request changed before the base-refresh label transition"
+                    )
+                if self.current_default_branch_sha() != default_branch_sha:
+                    raise UntrustedEvidenceError(
+                        "default branch changed before the base-refresh label transition"
+                    )
+                self.revalidate_base_refresh_transition_snapshot(
+                    state, transition_snapshot
+                )
+                self.github.set_pull_request_labels(state.number, expected_labels)
+                if self.pr_state() != expected_state:
+                    raise UntrustedEvidenceError(
+                        "pull request changed during the base-refresh label transition"
+                    )
+                if self.current_default_branch_sha() != default_branch_sha:
+                    raise UntrustedEvidenceError(
+                        "default branch changed during the base-refresh label transition"
+                    )
+                self.revalidate_base_refresh_transition_snapshot(
+                    expected_state, transition_snapshot
+                )
+            self.started_base_label_transitions.add(digest)
+        return True
 
     @staticmethod
     def matching_payload(
@@ -1595,6 +1812,9 @@ class PhaseLoop:
         refresh_records: list[MarkerEvidence],
         default_branch_sha: str,
     ) -> bool:
+        transition_snapshot = self.require_unique_base_refresh_transition_identity(
+            state, refresh_records
+        )
         matches = [
             item
             for item in refresh_records
@@ -1603,10 +1823,13 @@ class PhaseLoop:
         ]
         if not matches:
             return False
-        record = matches[-1]
-        recorded_target = str(record.payload.get("target_base_sha", ""))
-        validate_base_refresh(record.payload, state=state, target_base_sha=recorded_target)
-        if recorded_target != default_branch_sha:
+        current_matches = [
+            item
+            for item in matches
+            if item.payload.get("target_base_sha") == default_branch_sha
+        ]
+        if not current_matches:
+            record = matches[-1]
             source_phase = str(record.payload["from_phase"])
             prior_pass = MarkerEvidence(
                 payload={},
@@ -1621,6 +1844,10 @@ class PhaseLoop:
                 source_phase=source_phase,
             )
             return True
+        record = current_matches[-1]
+        validate_base_refresh(
+            record.payload, state=state, target_base_sha=default_branch_sha
+        )
         digest = canonical_digest(record.payload)
         if digest not in self.started_base_updates:
             self.log(
@@ -1628,7 +1855,28 @@ class PhaseLoop:
                 f"{state.phase} must pass again on the resulting SHA"
             )
             if not self.dry_run:
+                if self.pr_state() != state:
+                    raise UntrustedEvidenceError(
+                        "pull request changed before the exact-HEAD base refresh"
+                    )
+                if self.current_default_branch_sha() != default_branch_sha:
+                    raise UntrustedEvidenceError(
+                        "default branch changed before the exact-HEAD base refresh"
+                    )
+                self.revalidate_base_refresh_transition_snapshot(
+                    state, transition_snapshot
+                )
                 self.github.update_pull_request_branch(state.number, state.head_sha)
+                self.validate_post_base_refresh_pr_state(
+                    state, self.pr_state(), default_branch_sha
+                )
+                if self.current_default_branch_sha() != default_branch_sha:
+                    raise UntrustedEvidenceError(
+                        "default branch changed during the exact-HEAD base refresh"
+                    )
+                self.revalidate_base_refresh_transition_snapshot(
+                    state, transition_snapshot
+                )
             self.started_base_updates.add(digest)
         return True
 
@@ -2074,6 +2322,18 @@ class PhaseLoop:
             )
             ready_records = self.trusted_markers(comments, "redteam-ready-for-review")
             refresh_records = self.trusted_base_refresh_statuses(state, phase_records)
+
+            if self.perform_base_refresh_label_transition(
+                state, refresh_records, default_branch_sha
+            ):
+                status = f"waiting for base-refresh Phase rollback: {state.phase}"
+                if status != last_status:
+                    self.log(status)
+                    last_status = status
+                if self.dry_run:
+                    return f"DRY_RUN:{status}"
+                self.sleep()
+                continue
 
             if self.perform_pending_base_refresh(
                 state, refresh_records, default_branch_sha

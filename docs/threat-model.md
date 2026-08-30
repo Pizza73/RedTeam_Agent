@@ -39,9 +39,10 @@ External C2/MCP     --untrusted until approved/bound--> Adapter
 | Review actor compromised | Independent Phase-chain revalidation; audit trail; emergency stop labels/workflow disable |
 | Phase gate bypass | Ordered phase plan; label/current phase match; prior PASS marker; required Check Runs queried from GitHub |
 | Stale static Phase status blocks or authorizes work | Active PR authority requires an exact label + workflow-authored current-HEAD request + adjacent prior PASS; the status document is bootstrap-only |
-| Default-branch refresh reuses an old PASS | Approver-restricted preparation binds old HEAD/current base/prior PASS, rolls back exactly one Phase, and requires a new gate after synchronization |
+| Default-branch refresh reuses an old PASS | Approver-restricted workflow binds old HEAD/current base/prior PASS in a status; the local orchestrator verifies full PR state before and after an exact one-Phase label rollback and requires a new gate after synchronization |
+| Base-refresh status changes around a local write | Re-fetch and compare the unique PASS/status transition snapshot, PR state and default branch immediately before and after label replacement and expected-HEAD branch update |
 | Base refresh races a Codex/human commit | GitHub branch update includes the full old `expected_head_sha`; mismatch fails closed |
-| Branch synchronization becomes an early final merge | Base-refresh workflow has read-only PR permission and only uses update-branch; local final merge requires Phase 5 project-complete evidence |
+| Branch synchronization becomes an early final merge | Base-refresh workflow has read-only PR permission and writes status only; the local expected-HEAD update is separate from the Phase 5 project-complete final merge gate |
 | Forged or stale project-complete state triggers merge | Local runner reconstructs one exact base-linked Phase 0A→5 PASS chain, validates bot status/checks/labels/current main ancestry, re-reads PR state and supplies the exact HEAD to GitHub |
 | Overlapping local runners both attempt final merge | Atomically create one repository Git ref keyed by exact PR/HEAD; only the successful creator may persist the bound marker and dispatch |
 | Claim or merge endpoint returns an unknown outcome | Preserve the exact-PR/HEAD claim and PR/HEAD/default-base/gate/policy/actor/claim marker; any existing or uncertain claim/marker blocks redispatch until explicit live-state reconciliation |

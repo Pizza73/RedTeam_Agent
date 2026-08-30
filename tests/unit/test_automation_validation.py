@@ -140,7 +140,7 @@ def test_base_refresh_is_sha_bound_and_separate_from_exact_sha_final_merge() -> 
         "target_base_sha",
         "prior_pass_reference",
         "redteam/base-refresh/",
-        "setLabels",
+        "set_pull_request_labels",
         "createCommitStatus",
         "listCommitStatusesForRef",
         "trusted exact-SHA base refresh authorization",
@@ -153,7 +153,6 @@ def test_base_refresh_is_sha_bound_and_separate_from_exact_sha_final_merge() -> 
     )[0]
     assert permissions.strip().splitlines() == [
         "contents: read",
-        "  issues: write",
         "  pull-requests: read",
         "  statuses: write",
     ]
@@ -163,6 +162,7 @@ def test_base_refresh_is_sha_bound_and_separate_from_exact_sha_final_merge() -> 
     assert "pr.base.sha !== targetBaseSha" not in workflow
     assert "contents: write" not in workflow
     assert "pull-requests: write" not in workflow
+    assert "github.rest.issues.setLabels" not in workflow
     assert "github.rest.issues.createComment" not in workflow
     assert "secrets." not in workflow
     assert "update-branch" in runner

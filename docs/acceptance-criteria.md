@@ -34,6 +34,14 @@
   Implementation Request、隣接するPrior-Phase PASSの完全一致でのみ解決する
 - Default BranchをPRへ取り込む前にCurrent Phaseを1つ戻し、旧HEADのPASSを再利用せず、
   取込み後HEADで同Phase Gateを再実行する
+- Base-refresh Workflowは旧HEAD、Current default-branch SHA、隣接Prior PASSを固定したStatusのみ
+  書込み、PR labelの完全置換はLocal Orchestratorが変更前後の全PR状態を再取得して実行する
+- 同じHEAD/Current Phaseにsource側とrollback済み側の複数Base-refresh遷移Identityが成立する
+  場合は、label置換とbranch updateのどちらも行わずFail Closedにする
+- Local Orchestratorはlabel置換とbranch updateの直前・直後にCurrent PR、Default Branch、
+  trusted PASS/Status遷移Snapshotを再取得し、Driftまたは競合をFail Closedにする
+- label置換後のSnapshotはrollback後Phaseの視点で旧認可Identityを再確認し、さらに下位Phaseへ
+  戻す新しいsource Identityとの競合を拒否する
 - Base refreshは`expected_head_sha`とCurrent default-branch SHAへ固定し、Final merge APIを
   呼ばない
 - Final mergeはLocal Orchestratorだけが実行し、`phase-5`、`ai-project-complete`、

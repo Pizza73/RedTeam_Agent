@@ -90,3 +90,17 @@ This protected workflow change requires human review and manual merge. After mer
 clean local `main` checkout and restart `automation/run_phase_loop.py` for PR #3. The workflow can
 then retry the unchanged exact-SHA request; Phase 0A must pass again on the refreshed head before
 Phase 0B is authorized.
+
+## 2026-08-30 label-permission follow-up
+
+The live retry at `https://github.com/Pizza73/RedTeam_Agent/actions/runs/33311334201` proved that the
+workflow token could create the exact trusted status but received HTTP 403 `Resource not accessible
+by integration` at `PUT /repos/Pizza73/RedTeam_Agent/issues/3/labels`. Granting
+`pull-requests: write` was again rejected because it also authorizes the PR merge endpoint.
+
+The current design supersedes the earlier `issues: write` decision in this report. The workflow now
+has exactly `contents: read`, `pull-requests: read`, and `statuses: write`; it records authorization
+but performs no label mutation. The authenticated local orchestrator consumes the exact-SHA status,
+checks the complete PR state immediately before mutation, replaces the labels with one exact set,
+checks the complete resulting PR state, and only then performs the existing expected-HEAD branch
+update. Drift is fail closed, and GitHub Actions still has no final-merge authority.
