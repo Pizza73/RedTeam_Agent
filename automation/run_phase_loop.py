@@ -1707,10 +1707,6 @@ class PhaseLoop:
                 validate_base_refresh_payload(record.payload)
                 old_head = str(record.payload["head_sha"])
                 target_base = str(record.payload["target_base_sha"])
-                if target_base != default_branch_sha:
-                    raise UntrustedEvidenceError(
-                        "trusted base refresh is stale for the current default branch"
-                    )
                 if self.github.is_ancestor(
                     old_head, state.head_sha
                 ) and self.github.is_ancestor(target_base, state.head_sha):

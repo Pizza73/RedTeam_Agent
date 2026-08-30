@@ -44,6 +44,8 @@
   trusted PASS/Status遷移Snapshotを再取得し、Driftまたは競合をFail Closedにする
 - label置換後のSnapshotはrollback後Phaseの視点で旧認可Identityを再確認し、さらに下位Phaseへ
   戻す新しいsource Identityとの競合を拒否する
+- Refresh後Phase 0AのReview BaseはReviewed HEADに実際に包含されたtrusted target SHAへ固定し、
+  Review中にDefault Branchが進んでもそのGateを記録した後、次Phase実装前に再度rollbackする
 - Base refreshは`expected_head_sha`とCurrent default-branch SHAへ固定し、Final merge APIを
   呼ばない
 - Final mergeはLocal Orchestratorだけが実行し、`phase-5`、`ai-project-complete`、
