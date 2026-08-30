@@ -13,6 +13,8 @@ repeats this sequence:
    no-major-issues output, bot 👍 and unchanged review timeline.
 6. Dispatch **Record AI Phase Review**, which independently revalidates the SHA, review and CI.
 7. Request a bounded fix or continue with the next phase.
+8. If `main` advanced before the next Phase implementation began, roll back one Phase, incorporate
+   `main` with an exact expected HEAD, and repeat that prior Phase gate on the new HEAD.
 
 The process stops on a failure limit, `BLOCKED`, a runtime limit, the Phase 4/5 Human Gates, or
 project completion. It never merges or deploys. Closing it with Ctrl-C only pauses local polling;
@@ -140,6 +142,13 @@ Use `--dry-run` to validate local/GitHub prerequisites and report the next actio
 comment or dispatching a workflow. A normal restart is idempotent: the runner recognizes its own
 SHA-bound trigger markers and does not intentionally request the same work twice.
 
+The runner may use GitHub's **Update a pull request branch** operation. This merges the current
+default branch into the long-lived PR branch only after the approver-restricted workflow records a
+`redteam-base-refresh` marker. The request includes the old full HEAD as `expected_head_sha`, so a
+concurrent Codex or human commit is rejected. The Phase label is moved back one step first and CI
+must produce a new SHA-bound PASS. This operation does not merge the PR into `main`; final merge
+remains the manual checklist above.
+
 Codex Code Review posts standard GitHub evidence rather than repository-defined JSON. For PASS,
 the loop requires the standard no-major-issues comment, a matching 10-or-more-character commit
 prefix, a reviewer-authored 👍 reaction, no current-head P0/P1 or formal finding review, and no
@@ -178,6 +187,12 @@ machine-readable phase record.
   intentionally not accepted as phase-gate evidence.
 - `AI_LOOP=BLOCKED`: inspect the latest trusted bot marker and workflow run. Do not bypass labels,
   alter review evidence, or weaken CI to continue.
+- `waiting for trusted base-refresh transition`: inspect **Prepare AI Loop Base Refresh**. It must
+  be dispatched by `AI_GATE_APPROVER_LOGIN` and bind the old PR HEAD, current `main`, prior PASS and
+  current implementation request.
+- `waiting for refreshed PR head`: GitHub accepted or is processing the exact-HEAD branch update.
+  A changed HEAD causes the request to fail closed; restart from current clean `main` and inspect
+  the PR evidence rather than forcing an update.
 
 ## CI/CD boundary
 

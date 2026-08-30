@@ -47,6 +47,7 @@ CODEX_REVIEWED_COMMIT_PATTERN = re.compile(
 )
 CODEX_PRIORITY_PATTERN = re.compile(r"!\[P([01]) Badge\]")
 REQUIREMENT_ID_PATTERN = re.compile(r"\b(?:B|H|M|L)-\d{2}\b")
+CODEX_BLOCKED_PREFIX = "## BLOCKED"
 
 
 class PhaseLoopError(RuntimeError):
@@ -220,6 +221,94 @@ def select_evidence_action(
     if ready_exists:
         return "review"
     return "wait"
+
+
+def validate_base_refresh(
+    payload: dict[str, Any],
+    *,
+    state: PullRequestState,
+    target_base_sha: str,
+) -> None:
+    expected_keys = {
+        "schema_version",
+        "action",
+        "from_phase",
+        "revalidate_phase",
+        "head_sha",
+        "target_base_sha",
+        "prior_pass_reference",
+    }
+    if set(payload) != expected_keys:
+        raise UntrustedEvidenceError("base-refresh marker has missing or unknown fields")
+    if payload.get("schema_version") != "1.0" or payload.get("action") != "REFRESH_BASE":
+        raise UntrustedEvidenceError("base-refresh marker has an invalid version or action")
+    if payload.get("revalidate_phase") != state.phase:
+        raise UntrustedEvidenceError("base-refresh marker has the wrong revalidation phase")
+    from_phase = payload.get("from_phase")
+    if not isinstance(from_phase, str) or from_phase not in PHASES:
+        raise UntrustedEvidenceError("base-refresh marker has an invalid source phase")
+    source_index = PHASES.index(from_phase)
+    if source_index == 0 or PHASES[source_index - 1] != state.phase:
+        raise UntrustedEvidenceError("base-refresh marker does not roll back exactly one phase")
+    if payload.get("head_sha") != state.head_sha:
+        raise UntrustedEvidenceError("base-refresh marker is stale for the current PR head")
+    if not SHA_PATTERN.fullmatch(str(payload.get("target_base_sha", ""))):
+        raise UntrustedEvidenceError("base-refresh marker has a malformed target base SHA")
+    if payload.get("target_base_sha") != target_base_sha:
+        raise UntrustedEvidenceError("base-refresh marker is stale for the default branch")
+    reference = payload.get("prior_pass_reference")
+    if not isinstance(reference, str) or not reference.startswith("https://github.com/"):
+        raise UntrustedEvidenceError("base-refresh marker has an invalid PASS reference")
+
+
+def codex_implementation_blocker(
+    *,
+    comments: list[dict[str, Any]],
+    actor_login: str,
+    reviewer_login: str,
+    phase: str,
+    head_sha: str,
+    source_digest: str,
+) -> str | None:
+    expected_trigger = {
+        "schema_version": "1.0",
+        "kind": "implementation",
+        "phase": phase,
+        "head_sha": head_sha,
+        "source_digest": source_digest,
+    }
+    trigger_times = []
+    for item in comments:
+        if _github_author(item) != actor_login:
+            continue
+        body = item.get("body")
+        if not isinstance(body, str):
+            continue
+        payloads = marker_payloads(body, "redteam-local-codex-trigger")
+        if payloads == [expected_trigger]:
+            trigger_times.append(_github_timestamp(item, "created_at"))
+    if not trigger_times:
+        return None
+    latest_trigger = max(trigger_times)
+
+    blockers: list[tuple[datetime, str]] = []
+    for item in comments:
+        if _github_author(item) != reviewer_login:
+            continue
+        body = item.get("body")
+        if (
+            not isinstance(body, str)
+            or not body.startswith(CODEX_BLOCKED_PREFIX)
+            or phase not in body
+            or head_sha not in body
+        ):
+            continue
+        created_at = _github_timestamp(item, "created_at")
+        if created_at > latest_trigger:
+            blockers.append((created_at, str(item.get("html_url", ""))))
+    if not blockers:
+        return None
+    return max(blockers, key=lambda item: item[0])[1]
 
 
 def _github_author(item: dict[str, Any]) -> str:
@@ -655,6 +744,28 @@ class GitHubClient:
             ["api", f"repos/{self.repository}/commits/{branch}", "--jq", ".sha"]
         )
 
+    def compare(self, base_sha: str, head_sha: str) -> dict[str, Any]:
+        if not SHA_PATTERN.fullmatch(base_sha) or not SHA_PATTERN.fullmatch(head_sha):
+            raise UntrustedEvidenceError("compare requires two full commit SHAs")
+        return self.api_object(f"repos/{self.repository}/compare/{base_sha}...{head_sha}")
+
+    def update_pull_request_branch(self, number: int, expected_head_sha: str) -> None:
+        if number < 1 or not SHA_PATTERN.fullmatch(expected_head_sha):
+            raise UntrustedEvidenceError("branch update requires a PR and exact expected HEAD SHA")
+        raw = self.command.run(
+            [
+                "api",
+                "--method",
+                "PUT",
+                f"repos/{self.repository}/pulls/{number}/update-branch",
+                "--raw-field",
+                f"expected_head_sha={expected_head_sha}",
+            ]
+        )
+        value = strict_json_loads(raw)
+        if not isinstance(value, dict) or not isinstance(value.get("message"), str):
+            raise UntrustedEvidenceError("GitHub branch-update response is invalid")
+
     def post_comment(self, number: int, body: str) -> dict[str, Any]:
         raw = self.command.run(
             [
@@ -715,6 +826,8 @@ class PhaseLoop:
             if isinstance(item, dict) and "id" in item and "prompt" in item
         }
         self.dispatched_review_records: set[str] = set()
+        self.dispatched_base_refreshes: set[str] = set()
+        self.started_base_updates: set[str] = set()
 
     @staticmethod
     def _load_json(path: Path) -> dict[str, Any]:
@@ -856,6 +969,117 @@ class PhaseLoop:
             raise UntrustedEvidenceError(f"no trusted PASS record exists for {previous}")
         return str(passes[-1].payload["reviewed_sha"])
 
+    def base_refresh_candidate(
+        self,
+        state: PullRequestState,
+        requests: list[MarkerEvidence],
+        phase_records: list[MarkerEvidence],
+    ) -> MarkerEvidence | None:
+        phase_index = PHASES.index(state.phase)
+        if phase_index == 0 or "ai-needs-implementation" not in state.labels:
+            return None
+        request = self.matching_payload(
+            requests,
+            phase=state.phase,
+            sha_field="head_sha",
+            sha=state.head_sha,
+        )
+        if request is None:
+            return None
+        validate_implementation_request(
+            request.payload,
+            schema=self.implementation_schema,
+            phase=state.phase,
+            head_sha=state.head_sha,
+            phase_prompt=self.phase_prompts[state.phase],
+        )
+        previous = PHASES[phase_index - 1]
+        passes = [
+            record
+            for record in phase_records
+            if record.payload.get("phase") == previous
+            and record.payload.get("verdict") == "PASS"
+            and record.payload.get("reviewed_sha") == state.head_sha
+        ]
+        if not passes:
+            return None
+        comparison = self.github.compare(state.head_sha, state.base_sha)
+        ahead_by = comparison.get("ahead_by")
+        if not isinstance(ahead_by, int) or ahead_by < 0:
+            raise UntrustedEvidenceError("GitHub comparison has an invalid ahead_by value")
+        return passes[-1] if ahead_by > 0 else None
+
+    def request_base_refresh(
+        self,
+        state: PullRequestState,
+        prior_pass: MarkerEvidence,
+        *,
+        source_phase: str | None = None,
+    ) -> None:
+        requested_source = source_phase or state.phase
+        key = f"{requested_source}:{state.head_sha}:{state.base_sha}"
+        if key in self.dispatched_base_refreshes:
+            return
+        self.log(
+            f"requesting base refresh before {requested_source}: "
+            f"{state.head_sha[:12]} -> {state.base_sha[:12]}"
+        )
+        if not self.dry_run:
+            self.github.dispatch_workflow(
+                "refresh-ai-loop-base.yml",
+                self.default_branch,
+                {
+                    "pull_request_number": str(state.number),
+                    "source_phase": requested_source,
+                    "expected_head_sha": state.head_sha,
+                    "target_base_sha": state.base_sha,
+                    "prior_pass_reference": prior_pass.url,
+                    "confirmation": "REFRESH_AI_LOOP_BASE",
+                },
+            )
+        self.dispatched_base_refreshes.add(key)
+
+    def perform_pending_base_refresh(
+        self,
+        state: PullRequestState,
+        refresh_records: list[MarkerEvidence],
+    ) -> bool:
+        matches = [
+            item
+            for item in refresh_records
+            if item.payload.get("revalidate_phase") == state.phase
+            and item.payload.get("head_sha") == state.head_sha
+        ]
+        if not matches:
+            return False
+        record = matches[-1]
+        recorded_target = str(record.payload.get("target_base_sha", ""))
+        validate_base_refresh(record.payload, state=state, target_base_sha=recorded_target)
+        if recorded_target != state.base_sha:
+            source_phase = str(record.payload["from_phase"])
+            prior_pass = MarkerEvidence(
+                payload={},
+                url=str(record.payload["prior_pass_reference"]),
+                author=record.author,
+                body=record.body,
+            )
+            self.request_base_refresh(
+                state,
+                prior_pass,
+                source_phase=source_phase,
+            )
+            return True
+        digest = canonical_digest(record.payload)
+        if digest not in self.started_base_updates:
+            self.log(
+                f"updating PR branch at exact HEAD {state.head_sha[:12]}; "
+                f"{state.phase} must pass again on the resulting SHA"
+            )
+            if not self.dry_run:
+                self.github.update_pull_request_branch(state.number, state.head_sha)
+            self.started_base_updates.add(digest)
+        return True
+
     def local_trigger_exists(
         self,
         comments: list[dict[str, Any]],
@@ -934,6 +1158,18 @@ class PhaseLoop:
             head_sha=state.head_sha,
             source_digest=digest,
         ):
+            blocker = codex_implementation_blocker(
+                comments=comments,
+                actor_login=self.actor_login,
+                reviewer_login=self.reviewer_login,
+                phase=state.phase,
+                head_sha=state.head_sha,
+                source_digest=digest,
+            )
+            if blocker is not None:
+                raise LoopBlockedError(
+                    f"Codex reported a SHA-bound implementation blocker: {blocker}"
+                )
             return
         marker = self.trigger_marker(
             kind="implementation",
@@ -1087,6 +1323,31 @@ class PhaseLoop:
             )
             ready_records = self.trusted_markers(comments, "redteam-ready-for-review")
             phase_records = self.trusted_markers(comments, "redteam-phase-gate")
+            refresh_records = self.trusted_markers(comments, "redteam-base-refresh")
+
+            if self.perform_pending_base_refresh(state, refresh_records):
+                status = f"waiting for refreshed PR head: {state.phase} {state.head_sha[:12]}"
+                if status != last_status:
+                    self.log(status)
+                    last_status = status
+                if self.dry_run:
+                    return f"DRY_RUN:{status}"
+                self.sleep()
+                continue
+
+            refresh_candidate = self.base_refresh_candidate(
+                state, implementation_requests, phase_records
+            )
+            if refresh_candidate is not None:
+                self.request_base_refresh(state, refresh_candidate)
+                status = f"waiting for trusted base-refresh transition: {state.phase}"
+                if status != last_status:
+                    self.log(status)
+                    last_status = status
+                if self.dry_run:
+                    return f"DRY_RUN:{status}"
+                self.sleep()
+                continue
 
             request = self.matching_payload(
                 implementation_requests,

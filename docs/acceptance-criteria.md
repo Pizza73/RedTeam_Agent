@@ -30,10 +30,17 @@
 - 同じRequest/Reviewを再処理せず、停止後にGitHub Evidenceから再開できる
 - Phase 4/5は`ai-human-gate`中に停止し、承認済みProvider Gate遷移後だけ再開する
 - OpenAI API Keyを要求せず、GitHub CredentialをCodex Promptまたは実行環境へ渡さない
+- Active PRのCurrent Phaseは、exact phase label、`github-actions[bot]`のCurrent-HEAD
+  Implementation Request、隣接するPrior-Phase PASSの完全一致でのみ解決する
+- Default BranchをPRへ取り込む前にCurrent Phaseを1つ戻し、旧HEADのPASSを再利用せず、
+  取込み後HEADで同Phase Gateを再実行する
+- Base refreshは`expected_head_sha`とCurrent default-branch SHAへ固定し、Final merge APIを
+  呼ばない
 
 ## Phase 0A: Core Models / Authorization Kernel
 
-Phase 0A Gateは現在NO-GO。次をすべて満たすまでPhase 0Bへ進めない。
+Phase 0A Gateのbootstrap既定値はNO-GO。Active PRでは、次をすべて満たしたCurrent-HEADの
+trusted PASSが存在する場合に限りPhase 0Bへ進める。
 
 ### Blockers
 

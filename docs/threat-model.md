@@ -38,6 +38,10 @@ External C2/MCP     --untrusted until approved/bound--> Adapter
 | Malicious test exfiltration | No unrelated credentials in test jobs; CI egress should be organization-restricted where possible |
 | Review actor compromised | Human final merge; audit trail; emergency stop labels/workflow disable |
 | Phase gate bypass | Ordered phase plan; label/current phase match; prior PASS marker; required Check Runs queried from GitHub |
+| Stale static Phase status blocks or authorizes work | Active PR authority requires an exact label + workflow-authored current-HEAD request + adjacent prior PASS; the status document is bootstrap-only |
+| Default-branch refresh reuses an old PASS | Approver-restricted preparation binds old HEAD/current base/prior PASS, rolls back exactly one Phase, and requires a new gate after synchronization |
+| Base refresh races a Codex/human commit | GitHub branch update includes the full old `expected_head_sha`; mismatch fails closed |
+| Branch synchronization becomes an automated final merge | Automation uses only the update-branch endpoint; PR-to-main merge remains a human-only UI action |
 | Real offensive action from CI | No external credentials; Mock/Test servers; Human Gate for Phase 4/5 |
 | Secret in logs/artifacts | Reference-only prompts; redaction; no raw output upload |
 | Workflow supply-chain change | Pin third-party actions by commit SHA in production; advisory CODEOWNERS routing; separate human-reviewed governance PR |

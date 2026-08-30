@@ -102,3 +102,46 @@ def test_documented_reviewer_login_includes_bot_suffix() -> None:
     runbook = (REPO_ROOT / "docs" / "ai-loop-runbook.md").read_text(encoding="utf-8")
 
     assert "AI_REVIEWER_LOGIN --body 'chatgpt-codex-connector[bot]'" in runbook
+
+
+def test_base_refresh_is_sha_bound_and_cannot_merge_the_pull_request() -> None:
+    workflow = (
+        REPO_ROOT / ".github" / "workflows" / "refresh-ai-loop-base.yml"
+    ).read_text(encoding="utf-8")
+    runner = (REPO_ROOT / "automation" / "run_phase_loop.py").read_text(encoding="utf-8")
+
+    for required_control in (
+        "REFRESH_AI_LOOP_BASE",
+        "AI_GATE_APPROVER_LOGIN",
+        "source_phase",
+        "expected_head_sha",
+        "target_base_sha",
+        "prior_pass_reference",
+        "redteam-base-refresh",
+        "setLabels",
+        "contains a duplicate JSON key",
+        "Reauthorization requires a trusted prior base-refresh marker",
+    ):
+        assert required_control in workflow or required_control in runner
+    permissions = workflow.split("\npermissions:\n", maxsplit=1)[1].split(
+        "\njobs:\n", maxsplit=1
+    )[0]
+    assert permissions.strip().splitlines() == [
+        "contents: read",
+        "  issues: write",
+        "  pull-requests: read",
+        "  statuses: write",
+    ]
+    assert r"while (/\s/.test" in workflow
+    assert r"while (/\\s/.test" not in workflow
+    assert r"!/[\s,}\]]/.test" in workflow
+    assert "contents: write" not in workflow
+    assert "update-branch" in runner
+    for forbidden_operation in (
+        "github.rest.pulls.merge",
+        "mergePullRequest",
+        "/pulls/{number}/merge",
+        "/pulls/3/merge",
+    ):
+        assert forbidden_operation not in workflow
+        assert forbidden_operation not in runner

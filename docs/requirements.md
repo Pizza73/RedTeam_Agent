@@ -26,6 +26,9 @@ Codex CloudまたはChatGPTによる独立ReviewとCodexによる実装を、Pha
 | LOOP-016 | Local Orchestratorは`github-actions[bot]`が作成したCurrent Phase/HEAD SHA固定Requestだけを受理し、ChatGPT連携済みGitHub UserとしてCodex実装・Reviewを要求する |
 | LOOP-017 | Local Orchestratorはnative reviewer identity、P0/P1またはno-finding形式、ready/trigger、Phase、HEAD SHA、Base SHA、Review中のhead不変性を検証してから、承認者制限付きPhase Gate Workflowを起動する |
 | LOOP-018 | Phase 4/5はProvider Human Gate承認前に開始せず、承認後は同じLoopを再起動して当該Phaseを自動実行できる |
+| LOOP-019 | Active PRのCurrent Phaseはexact phase label、`github-actions[bot]`のCurrent-HEAD実装Request、隣接Prior-Phase PASSの一致から解決し、Default Branch上のStatus Snapshotを遷移権限として使用しない |
+| LOOP-020 | 次Phase実装前にDefault Branchが進んだ場合、Prior PASSと同じExpected HEADに限ってBase Refreshを許可し、Phaseを1つ戻して更新後HEADでGateを再実行する |
+| LOOP-021 | Base RefreshはPR BranchへDefault Branchを取り込む操作に限定し、Final PR Merge APIを呼び出さない |
 
 ## Non-Functional Requirements
 
