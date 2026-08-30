@@ -64,7 +64,10 @@ Phase reports under `docs/review/` may be created or updated.
 
 - Work only on the current PR branch.
 - Keep changes within the current phase.
-- Do not merge, force-push, rewrite history, or change branch protection.
+- Codex implementation and review tasks must not merge, force-push, rewrite history, or change
+  branch protection. The only merge exception is the repository-local orchestrator's configured
+  Phase 5 final gate after it revalidates the complete exact-SHA evidence chain; Codex must never
+  invoke or broaden that exception.
 - Do not weaken, delete, skip, or mark failing tests as expected failures.
 - Do not change requirements to make an implementation pass.
 - Add a regression test for every security finding fixed.
@@ -106,6 +109,14 @@ The final implementation report must include:
 - Secret Store, raw-result quarantine, and artifact encryption use separate key domains.
 - Encryption failure is fail-closed; there is no plaintext or cross-domain fallback.
 - External side-effect dispatch is absent in Phase 0A and uses no automatic retry in later phases.
+- Final PR merge is unavailable to Codex and GitHub Actions. Only the trusted local orchestrator may
+  issue one exact-HEAD merge after every configured Phase and final check passes; an uncertain merge
+  result is not automatically retried. Before dispatch, the orchestrator must atomically acquire a
+  repository Git ref claim for the exact PR/HEAD and persist an attempt record bound to that claim.
+  After those remote writes it must re-query the complete Phase chain, PR state, default branch,
+  ancestry, checks and trusted status immediately before merge. An existing/uncertain claim or any
+  post-claim drift requires explicit outcome reconciliation; normal execution never deletes the
+  claim.
 
 ## Code Review Rules
 

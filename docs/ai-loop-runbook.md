@@ -15,9 +15,11 @@ repeats this sequence:
 7. Request a bounded fix or continue with the next phase.
 8. If `main` advanced before the next Phase implementation began, roll back one Phase, incorporate
    `main` with an exact expected HEAD, and repeat that prior Phase gate on the new HEAD.
+9. At Phase 5 completion, revalidate the full Phase 0A→5 SHA chain and current-head checks, then
+   merge the `ai-loop` PR once with the exact current HEAD SHA.
 
 The process stops on a failure limit, `BLOCKED`, a runtime limit, the Phase 4/5 Human Gates, or
-project completion. It never merges or deploys. Closing it with Ctrl-C only pauses local polling;
+successful project merge. It never deploys. Closing it with Ctrl-C only pauses local polling;
 GitHub comments, labels and checks preserve the state for a later restart.
 
 ## One-time repository setup
@@ -60,7 +62,7 @@ GitHub comments, labels and checks preserve the state for a later restart.
 7. Set the GitHub Actions spending limit to zero if use beyond the included private-repository
    quota must be prevented.
 
-## Repository control mode: manual merge
+## Repository merge controls
 
 This private repository's current GitHub plan does not expose branch protection or repository
 rulesets. Do not create an empty ruleset. The controls in this section are therefore mandatory
@@ -71,7 +73,8 @@ Neither GitHub Actions nor Codex may merge, push directly to `main`, force-push,
 receive a merge bypass. `CODEOWNERS` identifies the human reviewer but cannot require that review
 on the current plan. Repository collaborators must make every change through a pull request.
 
-Immediately before every governance or implementation merge, the human operator must:
+Governance PRs are never automatic. Immediately before every governance merge, the human operator
+must:
 
 1. Copy the pull request's current full 40-character head SHA and confirm it is still current.
 2. Confirm an implementation PR has no governance-controlled paths. A PR that intentionally
@@ -84,16 +87,31 @@ Immediately before every governance or implementation merge, the human operator 
 - `governance-integrity`
 - `redteam/phase-review`
 
-4. For an implementation PR, confirm the Codex review and `redteam/phase-review` evidence refer to
-   the same current head SHA. For a governance PR, confirm `redteam/phase-review` reports
-   `not applicable: human-reviewed governance change` for that SHA and perform the owner review
-   yourself; a governance PR does not receive an AI phase verdict.
+4. Confirm `redteam/phase-review` reports `not applicable: human-reviewed governance change` for
+   that SHA and perform the owner review yourself; a governance PR does not receive an AI phase
+   verdict.
 5. Resolve all review conversations and inspect the complete final diff.
 6. Add a PR comment recording the reviewed head SHA, the five successful checks, the applicable
    Codex-review permalink or governance-review status, and whether governance-controlled paths
    changed.
-7. Merge through the GitHub pull request UI as the human operator. Never use a direct push,
-   force-push, automated merge, or command-line bypass to update `main`.
+7. Merge through the GitHub pull request UI as the human operator. Never use a direct push or
+   force-push to update `main`.
+
+The long-lived implementation PR is merged differently. `automation/final-merge-policy.json`
+enables only the local orchestrator, Phase 5, `ai-loop` plus completion/PASS labels, absence of all
+stop labels, one exact `base_sha`-linked PASS per Phase, the latest trusted Phase status, all four
+current-head Check Runs, and current `main` ancestry. The orchestrator re-reads live state and calls
+GitHub only after atomically creating
+`refs/redteam-final-merge-attempts/pr-<PR>-<FULL_HEAD>`, and then persisting a
+`redteam-final-merge-attempt` PR marker bound to PR, full HEAD, current `main`, Phase 5 gate, policy
+digest, actor and claim ref. It then calls the merge endpoint with
+`sha=<current-40-character-head>` and `merge_method=merge`. A 409, conflict, drift, malformed
+response or unknown claim/merge outcome stops without an automatic retry. GitHub ref creation is
+the atomic winner selection: only one overlapping runner can own it. The same PR/HEAD claim or
+marker blocks every normal restart until explicit reconciliation; the runner never deletes the
+claim. Immediately before dispatch, it re-queries the complete Phase chain, attempt marker, full PR
+state, current `main`, ancestry, checks and trusted status; any post-claim drift enters
+reconciliation. Fork and governance PRs cannot satisfy this policy.
 
 If GitHub branch protection or rulesets later become available, configure the pull-request,
 CODEOWNERS, stale-review, conversation-resolution, force-push/deletion, and five exact status-check
@@ -150,7 +168,7 @@ PASS. The workflow token has `statuses: write`, `issues: write` for labels, and 
 `pull-requests: read`; it cannot merge the PR. The branch-update request includes the old full HEAD
 as `expected_head_sha`, so a concurrent Codex or human commit is rejected. The Phase label is moved
 back one step first and CI must produce a new SHA-bound PASS. This operation does not merge the PR
-into `main`; final merge remains the manual checklist above.
+into `main`; it is distinct from the local Phase 5 final merge gate above.
 
 Codex Code Review posts standard GitHub evidence rather than repository-defined JSON. For PASS,
 the loop requires the standard no-major-issues comment, a matching 10-or-more-character commit
@@ -172,7 +190,8 @@ machine-readable phase record.
 - Before Phase 4 or Phase 5: approve `automation/provider-gates.json` in a separate,
   human-reviewed `governance-change` PR, merge it to `main`, run **Advance AI Loop Phase**, then
   restart the local command. The approved phase is automated, but the gate itself is not.
-- `ai-project-complete`: inspect the complete diff and evidence, then merge manually if acceptable.
+- `ai-project-complete`: keep the runner active. It revalidates the configured final gate and
+  reports `PROJECT_MERGED:<merge-sha>` only after GitHub confirms the exact-HEAD merge.
 
 ## Troubleshooting
 
@@ -196,6 +215,11 @@ machine-readable phase record.
 - `waiting for refreshed PR head`: GitHub accepted or is processing the exact-HEAD branch update.
   A changed HEAD causes the request to fail closed; restart from current clean `main` and inspect
   the PR evidence rather than forcing an update.
+- Automatic final merge blocked: inspect the Phase 0A→5 PASS chain, latest
+  `redteam/phase-review`, four Check Runs, stop labels, current `main` ancestry, the exact-HEAD
+  attempt comment and `refs/redteam-final-merge-attempts/pr-<PR>-<HEAD>`. Do not retry an uncertain
+  claim or merge response, and do not delete the claim, until the PR's live merged/open state and
+  claim ownership have been explicitly reconciled.
 
 ## CI/CD boundary
 

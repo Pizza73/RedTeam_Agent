@@ -36,6 +36,21 @@
   取込み後HEADで同Phase Gateを再実行する
 - Base refreshは`expected_head_sha`とCurrent default-branch SHAへ固定し、Final merge APIを
   呼ばない
+- Final mergeはLocal Orchestratorだけが実行し、`phase-5`、`ai-project-complete`、
+  `ai-review-passed`、全Phase PASS Chain、Current-HEAD Check、Trusted Phase Status、
+  Current default-branch ancestryを再検証する
+- Final merge APIへCurrent 40桁HEAD SHAを渡し、不一致、競合、不確実なResponseをFail
+  Closedにして自動Retryしない
+- Final merge dispatch前に同じPR/HEADの既存Attempt Recordがないことを再確認し、Repository
+  Git ref claimを原子的に作成して1プロセスだけが所有する
+- Claim取得後、PR、HEAD、Default Branch、Phase 5 Gate、Policy Digest、Actor、Claim Ref固定の
+  Attempt Recordを永続化してからmerge APIを呼ぶ
+- Attempt Record確認後に全Phase PASS Chain、PR全状態、Default Branch SHA/ancestry、
+  Current-HEAD Checks、Trusted Phase Statusを再取得し、すべて不変かつPASSの場合だけdispatchする
+- Claim/Attempt Recordが存在する、またはClaim作成結果が不明なPR/HEADは、Live GitHub Outcomeを
+  明示的にReconcileするまで再送せず、Claim取得後のGate Drift/Unknownも同様に停止し、通常実行で
+  Claimを削除しない
+- Governance PR、Fork PR、停止Label付きPR、`ai-loop`以外を自動mergeしない
 
 ## Phase 0A: Core Models / Authorization Kernel
 
@@ -171,7 +186,8 @@ Human GateでMCP Server、Protocol Revision、Transport Identity、Trust Policy�
 
 ## Project Complete
 
-Phase 5 PASS後、次を満たした場合に`ai-project-complete`とする。
+Phase 5 PASS後、次を満たした場合に`ai-project-complete`とし、Local Orchestratorの最終
+merge gateへ進む。
 
 - Phase 0A～5の全Gate ResultがGitHub履歴に存在
 - 最新HEADで全Common GateがPASS
@@ -180,4 +196,6 @@ Phase 5 PASS後、次を満たした場合に`ai-project-complete`とする。
 - README/SystemDesign/Config/Runbookが実装と一致
 - Fresh environment setupとMock end-to-endが再現可能
 - Known limitationsと残存MEDIUM/LOWを明文化
-- Final mergeは人が差分を確認して実施
+- Local Orchestratorが上記AI Loop Control Acceptanceを再検証し、完全HEAD SHA固定の
+  GitHub PR mergeを1回だけ実行
+- Merge未確認、Default Branch drift、競合または不明な結果は自動再試行せず停止

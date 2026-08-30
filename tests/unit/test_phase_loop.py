@@ -8,6 +8,8 @@ import pytest
 from automation.run_phase_loop import (
     BASE_REFRESH_STATUS_DESCRIPTION,
     PHASES,
+    FinalMergeReconciliationRequiredError,
+    FinalMergeRejectedError,
     GitHubClient,
     MarkerEvidence,
     PhaseLoop,
@@ -25,6 +27,9 @@ from automation.run_phase_loop import (
     select_finding_key,
     strict_json_loads,
     validate_base_refresh,
+    validate_final_merge_attempt_payload,
+    validate_final_merge_phase_chain,
+    validate_final_phase_status,
     validate_implementation_request,
     validate_review_result,
 )
@@ -41,6 +46,7 @@ TRIGGER_URL = "https://github.com/example/repo/pull/1#issuecomment-trigger"
 NO_FINDINGS_URL = "https://github.com/example/repo/pull/1#issuecomment-no-findings"
 REVIEW_URL = "https://github.com/example/repo/pull/1#pullrequestreview-77"
 PHASE_RECORD_URL = "https://github.com/example/repo/pull/3#issuecomment-record"
+PULL_REQUEST_PREFIX = "https://github.com/example/repo/pull/3"
 
 
 def load_schema(name: str) -> dict[str, object]:
@@ -94,6 +100,50 @@ def implementation_request() -> dict[str, object]:
 def marker(name: str, payload: dict[str, object]) -> str:
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return f"<!-- {name}\n{encoded}\n-->"
+
+
+def chained_phase_passes() -> list[MarkerEvidence]:
+    records: list[MarkerEvidence] = []
+    base_sha = "0" * 40
+    for index, phase in enumerate(PHASES, start=1):
+        reviewed_sha = f"{index:x}" * 40
+        url = f"{PULL_REQUEST_PREFIX}#issuecomment-{index}"
+        payload: dict[str, object] = {
+            "schema_version": "1.0",
+            "phase": phase,
+            "reviewed_sha": reviewed_sha,
+            "base_sha": base_sha,
+            "verdict": "PASS",
+            "summary": f"{phase} passed independent review",
+            "evidence_format": "codex-native-v1",
+            "review_reference": f"{PULL_REQUEST_PREFIX}#issuecomment-review-{index}",
+            "ready_reference": f"{PULL_REQUEST_PREFIX}#issuecomment-ready-{index}",
+            "review_trigger_reference": f"{PULL_REQUEST_PREFIX}#issuecomment-trigger-{index}",
+            "reviewer_login": REVIEWER_LOGIN,
+            "recorded_by": ACTOR_LOGIN,
+            "finding_key": None,
+            "required_checks": [
+                {"name": "tests (3.12)", "status": "PASS"},
+                {"name": "tests (3.14)", "status": "PASS"},
+                {"name": "quality", "status": "PASS"},
+                {"name": "governance-integrity", "status": "PASS"},
+            ],
+            "loop_state": "PASS",
+        }
+        records.append(MarkerEvidence(payload, url, "github-actions[bot]", ""))
+        base_sha = reviewed_sha
+    return records
+
+
+def final_phase_status(record: MarkerEvidence) -> dict[str, object]:
+    return {
+        "context": "redteam/phase-review",
+        "creator": {"login": "github-actions[bot]"},
+        "sha": record.payload["reviewed_sha"],
+        "state": "success",
+        "description": "phase-5: independent review PASS",
+        "target_url": record.url,
+    }
 
 
 def native_evidence() -> dict[str, object]:
@@ -194,6 +244,86 @@ def test_marker_parser_returns_each_named_marker() -> None:
     body = 'noise <!-- result {"value":1} --> more <!-- result\n{"value":2}\n--> trailing'
 
     assert marker_payloads(body, "result") == [{"value": 1}, {"value": 2}]
+
+
+def test_final_merge_requires_one_exact_sha_bound_phase_chain() -> None:
+    records = chained_phase_passes()
+
+    result = validate_final_merge_phase_chain(
+        records,
+        head_sha="8" * 40,
+        reviewer_login=REVIEWER_LOGIN,
+        approver_login=ACTOR_LOGIN,
+        pull_request_prefix=PULL_REQUEST_PREFIX,
+    )
+
+    assert result.payload["phase"] == "phase-5"
+    assert result.payload["reviewed_sha"] == "8" * 40
+
+
+def test_final_merge_rejects_unknown_phase_record_field() -> None:
+    records = chained_phase_passes()
+    records[-1].payload["unexpected"] = True
+
+    with pytest.raises(UntrustedEvidenceError, match="missing or unknown fields"):
+        validate_final_merge_phase_chain(
+            records,
+            head_sha="8" * 40,
+            reviewer_login=REVIEWER_LOGIN,
+            approver_login=ACTOR_LOGIN,
+            pull_request_prefix=PULL_REQUEST_PREFIX,
+        )
+
+
+def test_final_merge_rejects_a_different_pr_with_a_shared_number_prefix() -> None:
+    records = chained_phase_passes()
+    records[-1].payload["review_reference"] = (
+        "https://github.com/example/repo/pull/30#issuecomment-review"
+    )
+
+    with pytest.raises(UntrustedEvidenceError, match="invalid review reference"):
+        validate_final_merge_phase_chain(
+            records,
+            head_sha="8" * 40,
+            reviewer_login=REVIEWER_LOGIN,
+            approver_login=ACTOR_LOGIN,
+            pull_request_prefix=PULL_REQUEST_PREFIX,
+        )
+
+
+def test_final_merge_rejects_a_broken_or_ambiguous_phase_chain() -> None:
+    records = chained_phase_passes()
+    records[-1].payload["base_sha"] = "f" * 40
+
+    with pytest.raises(UntrustedEvidenceError, match="exactly one chained PASS for phase-4"):
+        validate_final_merge_phase_chain(
+            records,
+            head_sha="8" * 40,
+            reviewer_login=REVIEWER_LOGIN,
+            approver_login=ACTOR_LOGIN,
+            pull_request_prefix=PULL_REQUEST_PREFIX,
+        )
+
+
+def test_final_merge_requires_latest_trusted_phase_status() -> None:
+    record = chained_phase_passes()[-1]
+
+    validate_final_phase_status(
+        [final_phase_status(record)],
+        head_sha="8" * 40,
+        final_record_url=record.url,
+        context="redteam/phase-review",
+    )
+
+    untrusted = final_phase_status(record)
+    untrusted["creator"] = {"login": "attacker"}
+    with pytest.raises(UntrustedEvidenceError, match="untrusted, stale, or non-passing"):
+        validate_final_phase_status(
+            [untrusted],
+            head_sha="8" * 40,
+            final_record_url=record.url,
+            context="redteam/phase-review",
+        )
 
 
 def test_review_result_binds_phase_head_and_base() -> None:
@@ -878,6 +1008,414 @@ class _RecordingCommand:
         self.arguments = arguments
         return '{"message":"Updating pull request branch."}'
 
+
+class _MergeCommand:
+    def __init__(self, response: str) -> None:
+        self.arguments: list[str] = []
+        self.response = response
+
+    def run(self, arguments: list[str]) -> str:
+        self.arguments = arguments
+        return self.response
+
+
+class _ClaimFailureCommand:
+    def run(self, arguments: list[str]) -> str:
+        raise PrerequisiteError("GitHub rejected or did not confirm the atomic ref creation")
+
+
+def test_github_final_merge_uses_one_exact_head_request() -> None:
+    client = GitHubClient.__new__(GitHubClient)
+    client.repository = "example/repo"
+    command = _MergeCommand(
+        json.dumps({"sha": "9" * 40, "merged": True, "message": "merged"})
+    )
+    client.command = command  # type: ignore[assignment]
+
+    result = client.merge_pull_request(3, "8" * 40, merge_method="merge")
+
+    assert result == "9" * 40
+    assert command.arguments == [
+        "api",
+        "--method",
+        "PUT",
+        "repos/example/repo/pulls/3/merge",
+        "--raw-field",
+        f"sha={'8' * 40}",
+        "--raw-field",
+        "merge_method=merge",
+    ]
+
+
+def test_github_final_merge_does_not_accept_an_uncertain_result() -> None:
+    client = GitHubClient.__new__(GitHubClient)
+    client.repository = "example/repo"
+    client.command = _MergeCommand(  # type: ignore[assignment]
+        json.dumps({"sha": None, "merged": False, "message": "conflict"})
+    )
+
+    with pytest.raises(FinalMergeRejectedError, match="did not confirm"):
+        client.merge_pull_request(3, "8" * 40, merge_method="merge")
+
+
+def test_github_final_merge_claim_is_an_atomic_exact_head_ref_creation() -> None:
+    client = GitHubClient.__new__(GitHubClient)
+    client.repository = "example/repo"
+    claim_reference = f"refs/redteam-final-merge-attempts/pr-3-{'8' * 40}"
+    command = _MergeCommand(
+        json.dumps(
+            {
+                "ref": claim_reference,
+                "object": {"type": "commit", "sha": "8" * 40},
+            }
+        )
+    )
+    client.command = command  # type: ignore[assignment]
+
+    result = client.claim_final_merge_attempt(
+        3,
+        "8" * 40,
+        claim_ref_prefix="refs/redteam-final-merge-attempts",
+    )
+
+    assert result == claim_reference
+    assert command.arguments == [
+        "api",
+        "--method",
+        "POST",
+        "repos/example/repo/git/refs",
+        "--raw-field",
+        f"ref={claim_reference}",
+        "--raw-field",
+        f"sha={'8' * 40}",
+    ]
+
+
+def test_github_final_merge_claim_failure_requires_reconciliation() -> None:
+    client = GitHubClient.__new__(GitHubClient)
+    client.repository = "example/repo"
+    client.command = _ClaimFailureCommand()  # type: ignore[assignment]
+
+    with pytest.raises(FinalMergeReconciliationRequiredError, match="reconcile"):
+        client.claim_final_merge_attempt(
+            3,
+            "8" * 40,
+            claim_ref_prefix="refs/redteam-final-merge-attempts",
+        )
+
+
+def test_final_merge_attempt_rejects_claim_for_a_different_pr_head() -> None:
+    with pytest.raises(UntrustedEvidenceError, match="exact PR and HEAD"):
+        validate_final_merge_attempt_payload(
+            {
+                "schema_version": "1.0",
+                "action": "ATTEMPT_FINAL_MERGE",
+                "pull_request_number": 3,
+                "head_sha": "8" * 40,
+                "default_branch_sha": DEFAULT_BRANCH_SHA,
+                "phase_gate_reference": PHASE_RECORD_URL,
+                "policy_digest": "a" * 64,
+                "attempted_by": ACTOR_LOGIN,
+                "claim_reference": f"refs/redteam-final-merge-attempts/pr-30-{'8' * 40}",
+            }
+        )
+
+
+class _FinalMergeGitHub:
+    repository = "example/repo"
+
+    def __init__(
+        self,
+        records: list[MarkerEvidence],
+        *,
+        default_is_ancestor: bool = True,
+        merge_is_confirmed: bool = True,
+    ) -> None:
+        self.record = records[-1]
+        self.default_is_ancestor = default_is_ancestor
+        self.merge_is_confirmed = merge_is_confirmed
+        self.merge_calls: list[tuple[int, str, str]] = []
+        self.issue_comments: list[dict[str, object]] = []
+        self.phase_comments: list[dict[str, object]] = [
+            {
+                "user": {"login": "github-actions[bot]"},
+                "html_url": record.url,
+                "body": marker("redteam-phase-gate", record.payload),
+            }
+            for record in records
+        ]
+        self.claims: set[str] = set()
+        self.hidden_comment_calls: set[int] = set()
+        self.comment_calls = 0
+
+    def commit_statuses(self, sha: str) -> list[dict[str, object]]:
+        assert sha == "8" * 40
+        return [final_phase_status(self.record)]
+
+    def check_runs(self, sha: str) -> list[dict[str, object]]:
+        assert sha == "8" * 40
+        return [
+            {"name": name, "status": "completed", "conclusion": "success"}
+            for name in ("tests (3.12)", "tests (3.14)", "quality", "governance-integrity")
+        ]
+
+    def is_ancestor(self, ancestor_sha: str, descendant_sha: str) -> bool:
+        assert ancestor_sha == DEFAULT_BRANCH_SHA
+        assert descendant_sha == "8" * 40
+        return self.default_is_ancestor
+
+    def comments(self, number: int) -> list[dict[str, object]]:
+        assert number == 3
+        self.comment_calls += 1
+        if self.comment_calls in self.hidden_comment_calls:
+            return []
+        return [*self.phase_comments, *self.issue_comments]
+
+    def post_comment(self, number: int, body: str) -> dict[str, object]:
+        assert number == 3
+        comment: dict[str, object] = {
+            "user": {"login": ACTOR_LOGIN},
+            "html_url": f"{PULL_REQUEST_PREFIX}#issuecomment-final-attempt",
+            "body": body,
+        }
+        self.issue_comments.append(comment)
+        return comment
+
+    def claim_final_merge_attempt(
+        self,
+        number: int,
+        expected_head_sha: str,
+        *,
+        claim_ref_prefix: str,
+    ) -> str:
+        claim_reference = f"{claim_ref_prefix}/pr-{number}-{expected_head_sha}"
+        if claim_reference in self.claims:
+            raise FinalMergeReconciliationRequiredError(
+                "atomic final-merge claim already exists; reconcile"
+            )
+        self.claims.add(claim_reference)
+        return claim_reference
+
+    def merge_pull_request(
+        self, number: int, expected_head_sha: str, *, merge_method: str
+    ) -> str:
+        self.merge_calls.append((number, expected_head_sha, merge_method))
+        if not self.merge_is_confirmed:
+            raise FinalMergeRejectedError("GitHub did not confirm the merge")
+        return "9" * 40
+
+
+def final_merge_state(*, extra_labels: set[str] | None = None) -> PullRequestState:
+    labels = {"ai-loop", "ai-project-complete", "ai-review-passed", "phase-5"}
+    labels.update(extra_labels or set())
+    return PullRequestState(
+        number=3,
+        head_sha="8" * 40,
+        base_sha=BASE_SHA,
+        base_ref="main",
+        phase="phase-5",
+        labels=frozenset(labels),
+        state="open",
+        head_repository="example/repo",
+    )
+
+
+def configured_final_merge_loop(
+    state: PullRequestState, github: _FinalMergeGitHub
+) -> PhaseLoop:
+    loop = PhaseLoop.__new__(PhaseLoop)
+    loop.github = github  # type: ignore[assignment]
+    loop.final_merge_policy = {
+        "enabled": True,
+        "merge_method": "merge",
+        "claim_ref_prefix": "refs/redteam-final-merge-attempts",
+        "required_phase": "phase-5",
+        "required_labels": ["ai-loop", "ai-project-complete", "ai-review-passed", "phase-5"],
+        "forbidden_labels": [
+            "governance-change",
+            "ai-human-gate",
+            "ai-loop-blocked",
+            "ai-needs-fix",
+            "ai-needs-implementation",
+            "ai-needs-review",
+        ],
+        "phase_status_context": "redteam/phase-review",
+    }
+    loop.reviewer_login = REVIEWER_LOGIN
+    loop.approver_login = ACTOR_LOGIN
+    loop.actor_login = ACTOR_LOGIN
+    loop.pull_request_number = 3
+    loop.dry_run = False
+    loop.log = lambda _message: None  # type: ignore[method-assign]
+    loop.pr_state = lambda: state  # type: ignore[method-assign]
+    loop.current_default_branch_sha = lambda: DEFAULT_BRANCH_SHA  # type: ignore[method-assign]
+    return loop
+
+
+def test_automatic_final_merge_revalidates_and_merges_exact_head_once() -> None:
+    records = chained_phase_passes()
+    state = final_merge_state()
+    github = _FinalMergeGitHub(records)
+    loop = configured_final_merge_loop(state, github)
+
+    result = loop.automatic_final_merge(state, [], records, DEFAULT_BRANCH_SHA)
+
+    assert result == f"PROJECT_MERGED:{'9' * 40}"
+    assert github.merge_calls == [(3, "8" * 40, "merge")]
+    assert len(github.issue_comments) == 1
+    assert "redteam-final-merge-attempt" in str(github.issue_comments[0]["body"])
+    assert len(github.claims) == 1
+
+
+def test_automatic_final_merge_rejects_stop_label_without_calling_merge() -> None:
+    records = chained_phase_passes()
+    state = final_merge_state(extra_labels={"ai-loop-blocked"})
+    github = _FinalMergeGitHub(records)
+    loop = configured_final_merge_loop(state, github)
+
+    with pytest.raises(UntrustedEvidenceError, match="stop-state label"):
+        loop.automatic_final_merge(state, [], records, DEFAULT_BRANCH_SHA)
+
+    assert github.merge_calls == []
+
+
+def test_automatic_final_merge_rejects_governance_pr_without_calling_merge() -> None:
+    records = chained_phase_passes()
+    state = final_merge_state(extra_labels={"governance-change"})
+    github = _FinalMergeGitHub(records)
+    loop = configured_final_merge_loop(state, github)
+
+    with pytest.raises(UntrustedEvidenceError, match="stop-state label"):
+        loop.automatic_final_merge(state, [], records, DEFAULT_BRANCH_SHA)
+
+    assert github.merge_calls == []
+
+
+def test_automatic_final_merge_rejects_default_branch_not_in_head() -> None:
+    records = chained_phase_passes()
+    state = final_merge_state()
+    github = _FinalMergeGitHub(records, default_is_ancestor=False)
+    loop = configured_final_merge_loop(state, github)
+
+    with pytest.raises(UntrustedEvidenceError, match="default branch in PR HEAD ancestry"):
+        loop.automatic_final_merge(state, [], records, DEFAULT_BRANCH_SHA)
+
+    assert github.merge_calls == []
+
+
+def test_uncertain_final_merge_attempt_is_durable_and_never_retried() -> None:
+    records = chained_phase_passes()
+    state = final_merge_state()
+    github = _FinalMergeGitHub(records, merge_is_confirmed=False)
+    loop = configured_final_merge_loop(state, github)
+
+    with pytest.raises(FinalMergeRejectedError, match="did not confirm"):
+        loop.automatic_final_merge(state, [], records, DEFAULT_BRANCH_SHA)
+
+    assert len(github.issue_comments) == 1
+    assert github.merge_calls == [(3, "8" * 40, "merge")]
+
+    with pytest.raises(FinalMergeReconciliationRequiredError, match="reconcile"):
+        loop.automatic_final_merge(
+            state,
+            github.issue_comments,  # type: ignore[arg-type]
+            records,
+            DEFAULT_BRANCH_SHA,
+        )
+
+    assert github.merge_calls == [(3, "8" * 40, "merge")]
+
+
+def test_concurrent_final_merge_runners_share_one_atomic_claim() -> None:
+    records = chained_phase_passes()
+    state = final_merge_state()
+    github = _FinalMergeGitHub(records)
+    # Both runners observed the same empty comment snapshot before either persisted
+    # its audit comment; only the Git ref claim can serialize this interleaving.
+    github.hidden_comment_calls = {1, 3}
+    first_loop = configured_final_merge_loop(state, github)
+    second_loop = configured_final_merge_loop(state, github)
+
+    assert first_loop.automatic_final_merge(state, [], records, DEFAULT_BRANCH_SHA) == (
+        f"PROJECT_MERGED:{'9' * 40}"
+    )
+    with pytest.raises(FinalMergeReconciliationRequiredError, match="reconcile"):
+        second_loop.automatic_final_merge(state, [], records, DEFAULT_BRANCH_SHA)
+
+    assert len(github.claims) == 1
+    assert len(github.issue_comments) == 1
+    assert github.merge_calls == [(3, "8" * 40, "merge")]
+
+
+def test_post_claim_pr_drift_requires_reconciliation_without_merge() -> None:
+    records = chained_phase_passes()
+    state = final_merge_state()
+    changed_state = final_merge_state(extra_labels={"ai-loop-blocked"})
+    github = _FinalMergeGitHub(records)
+    loop = configured_final_merge_loop(state, github)
+    observed_states = iter((state, changed_state))
+    loop.pr_state = lambda: next(observed_states)  # type: ignore[method-assign]
+
+    with pytest.raises(FinalMergeReconciliationRequiredError, match="reconcile"):
+        loop.automatic_final_merge(state, [], records, DEFAULT_BRANCH_SHA)
+
+    assert len(github.claims) == 1
+    assert len(github.issue_comments) == 1
+    assert github.merge_calls == []
+
+
+def test_post_claim_default_branch_drift_requires_reconciliation_without_merge() -> None:
+    records = chained_phase_passes()
+    state = final_merge_state()
+    github = _FinalMergeGitHub(records)
+    loop = configured_final_merge_loop(state, github)
+    observed_defaults = iter((DEFAULT_BRANCH_SHA, "e" * 40))
+    loop.current_default_branch_sha = lambda: next(  # type: ignore[method-assign]
+        observed_defaults
+    )
+
+    with pytest.raises(FinalMergeReconciliationRequiredError, match="reconcile"):
+        loop.automatic_final_merge(state, [], records, DEFAULT_BRANCH_SHA)
+
+    assert len(github.claims) == 1
+    assert len(github.issue_comments) == 1
+    assert github.merge_calls == []
+
+
+def test_post_claim_check_drift_requires_reconciliation_without_merge() -> None:
+    records = chained_phase_passes()
+    state = final_merge_state()
+    github = _FinalMergeGitHub(records)
+    loop = configured_final_merge_loop(state, github)
+    observed_checks = iter(("success", "failure"))
+    loop.check_state = lambda _sha: next(observed_checks)  # type: ignore[method-assign]
+
+    with pytest.raises(FinalMergeReconciliationRequiredError, match="reconcile"):
+        loop.automatic_final_merge(state, [], records, DEFAULT_BRANCH_SHA)
+
+    assert len(github.claims) == 1
+    assert len(github.issue_comments) == 1
+    assert github.merge_calls == []
+
+
+def test_post_claim_status_drift_requires_reconciliation_without_merge() -> None:
+    records = chained_phase_passes()
+    state = final_merge_state()
+    github = _FinalMergeGitHub(records)
+    passing_status = final_phase_status(records[-1])
+    failing_status = {**passing_status, "state": "failure"}
+    observed_statuses = iter(([passing_status], [failing_status]))
+    github.commit_statuses = lambda _sha: next(  # type: ignore[method-assign]
+        observed_statuses
+    )
+    loop = configured_final_merge_loop(state, github)
+
+    with pytest.raises(FinalMergeReconciliationRequiredError, match="reconcile"):
+        loop.automatic_final_merge(state, [], records, DEFAULT_BRANCH_SHA)
+
+    assert len(github.claims) == 1
+    assert len(github.issue_comments) == 1
+    assert github.merge_calls == []
 
 class _ComparisonGitHub:
     is_ancestor = GitHubClient.is_ancestor

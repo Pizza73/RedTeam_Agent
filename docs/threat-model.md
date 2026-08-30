@@ -26,7 +26,7 @@ External C2/MCP     --untrusted until approved/bound--> Adapter
 | Threat | Control |
 |---|---|
 | PR/Source prompt injection | Reviewer/implementer prompts treat repository content as data; protected governance files; sanitize structured requests |
-| Codex changes tests/spec to pass | Base-branch protected-path checker; checker self-protection; separate governance PR; independent review; manual SHA-bound merge checklist |
+| Codex changes tests/spec to pass | Base-branch protected-path checker; checker self-protection; separate governance PR; independent review; local exact-SHA final merge gate |
 | Forged PASS comment | Local schema validation; gate actor check; reviewer permalink lookup; reviewer login, head SHA, phase base and actual Check Run revalidation |
 | Forged implementation/ready marker | Local orchestrator accepts only `github-actions[bot]`, exact current phase and exact current HEAD SHA |
 | Stale review applied to new code | Exact 40-char `reviewed_sha == PR head.sha` |
@@ -36,12 +36,16 @@ External C2/MCP     --untrusted until approved/bound--> Adapter
 | Duplicate/stale local dispatch | SHA/digest trigger markers, trusted GitHub state and bounded runtime make restart idempotent and fail closed |
 | OpenAI key exposed to repository code | OpenAI API use is disabled and `OPENAI_API_KEY` is not a repository secret |
 | Malicious test exfiltration | No unrelated credentials in test jobs; CI egress should be organization-restricted where possible |
-| Review actor compromised | Human final merge; audit trail; emergency stop labels/workflow disable |
+| Review actor compromised | Independent Phase-chain revalidation; audit trail; emergency stop labels/workflow disable |
 | Phase gate bypass | Ordered phase plan; label/current phase match; prior PASS marker; required Check Runs queried from GitHub |
 | Stale static Phase status blocks or authorizes work | Active PR authority requires an exact label + workflow-authored current-HEAD request + adjacent prior PASS; the status document is bootstrap-only |
 | Default-branch refresh reuses an old PASS | Approver-restricted preparation binds old HEAD/current base/prior PASS, rolls back exactly one Phase, and requires a new gate after synchronization |
 | Base refresh races a Codex/human commit | GitHub branch update includes the full old `expected_head_sha`; mismatch fails closed |
-| Branch synchronization becomes an automated final merge | Automation uses only the update-branch endpoint; PR-to-main merge remains a human-only UI action |
+| Branch synchronization becomes an early final merge | Base-refresh workflow has read-only PR permission and only uses update-branch; local final merge requires Phase 5 project-complete evidence |
+| Forged or stale project-complete state triggers merge | Local runner reconstructs one exact base-linked Phase 0A→5 PASS chain, validates bot status/checks/labels/current main ancestry, re-reads PR state and supplies the exact HEAD to GitHub |
+| Overlapping local runners both attempt final merge | Atomically create one repository Git ref keyed by exact PR/HEAD; only the successful creator may persist the bound marker and dispatch |
+| Claim or merge endpoint returns an unknown outcome | Preserve the exact-PR/HEAD claim and PR/HEAD/default-base/gate/policy/actor/claim marker; any existing or uncertain claim/marker blocks redispatch until explicit live-state reconciliation |
+| Merge gates drift while claim/marker remote writes complete | After confirming the marker, re-query the Phase chain, PR state, default branch/ancestry, checks and trusted status; drift or unknown state enters reconciliation before dispatch |
 | Real offensive action from CI | No external credentials; Mock/Test servers; Human Gate for Phase 4/5 |
 | Secret in logs/artifacts | Reference-only prompts; redaction; no raw output upload |
 | Workflow supply-chain change | Pin third-party actions by commit SHA in production; advisory CODEOWNERS routing; separate human-reviewed governance PR |
@@ -52,13 +56,15 @@ External C2/MCP     --untrusted until approved/bound--> Adapter
 - Branch protection and rulesets are unavailable on the current private-repository plan. Required
   reviews, checks, conversation resolution, and direct/force-push prohibitions are manual controls
   and are not enforced by GitHub.
-- A compromised write-capable GitHub account can direct-push or merge without completing the
-  manual checklist. Human error can also apply evidence to the wrong SHA.
+- A compromised write-capable GitHub account can direct-push or merge outside the orchestrator.
+- The GitHub merge endpoint binds the PR head SHA but not an explicit base SHA. The runner requires
+  current `main` ancestry immediately before the call, but the current plan cannot provide a
+  server-enforced merge queue for the remaining base-branch race.
 - A compromised GitHub account with repository administration can change repository controls.
 - GitHub-hosted runner egress is broader than a dedicated isolated runner unless organization controls restrict it.
 - Phase 4/5 vendor behavior may differ from mocks and requires isolated integration testing.
 
-The repository owner explicitly accepts the current manual-control residual risk. Deterministic
-CI, independent SHA-bound review, phase gates, Human Gate, recorded merge evidence, and final human
-merge are all retained. Server-enforced branch protection should replace the manual boundary when
-the repository plan supports it.
+The repository owner explicitly accepts the current plan-limit residual risk. Deterministic CI,
+independent SHA-bound review, Phase gates, provider Human Gates, recorded merge evidence and the
+local exact-SHA final gate are retained. Server-enforced branch protection or a merge queue should
+replace the remaining manual/account boundary when the repository plan supports it.

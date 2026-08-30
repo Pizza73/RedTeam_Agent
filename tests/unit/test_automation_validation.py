@@ -53,6 +53,19 @@ def test_approved_but_incomplete_provider_gate_is_rejected(tmp_path: Path) -> No
         validate_automation(repo)
 
 
+def test_unknown_final_merge_policy_field_is_rejected(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    shutil.copytree(REPO_ROOT / "automation", repo / "automation")
+    shutil.copytree(REPO_ROOT / "prompts", repo / "prompts")
+    policy_path = repo / "automation" / "final-merge-policy.json"
+    policy = json.loads(policy_path.read_text(encoding="utf-8"))
+    policy["bypass_checks"] = True
+    policy_path.write_text(json.dumps(policy), encoding="utf-8")
+
+    with pytest.raises(AutomationValidationError, match="schema validation failed"):
+        validate_automation(repo)
+
+
 def test_phase_gate_uses_fail_closed_native_codex_evidence_chain() -> None:
     workflow = (REPO_ROOT / ".github" / "workflows" / "ai-loop-control.yml").read_text(
         encoding="utf-8"
@@ -113,7 +126,7 @@ def test_documented_reviewer_login_includes_bot_suffix() -> None:
     assert "AI_REVIEWER_LOGIN --body 'chatgpt-codex-connector[bot]'" in runbook
 
 
-def test_base_refresh_is_sha_bound_and_cannot_merge_the_pull_request() -> None:
+def test_base_refresh_is_sha_bound_and_separate_from_exact_sha_final_merge() -> None:
     workflow = (
         REPO_ROOT / ".github" / "workflows" / "refresh-ai-loop-base.yml"
     ).read_text(encoding="utf-8")
@@ -160,4 +173,46 @@ def test_base_refresh_is_sha_bound_and_cannot_merge_the_pull_request() -> None:
         "/pulls/3/merge",
     ):
         assert forbidden_operation not in workflow
-        assert forbidden_operation not in runner
+    assert "merge_pull_request" in runner
+    assert 'f"sha={expected_head_sha}"' in runner
+    assert runner.count('f"repos/{self.repository}/pulls/{number}/merge"') == 1
+
+
+def test_final_merge_policy_is_fail_closed_and_local_only() -> None:
+    policy = json.loads(
+        (REPO_ROOT / "automation" / "final-merge-policy.json").read_text(encoding="utf-8")
+    )
+    runner = (REPO_ROOT / "automation" / "run_phase_loop.py").read_text(encoding="utf-8")
+
+    assert policy["enabled"] is True
+    assert policy["required_phase"] == "phase-5"
+    assert policy["merge_method"] == "merge"
+    assert policy["required_labels"] == [
+        "ai-loop",
+        "ai-project-complete",
+        "ai-review-passed",
+        "phase-5",
+    ]
+    assert "governance-change" in policy["forbidden_labels"]
+    assert "validate_final_merge_phase_chain" in runner
+    assert "validate_final_phase_status" in runner
+    assert "redteam-final-merge-attempt" in runner
+    assert "FinalMergeReconciliationRequiredError" in runner
+    assert policy["claim_ref_prefix"] == "refs/redteam-final-merge-attempts"
+    assert "claim_final_merge_attempt" in runner
+    assert "current default branch in PR HEAD ancestry" in runner
+    assert "PROJECT_MERGED" in runner
+    assert runner.index("redteam-final-merge-attempt") < runner.index(
+        "self.github.merge_pull_request("
+    )
+    merge_gate = runner[runner.index("    def automatic_final_merge(") :]
+    assert merge_gate.index("self.github.claim_final_merge_attempt(") < merge_gate.index(
+        "self.github.post_comment("
+    ) < merge_gate.index("self.github.merge_pull_request(")
+    assert merge_gate.rindex("validate_final_phase_status(") < merge_gate.index(
+        "self.github.merge_pull_request("
+    )
+    for workflow_path in (REPO_ROOT / ".github" / "workflows").glob("*.yml"):
+        workflow = workflow_path.read_text(encoding="utf-8")
+        assert "github.rest.pulls.merge" not in workflow
+        assert "/pulls/{number}/merge" not in workflow
