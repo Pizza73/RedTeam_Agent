@@ -114,6 +114,24 @@ Phase 0B:
   before the Execution record does so advances the latter without calling the ingester or
   resubmitting the external action. Inconsistent existing-result states fail closed.
 
+## Third independent review correction cycle
+
+The independent review for correction SHA
+`6d59df85205c2c17f08ceffbee982b49490140b2` returned two P1 findings. Both were addressed within
+Phase 0B:
+
+- [`discussion_r3890853717`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3890853717):
+  adapter, streaming, and quarantine exceptions during raw-result collection now route through the
+  Mission Manager to `PAUSED`, mark the bound sink as recovery-required, and persist integrity-bound
+  recovery metadata. Quarantine and streaming error types are preserved; adapter failures are
+  wrapped in the typed streaming error. A separately authorized later action is blocked before
+  adapter submit by the invalidated authorization epoch.
+- [`discussion_r3890853721`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3890853721):
+  the mock adapter can now exercise an interruption inside an artifact stream. Partial byte count
+  and chunk sequence are durably represented as `RECOVERY_REQUIRED`, no receipt is created, the
+  Mission enters `PAUSED` for human recovery, and neither result collection nor the external action
+  is automatically retried.
+
 ## Regression tests added
 
 The Phase 0B test set covers positive, negative, and failure paths, including:
@@ -138,8 +156,10 @@ The Phase 0B test set covers positive, negative, and failure paths, including:
 - cancellation crash recovery, provider task-ID replacement rejection, and expired-ingestion-lease
   takeover without action resubmit;
 - secure-ingestion failure pausing the Mission and blocking a separately authorized later dispatch;
-  and
-- split ingestion-success commit recovery without an ingester call or external action resubmit.
+- split ingestion-success commit recovery without an ingester call or external action resubmit;
+- integrated quarantine quota failure with durable recovery metadata, Mission pause, and later
+  dispatch rejection; and
+- mid-artifact interruption with partial sequence evidence and PAUSED human recovery.
 
 No test was skipped, weakened, deleted, or marked as an expected failure.
 
@@ -159,10 +179,10 @@ ruff: All checks passed
 mypy: Success: no issues found in 69 source files
 unit: 172 passed
 integration: 7 passed
-security: 132 passed
-full/coverage run: 311 passed
+security: 134 passed
+full/coverage run: 313 passed
 skipped=0, errors=0, failures=0
-coverage: 82% total (branch coverage enabled)
+coverage: 83% total (branch coverage enabled)
 pip check: No broken requirements found
 PHASE_GATE=phase-0b PASS
 ```
@@ -175,7 +195,7 @@ Additional focused command executed during development:
   tests/security/test_phase0b_execution_safety.py --strict-markers
 ```
 
-Focused result: `30 passed`.
+Focused result: `32 passed`.
 
 ## Remaining findings and constraints
 

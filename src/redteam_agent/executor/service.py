@@ -56,7 +56,7 @@ from .adapter import ExecutionAdapter, TrustedExecutionAdapterRegistry
 from .authorization_gate import authorize_execution
 from .finalization import FinalizationCoordinator
 from .ingestion import SecureResultIngester
-from .raw_results import MockRawResultSink, RawResultSinkFactory
+from .raw_results import MockRawResultSink, RawResultSink, RawResultSinkFactory
 
 
 class PreDispatchCapabilityProbe(Protocol):
@@ -431,10 +431,14 @@ class Executor:
         sink = self.sink_factory.for_execution(record.execution_id)
         try:
             metadata = await adapter.collect_result(record.provider_task_id, sink)
-        except AdapterOperationError as exc:
-            if isinstance(sink, MockRawResultSink):
-                sink.mark_recovery_required()
-                self.recovery.set_current(sink.recovery_metadata(updated_at=now))
+        except (
+            AdapterOperationError,
+            RawResultQuarantineError,
+            RawResultStreamingError,
+        ) as exc:
+            self._record_raw_result_failure(record, sink=sink, now=now)
+            if isinstance(exc, (RawResultQuarantineError, RawResultStreamingError)):
+                raise
             raise RawResultStreamingError("provider result streaming did not complete") from exc
         if not (
             metadata.execution_id == record.execution_id
@@ -489,6 +493,20 @@ class Executor:
                 now=now,
             )
         return metadata
+
+    def _record_raw_result_failure(
+        self,
+        record: ExecutionRecord,
+        *,
+        sink: RawResultSink,
+        now: datetime,
+    ) -> None:
+        self.finalization_requester.pause_for_raw_result_failure(
+            record.mission_id, now=now
+        )
+        if isinstance(sink, MockRawResultSink):
+            sink.mark_recovery_required()
+            self.recovery.set_current(sink.recovery_metadata(updated_at=now))
 
     async def ingest_result(
         self,

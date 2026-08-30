@@ -87,6 +87,7 @@ class TrustedExecutionAdapterRegistry:
 class MockArtifact:
     metadata: RawArtifactMetadata
     chunks: tuple[bytes, ...]
+    fail_after_chunks: int | None = None
 
 
 class MockExecutionAdapter:
@@ -199,7 +200,10 @@ class MockExecutionAdapter:
                 await sink.write_stderr(value)
             else:
                 assert isinstance(value, MockArtifact)
-                await sink.write_artifact(value.metadata, _chunks(value.chunks))
+                await sink.write_artifact(
+                    value.metadata,
+                    _chunks(value.chunks, fail_after=value.fail_after_chunks),
+                )
             self._collection_offsets[task_id] = index + 1
         receipt = await sink.commit()
         return self._metadata(execution_id, task_id, receipt)
@@ -254,6 +258,10 @@ class MockExecutionAdapter:
         )
 
 
-async def _chunks(chunks: tuple[bytes, ...]) -> AsyncIterator[bytes]:
-    for chunk in chunks:
+async def _chunks(
+    chunks: tuple[bytes, ...], *, fail_after: int | None = None
+) -> AsyncIterator[bytes]:
+    for index, chunk in enumerate(chunks):
+        if fail_after is not None and index >= fail_after:
+            raise AdapterOperationError("mock artifact stream interrupted")
         yield chunk

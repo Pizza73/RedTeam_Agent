@@ -120,6 +120,18 @@ class MissionManager:
             )
         return self.pause(mission_id, now=now)
 
+    def pause_for_raw_result_failure(self, mission_id: str, *, now: datetime) -> Mission:
+        """Fail closed when quarantine or streaming cannot safely continue."""
+
+        mission = self.current(mission_id)
+        if mission.state == "PAUSED":
+            return mission
+        if mission.state != "RUNNING":
+            raise MissionLifecycleAuthorizationError(
+                "raw-result failure can pause only a RUNNING mission"
+            )
+        return self.pause(mission_id, now=now)
+
     def resume(self, mission_id: str, *, now: datetime) -> Mission:
         mission = self.current(mission_id)
         if mission.state != "PAUSED":

@@ -12,6 +12,8 @@ from redteam_agent.errors import (
     ExecutionAuthorizationError,
     ExternalDispatchOutcomeUnknownError,
     MissionStateVersionConflictError,
+    RawResultQuarantineError,
+    RawResultStreamingError,
     ResultIngestionError,
     ResultIngestionLeaseError,
     TrustedDependencyUnavailableError,
@@ -19,14 +21,16 @@ from redteam_agent.errors import (
 from redteam_agent.executor import (
     Executor,
     FinalizationCoordinator,
+    MockArtifact,
     MockExecutionAdapter,
+    MockRawResultSinkFactory,
     MockSecureResultIngester,
     StaticPreDispatchCapabilityProbe,
     require_known_outcome,
 )
 from redteam_agent.mission import MissionManager
 from redteam_agent.models.capabilities import AdapterCapabilities
-from redteam_agent.models.execution import SecureIngestionSummary
+from redteam_agent.models.execution import RawArtifactMetadata, SecureIngestionSummary
 from redteam_agent.policy.approval import ApprovalService
 from redteam_agent.repositories import (
     ExecutionRepository,
@@ -491,6 +495,103 @@ def test_existing_result_converges_split_ingestion_success_commit() -> None:
     assert final_execution.result_ingestion_state == "SUCCEEDED"
     assert unused_ingester.calls == 0
     assert harness.adapter.submit_calls == 1
+
+
+def test_quarantine_quota_failure_persists_recovery_and_blocks_later_dispatch() -> None:
+    harness = build_execution_harness()
+    adapter = MockExecutionAdapter(
+        capabilities=harness.environment.adapter_snapshot.adapters[0],
+        now=FIXED_TIME + timedelta(minutes=3),
+        stdout_chunks=(b"quota-exceeded",),
+    )
+    limited_factory = MockRawResultSinkFactory(
+        now=FIXED_TIME + timedelta(minutes=3),
+        max_bytes=4,
+    )
+    harness.executor = executor_with_adapter(
+        harness,
+        adapter,
+        sink_factory=limited_factory,
+    )
+    prepared = prepare_execution(harness)
+    later = prepare_additional_execution(harness)
+    running = asyncio.run(
+        harness.executor.dispatch(
+            prepared.execution_id,
+            now=FIXED_TIME + timedelta(minutes=3),
+        )
+    )
+    with pytest.raises(RawResultQuarantineError):
+        asyncio.run(
+            harness.executor.collect_result(
+                running.execution_id,
+                now=FIXED_TIME + timedelta(minutes=4),
+            )
+        )
+
+    sink = limited_factory.mock_sink(running.execution_id)
+    assert sink is not None
+    recovery = harness.recovery.get(
+        sink.recovery_metadata(updated_at=FIXED_TIME + timedelta(minutes=4)).recovery_id
+    )
+    assert recovery is not None and recovery.state == "RECOVERY_REQUIRED"
+    assert harness.finalization.missions.current(running.mission_id).state == "PAUSED"
+    blocked = asyncio.run(
+        harness.executor.dispatch(
+            later.execution_id,
+            now=FIXED_TIME + timedelta(minutes=5),
+        )
+    )
+    assert blocked.provider_execution_state == "BLOCKED"
+    assert blocked.pre_dispatch_block_reason == "AUTHORIZATION_EPOCH_MISMATCH"
+    assert adapter.submit_calls == 1
+
+
+def test_mid_artifact_interruption_pauses_for_human_recovery() -> None:
+    harness = build_execution_harness()
+    artifact = MockArtifact(
+        metadata=RawArtifactMetadata(
+            artifact_sequence=0,
+            suggested_name="partial.bin",
+            declared_size=6,
+        ),
+        chunks=(b"abc", b"def"),
+        fail_after_chunks=1,
+    )
+    adapter = MockExecutionAdapter(
+        capabilities=harness.environment.adapter_snapshot.adapters[0],
+        now=FIXED_TIME + timedelta(minutes=3),
+        artifacts=(artifact,),
+    )
+    harness.executor = executor_with_adapter(harness, adapter)
+    prepared = prepare_execution(harness)
+    running = asyncio.run(
+        harness.executor.dispatch(
+            prepared.execution_id,
+            now=FIXED_TIME + timedelta(minutes=3),
+        )
+    )
+    with pytest.raises(RawResultStreamingError):
+        asyncio.run(
+            harness.executor.collect_result(
+                running.execution_id,
+                now=FIXED_TIME + timedelta(minutes=4),
+            )
+        )
+
+    sink = harness.sink_factory.mock_sink(running.execution_id)
+    assert sink is not None
+    recovery = harness.recovery.get(
+        sink.recovery_metadata(updated_at=FIXED_TIME + timedelta(minutes=4)).recovery_id
+    )
+    assert recovery is not None
+    assert recovery.state == "RECOVERY_REQUIRED"
+    assert recovery.bytes_received == 3
+    assert recovery.last_chunk_sequence == 0
+    assert harness.finalization.missions.current(running.mission_id).state == "PAUSED"
+    assert harness.receipts.get_by_execution(running.execution_id) is None
+    assert adapter.submit_calls == 1
+    assert adapter.collect_calls == 1
 
 
 def test_expired_ingestion_lease_is_taken_over_without_action_resubmit() -> None:
