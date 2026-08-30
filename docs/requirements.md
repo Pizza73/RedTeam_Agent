@@ -16,7 +16,7 @@ Codex CloudまたはChatGPTによる独立ReviewとCodexによる実装を、Pha
 | LOOP-006 | CI成功時だけ独立AI Reviewを要求する |
 | LOOP-007 | 同じSHAを重複Review・重複修正しない |
 | LOOP-008 | Phaseごとに最大5回、同じRoot Causeは最大3回で停止する |
-| LOOP-009 | Phase GateをPASSするまで次Phaseを開始しない |
+| LOOP-009 | Phase GateをPASSするまで次Phaseを開始しない。自動遷移は`ai-review-passed` marker中だけnext Phaseを先に追加してからcurrent Phaseを個別削除し、marker中の1件または隣接2件のPhaseをRunnerが遷移中として待機する。完全Label置換を使用せず、無関係な並行Label writeを上書きしない。競合によりmarker、HEAD、open state、Phase隣接性が崩れた場合はFail Closedにする |
 | LOOP-010 | Phase 0A、0B、0C、1、2、3、4、5の順序を固定する |
 | LOOP-011 | Phase 4/5の未設定外部依存はHuman Gateで停止する |
 | LOOP-012 | 最終mergeはLocal Orchestratorだけが、Phase 5のCurrent-HEAD PASS、Phase 0A～5の完全なSHA Chain、必須Check、Trusted Status、Current Default Branch包含を検証し、PR/完全HEAD固定のGit ref claimとBinding Recordを作成後に同じGateを再取得・再検証してから、Expected HEAD SHA固定で1回だけ実行する |
