@@ -215,8 +215,80 @@ jobs:
             }
 
             let expectedBaseSha;
+            let refreshTargetSha = null;
             if (phaseIndex === 0) {
+              const refreshPattern = /<!--\s*redteam-base-refresh\s*([\s\S]*?)-->/g;
+              const refreshKeys = [
+                'schema_version', 'action', 'from_phase', 'revalidate_phase', 'head_sha',
+                'target_base_sha', 'prior_pass_reference'
+              ];
+              const refreshes = [];
+              for (const comment of comments) {
+                if (comment.user?.login !== 'github-actions[bot]') continue;
+                for (const match of (comment.body || '').matchAll(refreshPattern)) {
+                  const raw = match[1].trim();
+                  const keys = [...raw.matchAll(/"((?:\\.|[^"\\])*)"\s*:/g)]
+                    .map((item) => JSON.parse(`"${item[1]}"`));
+                  if (new Set(keys).size !== keys.length) {
+                    core.setFailed('Base-refresh marker contains a duplicate JSON key.');
+                    return;
+                  }
+                  let refresh;
+                  try {
+                    refresh = JSON.parse(raw);
+                  } catch (_) {
+                    core.setFailed('Base-refresh marker is not valid JSON.');
+                    return;
+                  }
+                  if (
+                    JSON.stringify(Object.keys(refresh).sort()) !==
+                      JSON.stringify([...refreshKeys].sort()) ||
+                    refresh.schema_version !== '1.0' || refresh.action !== 'REFRESH_BASE' ||
+                    refresh.from_phase !== 'phase-0b' ||
+                    refresh.revalidate_phase !== 'phase-0a' ||
+                    !/^[0-9a-f]{40}$/.test(refresh.head_sha) ||
+                    !/^[0-9a-f]{40}$/.test(refresh.target_base_sha) ||
+                    typeof refresh.prior_pass_reference !== 'string' ||
+                    !refresh.prior_pass_reference.startsWith('https://github.com/')
+                  ) {
+                    core.setFailed('Base-refresh marker is malformed or not a Phase 0A rollback.');
+                    return;
+                  }
+                  refreshes.push(refresh);
+                }
+              }
               expectedBaseSha = pr.base.sha;
+              if (refreshes.length > 0) {
+                let matchedRefresh = null;
+                for (const refresh of [...refreshes].reverse()) {
+                  const [oldHeadComparison, targetBaseComparison] = await Promise.all([
+                    github.request('GET /repos/{owner}/{repo}/compare/{basehead}', {
+                      owner, repo, basehead: `${refresh.head_sha}...${reviewedSha}`,
+                    }),
+                    github.request('GET /repos/{owner}/{repo}/compare/{basehead}', {
+                      owner, repo, basehead: `${refresh.target_base_sha}...${reviewedSha}`,
+                    }),
+                  ]);
+                  const oldHeadIsAncestor =
+                    oldHeadComparison.data.merge_base_commit?.sha === refresh.head_sha &&
+                    oldHeadComparison.data.behind_by === 0 &&
+                    ['ahead', 'identical'].includes(oldHeadComparison.data.status);
+                  const targetBaseIsAncestor =
+                    targetBaseComparison.data.merge_base_commit?.sha === refresh.target_base_sha &&
+                    targetBaseComparison.data.behind_by === 0 &&
+                    ['ahead', 'identical'].includes(targetBaseComparison.data.status);
+                  if (oldHeadIsAncestor && targetBaseIsAncestor) {
+                    matchedRefresh = refresh;
+                    break;
+                  }
+                }
+                if (!matchedRefresh) {
+                  core.setFailed('Reviewed Phase 0A head is not descended from a trusted base refresh.');
+                  return;
+                }
+                expectedBaseSha = matchedRefresh.target_base_sha;
+                refreshTargetSha = matchedRefresh.target_base_sha;
+              }
             } else {
               const previousPhase = plan.phases[phaseIndex - 1].id;
               const previousPasses = priorRecords.filter(
@@ -500,6 +572,26 @@ jobs:
             const limitReached = verdict === 'CHANGES_REQUESTED' && (
               priorChanges.length + 1 >= maximum || sameFindingCount + 1 >= 3
             );
+
+            const { data: livePr } = await github.rest.pulls.get({owner, repo, pull_number});
+            const livePhases = livePr.labels.map((item) => item.name)
+              .filter((name) => /^phase-(0a|0b|0c|[1-5])$/.test(name));
+            if (
+              livePr.state !== 'open' || livePr.head.sha !== reviewedSha ||
+              livePhases.length !== 1 || livePhases[0] !== phase
+            ) {
+              core.setFailed('Pull request head or phase changed before recording the gate.');
+              return;
+            }
+            if (refreshTargetSha !== null) {
+              const { data: liveDefaultCommit } = await github.rest.repos.getCommit({
+                owner, repo, ref: context.payload.repository.default_branch,
+              });
+              if (liveDefaultCommit.sha !== refreshTargetSha) {
+                core.setFailed('Default branch changed before recording the refreshed Phase 0A gate.');
+                return;
+              }
+            }
 
             const record = {
               schema_version: '1.0',

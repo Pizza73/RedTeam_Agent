@@ -199,7 +199,7 @@ jobs:
             const { data: defaultCommit } = await github.rest.repos.getCommit({
               owner, repo, ref: defaultBranch,
             });
-            if (pr.base.sha !== targetBaseSha || defaultCommit.sha !== targetBaseSha) {
+            if (defaultCommit.sha !== targetBaseSha) {
               core.setFailed('The target base SHA is no longer the current default branch.');
               return;
             }

@@ -69,6 +69,13 @@ def test_phase_gate_uses_fail_closed_native_codex_evidence_chain() -> None:
         "missing its reviewer thumbs-up reaction",
         "missing retained P0/P1 findings",
         "duplicate JSON key",
+        "redteam-base-refresh",
+        "target_base_sha",
+        "merge_base_commit?.sha === refresh.target_base_sha",
+        "Reviewed Phase 0A head is not descended from a trusted base refresh",
+        "liveDefaultCommit.sha !== refreshTargetSha",
+        "Default branch changed before recording the refreshed Phase 0A gate",
+        "Pull request head or phase changed before recording the gate",
     ):
         assert required_control in workflow
     assert "Review evidence must contain exactly one redteam-ai-review marker" not in workflow
@@ -135,6 +142,7 @@ def test_base_refresh_is_sha_bound_and_cannot_merge_the_pull_request() -> None:
     assert r"while (/\s/.test" in workflow
     assert r"while (/\\s/.test" not in workflow
     assert r"!/[\s,}\]]/.test" in workflow
+    assert "pr.base.sha !== targetBaseSha" not in workflow
     assert "contents: write" not in workflow
     assert "update-branch" in runner
     for forbidden_operation in (
