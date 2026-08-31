@@ -46,7 +46,9 @@ _CREDENTIAL_KEY_COMPONENTS = (
     b"credential",
     b"password",
     b"passwd",
+    b"privatekey",
     b"secret",
+    b"sshkey",
     b"token",
     b"apikey",
 )

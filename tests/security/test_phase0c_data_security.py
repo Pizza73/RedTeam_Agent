@@ -294,6 +294,50 @@ def test_bearer_authorization_is_redacted_before_artifact_publication(
     assert bearer_secret not in visible
 
 
+def test_private_key_field_is_redacted_before_artifact_publication(
+    tmp_path: Path,
+) -> None:
+    quarantine, artifacts, secrets, authorizer, _ = _stores(tmp_path)
+    authorizer.allow_ingestion_write("mission-private-key", "execution-private-key")
+    private_key = b"-----BEGIN PRIVATE KEY-----private-material"
+    receipt = quarantine.commit(
+        mission_id="mission-private-key",
+        mission_revision=1,
+        execution_id="execution-private-key",
+        content=b'{"private_key":"' + private_key + b'"}',
+        created_at=NOW,
+        retention_until=NOW + timedelta(hours=1),
+    )
+
+    result = SecureIngestor(
+        quarantine=quarantine,
+        artifacts=artifacts,
+        secrets=secrets,
+    ).ingest(receipt, now=NOW)
+
+    assert result.redaction_metadata.redaction_count == 1
+    assert result.detected_secrets[0].credential_type == "private_key"
+    artifact = result.redacted_artifacts[0]
+    authorizer.set_grants(
+        "mission-private-key",
+        (
+            DataAccessGrant(
+                resource_type="artifact",
+                resource=ResourceBinding(
+                    resource_id=artifact.artifact_id,
+                    resource_version="1",
+                    resource_digest=artifact.sha256,
+                ),
+                operations=frozenset({"read"}),
+            ),
+        ),
+    )
+    visible = artifacts.read(artifact, operation="read", now=NOW)
+    assert visible == b'{"private_key":"[REDACTED]"}'
+    assert private_key not in visible
+    assert private_key.decode() not in result.model_dump_json()
+
+
 def test_encrypted_raw_artifact_cannot_be_used_as_context_read(
     tmp_path: Path,
 ) -> None:
@@ -387,6 +431,104 @@ def test_secure_ingestion_replacement_exception_drops_secret_bearing_traceback(
     assert checked_ingestion_frame
 
 
+def test_release_audit_failures_drop_decrypted_traceback_locals(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, artifacts, secrets, authorizer, _ = _stores(tmp_path)
+    mission_id = "mission-release-audit"
+    execution_id = "execution-release-audit"
+    secret_value = b"resolved-secret-must-not-enter-traceback"
+    raw_value = b"exported-raw-must-not-enter-traceback"
+    authorizer.allow_ingestion_write(mission_id, execution_id)
+    secret = secrets.create(
+        mission_id=mission_id,
+        secret_value=secret_value,
+        credential_type="token",
+        associated_principal_ref=None,
+        source_execution_id=execution_id,
+        created_at=NOW,
+    )
+    encrypted_raw = artifacts.put(
+        mission_id=mission_id,
+        content=raw_value,
+        media_type="application/octet-stream",
+        classification="secret",
+        variant="encrypted_raw",
+        source_execution_id=execution_id,
+        created_at=NOW,
+    )
+    authorizer.set_grants(
+        mission_id,
+        (
+            DataAccessGrant(
+                resource_type="secret_reference",
+                resource=ResourceBinding(
+                    resource_id=secret.secret_reference_id,
+                    resource_version="1",
+                    resource_digest=sha256_digest(secret),
+                ),
+                operations=frozenset({"resolve"}),
+            ),
+            DataAccessGrant(
+                resource_type="artifact",
+                resource=ResourceBinding(
+                    resource_id=encrypted_raw.artifact_id,
+                    resource_version="1",
+                    resource_digest=encrypted_raw.sha256,
+                ),
+                operations=frozenset({"export"}),
+            ),
+        ),
+    )
+
+    durable_audit = artifacts._audit
+
+    class FailReleaseAudit:
+        def record(self, **kwargs):
+            if kwargs["operation"] in {"resolve", "export"}:
+                raise AuditIntegrityError("simulated release audit failure")
+            return durable_audit.record(**kwargs)
+
+    failing_audit = FailReleaseAudit()
+    monkeypatch.setattr(secrets, "_audit", failing_audit)
+    monkeypatch.setattr(artifacts, "_audit", failing_audit)
+
+    with pytest.raises(SecretAccessError) as secret_error:
+        secrets.resolve(secret, now=NOW)
+    with pytest.raises(ArtifactSecurityError) as artifact_error:
+        artifacts.read(encrypted_raw, operation="export", now=NOW)
+
+    def assert_sanitized(
+        error: Exception,
+        *,
+        prohibited_name: str,
+        prohibited_value: bytes,
+    ) -> None:
+        assert error.__cause__ is None
+        assert error.__context__ is None
+        traceback = error.__traceback__
+        checked_store_frame = False
+        while traceback is not None:
+            if traceback.tb_frame.f_code.co_filename.endswith("data_security/stores.py"):
+                checked_store_frame = True
+                assert prohibited_name not in traceback.tb_frame.f_locals
+                assert prohibited_value not in traceback.tb_frame.f_locals.values()
+            traceback = traceback.tb_next
+        assert checked_store_frame
+
+    assert_sanitized(
+        secret_error.value,
+        prohibited_name="value",
+        prohibited_value=secret_value,
+    )
+    assert_sanitized(
+        artifact_error.value,
+        prohibited_name="content",
+        prohibited_value=raw_value,
+    )
+
+
 def test_oauth_fields_are_redacted_across_stream_chunks(tmp_path: Path) -> None:
     keys = _keys()
     authorizer = _ExactEnvelopeAuthorizer()
@@ -441,8 +583,9 @@ def test_oauth_fields_are_redacted_across_stream_chunks(tmp_path: Path) -> None:
         await sink.write_stdout(b'Hash":"hash-value","client')
         await sink.write_stdout(b'Secret":"client-value","refresh_')
         await sink.write_stdout(
-            b'token":"refresh-value","oauthToken":"oauth-value"} '
+            b'token":"refresh-value","oauthToken":"oauth-value","sshPrivate'
         )
+        await sink.write_stdout(b'Key":"ssh-value"} ')
         await sink.write_stdout(b"passwordHash=unquoted-hash token")
         await sink.write_stdout(b"Value: unquoted-token")
         receipt = await sink.commit()
@@ -453,7 +596,7 @@ def test_oauth_fields_are_redacted_across_stream_chunks(tmp_path: Path) -> None:
         ).ingest_stream(sink, receipt, now=NOW)
 
     result = asyncio.run(ingest_oauth_stream())
-    assert result.redaction_metadata.redaction_count == 10
+    assert result.redaction_metadata.redaction_count == 11
     assert result.redacted_artifacts[0].classification == "sensitive"
     assert {item.credential_type for item in result.detected_secrets} == {
         "tokenvalue",
@@ -464,6 +607,7 @@ def test_oauth_fields_are_redacted_across_stream_chunks(tmp_path: Path) -> None:
         "clientsecret",
         "refresh_token",
         "oauthtoken",
+        "sshprivatekey",
     }
     artifact = result.redacted_artifacts[0]
     authorizer.set_grants(
@@ -485,7 +629,8 @@ def test_oauth_fields_are_redacted_across_stream_chunks(tmp_path: Path) -> None:
         b'{"tokenValue":"[REDACTED]","credential":"[REDACTED]",'
         b'"access_token":"[REDACTED]","serviceCredential":"[REDACTED]",'
         b'"passwordHash":"[REDACTED]","clientSecret":"[REDACTED]",'
-        b'"refresh_token":"[REDACTED]","oauthToken":"[REDACTED]"} '
+        b'"refresh_token":"[REDACTED]","oauthToken":"[REDACTED]",'
+        b'"sshPrivateKey":"[REDACTED]"} '
         b"passwordHash=[REDACTED] tokenValue: [REDACTED]"
     )
     for value in (
@@ -497,6 +642,7 @@ def test_oauth_fields_are_redacted_across_stream_chunks(tmp_path: Path) -> None:
         b"client-value",
         b"refresh-value",
         b"oauth-value",
+        b"ssh-value",
         b"unquoted-hash",
         b"unquoted-token",
     ):

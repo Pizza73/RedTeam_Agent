@@ -1223,6 +1223,27 @@ class ArtifactStore:
             resource_id=reference.artifact_id,
             now=now,
         )
+        try:
+            return self._release_authorized_content(
+                reference,
+                envelope=envelope,
+                operation=operation,
+                now=now,
+            )
+        except Exception as failure:
+            failure.__traceback__ = None
+        raise ArtifactSecurityError("artifact release failed closed")
+
+    def _release_authorized_content(
+        self,
+        reference: ArtifactReference,
+        *,
+        envelope: _StoredEnvelope,
+        operation: Literal["read", "export"],
+        now: datetime,
+    ) -> bytes:
+        """Decrypt and audit content outside the sanitized public error frame."""
+
         if envelope.binding.to_dict().get("storage_format") == "artifact-stream-v1":
             content = self._read_stream(reference, now=now)
         else:
@@ -1859,6 +1880,27 @@ class SecretStore:
             operation="resolve",
             now=now,
         )
+        try:
+            return self._release_authorized_secret(
+                authoritative,
+                source_execution_id=source_execution_id,
+                version=version,
+                now=now,
+            )
+        except Exception as failure:
+            failure.__traceback__ = None
+        raise SecretAccessError("secret resolution failed closed")
+
+    def _release_authorized_secret(
+        self,
+        authoritative: SecretReferenceMetadata,
+        *,
+        source_execution_id: str,
+        version: int,
+        now: datetime,
+    ) -> bytes:
+        """Decrypt and audit a Secret outside the sanitized public error frame."""
+
         value = self._store.read(
             mission_id=authoritative.mission_id,
             resource_id=authoritative.secret_reference_id,

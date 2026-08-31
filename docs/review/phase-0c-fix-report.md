@@ -4,16 +4,16 @@
 
 - Current phase: `Phase 0C: Data Security and Audit`
 - Input review SHA: `6b55fe9ba6cf0453e8c8ba33af3a3a9368944df5`
-- Latest correction input SHA: `11cd9ac0c10e6cde20fec7f8c3563bdf6b387e90`
+- Latest correction input SHA: `6a35a51244314f1f7eab980d6c5ced2b259443ee`
 - Trusted Phase 0B base PASS SHA: `5cda9a5f8792ee33c3e153d8e791499f5619d82e`
 - Implementation branch: `ai/redteam-agent-phase-loop`
 - Independent-review result: `CHANGES_REQUESTED`
-- Latest finding key: `CODEX-P1-61DE840F99706095`
+- Latest finding key: `CODEX-P1-B7E66A94C49E09BF`
 - External provider, C2, MCP side effect, local attack, and external-target execution: absent
 
 ## Resulting working-tree diff
 
-The latest correction updates three implementation files, one test file, and this report. No protected
+The latest correction updates two implementation files, one test file, and this report. No protected
 governance file listed in `AGENTS.md` was modified. In particular, `SystemDesign.md`, `.github/**`,
 `automation/**`, requirements, acceptance criteria, safety invariants, implementation status,
 phase prompts, CI scripts, and dependency manifests are unchanged.
@@ -21,7 +21,6 @@ phase prompts, CI scripts, and dependency manifests are unchanged.
 Modified files:
 
 - `src/redteam_agent/data_security/ingestion.py`
-- `src/redteam_agent/data_security/keys.py`
 - `src/redteam_agent/data_security/stores.py`
 - `tests/security/test_phase0c_data_security.py`
 - `docs/review/phase-0c-fix-report.md`
@@ -262,6 +261,21 @@ under `CODEX-P1-61DE840F99706095`. The exact-SHA Human Resume covers all four fi
   after directory creation. Any intermediate symbolic link or non-directory fails closed instead
   of resolving to an external location.
 
+## Eleventh independent review correction cycle
+
+The review for exact HEAD `6a35a51244314f1f7eab980d6c5ced2b259443ee` recorded two P1 findings
+under `CODEX-P1-B7E66A94C49E09BF`. The exact-SHA Human Resume covers both findings:
+
+- [`discussion_r3896956464`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3896956464):
+  structured secret detection now recognizes normalized `private_key`, `privateKey`, SSH key, and
+  compound SSH private-key field names. Complete and cross-chunk values become Secret references;
+  only redaction markers enter the LLM-visible Artifact.
+- [`discussion_r3896956476`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3896956476):
+  authorized Secret resolution and Artifact content release now decrypt and audit in isolated inner
+  frames. Their public boundaries clear the original traceback and raise a typed fail-closed error
+  only after leaving the handler, so an audit failure exposes no decrypted value through exception
+  cause, context, or captured frame locals.
+
 ## Regression tests added
 
 The existing Phase 0C security test module now additionally covers:
@@ -320,7 +334,11 @@ The existing Phase 0C security test module now additionally covers:
 - low-entropy Secret creation without the former deterministic reference, plaintext-digest policy
   binding, or plaintext digest in the encrypted Store envelope; and
 - configured Store roots with an intermediate symlink, including proof that no directory is created
-  in the symlink target.
+  in the symlink target;
+- complete `private_key` and cross-chunk `sshPrivateKey` detection, Secret-reference creation, and
+  exact Artifact redaction; and
+- audit failures after Secret resolve and encrypted-raw export, with no decrypted value in exception
+  cause, context, or Store traceback locals.
 
 No test was removed, weakened, skipped, or marked as an expected failure.
 
@@ -340,8 +358,8 @@ ruff: All checks passed
 mypy: Success: no issues found in 78 source files
 unit: 186 passed
 integration: 7 passed
-security: 163 passed
-full/coverage run: 356 passed
+security: 165 passed
+full/coverage run: 358 passed
 skipped=0, errors=0, failures=0
 coverage: 83% total (branch coverage enabled)
 pip check: No broken requirements found
@@ -357,8 +375,8 @@ PATH="$PWD/.venv/bin:$PATH" python -m pytest -q \
   tests/security/test_phase0c_data_security.py
 ```
 
-Latest focused Phase 0C security result: `19 passed`. The four current review regressions pass with
-`4 passed, 15 deselected`.
+Latest focused Phase 0C security result: `21 passed`. The complete/private-key, cross-chunk SSH-key,
+and release-audit regressions pass with `3 passed, 18 deselected`.
 
 ## Remaining constraints
 
