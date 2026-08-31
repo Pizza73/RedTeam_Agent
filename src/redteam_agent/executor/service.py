@@ -449,6 +449,16 @@ class Executor:
             self._record_raw_result_failure(record, sink=sink, now=now)
             raise RawResultStreamingError("adapter result metadata binding mismatch")
         current = self._require_execution(execution_id)
+        if current.provider_execution_state not in {
+            "RUNNING",
+            "SUCCEEDED",
+            "FAILED",
+            "CANCELLED",
+        }:
+            self._record_raw_result_failure(record, sink=sink, now=now)
+            raise RawResultStreamingError(
+                "execution state changed during result collection"
+            )
         if (
             current.provider_execution_state in {"SUCCEEDED", "FAILED", "CANCELLED"}
             and metadata.provider_status != current.provider_execution_state
