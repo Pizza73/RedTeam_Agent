@@ -101,6 +101,20 @@ class _MismatchedTaskMetadataAdapter(MockExecutionAdapter):
         )
 
 
+class _ChangedRetryMetadataAdapter(MockExecutionAdapter):
+    async def collect_result(
+        self,
+        task_id: str,
+        sink: RawResultSink,
+    ) -> AdapterRawResult:
+        metadata = await super().collect_result(task_id, sink)
+        if self.collect_calls > 1:
+            return metadata.model_copy(
+                update={"provider_status": "FAILED", "exit_code": 1}
+            )
+        return metadata
+
+
 @pytest.mark.parametrize("reconcile_status", ["UNKNOWN", "UNSUPPORTED", "NOT_FOUND"])
 def test_uncertain_reconciliation_stops_without_duplicate_dispatch(reconcile_status: str) -> None:
     harness = build_execution_harness()
@@ -723,6 +737,73 @@ def test_committed_sink_metadata_mismatch_uses_raw_result_recovery() -> None:
     assert harness.finalization.missions.current(running.mission_id).state == "PAUSED"
     assert adapter.submit_calls == 1
     assert adapter.collect_calls == 1
+
+
+def test_collection_retry_rejects_metadata_changed_after_ingestion_commit_crash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = build_execution_harness()
+    adapter = _ChangedRetryMetadataAdapter(
+        capabilities=harness.environment.adapter_snapshot.adapters[0],
+        now=FIXED_TIME + timedelta(minutes=3),
+        stdout_chunks=(b"committed-before-crash",),
+    )
+    harness.executor = executor_with_adapter(harness, adapter)
+    prepared = prepare_execution(harness)
+    running = asyncio.run(
+        harness.executor.dispatch(
+            prepared.execution_id,
+            now=FIXED_TIME + timedelta(minutes=3),
+        )
+    )
+
+    def crash_before_provider_transition(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("simulated crash before provider transition")
+
+    with monkeypatch.context() as crash:
+        crash.setattr(
+            harness.executions,
+            "transition_provider",
+            crash_before_provider_transition,
+        )
+        with pytest.raises(RuntimeError, match="simulated crash"):
+            asyncio.run(
+                harness.executor.collect_result(
+                    running.execution_id,
+                    now=FIXED_TIME + timedelta(minutes=4),
+                )
+            )
+
+    persisted = harness.ingestions.get_by_execution(running.execution_id)
+    interrupted = harness.executions.get(running.execution_id)
+    assert persisted is not None and persisted.adapter_metadata_digest is not None
+    assert interrupted is not None and interrupted.provider_execution_state == "RUNNING"
+
+    with pytest.raises(
+        RawResultStreamingError,
+        match="metadata changed across collection attempts",
+    ):
+        asyncio.run(
+            harness.executor.collect_result(
+                running.execution_id,
+                now=FIXED_TIME + timedelta(minutes=5),
+            )
+        )
+
+    unchanged = harness.ingestions.get_by_execution(running.execution_id)
+    current = harness.executions.get(running.execution_id)
+    sink = harness.sink_factory.mock_sink(running.execution_id)
+    assert unchanged == persisted
+    assert current is not None and current.provider_execution_state == "RUNNING"
+    assert harness.results.get_by_execution(running.execution_id) is None
+    assert sink is not None and sink.committed
+    recovery = harness.recovery.get(
+        sink.recovery_metadata(updated_at=FIXED_TIME + timedelta(minutes=5)).recovery_id
+    )
+    assert recovery is not None and recovery.state == "COMMITTED"
+    assert harness.finalization.missions.current(running.mission_id).state == "PAUSED"
+    assert adapter.submit_calls == 1
+    assert adapter.collect_calls == 2
 
 
 def test_expired_ingestion_lease_is_taken_over_without_action_resubmit() -> None:

@@ -448,10 +448,21 @@ class Executor:
         ):
             self._record_raw_result_failure(record, sink=sink, now=now)
             raise RawResultStreamingError("adapter result metadata binding mismatch")
+        adapter_metadata_digest = sha256_digest(
+            metadata.model_dump(mode="python", exclude={"receipt"})
+        )
+        ingestion = self.ingestions.get_by_execution(record.execution_id)
+        if (
+            ingestion is not None
+            and ingestion.adapter_metadata_digest != adapter_metadata_digest
+        ):
+            self._record_raw_result_failure(record, sink=sink, now=now)
+            raise RawResultStreamingError(
+                "adapter result metadata changed across collection attempts"
+            )
         self.receipts.add(metadata.receipt)
         if isinstance(sink, MockRawResultSink):
             self.recovery.set_current(sink.recovery_metadata(updated_at=now))
-        ingestion = self.ingestions.get_by_execution(record.execution_id)
         current = self._require_execution(execution_id)
         if ingestion is None:
             provisional = ResultIngestionRecord(
@@ -469,9 +480,7 @@ class Executor:
                 status="PENDING",
                 receipt_id=metadata.receipt.receipt_id,
                 quarantine_id=metadata.receipt.quarantine_id,
-                adapter_metadata_digest=sha256_digest(
-                    metadata.model_dump(mode="python", exclude={"receipt"})
-                ),
+                adapter_metadata_digest=adapter_metadata_digest,
                 created_at=now,
                 updated_at=now,
             )

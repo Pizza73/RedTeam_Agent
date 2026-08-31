@@ -4,6 +4,9 @@
 
 - Current phase: `Phase 0B: Execution Safety`
 - Input independent-review SHA: `9060c6c7ded3158072989035cab78c5f97946642`
+- Latest correction input SHA: `1e2270d0307b63d01b55f1b640f20f8300e986c8`
+- Human-resume implementation request:
+  [`issuecomment-5472230358`](https://github.com/Pizza73/RedTeam_Agent/pull/3#issuecomment-5472230358)
 - Implementation branch: `ai/redteam-agent-phase-loop`
 - External execution boundary: `MockExecutionAdapter` only
 - Real provider, C2, MCP side effect, local shell execution, and external-target calls: absent
@@ -147,6 +150,22 @@ Phase 0B:
   Mission `PAUSED` and raw-result recovery path. The bound sink's `COMMITTED` recovery metadata is
   persisted, while the mismatched Adapter metadata never enters the normal receipt repository.
 
+## Fifth independent review correction cycle
+
+The independent review for correction SHA
+`1e2270d0307b63d01b55f1b640f20f8300e986c8` returned one P1 finding. The five-cycle safety stop
+was audited and a bounded same-phase correction was authorized through the trusted Human Resume
+workflow:
+
+- [`discussion_r3890905088`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3890905088):
+  Executor now recomputes the receipt-excluded Adapter metadata digest on every collection attempt
+  and compares it with the digest already bound to the ingestion record. A retry that changes
+  provider status, exit code, or timestamps is rejected through the Mission `PAUSED` and raw-result
+  recovery path before receipt persistence, provider-state transition, or result normalization.
+  The regression test simulates a crash after ingestion persistence but before provider transition,
+  then verifies that changed terminal metadata cannot become authoritative and does not resubmit the
+  external action.
+
 ## Regression tests added
 
 The Phase 0B test set covers positive, negative, and failure paths, including:
@@ -176,7 +195,9 @@ The Phase 0B test set covers positive, negative, and failure paths, including:
   dispatch rejection;
 - mid-artifact interruption with partial sequence evidence and PAUSED human recovery;
 - self-consistent but unbound Adapter receipt rejection against the exact sink commit; and
-- committed-sink task metadata mismatch routing to PAUSED recovery without receipt persistence.
+- committed-sink task metadata mismatch routing to PAUSED recovery without receipt persistence; and
+- changed Adapter terminal metadata on a post-ingestion crash retry being rejected before provider
+  transition or result normalization, with no external action resubmit.
 
 No test was skipped, weakened, deleted, or marked as an expected failure.
 
@@ -196,8 +217,8 @@ ruff: All checks passed
 mypy: Success: no issues found in 69 source files
 unit: 172 passed
 integration: 7 passed
-security: 136 passed
-full/coverage run: 315 passed
+security: 137 passed
+full/coverage run: 316 passed
 skipped=0, errors=0, failures=0
 coverage: 83% total (branch coverage enabled)
 pip check: No broken requirements found
@@ -213,6 +234,20 @@ Additional focused command executed during development:
 ```
 
 Focused result: `34 passed`.
+
+Additional latest-correction commands:
+
+```text
+.venv/bin/python -m pytest -q tests/security/test_phase0b_execution_safety.py \
+  -k 'collection_retry_rejects_metadata_changed_after_ingestion_commit_crash or \
+  committed_sink_metadata_mismatch or adapter_receipt_must_exactly_match' --strict-markers
+.venv/bin/python -m ruff check src/redteam_agent/executor/service.py \
+  tests/security/test_phase0b_execution_safety.py
+.venv/bin/python -m mypy src/redteam_agent
+```
+
+Latest-correction results: `3 passed`, Ruff `All checks passed`, and mypy
+`Success: no issues found in 69 source files`.
 
 ## Remaining findings and constraints
 
