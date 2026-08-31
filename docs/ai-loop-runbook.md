@@ -8,9 +8,11 @@ repeats this sequence:
 1. Read a SHA-bound implementation request created by `github-actions[bot]`.
 2. Post an `@codex` implementation request as the ChatGPT-linked GitHub user.
 3. Wait for Codex to push a normal PR commit and for all required CI checks to pass.
-4. Post `@codex review` for that exact phase, head SHA and phase base SHA.
-5. Validate the native Codex reviewer identity, ready/trigger chain, current head, P0/P1 or
-   no-major-issues output, bot 👍 and unchanged review timeline.
+4. Post one exhaustive `@codex review` for that exact phase, head SHA and phase base SHA. The same
+   review instruction applies to every Phase.
+5. Require Codex to continue after the first issue and retain every consequential P0/P1 in that
+   single native review. Validate reviewer identity, ready/trigger chain, current head, bot 👍 and
+   unchanged review timeline, then request one fix covering every retained finding.
 6. Dispatch **Record AI Phase Review**, which independently revalidates the SHA, review and CI.
 7. Request a bounded fix or continue with the next phase.
 8. If `main` advanced before the next Phase implementation began, roll back one Phase, incorporate
@@ -49,6 +51,7 @@ GitHub comments, labels and checks preserve the state for a later restart.
    `AI_GATE_APPROVER_LOGIN` must equal the account returned by `gh api user --jq .login`.
    `AI_REVIEWER_LOGIN` must equal the author shown on a real Codex PR review/comment, including the
    `[bot]` suffix; do not guess or use a display name.
+   `AI_LOOP_MAX_ITERATIONS` is fail-closed at exactly `5`; smaller or larger values block the loop.
 5. Do not create an `OPENAI_API_KEY` secret. The local process uses the existing `gh` credential
    store and never passes its token to Codex.
 6. Create the labels through the approved workflow:
@@ -173,10 +176,12 @@ Codex or human commit is rejected. CI must then produce a new SHA-bound PASS. Th
 not merge the PR into `main`; it is distinct from the local Phase 5 final merge gate above.
 
 Codex Code Review posts standard GitHub evidence rather than repository-defined JSON. For PASS,
-the loop requires the standard no-major-issues comment, a matching 10-or-more-character commit
-prefix, a reviewer-authored 👍 reaction, no current-head P0/P1 or formal finding review, and no
-head synchronization between the full-SHA trigger and completion. For `CHANGES_REQUESTED`, it
-requires a formal review bound to the full current SHA and retained P0/P1 inline comments. The
+the single review requires the standard no-major-issues comment, a matching 10-or-more-character
+commit prefix and a reviewer-authored 👍 reaction. For `CHANGES_REQUESTED`, it requires one formal
+review bound to the full current SHA and aggregates every retained P0/P1 inline comment from that
+review. The trusted fix request records the exact `finding_count` and every finding permalink;
+`finding_key` is used only for bounded retry counting, and Codex must resolve every retained
+finding. Head synchronization between the trigger and completion is forbidden. The
 approver-restricted workflow re-queries and validates the same evidence before producing the
 machine-readable phase record.
 
@@ -221,9 +226,9 @@ machine-readable phase record.
 - `local governance checkout is not the current default-branch SHA`: run `git pull --ff-only`.
 - No Codex response: verify the GitHub account is connected to ChatGPT/Codex, repository access is
   granted, and `AI_REVIEWER_LOGIN` matches the actual integration author.
-- Native review remains pending: confirm the exact runner-authored `@codex review` trigger follows
-  the current-head ready marker. Manual review comments without `redteam-local-codex-trigger` are
-  intentionally not accepted as phase-gate evidence.
+- Native review remains pending: confirm the single runner-authored `@codex review` follows the
+  current-head ready marker and contains `redteam-local-codex-trigger`. Manual review comments are
+  not accepted as phase-gate evidence.
 - `AI_LOOP=BLOCKED`: inspect the latest trusted bot marker and workflow run. Do not bypass labels,
   alter review evidence, or weaken CI to continue.
 - `waiting for trusted base-refresh transition`: inspect **Prepare AI Loop Base Refresh**. It must

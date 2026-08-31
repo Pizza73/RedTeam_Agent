@@ -76,8 +76,8 @@ IMPLEMENTATION_REQUESTED
   -> CI_RUNNING
        -> CI_FAILED -> FIX_REQUESTED
        -> REVIEW_READY
-  -> local orchestrator requests a fresh Codex/ChatGPT review
-  -> local orchestrator validates the review and dispatches Record AI Phase Review
+  -> local orchestrator requests one exhaustive Codex/ChatGPT review for one exact SHA
+  -> local orchestrator validates and aggregates the complete native review
        -> CHANGES_REQUESTED -> FIX_REQUESTED
        -> PASS -> NEXT_PHASE_REQUESTED or HUMAN_GATE or PROJECT_COMPLETE
        -> PROJECT_COMPLETE -> LOCAL_EXACT_SHA_MERGE or BLOCKED
@@ -183,19 +183,27 @@ review, and the earlier PASS never authorizes implementation across the new base
 
 After CI posts the review-ready marker:
 
-1. The local orchestrator posts `@codex review` only after the SHA-bound ready marker exists.
-2. Codex independently checks the current phase prompt, acceptance criteria and prior invariants,
-   then posts native P0/P1 inline findings or its standard no-major-issues completion and 👍.
-3. The orchestrator validates reviewer identity, current phase/head/base, ready/trigger chain,
-   native output shape and absence of `synchronize` events during review. For
-   `CHANGES_REQUESTED`, it derives a stable root-cause key from priority, path and headline.
-4. The orchestrator dispatches `Record AI Phase Review` as `AI_GATE_APPROVER_LOGIN`.
+1. The local orchestrator posts one `@codex review` only after the SHA-bound ready marker exists.
+   The same exhaustive instruction applies to every Phase.
+2. Codex reviews the complete Phase diff and supporting unchanged code across authorization and
+   lifecycle, secrets and untrusted output, integrity/cryptography/storage/recovery/concurrency,
+   every acceptance criterion, bypass path, and earlier-Phase regression.
+3. Codex continues after the first issue and retains every consequential finding in that one
+   native review, each in standard P0/P1 inline format. No-major-issues is valid only when none
+   remains.
+4. The orchestrator validates reviewer identity, current phase/head/base, ready/trigger chain,
+   native output and absence of `synchronize` events. It aggregates every retained P0/P1 into one
+   `CHANGES_REQUESTED`; the first finding supplies only the stable retry key, not the fix scope.
+5. The resulting trusted fix request records `finding_count` plus every P0/P1 permalink and
+   references the complete native review. Codex must fix every listed finding before the next
+   review. The orchestrator then dispatches
+   `Record AI Phase Review` as `AI_GATE_APPROVER_LOGIN`.
 
 The workflow rejects a stale SHA, wrong reviewer, wrong phase base, fork PR, missing/failed checks,
-review link outside the PR, untrusted ready/trigger links, a head change during review, ambiguous
+review link outside the PR, an untrusted ready/trigger link, a head change during review, ambiguous
 commit evidence, a PASS without the bot 👍, or orchestrator input that differs from the
-deterministically derived native result. A formal Codex review without retained P0/P1 comments is
-fail-closed. The loop stops after five change cycles in a phase or three occurrences of the same
+deterministically derived aggregate result. A formal Codex review without retained P0/P1 comments
+is fail-closed. The loop stops after five change cycles in a phase or five occurrences of the same
 root-cause key.
 
 ## Phase progression
