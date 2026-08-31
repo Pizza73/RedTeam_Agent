@@ -25,7 +25,7 @@ from redteam_agent.models.execution import (
     TaskStatus,
 )
 
-from .raw_results import MockRawResultSink, RawResultSink
+from .raw_results import RawResultSink
 
 
 class ExecutionAdapter(Protocol):
@@ -175,7 +175,7 @@ class MockExecutionAdapter:
         execution_id = self._execution_by_task.get(task_id)
         if execution_id is None:
             raise AdapterOperationError("mock task is not bound to an execution")
-        if isinstance(sink, MockRawResultSink) and sink.committed:
+        if sink.committed:
             receipt = await sink.commit()
             return self._metadata(execution_id, task_id, receipt)
 

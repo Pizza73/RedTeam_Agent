@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from datetime import datetime
+from typing import Literal
 
 from redteam_agent.canonical import sha256_digest, stable_id
 from redteam_agent.errors import SecretDetectionError, SecureIngestionError
+from redteam_agent.models.execution import RawResultReceipt, SecureIngestionSummary
 
 from .models import (
     ArtifactReference,
@@ -16,10 +19,108 @@ from .models import (
     SecureIngestionResult,
 )
 from .stores import ArtifactStore, EncryptedRawResultQuarantine, SecretStore
+from .streaming import EncryptedRawResultSink, EncryptedRawResultSinkFactory
 
 _SECRET_PATTERN = re.compile(
     rb"(?i)\b(password|passwd|token|api[_-]?key|secret)\s*([:=])\s*([^\s,;]+)"
 )
+_SECRET_KEYWORDS = (b"password", b"passwd", b"token", b"api_key", b"api-key", b"secret")
+_SECRET_TERMINATORS = frozenset(b" \t\n\r\v\f,;")
+_SECRET_WHITESPACE = _SECRET_TERMINATORS - {44, 59}
+_ASCII_WORD_BYTES = frozenset(
+    b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
+)
+_MAX_PENDING_SECRET_MATCH_BYTES = 64 * 1024
+
+
+class _StreamingSecretRedactor:
+    """Recognizes the Phase 0C secret grammar across arbitrary chunk boundaries."""
+
+    def __init__(
+        self,
+        replace: Callable[[bytes, bytes, bytes], bytes],
+    ) -> None:
+        self._replace = replace
+        self._pending = bytearray()
+        self._previous_byte: int | None = None
+
+    def feed(self, chunk: bytes, *, final: bool = False) -> bytes:
+        if not isinstance(chunk, bytes):
+            raise SecretDetectionError("secret detection failed closed")
+        self._pending.extend(chunk)
+        data = bytes(self._pending)
+        output = bytearray()
+        index = 0
+        while index < len(data):
+            previous = data[index - 1] if index else self._previous_byte
+            candidate = None
+            if previous is None or previous not in _ASCII_WORD_BYTES:
+                candidate = self._candidate(data, index, final=final)
+            if candidate == "incomplete":
+                self._previous_byte = data[index - 1] if index else self._previous_byte
+                self._pending = bytearray(data[index:])
+                if len(self._pending) > _MAX_PENDING_SECRET_MATCH_BYTES:
+                    raise SecretDetectionError("secret detection failed closed")
+                return bytes(output)
+            if candidate is not None:
+                keyword_end, separator_index, secret_start, secret_end = candidate
+                output.extend(data[index:keyword_end])
+                output.extend(data[separator_index : separator_index + 1])
+                output.extend(
+                    self._replace(
+                        data[index:keyword_end],
+                        data[separator_index : separator_index + 1],
+                        data[secret_start:secret_end],
+                    )
+                )
+                index = secret_end
+                continue
+            output.append(data[index])
+            index += 1
+        if data:
+            self._previous_byte = data[-1]
+        self._pending.clear()
+        return bytes(output)
+
+    @staticmethod
+    def _candidate(
+        data: bytes,
+        index: int,
+        *,
+        final: bool,
+    ) -> tuple[int, int, int, int] | Literal["incomplete"] | None:
+        keyword: bytes | None = None
+        for possible in _SECRET_KEYWORDS:
+            candidate = data[index : index + len(possible)].lower()
+            if len(candidate) < len(possible) and possible.startswith(candidate):
+                return None if final else "incomplete"
+            if candidate == possible:
+                keyword = possible
+                break
+        if keyword is None:
+            return None
+        keyword_end = index + len(keyword)
+        cursor = keyword_end
+        while cursor < len(data) and data[cursor] in _SECRET_WHITESPACE:
+            cursor += 1
+        if cursor == len(data):
+            return None if final else "incomplete"
+        if data[cursor] not in b":=":
+            return None
+        separator_index = cursor
+        cursor += 1
+        while cursor < len(data) and data[cursor] in _SECRET_WHITESPACE:
+            cursor += 1
+        if cursor == len(data):
+            return None if final else "incomplete"
+        secret_start = cursor
+        while cursor < len(data) and data[cursor] not in _SECRET_TERMINATORS:
+            cursor += 1
+        if cursor == len(data) and not final:
+            return "incomplete"
+        if cursor == secret_start:
+            return None
+        return keyword_end, separator_index, secret_start, cursor
 
 
 class SecureIngestor:
@@ -48,39 +149,20 @@ class SecureIngestor:
         try:
             raw = self._quarantine.resume(reference, now=now)
             detections: list[SecretDiscoveryReference] = []
-
-            def redact(match: re.Match[bytes]) -> bytes:
-                credential_type = match.group(1).decode("ascii").lower().replace("-", "_")
-                secret = self._secrets.create(
-                    mission_id=reference.mission_id,
-                    secret_value=match.group(3),
-                    credential_type=credential_type,
-                    associated_principal_ref=None,
-                    source_execution_id=reference.execution_id,
-                    created_at=now,
-                )
-                detections.append(
-                    SecretDiscoveryReference(
-                        secret_reference_id=secret.secret_reference_id,
-                        credential_type=secret.credential_type,
-                        associated_principal_ref=secret.associated_principal_ref,
-                        source_execution_id=reference.execution_id,
-                        verification_state=secret.verification_state,
-                    )
-                )
-                return match.group(1) + match.group(2) + b"[REDACTED]"
-
-            try:
-                redacted = _SECRET_PATTERN.sub(redact, raw)
-            except (UnicodeError, ValueError) as exc:
-                del exc
-                raise SecretDetectionError("secret detection failed closed") from None
+            redacted = self._redact(
+                raw,
+                mission_id=reference.mission_id,
+                source_execution_id=reference.execution_id,
+                detections=detections,
+                now=now,
+            )
             redacted_reference = self._artifacts.put(
                 mission_id=reference.mission_id,
                 content=redacted,
                 media_type="application/octet-stream",
                 classification="sensitive" if detections else "normal",
                 variant="redacted",
+                source_execution_id=reference.execution_id,
                 created_at=now,
                 derived_from_artifact_id=None,
             )
@@ -93,42 +175,207 @@ class SecureIngestor:
                         media_type="application/octet-stream",
                         classification="secret",
                         variant="encrypted_raw",
+                        source_execution_id=reference.execution_id,
                         created_at=now,
                         derived_from_artifact_id=redacted_reference.artifact_id,
                     ),
                 )
-            ingestion_id = stable_id(
-                "secureingestion",
-                {
-                    "quarantine_id": reference.quarantine_id,
-                    "quarantine_sha256": reference.sha256,
-                    "rule_version": self._rule_version,
-                },
+            result = self._result(
+                quarantine_id=reference.quarantine_id,
+                quarantine_digest=reference.sha256,
+                redacted_reference=redacted_reference,
+                encrypted_raw=encrypted_raw,
+                detections=detections,
             )
-            redaction_metadata = RedactionMetadata(
-                rule_version=self._rule_version,
-                redaction_count=len(detections),
-                secret_detection_count=len(detections),
-            )
-            digest_payload = {
-                "ingestion_id": ingestion_id,
-                "redacted_artifacts": (redacted_reference,),
-                "encrypted_raw_artifacts": encrypted_raw,
-                "detected_secrets": tuple(detections),
-                "redaction_metadata": redaction_metadata,
-            }
-            result = SecureIngestionResult(
-                ingestion_id=ingestion_id,
-                ingestion_digest=sha256_digest(digest_payload),
-                redacted_artifacts=(redacted_reference,),
-                encrypted_raw_artifacts=encrypted_raw,
-                detected_secrets=tuple(detections),
-                redaction_metadata=redaction_metadata,
-            )
-            self._quarantine.delete(reference)
+            self._quarantine.delete(reference, now=now)
             return result
         except SecureIngestionError:
             raise
         except Exception as exc:
             del exc
             raise SecureIngestionError("secure ingestion failed closed") from None
+
+    async def ingest_stream(
+        self,
+        sink: EncryptedRawResultSink,
+        receipt: RawResultReceipt,
+        *,
+        now: datetime,
+        retain_encrypted_raw: bool = False,
+    ) -> SecureIngestionResult:
+        """Decrypt and redact one committed quarantine stream with bounded raw memory."""
+
+        try:
+            if retain_encrypted_raw:
+                raise SecureIngestionError(
+                    "chunked encrypted-raw retention is not configured"
+                )
+            detections: list[SecretDiscoveryReference] = []
+
+            def replace(keyword: bytes, separator: bytes, secret_value: bytes) -> bytes:
+                del separator
+                self._record_detection(
+                    keyword=keyword,
+                    secret_value=secret_value,
+                    mission_id=sink.binding.mission_id,
+                    source_execution_id=receipt.execution_id,
+                    detections=detections,
+                    now=now,
+                )
+                return b"[REDACTED]"
+
+            redactor = _StreamingSecretRedactor(replace)
+            redacted_parts: list[bytes] = []
+            async for chunk in sink._iter_committed_chunks(receipt, now=now):
+                redacted_parts.append(redactor.feed(chunk))
+            redacted_parts.append(redactor.feed(b"", final=True))
+            redacted = b"".join(redacted_parts)
+            redacted_reference = self._artifacts.put(
+                mission_id=sink.binding.mission_id,
+                content=redacted,
+                media_type="application/octet-stream",
+                classification="sensitive" if detections else "normal",
+                variant="redacted",
+                source_execution_id=receipt.execution_id,
+                created_at=now,
+                derived_from_artifact_id=None,
+            )
+            result = self._result(
+                quarantine_id=receipt.quarantine_id,
+                quarantine_digest=receipt.ciphertext_digest,
+                redacted_reference=redacted_reference,
+                encrypted_raw=(),
+                detections=detections,
+            )
+            sink._delete_committed(now=now)
+            return result
+        except SecureIngestionError:
+            raise
+        except Exception as exc:
+            del exc
+            raise SecureIngestionError("secure ingestion failed closed") from None
+
+    def _redact(
+        self,
+        raw: bytes,
+        *,
+        mission_id: str,
+        source_execution_id: str,
+        detections: list[SecretDiscoveryReference],
+        now: datetime,
+    ) -> bytes:
+        def replace(match: re.Match[bytes]) -> bytes:
+            self._record_detection(
+                keyword=match.group(1),
+                secret_value=match.group(3),
+                mission_id=mission_id,
+                source_execution_id=source_execution_id,
+                detections=detections,
+                now=now,
+            )
+            return match.group(1) + match.group(2) + b"[REDACTED]"
+
+        try:
+            return _SECRET_PATTERN.sub(replace, raw)
+        except (UnicodeError, ValueError) as exc:
+            del exc
+            raise SecretDetectionError("secret detection failed closed") from None
+
+    def _record_detection(
+        self,
+        *,
+        keyword: bytes,
+        secret_value: bytes,
+        mission_id: str,
+        source_execution_id: str,
+        detections: list[SecretDiscoveryReference],
+        now: datetime,
+    ) -> None:
+        credential_type = keyword.decode("ascii").lower().replace("-", "_")
+        secret = self._secrets.create(
+            mission_id=mission_id,
+            secret_value=secret_value,
+            credential_type=credential_type,
+            associated_principal_ref=None,
+            source_execution_id=source_execution_id,
+            created_at=now,
+        )
+        detections.append(
+            SecretDiscoveryReference(
+                secret_reference_id=secret.secret_reference_id,
+                credential_type=secret.credential_type,
+                associated_principal_ref=secret.associated_principal_ref,
+                source_execution_id=source_execution_id,
+                verification_state=secret.verification_state,
+            )
+        )
+
+    def _result(
+        self,
+        *,
+        quarantine_id: str,
+        quarantine_digest: str,
+        redacted_reference: ArtifactReference,
+        encrypted_raw: tuple[ArtifactReference, ...],
+        detections: list[SecretDiscoveryReference],
+    ) -> SecureIngestionResult:
+        ingestion_id = stable_id(
+            "secureingestion",
+            {
+                "quarantine_id": quarantine_id,
+                "quarantine_sha256": quarantine_digest,
+                "rule_version": self._rule_version,
+            },
+        )
+        redaction_metadata = RedactionMetadata(
+            rule_version=self._rule_version,
+            redaction_count=len(detections),
+            secret_detection_count=len(detections),
+        )
+        digest_payload = {
+            "ingestion_id": ingestion_id,
+            "redacted_artifacts": (redacted_reference,),
+            "encrypted_raw_artifacts": encrypted_raw,
+            "detected_secrets": tuple(detections),
+            "redaction_metadata": redaction_metadata,
+        }
+        return SecureIngestionResult(
+            ingestion_id=ingestion_id,
+            ingestion_digest=sha256_digest(digest_payload),
+            redacted_artifacts=(redacted_reference,),
+            encrypted_raw_artifacts=encrypted_raw,
+            detected_secrets=tuple(detections),
+            redaction_metadata=redaction_metadata,
+        )
+
+
+class EncryptedSecureResultIngester:
+    """Executor ingestion adapter that resolves only the receipt-bound durable sink."""
+
+    def __init__(
+        self,
+        *,
+        ingestor: SecureIngestor,
+        sinks: EncryptedRawResultSinkFactory,
+        clock: Callable[[], datetime],
+        retain_encrypted_raw: bool = False,
+    ) -> None:
+        self._ingestor = ingestor
+        self._sinks = sinks
+        self._clock = clock
+        self._retain_encrypted_raw = retain_encrypted_raw
+
+    async def ingest(self, receipt: RawResultReceipt) -> SecureIngestionSummary:
+        sink = self._sinks.for_execution(receipt.execution_id)
+        result = await self._ingestor.ingest_stream(
+            sink,
+            receipt,
+            now=self._clock(),
+            retain_encrypted_raw=self._retain_encrypted_raw,
+        )
+        return SecureIngestionSummary(
+            secure_ingestion_id=result.ingestion_id,
+            redacted_artifact_references=tuple(
+                artifact.artifact_id for artifact in result.redacted_artifacts
+            ),
+        )

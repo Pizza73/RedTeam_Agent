@@ -3,13 +3,114 @@
 from __future__ import annotations
 
 import hmac
+import secrets
 from datetime import datetime
 from threading import RLock
+from typing import Literal, Protocol
+
+from pydantic import Field, model_validator
 
 from redteam_agent.canonical import CanonicalJsonObject, sha256_digest
 from redteam_agent.errors import AuditIntegrityError, AuditSequenceConflictError
+from redteam_agent.models.base import StrictImmutableBoundaryModel
 
 from .models import AuditEvent
+
+AuditResourceType = Literal[
+    "artifact",
+    "secret_reference",
+    "raw_result_quarantine",
+]
+AuditOperation = Literal[
+    "create",
+    "write_chunk",
+    "commit",
+    "abort",
+    "resume",
+    "read",
+    "export",
+    "resolve",
+    "revoke",
+    "delete",
+]
+
+
+class AuditReferencePayload(StrictImmutableBoundaryModel):
+    """Reference-only audit payload; arbitrary values and raw content are impossible."""
+
+    resource_type: AuditResourceType
+    resource_id: str = Field(min_length=1)
+    operation: AuditOperation
+    metadata_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def reference_id_matches_type(self) -> AuditReferencePayload:
+        prefixes = {
+            "artifact": "artifact_",
+            "secret_reference": "secret_",
+            "raw_result_quarantine": "quarantine_",
+        }
+        if not self.resource_id.startswith(prefixes[self.resource_type]):
+            raise ValueError("audit resource must be an internal reference ID")
+        suffix = self.resource_id.removeprefix(prefixes[self.resource_type])
+        if len(suffix) != 32 or any(character not in "0123456789abcdef" for character in suffix):
+            raise ValueError("audit resource reference ID is malformed")
+        return self
+
+
+class AuditContext(StrictImmutableBoundaryModel):
+    mission_revision: int = Field(ge=1)
+    authorization_epoch: int = Field(ge=0)
+
+
+class AuditContextResolver(Protocol):
+    def current_context(self, mission_id: str, *, now: datetime) -> AuditContext: ...
+
+
+class DataStoreAuditRecorder(Protocol):
+    def record(
+        self,
+        *,
+        mission_id: str,
+        resource_type: AuditResourceType,
+        resource_id: str,
+        operation: AuditOperation,
+        metadata_digest: str,
+        occurred_at: datetime,
+    ) -> AuditEvent: ...
+
+
+class MissionAuditRecorder:
+    """Resolves current mission authority before appending a typed store event."""
+
+    def __init__(self, *, audit_log: MissionAuditLog, contexts: AuditContextResolver) -> None:
+        self._audit_log = audit_log
+        self._contexts = contexts
+
+    def record(
+        self,
+        *,
+        mission_id: str,
+        resource_type: AuditResourceType,
+        resource_id: str,
+        operation: AuditOperation,
+        metadata_digest: str,
+        occurred_at: datetime,
+    ) -> AuditEvent:
+        context = self._contexts.current_context(mission_id, now=occurred_at)
+        payload = AuditReferencePayload(
+            resource_type=resource_type,
+            resource_id=resource_id,
+            operation=operation,
+            metadata_digest=metadata_digest,
+        )
+        return self._audit_log.append(
+            mission_id=mission_id,
+            mission_revision=context.mission_revision,
+            authorization_epoch=context.authorization_epoch,
+            payload=payload,
+            occurred_at=occurred_at,
+        )
 
 
 class MissionAuditLog:
@@ -24,30 +125,17 @@ class MissionAuditLog:
     def append(
         self,
         *,
-        event_id: str,
         mission_id: str,
         mission_revision: int,
         authorization_epoch: int,
-        event_type: str,
-        canonical_payload: CanonicalJsonObject,
+        payload: AuditReferencePayload,
         occurred_at: datetime,
         expected_sequence_number: int | None = None,
     ) -> AuditEvent:
-        self._validate_payload(canonical_payload)
+        canonical_payload = CanonicalJsonObject(payload.model_dump(mode="python"))
         with self._lock:
-            existing = self._event_ids.get(event_id)
-            if existing is not None:
-                if self._matches_request(
-                    existing,
-                    mission_id=mission_id,
-                    mission_revision=mission_revision,
-                    authorization_epoch=authorization_epoch,
-                    event_type=event_type,
-                    canonical_payload=canonical_payload,
-                    occurred_at=occurred_at,
-                ):
-                    return existing
-                raise AuditSequenceConflictError("audit event identifier was reused")
+            event_id = "auditevent_" + secrets.token_hex(16)
+            event_type = f"{payload.resource_type}.{payload.operation}"
             mission_events = self._events.setdefault(mission_id, [])
             sequence = len(mission_events) + 1
             if expected_sequence_number is not None and expected_sequence_number != sequence:
@@ -127,33 +215,6 @@ class MissionAuditLog:
         return candidates
 
     @staticmethod
-    def _validate_payload(payload: CanonicalJsonObject) -> None:
-        forbidden = {
-            "body",
-            "ciphertext",
-            "content",
-            "password",
-            "raw_stderr",
-            "raw_stdout",
-            "raw_tool_output",
-            "secret",
-            "secret_value",
-            "token",
-        }
-
-        def inspect(value: object) -> None:
-            if isinstance(value, dict):
-                for key, item in value.items():
-                    if key.casefold() in forbidden:
-                        raise AuditIntegrityError("audit payload contains prohibited raw data")
-                    inspect(item)
-            elif isinstance(value, list):
-                for item in value:
-                    inspect(item)
-
-        inspect(payload.to_dict())
-
-    @staticmethod
     def _event_payload(
         *,
         event_id: str,
@@ -178,23 +239,3 @@ class MissionAuditLog:
             "canonical_payload": canonical_payload,
             "occurred_at": occurred_at,
         }
-
-    @staticmethod
-    def _matches_request(
-        event: AuditEvent,
-        *,
-        mission_id: str,
-        mission_revision: int,
-        authorization_epoch: int,
-        event_type: str,
-        canonical_payload: CanonicalJsonObject,
-        occurred_at: datetime,
-    ) -> bool:
-        return (
-            event.mission_id == mission_id
-            and event.mission_revision == mission_revision
-            and event.authorization_epoch == authorization_epoch
-            and event.event_type == event_type
-            and event.canonical_payload == canonical_payload
-            and event.occurred_at == occurred_at
-        )

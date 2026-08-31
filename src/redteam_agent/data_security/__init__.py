@@ -1,7 +1,14 @@
 """Phase 0C data-security and audit boundaries."""
 
-from .audit import MissionAuditLog
-from .ingestion import SecureIngestor
+from .audit import (
+    AuditContext,
+    AuditContextResolver,
+    AuditReferencePayload,
+    DataStoreAuditRecorder,
+    MissionAuditLog,
+    MissionAuditRecorder,
+)
+from .ingestion import EncryptedSecureResultIngester, SecureIngestor
 from .keys import EncryptionKeyProvider, InMemoryEncryptionKeyProvider
 from .models import (
     ArtifactReference,
@@ -22,20 +29,36 @@ from .stores import (
     EncryptedRawResultQuarantine,
     SecretStore,
 )
+from .streaming import (
+    EncryptedRawResultSink,
+    EncryptedRawResultSinkFactory,
+    QuarantineStreamBinding,
+    QuarantineStreamBindingResolver,
+)
 
 __all__ = [
     "ArtifactReference",
     "ArtifactStore",
+    "AuditContext",
+    "AuditContextResolver",
     "AuditEvent",
+    "AuditReferencePayload",
     "DataAccessAuthorizer",
+    "DataStoreAuditRecorder",
     "EncryptedPayload",
     "EncryptedRawResultQuarantine",
+    "EncryptedRawResultSink",
+    "EncryptedRawResultSinkFactory",
+    "EncryptedSecureResultIngester",
     "EncryptionKeyProvider",
     "EncryptionMetadata",
     "InMemoryEncryptionKeyProvider",
     "KeyDomain",
     "MissionAuditLog",
+    "MissionAuditRecorder",
     "QuarantineReference",
+    "QuarantineStreamBinding",
+    "QuarantineStreamBindingResolver",
     "RedactionMetadata",
     "SandboxPolicy",
     "SandboxRequirement",

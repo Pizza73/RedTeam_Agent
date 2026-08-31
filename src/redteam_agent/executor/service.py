@@ -57,7 +57,7 @@ from .adapter import ExecutionAdapter, TrustedExecutionAdapterRegistry
 from .authorization_gate import authorize_execution
 from .finalization import FinalizationCoordinator
 from .ingestion import SecureResultIngester
-from .raw_results import MockRawResultSink, RawResultSink, RawResultSinkFactory
+from .raw_results import RawResultSink, RawResultSinkFactory
 
 
 @dataclass(frozen=True)
@@ -525,8 +525,7 @@ class Executor:
                 "adapter result metadata changed across collection attempts"
             )
         self.receipts.add(metadata.receipt)
-        if isinstance(sink, MockRawResultSink):
-            self.recovery.set_current(sink.recovery_metadata(updated_at=now))
+        self.recovery.set_current(sink.recovery_metadata(updated_at=now))
         if ingestion is None:
             provisional = ResultIngestionRecord(
                 ingestion_id=stable_id(
@@ -580,9 +579,8 @@ class Executor:
         sink: RawResultSink,
         now: datetime,
     ) -> None:
-        if isinstance(sink, MockRawResultSink):
-            sink.mark_recovery_required()
-            self.recovery.set_current(sink.recovery_metadata(updated_at=now))
+        sink.mark_recovery_required()
+        self.recovery.set_current(sink.recovery_metadata(updated_at=now))
         self.finalization_requester.pause_for_raw_result_failure(
             record.mission_id, now=now
         )
