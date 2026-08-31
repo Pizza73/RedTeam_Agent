@@ -379,27 +379,61 @@ jobs:
               }
             }
 
-            const requestPattern = /<!--\s*redteam-implementation-request\s*([\s\S]*?)-->/g;
-            const currentRequests = [];
-            const requestPhase = isBlockedCurrentPhase ? currentPhase : sourcePhase;
-            const requestConfig = plan.phases.find((item) => item.id === requestPhase);
-            for (const comment of comments) {
-              if (comment.user?.login !== 'github-actions[bot]') continue;
-              for (const match of (comment.body || '').matchAll(requestPattern)) {
-                const request = singleMarker(`<!-- redteam-implementation-request\n${match[1]}\n-->`, 'redteam-implementation-request');
-                if (
-                  exactKeys(request, ['schema_version', 'action', 'trigger', 'phase', 'head_sha', 'phase_prompt']) &&
-                  request.schema_version === '1.0' && request.action === 'IMPLEMENT_PHASE' &&
-                  request.phase === requestPhase && request.head_sha === expectedHeadSha &&
-                  request.phase_prompt === requestConfig?.prompt
-                ) currentRequests.push(JSON.stringify(request));
-              }
-            }
-            if (new Set(currentRequests).size !== 1) {
-              core.setFailed(
-                'Exactly one unique trusted current-phase implementation request is required.'
+            if (isBlockedCurrentPhase) {
+              const readyReference = authorization.ready_reference;
+              const readyComment = comments.find(
+                (item) => item.html_url === readyReference &&
+                  item.user?.login === 'github-actions[bot]'
               );
-              return;
+              let ready;
+              try {
+                ready = readyComment && singleMarker(
+                  readyComment.body, 'redteam-ready-for-review'
+                );
+              } catch (_) {
+                ready = null;
+              }
+              if (
+                typeof readyReference !== 'string' ||
+                !readyReference.startsWith(expectedPrPrefix) ||
+                !exactKeys(ready, ['schema_version', 'phase', 'head_sha']) ||
+                ready.schema_version !== '1.0' || ready.phase !== currentPhase ||
+                ready.head_sha !== expectedHeadSha
+              ) {
+                core.setFailed(
+                  'Blocked current Phase lacks trusted exact-HEAD ready evidence.'
+                );
+                return;
+              }
+            } else {
+              const requestPattern =
+                /<!--\s*redteam-implementation-request\s*([\s\S]*?)-->/g;
+              const currentRequests = [];
+              const requestConfig = plan.phases.find((item) => item.id === sourcePhase);
+              for (const comment of comments) {
+                if (comment.user?.login !== 'github-actions[bot]') continue;
+                for (const match of (comment.body || '').matchAll(requestPattern)) {
+                  const request = singleMarker(
+                    `<!-- redteam-implementation-request\n${match[1]}\n-->`,
+                    'redteam-implementation-request'
+                  );
+                  if (
+                    exactKeys(request, [
+                      'schema_version', 'action', 'trigger', 'phase', 'head_sha',
+                      'phase_prompt'
+                    ]) && request.schema_version === '1.0' &&
+                    request.action === 'IMPLEMENT_PHASE' &&
+                    request.phase === sourcePhase && request.head_sha === expectedHeadSha &&
+                    request.phase_prompt === requestConfig?.prompt
+                  ) currentRequests.push(JSON.stringify(request));
+                }
+              }
+              if (new Set(currentRequests).size !== 1) {
+                core.setFailed(
+                  'Exactly one unique trusted current-phase implementation request is required.'
+                );
+                return;
+              }
             }
 
             await github.rest.repos.createCommitStatus({
