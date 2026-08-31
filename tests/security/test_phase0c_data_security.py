@@ -287,6 +287,100 @@ def test_bearer_authorization_is_redacted_before_artifact_publication(
     assert bearer_secret not in visible
 
 
+def test_oauth_fields_are_redacted_across_stream_chunks(tmp_path: Path) -> None:
+    keys = _keys()
+    authorizer = _ExactEnvelopeAuthorizer()
+    authorizer.allow_ingestion_write("mission-oauth", "execution-oauth")
+    audit = MissionAuditRecorder(
+        audit_log=MissionAuditLog(),
+        contexts=_AuditContexts(),
+    )
+    quarantine = EncryptedRawResultQuarantine(
+        root=tmp_path / "oauth-quarantine",
+        keys=keys,
+        audit=audit,
+        max_item_bytes=4096,
+        mission_quota_bytes=16 * 1024,
+    )
+    binding = QuarantineStreamBinding(
+        mission_id="mission-oauth",
+        mission_revision=1,
+        execution_id="execution-oauth",
+        retention_until=NOW + timedelta(hours=1),
+        max_result_bytes=4096,
+        resume_mode="from_start",
+    )
+    factory = EncryptedRawResultSinkFactory(
+        quarantine=quarantine,
+        bindings=_StreamBindings(binding),
+        clock=lambda: NOW,
+    )
+    artifacts = ArtifactStore(
+        root=tmp_path / "oauth-artifacts",
+        keys=keys,
+        authorizer=authorizer,
+        audit=audit,
+        max_item_bytes=4096,
+        mission_quota_bytes=8192,
+    )
+    secrets = SecretStore(
+        root=tmp_path / "oauth-secrets",
+        keys=keys,
+        authorizer=authorizer,
+        audit=audit,
+        max_item_bytes=1024,
+        mission_quota_bytes=4096,
+    )
+
+    async def ingest_oauth_stream():
+        sink = factory.for_execution("execution-oauth")
+        await sink.write_stdout(b'{"access_')
+        await sink.write_stdout(b'token":"access-value","client')
+        await sink.write_stdout(b'Secret":"client-value","refresh_')
+        await sink.write_stdout(
+            b'token":"refresh-value","oauthToken":"oauth-value"}'
+        )
+        receipt = await sink.commit()
+        return await SecureIngestor(
+            quarantine=quarantine,
+            artifacts=artifacts,
+            secrets=secrets,
+        ).ingest_stream(sink, receipt, now=NOW)
+
+    result = asyncio.run(ingest_oauth_stream())
+    assert result.redaction_metadata.redaction_count == 4
+    assert result.redacted_artifacts[0].classification == "sensitive"
+    assert {item.credential_type for item in result.detected_secrets} == {
+        "access_token",
+        "clientsecret",
+        "refresh_token",
+        "oauthtoken",
+    }
+    artifact = result.redacted_artifacts[0]
+    authorizer.set_grants(
+        "mission-oauth",
+        (
+            DataAccessGrant(
+                resource_type="artifact",
+                resource=ResourceBinding(
+                    resource_id=artifact.artifact_id,
+                    resource_version="1",
+                    resource_digest=artifact.sha256,
+                ),
+                operations=frozenset({"read"}),
+            ),
+        ),
+    )
+    visible = artifacts.read(artifact, operation="read", now=NOW)
+    assert visible == (
+        b'{"access_token":"[REDACTED]","clientSecret":"[REDACTED]",'
+        b'"refresh_token":"[REDACTED]","oauthToken":"[REDACTED]"}'
+    )
+    for value in (b"access-value", b"client-value", b"refresh-value", b"oauth-value"):
+        assert value not in visible
+        assert value.decode() not in result.model_dump_json()
+
+
 def test_secret_resolution_requires_trusted_exact_mission_grant(tmp_path: Path) -> None:
     _, _, secrets, authorizer, audit_log = _stores(tmp_path)
     with pytest.raises(SecretAccessError):
@@ -1054,6 +1148,155 @@ def test_storage_rejects_traversal_symlink_quota_retention_and_corruption(
     assert all(
         raw_secret not in path.read_bytes() for path in tmp_path.rglob("*.json")
     )
+
+
+def test_artifact_expiry_is_audited_and_resumes_cryptographic_erasure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    keys = _keys()
+    authorizer = _ExactEnvelopeAuthorizer()
+    authorizer.allow_ingestion_write("mission-expiry", "execution-expiry")
+    audit_log = MissionAuditLog()
+    audit = MissionAuditRecorder(audit_log=audit_log, contexts=_AuditContexts())
+    artifact_root = tmp_path / "expiry-artifacts"
+    artifacts = ArtifactStore(
+        root=artifact_root,
+        keys=keys,
+        authorizer=authorizer,
+        audit=audit,
+        max_item_bytes=16 * 1024,
+        mission_quota_bytes=32 * 1024,
+    )
+
+    async def artifact_chunks():
+        yield b"A" * 4096
+        yield b"B" * 17
+
+    retention_until = NOW + timedelta(minutes=5)
+    reference = asyncio.run(
+        artifacts.put_stream(
+            mission_id="mission-expiry",
+            chunks=artifact_chunks(),
+            media_type="application/octet-stream",
+            classification=lambda: "normal",
+            variant="redacted",
+            source_execution_id="execution-expiry",
+            created_at=NOW,
+            retention_until=retention_until,
+        )
+    )
+    target_ids = artifacts._deletion_targets(reference)
+    target_envelopes = {
+        resource_id: artifacts._store.verified_envelope(
+            mission_id=reference.mission_id,
+            resource_id=resource_id,
+            now=None,
+        )
+        for resource_id in target_ids
+    }
+    target_snapshots = {
+        resource_id: artifacts._store._path(
+            reference.mission_id,
+            resource_id,
+            create_parent=False,
+        ).read_bytes()
+        for resource_id in target_ids
+    }
+
+    intent_path = artifacts._store._path(
+        reference.mission_id,
+        artifacts._deletion_intent_id(reference.artifact_id),
+        create_parent=False,
+    )
+    intent_path.symlink_to(tmp_path)
+    with pytest.raises(ArtifactSecurityError):
+        artifacts.expire(reference, now=retention_until)
+    intent_path.unlink()
+
+    with pytest.raises(ArtifactSecurityError):
+        artifacts.expire(reference, now=retention_until - timedelta(seconds=1))
+    with pytest.raises(SecretAccessError):
+        artifacts.expire(reference, now=retention_until)
+    assert all(
+        artifacts._store.has_resource(
+            mission_id=reference.mission_id,
+            resource_id=resource_id,
+        )
+        for resource_id in target_ids
+    )
+
+    authorizer.set_grants(
+        reference.mission_id,
+        (
+            DataAccessGrant(
+                resource_type="artifact",
+                resource=ResourceBinding(
+                    resource_id=reference.artifact_id,
+                    resource_version="1",
+                    resource_digest=reference.sha256,
+                ),
+                operations=frozenset({"write"}),
+            ),
+        ),
+    )
+    original_erase = artifacts._store.erase_resource
+    erase_calls = 0
+
+    def interrupt_erasure(*, mission_id: str, resource_id: str) -> None:
+        nonlocal erase_calls
+        original_erase(mission_id=mission_id, resource_id=resource_id)
+        erase_calls += 1
+        if erase_calls == 1:
+            raise ArtifactSecurityError("simulated artifact erasure interruption")
+
+    monkeypatch.setattr(artifacts._store, "erase_resource", interrupt_erasure)
+    with pytest.raises(ArtifactSecurityError):
+        artifacts.expire(reference, now=retention_until)
+
+    first_target = target_ids[0]
+    first_path = artifacts._store._path(
+        reference.mission_id,
+        first_target,
+        create_parent=False,
+    )
+    first_path.write_bytes(target_snapshots[first_target])
+    with pytest.raises(EncryptionKeyUnavailableError):
+        artifacts._store.read_bound(
+            mission_id=reference.mission_id,
+            resource_id=first_target,
+            now=None,
+        )
+
+    monkeypatch.setattr(artifacts._store, "erase_resource", original_erase)
+    restarted = ArtifactStore(
+        root=artifact_root,
+        keys=keys,
+        authorizer=authorizer,
+        audit=audit,
+        max_item_bytes=16 * 1024,
+        mission_quota_bytes=32 * 1024,
+    )
+    restarted.expire(reference, now=retention_until + timedelta(seconds=1))
+    restarted.expire(reference, now=retention_until + timedelta(seconds=2))
+    assert all(
+        not restarted._store.has_resource(
+            mission_id=reference.mission_id,
+            resource_id=resource_id,
+        )
+        for resource_id in target_ids
+    )
+    assert all(
+        restarted._store._keys.resource_key_destroyed(envelope.payload.metadata)
+        for envelope in target_envelopes.values()
+    )
+    assert len(
+        [
+            event
+            for event in audit_log.events_for(reference.mission_id)
+            if event.event_type == "artifact.delete"
+        ]
+    ) == 1
 
 
 def test_sqlite_audit_chain_persists_events_and_trusted_head(tmp_path: Path) -> None:

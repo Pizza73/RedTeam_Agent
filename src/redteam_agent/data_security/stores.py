@@ -136,6 +136,12 @@ class _ArtifactStreamManifest(StrictImmutableBoundaryModel):
     chunks: tuple[_ArtifactStreamChunkReference, ...]
 
 
+class _ArtifactDeletionIntent(StrictImmutableBoundaryModel):
+    record_type: Literal["artifact_delete_intent"]
+    reference: ArtifactReference
+    resource_ids: tuple[str, ...] = Field(min_length=1)
+
+
 class _EncryptedFileStore:
     def __init__(
         self,
@@ -1083,6 +1089,189 @@ class ArtifactStore:
             occurred_at=now,
         )
         return content
+
+    def expire(self, reference: ArtifactReference, *, now: datetime) -> None:
+        """Cryptographically erase an expired Artifact through a durable intent."""
+
+        _require_time(now)
+        intent_id = self._deletion_intent_id(reference.artifact_id)
+        intent_exists = self._store.has_resource(
+            mission_id=reference.mission_id,
+            resource_id=intent_id,
+        )
+        if intent_exists:
+            intent, intent_envelope = self._load_deletion_intent(
+                mission_id=reference.mission_id,
+                artifact_id=reference.artifact_id,
+            )
+            authoritative = intent.reference
+        else:
+            authoritative = self._stored_reference(
+                mission_id=reference.mission_id,
+                artifact_id=reference.artifact_id,
+                now=None,
+            )
+            intent = None
+            intent_envelope = None
+        if authoritative != reference:
+            raise DigestIntegrityError("artifact reference integrity failed")
+        if reference.retention_until is None or now < reference.retention_until:
+            raise ArtifactSecurityError("artifact retention has not expired")
+        self._reconcile_create_audit(authoritative)
+        self._authorizer.require_access(
+            mission_id=reference.mission_id,
+            resource_type="artifact",
+            resource=ResourceBinding(
+                resource_id=reference.artifact_id,
+                resource_version="1",
+                resource_digest=reference.sha256,
+            ),
+            operation="write",
+            now=now,
+        )
+        if intent is None:
+            intent = _ArtifactDeletionIntent(
+                record_type="artifact_delete_intent",
+                reference=reference,
+                resource_ids=self._deletion_targets(reference),
+            )
+            self._store.write(
+                mission_id=reference.mission_id,
+                resource_id=intent_id,
+                content=b"",
+                binding=intent.model_dump(mode="json"),
+                created_at=now,
+                retention_until=None,
+            )
+            intent, intent_envelope = self._load_deletion_intent(
+                mission_id=reference.mission_id,
+                artifact_id=reference.artifact_id,
+            )
+        if intent_envelope is None:
+            raise ArtifactSecurityError("artifact deletion intent is unavailable")
+        self._audit.record(
+            mission_id=reference.mission_id,
+            resource_type="artifact",
+            resource_id=reference.artifact_id,
+            operation="delete",
+            operation_id=stable_id(
+                "auditop",
+                {
+                    "schema_version": "artifact-expiry-audit-v1",
+                    "artifact_id": reference.artifact_id,
+                },
+            ),
+            metadata_digest=reference.sha256,
+            occurred_at=intent_envelope.created_at,
+        )
+        for resource_id in intent.resource_ids:
+            self._store.erase_resource(
+                mission_id=reference.mission_id,
+                resource_id=resource_id,
+            )
+
+    def _load_deletion_intent(
+        self,
+        *,
+        mission_id: str,
+        artifact_id: str,
+    ) -> tuple[_ArtifactDeletionIntent, _StoredEnvelope]:
+        raw, envelope = self._store.read_bound(
+            mission_id=mission_id,
+            resource_id=self._deletion_intent_id(artifact_id),
+            now=None,
+        )
+        if raw:
+            raise ArtifactSecurityError("artifact deletion intent content is invalid")
+        try:
+            intent = _ArtifactDeletionIntent.model_validate_json(
+                canonicalize(envelope.binding.to_dict()),
+                strict=True,
+            )
+        except ValueError as exc:
+            raise ArtifactSecurityError("artifact deletion intent is invalid") from exc
+        if not (
+            intent.reference.mission_id == mission_id
+            and intent.reference.artifact_id == artifact_id
+            and len(set(intent.resource_ids)) == len(intent.resource_ids)
+            and intent.resource_ids[-1] == artifact_id
+            and all(
+                resource_id == artifact_id
+                or resource_id.startswith("artifactchunk_")
+                for resource_id in intent.resource_ids
+            )
+        ):
+            raise ArtifactSecurityError("artifact deletion intent binding is invalid")
+        return intent, envelope
+
+    def _deletion_targets(self, reference: ArtifactReference) -> tuple[str, ...]:
+        envelope = self._store.verified_envelope(
+            mission_id=reference.mission_id,
+            resource_id=reference.artifact_id,
+            now=None,
+        )
+        if envelope.binding.to_dict().get("storage_format") != "artifact-stream-v1":
+            return (reference.artifact_id,)
+        raw, envelope = self._store.read_bound(
+            mission_id=reference.mission_id,
+            resource_id=reference.artifact_id,
+            now=None,
+        )
+        try:
+            canonical_loads(raw)
+            manifest = _ArtifactStreamManifest.model_validate_json(raw, strict=True)
+        except (TypeError, ValueError) as exc:
+            raise ArtifactSecurityError("artifact stream manifest is invalid") from exc
+        if not self._manifest_matches_reference(manifest, reference, envelope):
+            raise DigestIntegrityError("artifact stream manifest binding failed")
+        expected_offset = 0
+        resource_ids: list[str] = []
+        for expected_sequence, chunk in enumerate(manifest.chunks):
+            chunk_envelope = self._store.verified_envelope(
+                mission_id=reference.mission_id,
+                resource_id=chunk.resource_id,
+                now=None,
+            )
+            try:
+                binding = _ArtifactStreamChunkBinding.model_validate(
+                    chunk_envelope.binding.to_dict()
+                )
+            except ValueError as exc:
+                raise ArtifactSecurityError(
+                    "artifact stream chunk binding is invalid"
+                ) from exc
+            if not (
+                chunk.sequence_number == expected_sequence
+                and chunk.plaintext_offset == expected_offset
+                and binding.stream_id == manifest.stream_id
+                and binding.source_execution_id == manifest.source_execution_id
+                and binding.sequence_number == chunk.sequence_number
+                and binding.plaintext_offset == chunk.plaintext_offset
+                and binding.plaintext_size
+                == chunk.plaintext_size
+                == chunk_envelope.plaintext_size
+                and binding.plaintext_sha256
+                == chunk.plaintext_sha256
+                == chunk_envelope.plaintext_sha256
+                and chunk.encryption_metadata_id
+                == chunk_envelope.encryption_metadata_id
+            ):
+                raise DigestIntegrityError("artifact stream chunk integrity failed")
+            resource_ids.append(chunk.resource_id)
+            expected_offset += chunk.plaintext_size
+        if expected_offset != reference.size_bytes:
+            raise DigestIntegrityError("artifact stream aggregate integrity failed")
+        return (*resource_ids, reference.artifact_id)
+
+    @staticmethod
+    def _deletion_intent_id(artifact_id: str) -> str:
+        return stable_id(
+            "artifactdeletion",
+            {
+                "schema_version": "artifact-deletion-intent-v1",
+                "artifact_id": artifact_id,
+            },
+        )
 
     def _read_stream(self, reference: ArtifactReference, *, now: datetime) -> bytes:
         raw, envelope = self._store.read_bound(

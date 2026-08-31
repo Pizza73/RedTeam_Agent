@@ -4,11 +4,11 @@
 
 - Current phase: `Phase 0C: Data Security and Audit`
 - Input review SHA: `6b55fe9ba6cf0453e8c8ba33af3a3a9368944df5`
-- Latest correction input SHA: `0b9ce88d297179a765ad94f27ebb91eba3429890`
+- Latest correction input SHA: `68a47875eb5b77ea2ab5d2ee0570f57d7706f867`
 - Trusted Phase 0B base PASS SHA: `5cda9a5f8792ee33c3e153d8e791499f5619d82e`
 - Implementation branch: `ai/redteam-agent-phase-loop`
 - Independent-review result: `CHANGES_REQUESTED`
-- Latest finding key: `CODEX-P1-344F930A8CCE7B53`
+- Latest finding key: `CODEX-P1-0B4FA62084F27547`
 - External provider, C2, MCP side effect, local attack, and external-target execution: absent
 
 ## Resulting working-tree diff
@@ -151,6 +151,21 @@ under `CODEX-P1-344F930A8CCE7B53`. The exact-SHA Human Resume covers both findin
   record binding before returning revoked metadata, so interruption before resource-key destruction
   cannot leave the secret indefinitely decryptable.
 
+## Fifth independent review correction cycle
+
+The review for exact HEAD `68a47875eb5b77ea2ab5d2ee0570f57d7706f867` recorded two P1 findings
+under `CODEX-P1-0B4FA62084F27547`. The exact-SHA Human Resume covers both findings:
+
+- [`discussion_r3895271557`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3895271557):
+  the bounded detector now recognizes `access_token`, `refresh_token`, `client_secret`, and
+  `oauth_token` with underscore, hyphen, and separator-free camelCase-normalized spellings.
+  Cross-chunk JSON values become Secret references and only redaction markers reach the Artifact.
+- [`discussion_r3895271565`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3895271565):
+  `ArtifactStore.expire()` verifies an authoritative exact reference, requires current trusted
+  write authorization, and persists an authenticated reference-only deletion intent before an
+  idempotent delete audit and resource-key destruction. Stream chunks are erased before the
+  manifest; symlinked intent paths fail closed, and restart or repeated calls resume safely.
+
 ## Regression tests added
 
 The existing Phase 0C security test module now additionally covers:
@@ -183,7 +198,12 @@ The existing Phase 0C security test module now additionally covers:
 - Bearer authorization detection, sensitive classification, reference-only storage, and exact
   credential-value redaction before Artifact publication; and
 - retry after interruption between durable secret revocation and encrypted-record deletion,
-  including confirmation that the original resource key is destroyed.
+  including confirmation that the original resource key is destroyed;
+- OAuth credential keys split across encrypted stream chunks, with sensitive classification,
+  reference-only results, and exact redacted Artifact output; and
+- Artifact expiry before retention and without write authority rejection, deletion-intent symlink
+  rejection, interrupted erasure, process reconstruction, idempotent audit, and restored-ciphertext
+  failure after per-resource key destruction.
 
 No test was removed, weakened, skipped, or marked as an expected failure.
 
@@ -203,8 +223,8 @@ ruff: All checks passed
 mypy: Success: no issues found in 78 source files
 unit: 186 passed
 integration: 7 passed
-security: 153 passed
-full/coverage run: 346 passed
+security: 155 passed
+full/coverage run: 348 passed
 skipped=0, errors=0, failures=0
 coverage: 82% total (branch coverage enabled)
 pip check: No broken requirements found
@@ -220,8 +240,8 @@ PATH="$PWD/.venv/bin:$PATH" python -m pytest -q \
   tests/security/test_phase0c_data_security.py
 ```
 
-Latest focused Phase 0C security result: `9 passed`. The two new targeted regressions pass with
-`2 passed, 7 deselected`.
+Latest focused Phase 0C security result: `11 passed`. The two new targeted regressions pass with
+`2 passed, 9 deselected`.
 
 ## Remaining constraints
 

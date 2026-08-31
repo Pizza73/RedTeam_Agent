@@ -21,6 +21,18 @@ from .stores import ArtifactStore, EncryptedRawResultQuarantine, SecretStore
 from .streaming import EncryptedRawResultSink, EncryptedRawResultSinkFactory
 
 _SECRET_KEYWORDS = (
+    b"access_token",
+    b"access-token",
+    b"accesstoken",
+    b"refresh_token",
+    b"refresh-token",
+    b"refreshtoken",
+    b"client_secret",
+    b"client-secret",
+    b"clientsecret",
+    b"oauth_token",
+    b"oauth-token",
+    b"oauthtoken",
     b"password",
     b"passwd",
     b"token",
