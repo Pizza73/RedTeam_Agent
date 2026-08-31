@@ -112,7 +112,7 @@ class MissionManager:
         """Fail closed after secure ingestion fails, including repeated recovery attempts."""
 
         mission = self.current(mission_id)
-        if mission.state == "PAUSED":
+        if mission.state in {"PAUSED", "FINALIZING"}:
             return mission
         if mission.state != "RUNNING":
             raise MissionLifecycleAuthorizationError(
@@ -124,7 +124,7 @@ class MissionManager:
         """Fail closed when quarantine or streaming cannot safely continue."""
 
         mission = self.current(mission_id)
-        if mission.state == "PAUSED":
+        if mission.state in {"PAUSED", "FINALIZING"}:
             return mission
         if mission.state != "RUNNING":
             raise MissionLifecycleAuthorizationError(

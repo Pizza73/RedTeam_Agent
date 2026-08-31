@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Protocol
+from typing import Literal, Protocol
 
 from redteam_agent.authorization_runtime import AuthorizationRuntimeContextResolver
 from redteam_agent.canonical import digest_model, sha256_digest, stable_id
@@ -59,10 +60,29 @@ from .ingestion import SecureResultIngester
 from .raw_results import MockRawResultSink, RawResultSink, RawResultSinkFactory
 
 
+@dataclass(frozen=True)
+class SessionFreshnessObservation:
+    """Trusted live session status kept separate from security-context digests."""
+
+    status: Literal["active", "inactive", "lost"]
+    last_seen: datetime
+    stale_after: datetime
+
+    def is_fresh_at(self, now: datetime) -> bool:
+        return (
+            self.status == "active"
+            and self.last_seen <= now
+            and self.last_seen < self.stale_after
+            and now < self.stale_after
+        )
+
+
 class PreDispatchCapabilityProbe(Protocol):
     """Trusted live capability observation used immediately before provider submit."""
 
     async def session_security_context_digest(self) -> str: ...
+
+    async def session_freshness(self) -> SessionFreshnessObservation: ...
 
     async def sandbox_capabilities_digest(self, adapter_id: str) -> str: ...
 
@@ -76,15 +96,26 @@ class StaticPreDispatchCapabilityProbe:
         self,
         *,
         session_digest: str,
+        session_status: Literal["active", "inactive", "lost"],
+        session_last_seen: datetime,
+        session_stale_after: datetime,
         sandbox_digest: str,
         remote_trust_digest: str,
     ) -> None:
         self._session_digest = session_digest
+        self._session_freshness = SessionFreshnessObservation(
+            status=session_status,
+            last_seen=session_last_seen,
+            stale_after=session_stale_after,
+        )
         self._sandbox_digest = sandbox_digest
         self._remote_trust_digest = remote_trust_digest
 
     async def session_security_context_digest(self) -> str:
         return self._session_digest
+
+    async def session_freshness(self) -> SessionFreshnessObservation:
+        return self._session_freshness
 
     async def sandbox_capabilities_digest(self, adapter_id: str) -> str:
         del adapter_id
@@ -428,6 +459,20 @@ class Executor:
             "CANCELLED",
         } or record.provider_task_id is None:
             raise ExecutionStateTransitionError("execution has no confirmed provider result task")
+        collection_lease_id = stable_id(
+            "lease",
+            {
+                "schema_version": "result-collection-lease-v1",
+                "execution_id": record.execution_id,
+                "requested_at": now,
+            },
+        )
+        self.executions.acquire_result_collection_claim(
+            record.execution_id,
+            lease_id=collection_lease_id,
+            lease_expires_at=now + timedelta(minutes=1),
+            now=now,
+        )
         sink = self.sink_factory.for_execution(record.execution_id)
         try:
             metadata = await adapter.collect_result(record.provider_task_id, sink)
@@ -506,6 +551,10 @@ class Executor:
                 update={"ingestion_digest": ingestion_record_digest(provisional)}
             )
             self.ingestions.add_pending(ingestion)
+        self.executions.release_result_collection_claim(
+            record.execution_id,
+            lease_id=collection_lease_id,
+        )
         if current.provider_execution_state in {"RUNNING"}:
             current = self.executions.transition_provider(
                 current.execution_id,
@@ -531,12 +580,12 @@ class Executor:
         sink: RawResultSink,
         now: datetime,
     ) -> None:
-        self.finalization_requester.pause_for_raw_result_failure(
-            record.mission_id, now=now
-        )
         if isinstance(sink, MockRawResultSink):
             sink.mark_recovery_required()
             self.recovery.set_current(sink.recovery_metadata(updated_at=now))
+        self.finalization_requester.pause_for_raw_result_failure(
+            record.mission_id, now=now
+        )
 
     async def ingest_result(
         self,
@@ -619,21 +668,22 @@ class Executor:
         try:
             summary = await ingester.ingest(adapter_result.receipt)
         except ResultIngestionError:
+            with self.executions.database.transaction(immediate=True):
+                self.ingestions.transition(
+                    active.ingestion_id,
+                    expected_state_version=active.state_version,
+                    status="FAILED",
+                    failure_code="SECURE_INGESTION_FAILED",
+                    now=now,
+                )
+                self.executions.transition_ingestion(
+                    record.execution_id,
+                    expected_state_version=record.state_version,
+                    new_state="FAILED",
+                    now=now,
+                )
             self.finalization_requester.pause_for_result_ingestion_failure(
                 record.mission_id, now=now
-            )
-            self.ingestions.transition(
-                active.ingestion_id,
-                expected_state_version=active.state_version,
-                status="FAILED",
-                failure_code="SECURE_INGESTION_FAILED",
-                now=now,
-            )
-            self.executions.transition_ingestion(
-                record.execution_id,
-                expected_state_version=record.state_version,
-                new_state="FAILED",
-                now=now,
             )
             raise
         result = self._normalize_result(record, adapter_result, summary)
@@ -761,6 +811,8 @@ class Executor:
             await self.capability_probe.session_security_context_digest()
             != runtime.session_snapshot.snapshot_digest
         ):
+            return "SESSION_STALE"
+        if not (await self.capability_probe.session_freshness()).is_fresh_at(now):
             return "SESSION_STALE"
         if (
             await self.capability_probe.sandbox_capabilities_digest(

@@ -84,6 +84,9 @@ def build_execution_harness(*, approval_rule: str = "policy") -> ExecutionHarnes
     )
     capability_probe = StaticPreDispatchCapabilityProbe(
         session_digest=environment.session_snapshot.snapshot_digest,
+        session_status="active",
+        session_last_seen=FIXED_TIME + timedelta(minutes=2),
+        session_stale_after=FIXED_TIME + timedelta(minutes=30),
         sandbox_digest=environment.sandbox_snapshot.snapshot_digest,
         remote_trust_digest=environment.remote_snapshot.snapshot_digest,
     )

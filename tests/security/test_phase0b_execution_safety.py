@@ -386,6 +386,9 @@ def test_live_sandbox_capability_mismatch_blocks_before_provider() -> None:
     prepared = prepare_execution(harness)
     harness.executor.capability_probe = StaticPreDispatchCapabilityProbe(
         session_digest=harness.environment.session_snapshot.snapshot_digest,
+        session_status="active",
+        session_last_seen=FIXED_TIME + timedelta(minutes=2),
+        session_stale_after=FIXED_TIME + timedelta(minutes=30),
         sandbox_digest="sha256:stale-live-sandbox",
         remote_trust_digest=harness.environment.remote_snapshot.snapshot_digest,
     )
@@ -1011,6 +1014,126 @@ def test_expired_ingestion_lease_is_taken_over_without_action_resubmit() -> None
     assert recovered.attempt_count == 2
     assert result.secure_ingestion_id == "lease-recovered"
     assert harness.adapter.submit_calls == 1
+
+
+def test_stale_session_observation_blocks_before_provider_submit() -> None:
+    harness = build_execution_harness()
+    prepared = prepare_execution(harness)
+    harness.executor.capability_probe = StaticPreDispatchCapabilityProbe(
+        session_digest=harness.environment.session_snapshot.snapshot_digest,
+        session_status="active",
+        session_last_seen=FIXED_TIME,
+        session_stale_after=FIXED_TIME + timedelta(minutes=2),
+        sandbox_digest=harness.environment.sandbox_snapshot.snapshot_digest,
+        remote_trust_digest=harness.environment.remote_snapshot.snapshot_digest,
+    )
+
+    blocked = asyncio.run(
+        harness.executor.dispatch(
+            prepared.execution_id,
+            now=FIXED_TIME + timedelta(minutes=3),
+        )
+    )
+
+    assert blocked.provider_execution_state == "BLOCKED"
+    assert blocked.pre_dispatch_block_reason == "SESSION_STALE"
+    assert harness.adapter.submit_calls == 0
+
+
+def test_duplicate_active_result_collectors_are_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = build_execution_harness()
+    prepared = prepare_execution(harness)
+    running = asyncio.run(
+        harness.executor.dispatch(
+            prepared.execution_id,
+            now=FIXED_TIME + timedelta(minutes=3),
+        )
+    )
+
+    async def collect_concurrently() -> None:
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        original_collect = harness.adapter.collect_result
+
+        async def wait_during_collection(
+            task_id: str,
+            sink: RawResultSink,
+        ) -> AdapterRawResult:
+            entered.set()
+            await release.wait()
+            return await original_collect(task_id, sink)
+
+        monkeypatch.setattr(
+            harness.adapter,
+            "collect_result",
+            wait_during_collection,
+        )
+        first = asyncio.create_task(
+            harness.executor.collect_result(
+                running.execution_id,
+                now=FIXED_TIME + timedelta(minutes=4),
+            )
+        )
+        await entered.wait()
+        try:
+            with pytest.raises(
+                ResultIngestionLeaseError,
+                match="result-collection lease is still active",
+            ):
+                await harness.executor.collect_result(
+                    running.execution_id,
+                    now=FIXED_TIME + timedelta(minutes=4),
+                )
+        finally:
+            release.set()
+        await first
+
+    asyncio.run(collect_concurrently())
+
+    assert harness.adapter.collect_calls == 1
+    assert harness.receipts.get_by_execution(running.execution_id) is not None
+    assert harness.ingestions.get_by_execution(running.execution_id) is not None
+    assert harness.database.connection.execute(
+        "SELECT COUNT(*) FROM result_collection_claims"
+    ).fetchone()[0] == 0
+
+
+def test_ingestion_failure_is_preserved_while_mission_is_finalizing() -> None:
+    harness = build_execution_harness()
+    prepared = prepare_execution(harness)
+    running = asyncio.run(
+        harness.executor.dispatch(
+            prepared.execution_id,
+            now=FIXED_TIME + timedelta(minutes=3),
+        )
+    )
+    finalizing = harness.finalization.begin_for_goal(
+        running.mission_id,
+        now=FIXED_TIME + timedelta(minutes=3, seconds=30),
+    )
+    assert finalizing.state == "FINALIZING"
+    ingester = MockSecureResultIngester(
+        summary=SecureIngestionSummary(secure_ingestion_id="must-not-succeed"),
+        fail=True,
+    )
+
+    with pytest.raises(ResultIngestionError):
+        asyncio.run(
+            harness.executor.ingest_result(
+                running.execution_id,
+                ingester=ingester,
+                now=FIXED_TIME + timedelta(minutes=4),
+            )
+        )
+
+    ingestion = harness.ingestions.get_by_execution(running.execution_id)
+    execution = harness.executions.get(running.execution_id)
+    mission = harness.finalization.missions.current(running.mission_id)
+    assert ingestion is not None and ingestion.status == "FAILED"
+    assert execution is not None and execution.result_ingestion_state == "FAILED"
+    assert mission.state == "FINALIZING"
 
 
 def test_require_approval_has_no_execution_until_exact_approval_exists() -> None:

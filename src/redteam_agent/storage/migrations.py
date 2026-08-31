@@ -288,6 +288,13 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             )
             """,
             """
+            CREATE TABLE result_collection_claims (
+                execution_id TEXT PRIMARY KEY REFERENCES execution_records(execution_id),
+                lease_id TEXT NOT NULL UNIQUE,
+                lease_expires_at TEXT NOT NULL
+            )
+            """,
+            """
             CREATE TABLE execution_results (
                 result_id TEXT PRIMARY KEY,
                 result_digest TEXT NOT NULL,

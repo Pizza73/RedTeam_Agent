@@ -11,6 +11,7 @@ from redteam_agent.errors import (
     DuplicateExecutionError,
     ExecutionStateTransitionError,
     RepositoryConflictError,
+    ResultIngestionLeaseError,
     WorkflowRunBindingError,
 )
 from redteam_agent.models.execution import (
@@ -299,6 +300,50 @@ class ExecutionRepository(ImmutableJsonRepository[ExecutionRecord]):
             (policy_decision_id,),
         ).fetchone()
         return None if row is None else self.get(str(row["execution_id"]))
+
+    def acquire_result_collection_claim(
+        self,
+        execution_id: str,
+        *,
+        lease_id: str,
+        lease_expires_at: datetime,
+        now: datetime,
+    ) -> None:
+        if lease_expires_at <= now:
+            raise ResultIngestionLeaseError("result-collection lease must expire in the future")
+        with self.database.transaction(immediate=True):
+            row = self.database.connection.execute(
+                "SELECT lease_id, lease_expires_at FROM result_collection_claims "
+                "WHERE execution_id = ?",
+                (execution_id,),
+            ).fetchone()
+            if row is not None and now < datetime.fromisoformat(row["lease_expires_at"]):
+                raise ResultIngestionLeaseError("result-collection lease is still active")
+            if row is None:
+                self.database.connection.execute(
+                    "INSERT INTO result_collection_claims"
+                    "(execution_id, lease_id, lease_expires_at) VALUES (?, ?, ?)",
+                    (execution_id, lease_id, lease_expires_at.isoformat()),
+                )
+            else:
+                self.database.connection.execute(
+                    "UPDATE result_collection_claims SET lease_id = ?, lease_expires_at = ? "
+                    "WHERE execution_id = ?",
+                    (lease_id, lease_expires_at.isoformat(), execution_id),
+                )
+
+    def release_result_collection_claim(
+        self,
+        execution_id: str,
+        *,
+        lease_id: str,
+    ) -> None:
+        cursor = self.database.connection.execute(
+            "DELETE FROM result_collection_claims WHERE execution_id = ? AND lease_id = ?",
+            (execution_id, lease_id),
+        )
+        if cursor.rowcount != 1:
+            raise ResultIngestionLeaseError("result-collection lease ownership was lost")
 
     def transition_provider(
         self,
