@@ -43,6 +43,10 @@ rules, Human Gates, or stop conditions. If the complete evidence chain is missin
 ambiguous, or inconsistent, stop with `BLOCKED`. After a default-branch refresh changes the PR
 HEAD, the rolled-back phase must pass again on the refreshed HEAD; an adjacent earlier-phase PASS
 may remain only as that phase's incorporated base, never as a PASS for the rolled-back phase.
+If a blocked cumulative Phase 0B through Phase 3 HEAD predates required governance on `main`, a
+trusted current-Phase `BLOCKED_LIMIT` gate may authorize an exact-HEAD base refresh without changing
+the Phase label. The gate's adjacent base PASS, default-branch SHA, resulting ancestry, current-HEAD
+checks, and bounded Resume must all be revalidated; a free-form branch update is not authority.
 
 ## Protected Files
 

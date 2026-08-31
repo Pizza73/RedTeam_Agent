@@ -256,6 +256,7 @@ def test_base_refresh_is_sha_bound_and_separate_from_exact_sha_final_merge() -> 
     for required_control in (
         "REFRESH_AI_LOOP_BASE",
         "AI_GATE_APPROVER_LOGIN",
+        "AI_REVIEWER_LOGIN",
         "source_phase",
         "expected_head_sha",
         "target_base_sha",
@@ -267,6 +268,12 @@ def test_base_refresh_is_sha_bound_and_separate_from_exact_sha_final_merge() -> 
         "trusted exact-SHA base refresh authorization",
         "contains a duplicate JSON key",
         "Reauthorization requires a trusted prior base-refresh status",
+        "isBlockedCurrentPhase",
+        "Blocked current Phase lacks one trusted adjacent base PASS",
+        "Blocked current-Phase base PASS is not incorporated in HEAD",
+        "blocked_base_refresh_candidate",
+        "perform_post_blocked_refresh_resume",
+        "resuming {state.phase} after trusted current-Phase base refresh",
     ):
         assert required_control in workflow or required_control in runner
     permissions = workflow.split("\npermissions:\n", maxsplit=1)[1].split(

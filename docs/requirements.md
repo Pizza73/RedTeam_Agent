@@ -31,6 +31,7 @@ Codex CloudまたはChatGPTによる独立ReviewとCodexによる実装を、Pha
 | LOOP-021 | Base RefreshはPR BranchへDefault Branchを取り込む操作に限定し、Final PR Merge APIを呼び出さない |
 | LOOP-022 | Governance PR、Fork PR、Phase未完了、Stop Label、Stale/Unknown/Ambiguous Evidence、Default Branch未包含時は自動mergeしない。CodexとGitHub ActionsにはFinal Merge APIを与えない |
 | LOOP-023 | Final Merge API呼出し前に、PR番号と完全HEAD固定のRepository Git ref claimを原子的に作成し、PR番号、完全HEAD、Default Branch SHA、Phase 5 Gate、Policy Digest、Actor、Claim RefへBindingした永続Attempt RecordをPRへ保存する。同じPR/HEADのClaim/Recordが存在・作成結果不明、または取得後GateにDrift/Unknownがあれば、明示的Reconciliationなしに再送しない |
+| LOOP-024 | Phase 0B～3のblocked cumulative HEADがCurrent default branch上の必須Governanceを含まない場合、Approver限定WorkflowはCurrent-Phase `BLOCKED_LIMIT` Gate、そのGateの唯一の隣接Base PASS、旧HEAD、Current default-branch SHAを検証したStatusだけを発行する。Local OrchestratorはPhase Labelを戻さずExpected HEAD固定でBaseを取り込み、両祖先関係とCurrent-HEAD Checkを検証後、同Gate permalinkへBindingしたbounded Resumeだけを発行する |
 
 ## Non-Functional Requirements
 
