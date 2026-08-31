@@ -1,5 +1,9 @@
 # Blocked Phase Prior-Phase Revalidation Governance
 
+> Superseded by `cumulative-phase-authority-governance.md`. Rolling an unchanged cumulative tree
+> to its adjacent prior Phase was found to be semantically invalid once later-Phase code existed.
+> This file is retained only as historical audit evidence.
+
 ## Problem
 
 The active pull-request authority rule requires an adjacent prior-Phase PASS bound to the exact

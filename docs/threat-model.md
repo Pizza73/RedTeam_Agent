@@ -37,9 +37,10 @@ External C2/MCP     --untrusted until approved/bound--> Adapter
 | OpenAI key exposed to repository code | OpenAI API use is disabled and `OPENAI_API_KEY` is not a repository secret |
 | Malicious test exfiltration | No unrelated credentials in test jobs; CI egress should be organization-restricted where possible |
 | Review actor compromised | Independent Phase-chain revalidation; audit trail; emergency stop labels/workflow disable |
-| Phase gate bypass | Ordered phase plan; label/current phase match; prior PASS marker; required Check Runs queried from GitHub |
+| Phase gate bypass | Ordered phase plan; label/current phase match; unique maximal incorporated adjacent PASS; required Check Runs queried from GitHub |
 | Runner observes or races a Phase transition | Keep `ai-review-passed` as a transition marker, add next before removing current, make the Runner wait on a marked single/adjacent-dual Phase state, mutate only named managed labels, and revalidate every boundary; stale full-label replacement is forbidden |
-| Stale static Phase status blocks or authorizes work | Active PR authority requires an exact label + workflow-authored current-HEAD request + adjacent prior PASS; the status document is bootstrap-only |
+| Stale static Phase status blocks or authorizes work | Active PR authority requires an exact label + workflow-authored current-HEAD request + unique maximal incorporated adjacent PASS; the status document is bootstrap-only |
+| Cumulative later-Phase code is reviewed as an earlier Phase | Recovery validates trusted current-Phase finding/gate, identical reviewed/current trees and the incorporated phase base, then restores the same source Phase for a fresh review; it never rolls the unchanged tree to the prior Phase |
 | Default-branch refresh reuses an old PASS | Approver-restricted workflow binds old HEAD/current base/prior PASS in a status; the local orchestrator verifies full PR state before and after an exact one-Phase label rollback and requires a new gate after synchronization |
 | Base-refresh status changes around a local write | Re-fetch and compare the unique PASS/status transition snapshot, PR state and default branch immediately before and after label replacement and expected-HEAD branch update |
 | Default branch advances during a rolled-back review | Bind the review to the trusted target actually incorporated in its HEAD; after recording it, the next-Phase pre-implementation check rolls back and refreshes again |

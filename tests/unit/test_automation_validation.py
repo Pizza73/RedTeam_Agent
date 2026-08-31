@@ -93,6 +93,9 @@ def test_phase_gate_uses_fail_closed_native_codex_evidence_chain() -> None:
         "Reviewed Phase 0A head is not descended from a trusted base refresh",
         "Incorporated Phase 0A base-refresh evidence is ambiguous",
         "maximalRefreshes.length !== 1",
+        "incorporatedPassHeads",
+        "maximalPassHeads.length !== 1",
+        "Incorporated PASS evidence for previous phase",
         "Pull request head or phase changed before recording the gate",
         "phase_transition",
         "automation/transition_phase.py",
@@ -101,6 +104,7 @@ def test_phase_gate_uses_fail_closed_native_codex_evidence_chain() -> None:
     assert "liveDefaultCommit.sha !== refreshTargetSha" not in workflow
     assert "Default branch changed before recording the refreshed Phase 0A gate" not in workflow
     assert "status.sha !== pass.reviewed_sha" not in workflow
+    assert "previousPasses.at(-1).reviewed_sha" not in workflow
     assert "await removeLabel(phase)" not in workflow
     assert "await addLabels([next.label, 'ai-needs-implementation'])" not in workflow
     assert "Review evidence must contain exactly one redteam-ai-review marker" not in workflow
@@ -175,12 +179,12 @@ def test_resume_workflow_can_comment_on_pr_without_merge_authority() -> None:
         assert forbidden_operation not in workflow
 
 
-def test_blocked_phase_revalidation_is_exact_head_and_fail_closed() -> None:
+def test_current_phase_recovery_is_identical_tree_and_fail_closed() -> None:
     workflow = (
         REPO_ROOT / ".github" / "workflows" / "revalidate-blocked-phase.yml"
     ).read_text(encoding="utf-8")
     assert "\npermissions: {}\n" in workflow
-    assert """  revalidate:
+    assert """  validate:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -189,7 +193,7 @@ def test_blocked_phase_revalidation_is_exact_head_and_fail_closed() -> None:
       pull-requests: read
 """ in workflow
     assert """  publish:
-    needs: revalidate
+    needs: validate
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -200,20 +204,25 @@ def test_blocked_phase_revalidation_is_exact_head_and_fail_closed() -> None:
       statuses: write
 """ in workflow
     for required_control in (
-        "REVALIDATE_PRIOR_PHASE",
+        "RECOVER_CURRENT_PHASE",
         "AI_GATE_APPROVER_LOGIN",
         "AI_REVIEWER_LOGIN",
-        "ai-loop-blocked",
-        "original_commit_id !== headSha",
-        "review.commit_id !== headSha",
+        "reviewed_head_sha",
+        "reviewedCommit.commit.tree.sha !== currentCommit.commit.tree.sha",
+        "isAncestor(reviewedHead, currentHead)",
+        "original_commit_id !== reviewedHead",
+        "review.commit_id !== reviewedHead",
+        "Exactly one trusted current-phase CHANGES_REQUESTED gate is required",
+        "Current-phase gate is not bound to one incorporated adjacent PASS",
         "Required current-head check is not uniquely successful",
-        "Default branch changed during prior-phase validation",
-        'run: bash scripts/ci/run_phase_gate.sh "$REVALIDATE_PHASE"',
+        "Repository or PR state changed during current-phase validation",
+        'run: bash scripts/ci/run_phase_gate.sh "$SOURCE_PHASE"',
         "redteam-implementation-request",
         "redteam-ready-for-review",
         "github.rest.issues.setLabels",
-        "PR changed before the exact prior-phase label transition",
-        "PR changed during the exact prior-phase label transition",
+        "AUTHORIZED_EVIDENCE_DIGEST",
+        "AUTHORIZED_LABELS_DIGEST",
+        "PR changed during the exact current-phase label transition",
     ):
         assert required_control in workflow
     read_only_job = workflow.split("\n  publish:\n", maxsplit=1)[0]

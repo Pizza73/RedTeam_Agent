@@ -26,7 +26,7 @@ Codex CloudまたはChatGPTによる独立ReviewとCodexによる実装を、Pha
 | LOOP-016 | Local Orchestratorは`github-actions[bot]`が作成したCurrent Phase/HEAD SHA固定Requestだけを受理し、ChatGPT連携済みGitHub UserとしてCodex実装・Reviewを要求する |
 | LOOP-017 | Local Orchestratorはnative reviewer identity、P0/P1またはno-finding形式、ready/trigger、Phase、HEAD SHA、Base SHA、Review中のhead不変性を検証してから、承認者制限付きPhase Gate Workflowを起動する |
 | LOOP-018 | Phase 4/5はProvider Human Gate承認前に開始せず、承認後は同じLoopを再起動して当該Phaseを自動実行できる |
-| LOOP-019 | Active PRのCurrent Phaseはexact phase label、`github-actions[bot]`のCurrent-HEAD実装Request、隣接Prior-Phase PASSの一致から解決し、Default Branch上のStatus Snapshotを遷移権限として使用しない |
+| LOOP-019 | Active PRのCurrent Phaseはexact phase label、`github-actions[bot]`のCurrent-HEAD実装Request、Current HEADへ包含された隣接Prior-Phase PASSから解決する。複数PASSはGit祖先関係で唯一の最大候補だけをPhase Baseとし、コメント順やDefault Branch上のStatus Snapshotを遷移権限として使用しない |
 | LOOP-020 | 次Phase実装前にDefault Branchが進んだ場合、Approver限定WorkflowがPrior PASSと同じExpected HEADへ固定したStatusを記録し、Local Orchestratorだけが競合しない単一の遷移Identityと全PR状態を前後検証してPhaseを1つ戻し、Expected HEAD固定でBase Refreshした後の新HEADでGateを再実行する。Refresh履歴が複数ある場合は旧HEADとtarget baseの両方の祖先関係で唯一の最大遷移だけをReview Baseに採用し、並行または曖昧な履歴を拒否する |
 | LOOP-021 | Base RefreshはPR BranchへDefault Branchを取り込む操作に限定し、Final PR Merge APIを呼び出さない |
 | LOOP-022 | Governance PR、Fork PR、Phase未完了、Stop Label、Stale/Unknown/Ambiguous Evidence、Default Branch未包含時は自動mergeしない。CodexとGitHub ActionsにはFinal Merge APIを与えない |

@@ -1445,6 +1445,83 @@ def test_initial_phase_zero_a_review_keeps_original_pr_base_sha() -> None:
     assert loop.expected_base_sha(phase_state(), [], [], DEFAULT_BRANCH_SHA) == BASE_SHA
 
 
+def prior_pass(head_sha: str) -> MarkerEvidence:
+    payload = chained_phase_passes()[0].payload.copy()
+    payload["reviewed_sha"] = head_sha
+    return MarkerEvidence(
+        payload,
+        f"{PULL_REQUEST_PREFIX}#issuecomment-pass-{head_sha[:8]}",
+        "github-actions[bot]",
+        "",
+    )
+
+
+def later_phase_loop(ancestors: set[tuple[str, str]]) -> PhaseLoop:
+    loop = PhaseLoop.__new__(PhaseLoop)
+    github = _AncestorGitHub(ancestors)
+    github.repository = "example/repo"  # type: ignore[attr-defined]
+    loop.github = github  # type: ignore[assignment]
+    loop.reviewer_login = REVIEWER_LOGIN
+    loop.approver_login = ACTOR_LOGIN
+    return loop
+
+
+def test_later_phase_review_uses_unique_maximal_ancestor_pass() -> None:
+    earlier = "1" * 40
+    later = "2" * 40
+    loop = later_phase_loop({(earlier, HEAD_SHA), (later, HEAD_SHA), (earlier, later)})
+
+    assert (
+        loop.expected_base_sha(
+            phase_state(phase="phase-0b"),
+            [prior_pass(later), prior_pass(earlier)],
+            [],
+            DEFAULT_BRANCH_SHA,
+        )
+        == later
+    )
+
+
+def test_later_phase_review_rejects_incomparable_prior_passes() -> None:
+    first = "1" * 40
+    second = "2" * 40
+    loop = later_phase_loop({(first, HEAD_SHA), (second, HEAD_SHA)})
+
+    with pytest.raises(UntrustedEvidenceError, match="PASS evidence.*ambiguous"):
+        loop.expected_base_sha(
+            phase_state(phase="phase-0b"),
+            [prior_pass(first), prior_pass(second)],
+            [],
+            DEFAULT_BRANCH_SHA,
+        )
+
+
+def test_later_phase_review_rejects_unincorporated_prior_pass() -> None:
+    loop = later_phase_loop(set())
+
+    with pytest.raises(UntrustedEvidenceError, match="no trusted PASS"):
+        loop.expected_base_sha(
+            phase_state(phase="phase-0b"),
+            [prior_pass("1" * 40)],
+            [],
+            DEFAULT_BRANCH_SHA,
+        )
+
+
+def test_later_phase_review_rejects_malformed_incorporated_prior_pass() -> None:
+    pass_record = prior_pass("1" * 40)
+    del pass_record.payload["loop_state"]
+    loop = later_phase_loop({("1" * 40, HEAD_SHA)})
+
+    with pytest.raises(UntrustedEvidenceError, match="missing or unknown fields"):
+        loop.expected_base_sha(
+            phase_state(phase="phase-0b"),
+            [pass_record],
+            [],
+            DEFAULT_BRANCH_SHA,
+        )
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
