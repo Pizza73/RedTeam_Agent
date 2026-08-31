@@ -39,6 +39,7 @@ from .keys import EncryptionKeyProvider
 from .models import (
     ArtifactReference,
     EncryptedPayload,
+    EncryptionMetadata,
     KeyDomain,
     QuarantineReference,
     SecretReferenceMetadata,
@@ -173,6 +174,7 @@ class _EncryptedFileStore:
     @classmethod
     def _prepare_root(cls, root: Path) -> Path:
         absolute_root = Path(os.path.abspath(root))
+        cls._validate_lexical_root(absolute_root)
         missing_components: list[Path] = []
         existing_ancestor = absolute_root
         while not existing_ancestor.exists():
@@ -193,9 +195,29 @@ class _EncryptedFileStore:
                 raise ArtifactSecurityError("storage root ancestry is invalid")
             cls._sync_parent_directory(directory.parent)
         try:
-            return absolute_root.resolve(strict=True)
+            cls._validate_lexical_root(absolute_root)
+            resolved = absolute_root.resolve(strict=True)
         except OSError as exc:
             raise ArtifactSecurityError("storage root is unavailable") from exc
+        if resolved != absolute_root:
+            raise ArtifactSecurityError("storage root ancestry is invalid")
+        return resolved
+
+    @staticmethod
+    def _validate_lexical_root(root: Path) -> None:
+        """Reject a symlink or non-directory in every existing lexical component."""
+
+        current = Path(root.anchor)
+        for component in root.parts[1:]:
+            current /= component
+            try:
+                metadata = os.lstat(current)
+            except FileNotFoundError:
+                return
+            except OSError as exc:
+                raise ArtifactSecurityError("storage root is unavailable") from exc
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+                raise ArtifactSecurityError("storage root ancestry is invalid")
 
     def write(
         self,
@@ -425,7 +447,11 @@ class _EncryptedFileStore:
         )
         if not (
             len(plaintext) == envelope.plaintext_size
-            and self._content_digest(plaintext) == envelope.plaintext_sha256
+            and self._content_digest(
+                plaintext,
+                metadata=envelope.payload.metadata,
+            )
+            == envelope.plaintext_sha256
         ):
             raise DigestIntegrityError("decrypted resource integrity failed")
         return plaintext
@@ -560,8 +586,19 @@ class _EncryptedFileStore:
         if _SAFE_TOKEN.fullmatch(value) is None or value in {".", ".."}:
             raise ArtifactSecurityError("storage identifier is not an internal token")
 
-    @staticmethod
-    def _content_digest(content: bytes) -> str:
+    def _content_digest(
+        self,
+        content: bytes,
+        *,
+        metadata: EncryptionMetadata | None = None,
+    ) -> str:
+        if self._domain == "secret_store":
+            return self._keys.keyed_digest(
+                "secret_store",
+                "stored-plaintext-integrity",
+                content,
+                metadata=metadata,
+            )
         return "sha256:" + hashlib.sha256(content).hexdigest()
 
     def _mission_usage(self, mission_root: Path) -> int:
@@ -716,7 +753,7 @@ class EncryptedRawResultQuarantine:
             {
                 "mission_id": mission_id,
                 **binding,
-                "content_sha256": _EncryptedFileStore._content_digest(content),
+                "content_sha256": self._store._content_digest(content),
             },
         )
         digest, metadata_id = self._store.write(
@@ -1165,6 +1202,10 @@ class ArtifactStore:
         )
         if authoritative != reference:
             raise DigestIntegrityError("artifact reference integrity failed")
+        if authoritative.variant == "encrypted_raw" and operation == "read":
+            raise SecretAccessError(
+                "encrypted raw artifacts are unavailable to context reads"
+            )
         self._reconcile_create_audit(authoritative)
         self._authorizer.require_access(
             mission_id=reference.mission_id,
@@ -1677,6 +1718,7 @@ class SecretStore:
         )
         self._authorizer = authorizer
         self._audit = audit
+        self._keys = keys
 
     def create(
         self,
@@ -1700,10 +1742,15 @@ class SecretStore:
         secret_reference_id = stable_id(
             "secret",
             {
+                "schema_version": "secret-reference-v2",
                 "mission_id": mission_id,
                 "source_execution_id": source_execution_id,
                 "credential_type": credential_type,
-                "secret_digest": self._store._content_digest(secret_value),
+                "secret_token": self._keys.keyed_digest(
+                    "secret_store",
+                    "secret-reference",
+                    secret_value,
+                ),
             },
         )
         binding: dict[str, object] = {
@@ -1717,7 +1764,16 @@ class SecretStore:
         write_binding = ResourceBinding(
             resource_id=secret_reference_id,
             resource_version="1",
-            resource_digest=self._store._content_digest(secret_value),
+            resource_digest=sha256_digest(
+                {
+                    "schema_version": "secret-ingestion-binding-v2",
+                    "mission_id": mission_id,
+                    "secret_reference_id": secret_reference_id,
+                    "credential_type": credential_type,
+                    "associated_principal_ref": associated_principal_ref,
+                    "source_execution_id": source_execution_id,
+                }
+            ),
         )
         self._authorizer.require_ingestion_write(
             mission_id=mission_id,

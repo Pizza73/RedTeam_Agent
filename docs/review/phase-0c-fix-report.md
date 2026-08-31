@@ -4,22 +4,24 @@
 
 - Current phase: `Phase 0C: Data Security and Audit`
 - Input review SHA: `6b55fe9ba6cf0453e8c8ba33af3a3a9368944df5`
-- Latest correction input SHA: `ea6b43bd56d305a2e7b38a8c06237582bad76af2`
+- Latest correction input SHA: `11cd9ac0c10e6cde20fec7f8c3563bdf6b387e90`
 - Trusted Phase 0B base PASS SHA: `5cda9a5f8792ee33c3e153d8e791499f5619d82e`
 - Implementation branch: `ai/redteam-agent-phase-loop`
 - Independent-review result: `CHANGES_REQUESTED`
-- Latest finding key: `CODEX-P1-D863C9C4AECF87D3`
+- Latest finding key: `CODEX-P1-61DE840F99706095`
 - External provider, C2, MCP side effect, local attack, and external-target execution: absent
 
 ## Resulting working-tree diff
 
-The latest correction updates two implementation/test files and this report. No protected
+The latest correction updates three implementation files, one test file, and this report. No protected
 governance file listed in `AGENTS.md` was modified. In particular, `SystemDesign.md`, `.github/**`,
 `automation/**`, requirements, acceptance criteria, safety invariants, implementation status,
 phase prompts, CI scripts, and dependency manifests are unchanged.
 
 Modified files:
 
+- `src/redteam_agent/data_security/ingestion.py`
+- `src/redteam_agent/data_security/keys.py`
 - `src/redteam_agent/data_security/stores.py`
 - `tests/security/test_phase0c_data_security.py`
 - `docs/review/phase-0c-fix-report.md`
@@ -236,6 +238,30 @@ The regression starts with a nonexistent two-level Store root, injects failure w
 the final root entry, verifies that construction fails before ciphertext or audit creation, and
 then confirms that restart re-synchronizes the existing root before an authenticated first write.
 
+## Tenth independent review correction cycle
+
+The review for exact HEAD `11cd9ac0c10e6cde20fec7f8c3563bdf6b387e90` recorded four P1 findings
+under `CODEX-P1-61DE840F99706095`. The exact-SHA Human Resume covers all four findings:
+
+- [`discussion_r3896743741`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3896743741):
+  an `encrypted_raw` Artifact is now rejected before authorization or decryption when requested
+  through the normal `read` operation used for LLM context. Only a distinct exact-resource
+  `export` grant can release the encrypted raw value.
+- [`discussion_r3896743746`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3896743746):
+  secret-bearing synchronous and streamed ingestion work now runs in an inner frame. The outer
+  fail-closed boundary clears the original exception traceback and raises its replacement only
+  after leaving the handler, so the replacement has no cause, context, or frame containing raw
+  result bytes.
+- [`discussion_r3896743753`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3896743753):
+  Secret references use a domain- and purpose-separated keyed token rather than an unkeyed
+  plaintext digest. Public ingestion authorization binds only non-secret metadata, and Secret
+  envelope integrity uses a separately purpose-keyed digest, removing exposed offline guess
+  verifiers while retaining deterministic retry behavior.
+- [`discussion_r3896743757`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3896743757):
+  Store initialization validates every existing lexical root component with `lstat` before and
+  after directory creation. Any intermediate symbolic link or non-directory fails closed instead
+  of resolving to an external location.
+
 ## Regression tests added
 
 The existing Phase 0C security test module now additionally covers:
@@ -286,7 +312,15 @@ The existing Phase 0C security test module now additionally covers:
 - first-Mission Store-root synchronization failure before ciphertext/audit creation, followed by
   synchronized retry recovery; and
 - nested Store-root component creation with parent-by-parent durability, injected final-entry sync
-  failure, and restart recovery before the first acknowledged encrypted write.
+  failure, and restart recovery before the first acknowledged encrypted write;
+- rejection of an `encrypted_raw` Artifact from context reads even when an exact read grant exists,
+  while a distinct exact export grant remains usable;
+- replacement ingestion exceptions with no cause, context, or ingestion traceback local containing
+  the resumed raw bytes;
+- low-entropy Secret creation without the former deterministic reference, plaintext-digest policy
+  binding, or plaintext digest in the encrypted Store envelope; and
+- configured Store roots with an intermediate symlink, including proof that no directory is created
+  in the symlink target.
 
 No test was removed, weakened, skipped, or marked as an expected failure.
 
@@ -306,10 +340,10 @@ ruff: All checks passed
 mypy: Success: no issues found in 78 source files
 unit: 186 passed
 integration: 7 passed
-security: 159 passed
-full/coverage run: 352 passed
+security: 163 passed
+full/coverage run: 356 passed
 skipped=0, errors=0, failures=0
-coverage: 82% total (branch coverage enabled)
+coverage: 83% total (branch coverage enabled)
 pip check: No broken requirements found
 PHASE_GATE=phase-0c PASS
 ```
@@ -323,8 +357,8 @@ PATH="$PWD/.venv/bin:$PATH" python -m pytest -q \
   tests/security/test_phase0c_data_security.py
 ```
 
-Latest focused Phase 0C security result: `15 passed`. The new nested Store-root durability
-regression passes with `1 passed, 14 deselected`.
+Latest focused Phase 0C security result: `19 passed`. The four current review regressions pass with
+`4 passed, 15 deselected`.
 
 ## Remaining constraints
 

@@ -288,53 +288,66 @@ class SecureIngestor:
         retain_encrypted_raw: bool = False,
     ) -> SecureIngestionResult:
         try:
-            raw = self._quarantine.resume(reference, now=now)
-            detections: list[SecretDiscoveryReference] = []
-            redacted = self._redact(
-                raw,
-                mission_id=reference.mission_id,
-                source_execution_id=reference.execution_id,
-                detections=detections,
+            return self._ingest_quarantined(
+                reference,
                 now=now,
+                retain_encrypted_raw=retain_encrypted_raw,
             )
-            redacted_reference = self._artifacts.put(
-                mission_id=reference.mission_id,
-                content=redacted,
-                media_type="application/octet-stream",
-                classification="sensitive" if detections else "normal",
-                variant="redacted",
-                source_execution_id=reference.execution_id,
-                created_at=now,
-                derived_from_artifact_id=None,
+        except Exception as failure:
+            failure.__traceback__ = None
+        raise SecureIngestionError("secure ingestion failed closed")
+
+    def _ingest_quarantined(
+        self,
+        reference: QuarantineReference,
+        *,
+        now: datetime,
+        retain_encrypted_raw: bool,
+    ) -> SecureIngestionResult:
+        """Run secret-bearing work outside the replacement exception frame."""
+
+        raw = self._quarantine.resume(reference, now=now)
+        detections: list[SecretDiscoveryReference] = []
+        redacted = self._redact(
+            raw,
+            mission_id=reference.mission_id,
+            source_execution_id=reference.execution_id,
+            detections=detections,
+            now=now,
+        )
+        redacted_reference = self._artifacts.put(
+            mission_id=reference.mission_id,
+            content=redacted,
+            media_type="application/octet-stream",
+            classification="sensitive" if detections else "normal",
+            variant="redacted",
+            source_execution_id=reference.execution_id,
+            created_at=now,
+            derived_from_artifact_id=None,
+        )
+        encrypted_raw: tuple[ArtifactReference, ...] = ()
+        if retain_encrypted_raw:
+            encrypted_raw = (
+                self._artifacts.put(
+                    mission_id=reference.mission_id,
+                    content=raw,
+                    media_type="application/octet-stream",
+                    classification="secret",
+                    variant="encrypted_raw",
+                    source_execution_id=reference.execution_id,
+                    created_at=now,
+                    derived_from_artifact_id=redacted_reference.artifact_id,
+                ),
             )
-            encrypted_raw: tuple[ArtifactReference, ...] = ()
-            if retain_encrypted_raw:
-                encrypted_raw = (
-                    self._artifacts.put(
-                        mission_id=reference.mission_id,
-                        content=raw,
-                        media_type="application/octet-stream",
-                        classification="secret",
-                        variant="encrypted_raw",
-                        source_execution_id=reference.execution_id,
-                        created_at=now,
-                        derived_from_artifact_id=redacted_reference.artifact_id,
-                    ),
-                )
-            result = self._result(
-                quarantine_id=reference.quarantine_id,
-                quarantine_digest=reference.sha256,
-                redacted_reference=redacted_reference,
-                encrypted_raw=encrypted_raw,
-                detections=detections,
-            )
-            self._quarantine.delete(reference, now=now)
-            return result
-        except SecureIngestionError:
-            raise
-        except Exception as exc:
-            del exc
-            raise SecureIngestionError("secure ingestion failed closed") from None
+        result = self._result(
+            quarantine_id=reference.quarantine_id,
+            quarantine_digest=reference.sha256,
+            redacted_reference=redacted_reference,
+            encrypted_raw=encrypted_raw,
+            detections=detections,
+        )
+        self._quarantine.delete(reference, now=now)
+        return result
 
     async def ingest_stream(
         self,
@@ -347,63 +360,76 @@ class SecureIngestor:
         """Decrypt and redact one committed quarantine stream with bounded raw memory."""
 
         try:
-            if retain_encrypted_raw:
-                raise SecureIngestionError(
-                    "chunked encrypted-raw retention is not configured"
-                )
-            durable_result = sink._durable_ingestion_result(receipt)
-            if durable_result is not None:
-                sink._delete_committed(now=now)
-                return durable_result
-            detections: list[SecretDiscoveryReference] = []
-
-            def replace(keyword: bytes, secret_value: bytes) -> bytes:
-                self._record_detection(
-                    keyword=keyword,
-                    secret_value=secret_value,
-                    mission_id=sink.binding.mission_id,
-                    source_execution_id=receipt.execution_id,
-                    detections=detections,
-                    now=now,
-                )
-                return b"[REDACTED]"
-
-            redactor = _StreamingSecretRedactor(replace)
-
-            async def redacted_chunks() -> AsyncIterator[bytes]:
-                async for chunk in sink._iter_committed_chunks(receipt, now=now):
-                    redacted = redactor.feed(chunk)
-                    if redacted:
-                        yield redacted
-                final = redactor.feed(b"", final=True)
-                if final:
-                    yield final
-
-            redacted_reference = await self._artifacts.put_stream(
-                mission_id=sink.binding.mission_id,
-                chunks=redacted_chunks(),
-                media_type="application/octet-stream",
-                classification=lambda: "sensitive" if detections else "normal",
-                variant="redacted",
-                source_execution_id=receipt.execution_id,
-                created_at=now,
-                derived_from_artifact_id=None,
+            return await self._ingest_committed_stream(
+                sink,
+                receipt,
+                now=now,
+                retain_encrypted_raw=retain_encrypted_raw,
             )
-            result = self._result(
-                quarantine_id=receipt.quarantine_id,
-                quarantine_digest=receipt.ciphertext_digest,
-                redacted_reference=redacted_reference,
-                encrypted_raw=(),
-                detections=detections,
+        except Exception as failure:
+            failure.__traceback__ = None
+        raise SecureIngestionError("secure ingestion failed closed")
+
+    async def _ingest_committed_stream(
+        self,
+        sink: EncryptedRawResultSink,
+        receipt: RawResultReceipt,
+        *,
+        now: datetime,
+        retain_encrypted_raw: bool,
+    ) -> SecureIngestionResult:
+        if retain_encrypted_raw:
+            raise SecureIngestionError(
+                "chunked encrypted-raw retention is not configured"
             )
-            sink._commit_ingestion_result(receipt, result, now=now)
+        durable_result = sink._durable_ingestion_result(receipt)
+        if durable_result is not None:
             sink._delete_committed(now=now)
-            return result
-        except SecureIngestionError:
-            raise
-        except Exception as exc:
-            del exc
-            raise SecureIngestionError("secure ingestion failed closed") from None
+            return durable_result
+        detections: list[SecretDiscoveryReference] = []
+
+        def replace(keyword: bytes, secret_value: bytes) -> bytes:
+            self._record_detection(
+                keyword=keyword,
+                secret_value=secret_value,
+                mission_id=sink.binding.mission_id,
+                source_execution_id=receipt.execution_id,
+                detections=detections,
+                now=now,
+            )
+            return b"[REDACTED]"
+
+        redactor = _StreamingSecretRedactor(replace)
+
+        async def redacted_chunks() -> AsyncIterator[bytes]:
+            async for chunk in sink._iter_committed_chunks(receipt, now=now):
+                redacted = redactor.feed(chunk)
+                if redacted:
+                    yield redacted
+            final = redactor.feed(b"", final=True)
+            if final:
+                yield final
+
+        redacted_reference = await self._artifacts.put_stream(
+            mission_id=sink.binding.mission_id,
+            chunks=redacted_chunks(),
+            media_type="application/octet-stream",
+            classification=lambda: "sensitive" if detections else "normal",
+            variant="redacted",
+            source_execution_id=receipt.execution_id,
+            created_at=now,
+            derived_from_artifact_id=None,
+        )
+        result = self._result(
+            quarantine_id=receipt.quarantine_id,
+            quarantine_digest=receipt.ciphertext_digest,
+            redacted_reference=redacted_reference,
+            encrypted_raw=(),
+            detections=detections,
+        )
+        sink._commit_ingestion_result(receipt, result, now=now)
+        sink._delete_committed(now=now)
+        return result
 
     def _redact(
         self,

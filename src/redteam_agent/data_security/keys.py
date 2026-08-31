@@ -43,6 +43,15 @@ class EncryptionKeyProvider(Protocol):
 
     def metadata_id(self, metadata: EncryptionMetadata) -> str: ...
 
+    def keyed_digest(
+        self,
+        domain: KeyDomain,
+        purpose: str,
+        value: bytes,
+        *,
+        metadata: EncryptionMetadata | None = None,
+    ) -> str: ...
+
     def seal_for_resource(
         self,
         domain: KeyDomain,
@@ -360,6 +369,39 @@ class InMemoryEncryptionKeyProvider:
             },
         )
 
+    def keyed_digest(
+        self,
+        domain: KeyDomain,
+        purpose: str,
+        value: bytes,
+        *,
+        metadata: EncryptionMetadata | None = None,
+    ) -> str:
+        """Return a purpose-separated digest that does not support offline guesses."""
+
+        if not purpose or not purpose.isascii():
+            raise EncryptionKeyUnavailableError("keyed digest purpose is invalid")
+        if metadata is None:
+            metadata = self.get_active_key_metadata(domain)
+        if metadata.key_domain != domain:
+            raise EncryptionKeyUnavailableError("keyed digest domain is invalid")
+        record = self._record_for(metadata, operation="decrypt")
+        if record.parent_key is not None:
+            with self._lock:
+                parent = self._records.get((domain, *record.parent_key))
+            if parent is None or parent.metadata.rotation_state not in {
+                "active",
+                "decrypt_only",
+            }:
+                raise EncryptionKeyUnavailableError("keyed digest parent is unavailable")
+            record = parent
+        purpose_key = hmac.digest(
+            self._required_material(record),
+            b"redteam-keyed-digest-v1\x00" + purpose.encode("ascii"),
+            "sha256",
+        )
+        return "sha256:" + hmac.digest(purpose_key, value, "sha256").hex()
+
     def _record_for(
         self, metadata: EncryptionMetadata, *, operation: Literal["encrypt", "decrypt"]
     ) -> _KeyRecord:
@@ -383,6 +425,12 @@ class InMemoryEncryptionKeyProvider:
         if material is None:
             raise EncryptionKeyUnavailableError("key material is destroyed")
         return hmac.digest(material, b"redteam-authentication-v1", "sha256")
+
+    @staticmethod
+    def _required_material(record: _KeyRecord) -> bytes | bytearray:
+        if record.material is None:
+            raise EncryptionKeyUnavailableError("key material is destroyed")
+        return record.material
 
     @staticmethod
     def _xor_stream(

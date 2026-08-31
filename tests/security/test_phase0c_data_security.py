@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import stat
@@ -12,7 +13,7 @@ from threading import Event
 import pytest
 from pydantic import ValidationError
 
-from redteam_agent.canonical import CanonicalJsonObject, sha256_digest
+from redteam_agent.canonical import CanonicalJsonObject, sha256_digest, stable_id
 from redteam_agent.data_security import (
     ArtifactStore,
     AuditContext,
@@ -56,6 +57,7 @@ class _ExactEnvelopeAuthorizer:
     def __init__(self) -> None:
         self._grants: dict[str, tuple[DataAccessGrant, ...]] = {}
         self._ingestion_writes: set[tuple[str, str]] = set()
+        self.ingestion_write_resources: list[tuple[str, ResourceBinding]] = []
 
     def set_grants(self, mission_id: str, grants: tuple[DataAccessGrant, ...]) -> None:
         self._grants[mission_id] = grants
@@ -90,9 +92,10 @@ class _ExactEnvelopeAuthorizer:
         resource: ResourceBinding,
         now: datetime,
     ) -> None:
-        del resource_type, resource, now
+        del now
         if (mission_id, source_execution_id) not in self._ingestion_writes:
             raise SecretAccessError("trusted ingestion authorization denied resource write")
+        self.ingestion_write_resources.append((resource_type, resource))
 
 
 class _AuditContexts:
@@ -289,6 +292,99 @@ def test_bearer_authorization_is_redacted_before_artifact_publication(
     visible = artifacts.read(artifact, operation="read", now=NOW)
     assert visible == b"Authorization: Bearer [REDACTED]\nstatus=ok"
     assert bearer_secret not in visible
+
+
+def test_encrypted_raw_artifact_cannot_be_used_as_context_read(
+    tmp_path: Path,
+) -> None:
+    quarantine, artifacts, secrets, authorizer, _ = _stores(tmp_path)
+    authorizer.allow_ingestion_write("mission-raw", "execution-raw")
+    raw = b"raw-result-that-must-not-enter-context"
+    receipt = quarantine.commit(
+        mission_id="mission-raw",
+        mission_revision=1,
+        execution_id="execution-raw",
+        content=raw,
+        created_at=NOW,
+        retention_until=NOW + timedelta(hours=1),
+    )
+    result = SecureIngestor(
+        quarantine=quarantine,
+        artifacts=artifacts,
+        secrets=secrets,
+    ).ingest(receipt, now=NOW, retain_encrypted_raw=True)
+    encrypted_raw = result.encrypted_raw_artifacts[0]
+    grant_resource = ResourceBinding(
+        resource_id=encrypted_raw.artifact_id,
+        resource_version="1",
+        resource_digest=encrypted_raw.sha256,
+    )
+    authorizer.set_grants(
+        "mission-raw",
+        (
+            DataAccessGrant(
+                resource_type="artifact",
+                resource=grant_resource,
+                operations=frozenset({"read"}),
+            ),
+        ),
+    )
+
+    with pytest.raises(SecretAccessError, match="context reads"):
+        artifacts.read(encrypted_raw, operation="read", now=NOW)
+
+    authorizer.set_grants(
+        "mission-raw",
+        (
+            DataAccessGrant(
+                resource_type="artifact",
+                resource=grant_resource,
+                operations=frozenset({"export"}),
+            ),
+        ),
+    )
+    assert artifacts.read(encrypted_raw, operation="export", now=NOW) == raw
+
+
+def test_secure_ingestion_replacement_exception_drops_secret_bearing_traceback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    quarantine, artifacts, secrets, authorizer, _ = _stores(tmp_path)
+    authorizer.allow_ingestion_write("mission-traceback", "execution-traceback")
+    raw = b"traceback-private-result"
+    receipt = quarantine.commit(
+        mission_id="mission-traceback",
+        mission_revision=1,
+        execution_id="execution-traceback",
+        content=raw,
+        created_at=NOW,
+        retention_until=NOW + timedelta(hours=1),
+    )
+
+    def fail_artifact_write(**kwargs) -> None:
+        del kwargs
+        raise ArtifactSecurityError("simulated publication failure")
+
+    monkeypatch.setattr(artifacts, "put", fail_artifact_write)
+    with pytest.raises(SecureIngestionError) as caught:
+        SecureIngestor(
+            quarantine=quarantine,
+            artifacts=artifacts,
+            secrets=secrets,
+        ).ingest(receipt, now=NOW)
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    traceback = caught.value.__traceback__
+    checked_ingestion_frame = False
+    while traceback is not None:
+        if traceback.tb_frame.f_code.co_filename.endswith("data_security/ingestion.py"):
+            checked_ingestion_frame = True
+            assert "raw" not in traceback.tb_frame.f_locals
+            assert raw not in traceback.tb_frame.f_locals.values()
+        traceback = traceback.tb_next
+    assert checked_ingestion_frame
 
 
 def test_oauth_fields_are_redacted_across_stream_chunks(tmp_path: Path) -> None:
@@ -583,6 +679,29 @@ def test_encrypted_store_fsyncs_new_nested_root_before_acknowledging_write(
     )
 
 
+def test_encrypted_store_rejects_intermediate_symlink_in_configured_root(
+    tmp_path: Path,
+) -> None:
+    keys = _keys()
+    audit = MissionAuditRecorder(audit_log=MissionAuditLog(), contexts=_AuditContexts())
+    trusted_parent = tmp_path / "trusted-parent"
+    external_parent = tmp_path / "external-parent"
+    trusted_parent.mkdir()
+    external_parent.mkdir()
+    (trusted_parent / "linked").symlink_to(external_parent, target_is_directory=True)
+
+    with pytest.raises(ArtifactSecurityError, match="ancestry"):
+        EncryptedRawResultQuarantine(
+            root=trusted_parent / "linked" / "quarantine",
+            keys=keys,
+            audit=audit,
+            max_item_bytes=1024,
+            mission_quota_bytes=4096,
+        )
+
+    assert not (external_parent / "quarantine").exists()
+
+
 def test_secret_resolution_requires_trusted_exact_mission_grant(tmp_path: Path) -> None:
     _, _, secrets, authorizer, audit_log = _stores(tmp_path)
     with pytest.raises(SecretAccessError):
@@ -702,6 +821,47 @@ def test_secret_resolution_requires_trusted_exact_mission_grant(tmp_path: Path) 
         secrets.resolve(stale, now=NOW + timedelta(seconds=2))
     assert b"private-value" not in b"".join(
         path.read_bytes() for path in tmp_path.rglob("*.json")
+    )
+
+
+def test_secret_reference_and_public_binding_do_not_expose_guess_verifiers(
+    tmp_path: Path,
+) -> None:
+    _, _, secrets, authorizer, _ = _stores(tmp_path)
+    mission_id = "mission-low-entropy"
+    execution_id = "execution-low-entropy"
+    credential_type = "password"
+    secret_value = b"1234"
+    authorizer.allow_ingestion_write(mission_id, execution_id)
+
+    metadata = secrets.create(
+        mission_id=mission_id,
+        secret_value=secret_value,
+        credential_type=credential_type,
+        associated_principal_ref=None,
+        source_execution_id=execution_id,
+        created_at=NOW,
+    )
+
+    plaintext_digest = "sha256:" + hashlib.sha256(secret_value).hexdigest()
+    former_reference_id = stable_id(
+        "secret",
+        {
+            "mission_id": mission_id,
+            "source_execution_id": execution_id,
+            "credential_type": credential_type,
+            "secret_digest": plaintext_digest,
+        },
+    )
+    secret_write = next(
+        resource
+        for resource_type, resource in authorizer.ingestion_write_resources
+        if resource_type == "secret_reference"
+    )
+    assert metadata.secret_reference_id != former_reference_id
+    assert secret_write.resource_digest != plaintext_digest
+    assert plaintext_digest.encode("ascii") not in b"".join(
+        path.read_bytes() for path in (tmp_path / "secrets").rglob("*.json")
     )
 
 
