@@ -161,3 +161,43 @@ class WorkflowRunBindingError(RedTeamAgentError):
 
 class ResultIngestionLeaseError(ResultIngestionError):
     """A result-ingestion lease is still active, absent, or not safely recoverable."""
+
+
+class EncryptionKeyUnavailableError(RedTeamAgentError):
+    """A required key, domain, version, state, or algorithm was unavailable."""
+
+
+class EncryptionIntegrityError(RedTeamAgentError):
+    """Authenticated ciphertext or its binding failed verification."""
+
+
+class EncryptionNonceReuseError(RedTeamAgentError):
+    """A nonce was reused with the same encryption key version."""
+
+
+class ArtifactSecurityError(RedTeamAgentError):
+    """An artifact operation violated path, quota, retention, or integrity policy."""
+
+
+class SecretAccessError(DataAccessDeniedError):
+    """Secret creation or resolution was not authorized by an exact grant."""
+
+
+class SecureIngestionError(ResultIngestionError):
+    """Raw content could not complete the secure-ingestion pipeline."""
+
+
+class SecretDetectionError(SecureIngestionError):
+    """Secret detection failed closed without exposing the inspected content."""
+
+
+class AuditIntegrityError(RedTeamAgentError):
+    """A mission audit chain was missing, reordered, or modified."""
+
+
+class AuditSequenceConflictError(RedTeamAgentError):
+    """A mission audit event conflicted with its atomic sequence allocation."""
+
+
+class SandboxCapabilityStaleError(SandboxRuntimeBindingError):
+    """Current sandbox enforcement no longer matches the trusted capability snapshot."""
