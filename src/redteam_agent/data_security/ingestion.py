@@ -41,7 +41,8 @@ _SECRET_KEYWORDS = (
     b"apikey",
     b"secret",
 )
-_AUTHORIZATION_SCHEMES = (b"bearer", b"basic")
+_AUTHORIZATION_HEADER = b"authorization"
+_SUPPORTED_AUTHORIZATION_SCHEMES = (b"bearer", b"basic")
 _CREDENTIAL_KEY_COMPONENTS = (
     b"credential",
     b"password",
@@ -58,6 +59,7 @@ _QUOTE_BYTES = frozenset(b"\"'")
 _ASCII_WORD_BYTES = frozenset(
     b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
 )
+_AUTHORIZATION_SCHEME_BYTES = _ASCII_WORD_BYTES | frozenset(b"!#$%&'*+-.^`|~")
 _STRUCTURED_KEY_BYTES = _ASCII_WORD_BYTES | frozenset(b"-")
 _MAX_PENDING_SECRET_MATCH_BYTES = 64 * 1024
 _JSON_KEY_SIMPLE_ESCAPES = {
@@ -139,7 +141,14 @@ class _StreamingSecretRedactor:
         *,
         final: bool,
     ) -> _SecretMatch | Literal["incomplete"] | None:
-        authorization = _StreamingSecretRedactor._authorization_candidate(
+        header = _StreamingSecretRedactor._authorization_header_candidate(
+            data,
+            index,
+            final=final,
+        )
+        if header is not None:
+            return header
+        authorization = _StreamingSecretRedactor._supported_scheme_candidate(
             data,
             index,
             final=final,
@@ -299,7 +308,106 @@ class _StreamingSecretRedactor:
         return bytes(decoded)
 
     @staticmethod
-    def _authorization_candidate(
+    def _authorization_header_candidate(
+        data: bytes,
+        index: int,
+        *,
+        final: bool,
+    ) -> _SecretMatch | Literal["incomplete"] | None:
+        """Parse the header first so an unknown authorization scheme fails closed."""
+
+        key_quote = data[index] if data[index] in _QUOTE_BYTES else None
+        keyword_start = index + 1 if key_quote is not None else index
+        candidate = data[
+            keyword_start : keyword_start + len(_AUTHORIZATION_HEADER)
+        ].lower()
+        if len(candidate) < len(_AUTHORIZATION_HEADER):
+            if _AUTHORIZATION_HEADER.startswith(candidate):
+                return None if final else "incomplete"
+            return None
+        if candidate != _AUTHORIZATION_HEADER:
+            return None
+        cursor = keyword_start + len(_AUTHORIZATION_HEADER)
+        if key_quote is not None:
+            if cursor == len(data):
+                return None if final else "incomplete"
+            if data[cursor] != key_quote:
+                return None
+            cursor += 1
+        while cursor < len(data) and data[cursor] in _SECRET_WHITESPACE:
+            cursor += 1
+        if cursor == len(data):
+            return None if final else "incomplete"
+        if data[cursor] not in b":=":
+            return None
+        cursor += 1
+        while cursor < len(data) and data[cursor] in _SECRET_WHITESPACE:
+            cursor += 1
+        if cursor == len(data):
+            return None if final else "incomplete"
+        value_quote = data[cursor] if data[cursor] in _QUOTE_BYTES else None
+        if value_quote is not None:
+            cursor += 1
+        scheme_start = cursor
+        while cursor < len(data) and data[cursor] in _AUTHORIZATION_SCHEME_BYTES:
+            cursor += 1
+        if cursor == len(data):
+            if final:
+                raise SecretDetectionError("secret detection failed closed")
+            return "incomplete"
+        if cursor == scheme_start:
+            raise SecretDetectionError("secret detection failed closed")
+        scheme = data[scheme_start:cursor]
+        if data[cursor] not in _SECRET_WHITESPACE:
+            raise SecretDetectionError("secret detection failed closed")
+        while cursor < len(data) and data[cursor] in _SECRET_WHITESPACE:
+            cursor += 1
+        if cursor == len(data):
+            return None if final else "incomplete"
+        secret_start = cursor
+        if value_quote is not None:
+            while cursor < len(data):
+                if data[cursor] == 92:
+                    if cursor + 1 == len(data):
+                        if final:
+                            raise SecretDetectionError(
+                                "secret detection failed closed"
+                            )
+                        return "incomplete"
+                    cursor += 2
+                    continue
+                if data[cursor] == value_quote:
+                    break
+                cursor += 1
+            if cursor == len(data):
+                if final:
+                    raise SecretDetectionError("secret detection failed closed")
+                return "incomplete"
+        else:
+            while cursor < len(data) and data[cursor] not in b"\r\n":
+                cursor += 1
+            if cursor == len(data) and not final:
+                return "incomplete"
+        if cursor == secret_start:
+            raise SecretDetectionError("secret detection failed closed")
+        match_end = (
+            cursor + 1
+            if value_quote is not None
+            and cursor < len(data)
+            and data[cursor] == value_quote
+            else cursor
+        )
+        return (
+            keyword_start,
+            keyword_start + len(_AUTHORIZATION_HEADER),
+            secret_start,
+            cursor,
+            match_end,
+            scheme,
+        )
+
+    @staticmethod
+    def _supported_scheme_candidate(
         data: bytes,
         index: int,
         *,
@@ -311,14 +419,16 @@ class _StreamingSecretRedactor:
         keyword_start = index + 1 if wrapper_quote is not None else index
         available = data[keyword_start:].lower()
         matching_schemes = tuple(
-            scheme for scheme in _AUTHORIZATION_SCHEMES if scheme.startswith(available)
+            scheme
+            for scheme in _SUPPORTED_AUTHORIZATION_SCHEMES
+            if scheme.startswith(available)
         )
         if matching_schemes and all(len(available) < len(item) for item in matching_schemes):
             return None if final else "incomplete"
         scheme = next(
             (
                 item
-                for item in _AUTHORIZATION_SCHEMES
+                for item in _SUPPORTED_AUTHORIZATION_SCHEMES
                 if available[: len(item)] == item
             ),
             None,

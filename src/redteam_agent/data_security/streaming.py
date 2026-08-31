@@ -119,6 +119,17 @@ class _DeletionBinding(StrictImmutableBoundaryModel):
     ingestion_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
 
 
+class _AbortDeletionBinding(StrictImmutableBoundaryModel):
+    record_type: Literal["stream_abort_delete_intent"]
+    mission_revision: int = Field(ge=1)
+    stream_binding_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    execution_id: str = Field(min_length=1)
+    sink_id: str = Field(min_length=1)
+    chunk_count: int = Field(ge=0)
+    artifact_sequences: tuple[int, ...]
+    aggregate_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+
+
 class _IngestionResultBinding(StrictImmutableBoundaryModel):
     record_type: Literal["stream_ingestion_result"]
     mission_revision: int = Field(ge=1)
@@ -179,6 +190,9 @@ class EncryptedRawResultSink:
             return
         self._load_durable_state()
         self._load_ingestion_result()
+        if self._aborted:
+            self._delete_aborted(now=self._clock())
+            return
         if (
             binding.resume_mode == "from_cursor"
             and binding.resume_cursor != len(self._chunks)
@@ -355,9 +369,12 @@ class EncryptedRawResultSink:
         return receipt
 
     async def abort(self) -> None:
-        if self._receipt is not None or self._aborted:
+        if self._receipt is not None:
             return
         now = self._clock()
+        if self._aborted:
+            self._delete_aborted(now=now)
+            return
         terminal = _TerminalBinding(
             record_type="stream_abort",
             mission_revision=self.binding.mission_revision,
@@ -386,6 +403,12 @@ class EncryptedRawResultSink:
             occurred_at=now,
         )
         self._aborted = True
+        self._terminal_envelope = next(
+            item
+            for item in self._store.envelopes_for(self.binding.mission_id)
+            if item.resource_id == self._terminal_resource_id("abort")
+        )
+        self._delete_aborted(now=now)
 
     def recovery_metadata(self, *, updated_at: datetime) -> RawResultRecoveryMetadata:
         state: Literal["OPEN", "COMMITTED", "RECOVERY_REQUIRED", "ABORTED"] = (
@@ -645,8 +668,16 @@ class EncryptedRawResultSink:
         if not isinstance(chunk, bytes):
             raise RawResultStreamingError("raw-result chunks must be bytes")
         self.max_observed_chunk_bytes = max(self.max_observed_chunk_bytes, len(chunk))
-        digest = self._store._content_digest(chunk)
         sequence = self._input_sequence
+        durable_envelope = (
+            self._chunks[sequence][1] if sequence < len(self._chunks) else None
+        )
+        digest = self._store._content_digest(
+            chunk,
+            metadata=(
+                None if durable_envelope is None else durable_envelope.payload.metadata
+            ),
+        )
         ciphertext_offset = sum(
             envelope.plaintext_size for _, envelope in self._chunks[:sequence]
         )
@@ -1021,10 +1052,6 @@ class EncryptedRawResultSink:
         )
 
     def _resume_deletion(self) -> None:
-        if self._ingestion_result is None:
-            raise RawResultQuarantineError(
-                "deletion intent lacks a durable ingestion result"
-            )
         raw, envelope = self._store.read_bound(
             mission_id=self.binding.mission_id,
             resource_id=self._deletion_resource_id(),
@@ -1032,8 +1059,16 @@ class EncryptedRawResultSink:
         )
         if raw:
             raise RawResultQuarantineError("deletion intent content is invalid")
+        value = envelope.binding.to_dict()
+        if value.get("record_type") == "stream_abort_delete_intent":
+            self._resume_abort_deletion(value, envelope=envelope)
+            return
+        if self._ingestion_result is None:
+            raise RawResultQuarantineError(
+                "deletion intent lacks a durable ingestion result"
+            )
         try:
-            intent = _DeletionBinding.model_validate(envelope.binding.to_dict())
+            intent = _DeletionBinding.model_validate(value)
         except ValueError as exc:
             raise RawResultQuarantineError("deletion intent is invalid") from exc
         terminal_envelope = self._store.verified_envelope(
@@ -1074,6 +1109,119 @@ class EncryptedRawResultSink:
                 mission_id=self.binding.mission_id,
                 resource_id=self._chunk_resource_id(sequence),
             )
+        self._deleted = True
+
+    def _delete_aborted(self, *, now: datetime) -> None:
+        if self._deleted:
+            return
+        if not self._aborted or self._terminal_envelope is None:
+            raise RawResultQuarantineError("raw-result stream is not aborted")
+        if self._store.has_resource(
+            mission_id=self.binding.mission_id,
+            resource_id=self._deletion_resource_id(),
+        ):
+            self._resume_deletion()
+            return
+        terminal = _TerminalBinding.model_validate(
+            self._terminal_envelope.binding.to_dict()
+        )
+        intent = _AbortDeletionBinding(
+            record_type="stream_abort_delete_intent",
+            mission_revision=self.binding.mission_revision,
+            stream_binding_digest=self._binding_digest,
+            execution_id=self.execution_id,
+            sink_id=self.sink_id,
+            chunk_count=len(self._chunks),
+            artifact_sequences=tuple(sorted(self._artifact_terminals)),
+            aggregate_digest=terminal.aggregate_digest,
+        )
+        self._store.write(
+            mission_id=self.binding.mission_id,
+            resource_id=self._deletion_resource_id(),
+            content=b"",
+            binding=intent.model_dump(mode="python"),
+            created_at=now,
+            retention_until=None,
+        )
+        self._resume_deletion()
+
+    def _resume_abort_deletion(
+        self,
+        value: dict[str, object],
+        *,
+        envelope: _StoredEnvelope,
+    ) -> None:
+        try:
+            intent = _AbortDeletionBinding.model_validate_json(
+                canonicalize(value),
+                strict=True,
+            )
+        except (TypeError, ValueError) as exc:
+            raise RawResultQuarantineError("abort deletion intent is invalid") from exc
+        terminal_envelope: _StoredEnvelope | None = None
+        terminal: _TerminalBinding | None = None
+        if self._store.has_resource(
+            mission_id=self.binding.mission_id,
+            resource_id=self._terminal_resource_id("abort"),
+        ):
+            terminal_envelope = self._store.verified_envelope(
+                mission_id=self.binding.mission_id,
+                resource_id=self._terminal_resource_id("abort"),
+                now=None,
+            )
+            try:
+                terminal = _TerminalBinding.model_validate(
+                    terminal_envelope.binding.to_dict()
+                )
+            except ValueError as exc:
+                raise RawResultQuarantineError(
+                    "abort deletion terminal is invalid"
+                ) from exc
+        if not (
+            intent.mission_revision == self.binding.mission_revision
+            and intent.stream_binding_digest == self._binding_digest
+            and intent.execution_id == self.execution_id
+            and intent.sink_id == self.sink_id
+            and intent.artifact_sequences
+            == tuple(sorted(set(intent.artifact_sequences)))
+            and all(sequence >= 0 for sequence in intent.artifact_sequences)
+            and (
+                terminal is None
+                or (
+                    terminal.record_type == "stream_abort"
+                    and terminal.chunk_count == intent.chunk_count
+                    and terminal.aggregate_digest == intent.aggregate_digest
+                )
+            )
+        ):
+            raise RawResultQuarantineError("abort deletion intent binding is invalid")
+        self._audit.record(
+            mission_id=self.binding.mission_id,
+            resource_type="raw_result_quarantine",
+            resource_id=self.quarantine_id,
+            operation="delete",
+            operation_id=self._audit_operation_id("delete", "abort-intent"),
+            metadata_digest=intent.aggregate_digest,
+            occurred_at=envelope.created_at,
+        )
+        for sequence in range(intent.chunk_count):
+            self._store.erase_resource(
+                mission_id=self.binding.mission_id,
+                resource_id=self._chunk_resource_id(sequence),
+            )
+        for artifact_sequence in intent.artifact_sequences:
+            self._store.erase_resource(
+                mission_id=self.binding.mission_id,
+                resource_id=self._artifact_terminal_resource_id(artifact_sequence),
+            )
+        self._store.erase_resource(
+            mission_id=self.binding.mission_id,
+            resource_id=self._terminal_resource_id("abort"),
+        )
+        self._chunks.clear()
+        self._artifact_terminals.clear()
+        self._aborted = True
+        self._terminal_envelope = None
         self._deleted = True
 
     def _receipt_counts(self) -> tuple[int, int, int]:

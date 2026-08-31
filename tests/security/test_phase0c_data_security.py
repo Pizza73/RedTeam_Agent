@@ -390,6 +390,106 @@ def test_basic_authorization_is_redacted_complete_and_across_stream_chunks(
         assert value.decode() not in result.model_dump_json()
 
 
+def test_unsupported_authorization_schemes_are_redacted_complete_and_split(
+    tmp_path: Path,
+) -> None:
+    keys = _keys()
+    authorizer = _ExactEnvelopeAuthorizer()
+    audit = MissionAuditRecorder(
+        audit_log=MissionAuditLog(),
+        contexts=_AuditContexts(),
+    )
+    quarantine = EncryptedRawResultQuarantine(
+        root=tmp_path / "unsupported-auth-quarantine",
+        keys=keys,
+        audit=audit,
+        max_item_bytes=4096,
+        mission_quota_bytes=16 * 1024,
+    )
+    artifacts = ArtifactStore(
+        root=tmp_path / "unsupported-auth-artifacts",
+        keys=keys,
+        authorizer=authorizer,
+        audit=audit,
+        max_item_bytes=4096,
+        mission_quota_bytes=8192,
+    )
+    secrets = SecretStore(
+        root=tmp_path / "unsupported-auth-secrets",
+        keys=keys,
+        authorizer=authorizer,
+        audit=audit,
+        max_item_bytes=1024,
+        mission_quota_bytes=4096,
+    )
+
+    async def ingest(case: str, chunks: tuple[bytes, ...], secret: bytes) -> None:
+        mission_id = f"mission-unsupported-{case}"
+        execution_id = f"execution-unsupported-{case}"
+        authorizer.allow_ingestion_write(mission_id, execution_id)
+        sink = EncryptedRawResultSinkFactory(
+            quarantine=quarantine,
+            bindings=_StreamBindings(
+                QuarantineStreamBinding(
+                    mission_id=mission_id,
+                    mission_revision=1,
+                    execution_id=execution_id,
+                    retention_until=NOW + timedelta(hours=1),
+                    max_result_bytes=4096,
+                    resume_mode="from_start",
+                )
+            ),
+            clock=lambda: NOW,
+        ).for_execution(execution_id)
+        for chunk in chunks:
+            await sink.write_stdout(chunk)
+        receipt = await sink.commit()
+        result = await SecureIngestor(
+            quarantine=quarantine,
+            artifacts=artifacts,
+            secrets=secrets,
+        ).ingest_stream(sink, receipt, now=NOW)
+        assert result.redaction_metadata.redaction_count == 1
+        assert result.detected_secrets[0].credential_type == case
+        assert secret.decode() not in result.model_dump_json()
+        artifact = result.redacted_artifacts[0]
+        authorizer.set_grants(
+            mission_id,
+            (
+                DataAccessGrant(
+                    resource_type="artifact",
+                    resource=ResourceBinding(
+                        resource_id=artifact.artifact_id,
+                        resource_version="1",
+                        resource_digest=artifact.sha256,
+                    ),
+                    operations=frozenset({"read"}),
+                ),
+            ),
+        )
+        visible = artifacts.read(artifact, operation="read", now=NOW)
+        assert secret not in visible
+        assert b"[REDACTED]" in visible
+
+    asyncio.run(
+        ingest(
+            "apikey",
+            (b"Authorization: ApiKey abc123",),
+            b"abc123",
+        )
+    )
+    asyncio.run(
+        ingest(
+            "digest",
+            (
+                b'host=example\n"Authorization":"Di',
+                b'gest username=admin, response=response-value"',
+            ),
+            b"username=admin, response=response-value",
+        )
+    )
+
+
 def test_private_key_field_is_redacted_before_artifact_publication(
     tmp_path: Path,
 ) -> None:
@@ -927,8 +1027,9 @@ def test_encrypted_store_write_is_anchored_during_mission_directory_swap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     keys = _keys()
+    audit_log = MissionAuditLog()
     audit = MissionAuditRecorder(
-        audit_log=MissionAuditLog(),
+        audit_log=audit_log,
         contexts=_AuditContexts(),
     )
     root = tmp_path / "anchored-quarantine"
@@ -955,7 +1056,24 @@ def test_encrypted_store_write_is_anchored_during_mission_directory_swap(
         original_link(src, dst, **kwargs)
 
     monkeypatch.setattr(os, "link", swap_before_link)
-    quarantine.commit(
+    with pytest.raises(ArtifactSecurityError, match="directory changed"):
+        quarantine.commit(
+            mission_id="mission-swap",
+            mission_revision=1,
+            execution_id="execution-swap",
+            content=b"anchored-content",
+            created_at=NOW,
+            retention_until=NOW + timedelta(hours=1),
+        )
+
+    assert swapped
+    assert not list(outside.iterdir())
+    assert not list(detached_mission_root.glob("*.json"))
+    assert audit_log.events_for("mission-swap") == ()
+
+    mission_root.unlink()
+    detached_mission_root.rename(mission_root)
+    reference = quarantine.commit(
         mission_id="mission-swap",
         mission_revision=1,
         execution_id="execution-swap",
@@ -963,10 +1081,7 @@ def test_encrypted_store_write_is_anchored_during_mission_directory_swap(
         created_at=NOW,
         retention_until=NOW + timedelta(hours=1),
     )
-
-    assert swapped
-    assert not list(outside.iterdir())
-    assert len(list(detached_mission_root.glob("*.json"))) == 1
+    assert quarantine.resume(reference, now=NOW) == b"anchored-content"
 
 
 def test_encrypted_store_fsyncs_store_root_for_first_mission_write(
@@ -1334,6 +1449,228 @@ def test_quarantine_verifiers_do_not_expose_low_entropy_plaintext_digests(
         for mission_id in ("mission-keyed", "mission-keyed-stream")
         for event in audit_log.events_for(mission_id)
     )
+
+
+def test_quarantine_verifiers_remain_bound_across_domain_key_rotation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    keys = _keys()
+    audit = MissionAuditRecorder(
+        audit_log=MissionAuditLog(),
+        contexts=_AuditContexts(),
+    )
+    quarantine = EncryptedRawResultQuarantine(
+        root=tmp_path / "rotated-quarantine",
+        keys=keys,
+        audit=audit,
+        max_item_bytes=1024,
+        mission_quota_bytes=16 * 1024,
+    )
+    reference = quarantine.commit(
+        mission_id="mission-rotation",
+        mission_revision=1,
+        execution_id="execution-rotation",
+        content=b"pre-rotation",
+        created_at=NOW,
+        retention_until=NOW + timedelta(hours=1),
+    )
+    binding = QuarantineStreamBinding(
+        mission_id="mission-stream-rotation",
+        mission_revision=1,
+        execution_id="execution-stream-rotation",
+        retention_until=NOW + timedelta(hours=1),
+        max_result_bytes=1024,
+        resume_mode="from_start",
+    )
+    bindings = _StreamBindings(binding)
+    factory = EncryptedRawResultSinkFactory(
+        quarantine=quarantine,
+        bindings=bindings,
+        clock=lambda: NOW,
+    )
+
+    async def write_first_chunk() -> None:
+        sink = factory.for_execution("execution-stream-rotation")
+        await sink.write_stdout(b"first-version")
+
+    asyncio.run(write_first_chunk())
+    keys.set_rotation_state(
+        "raw_result_quarantine",
+        "raw_result_quarantine-key-v1",
+        1,
+        "decrypt_only",
+    )
+    keys.register_key(
+        domain="raw_result_quarantine",
+        key_id="raw_result_quarantine-key-v2",
+        key_version=2,
+        key_separation_tag="raw_result_quarantine-separation-v2",
+        material=b"\x09" * 32,
+        created_at=NOW + timedelta(minutes=1),
+    )
+    assert quarantine.resume(reference, now=NOW) == b"pre-rotation"
+    assert (
+        quarantine.commit(
+            mission_id="mission-rotation",
+            mission_revision=1,
+            execution_id="execution-rotation",
+            content=b"pre-rotation",
+            created_at=NOW,
+            retention_until=NOW + timedelta(hours=1),
+        )
+        == reference
+    )
+
+    async def replay_continue_and_resume() -> None:
+        replay = factory.for_execution("execution-stream-rotation")
+        await replay.write_stdout(b"first-version")
+        await replay.write_stdout(b"second-version")
+        receipt = await replay.commit()
+        recovered = factory.for_execution("execution-stream-rotation")
+        resumed = b"".join(
+            [chunk async for chunk in recovered._iter_committed_chunks(receipt, now=NOW)]
+        )
+        assert resumed == b"first-versionsecond-version"
+
+    asyncio.run(replay_continue_and_resume())
+
+    original_seal = keys.seal_for_resource
+    rotated_during_write = False
+
+    def rotate_before_seal(*args, **kwargs):
+        nonlocal rotated_during_write
+        if not rotated_during_write:
+            rotated_during_write = True
+            keys.set_rotation_state(
+                "raw_result_quarantine",
+                "raw_result_quarantine-key-v2",
+                2,
+                "decrypt_only",
+            )
+            keys.register_key(
+                domain="raw_result_quarantine",
+                key_id="raw_result_quarantine-key-v3",
+                key_version=3,
+                key_separation_tag="raw_result_quarantine-separation-v3",
+                material=b"\x0a" * 32,
+                created_at=NOW + timedelta(minutes=2),
+            )
+        return original_seal(*args, **kwargs)
+
+    monkeypatch.setattr(keys, "seal_for_resource", rotate_before_seal)
+    with pytest.raises(ArtifactSecurityError, match="verifier key changed"):
+        quarantine.commit(
+            mission_id="mission-rotation-race",
+            mission_revision=1,
+            execution_id="execution-rotation-race",
+            content=b"rotation-race",
+            created_at=NOW,
+            retention_until=NOW + timedelta(hours=1),
+        )
+    monkeypatch.setattr(keys, "seal_for_resource", original_seal)
+    race_reference = quarantine.commit(
+        mission_id="mission-rotation-race",
+        mission_revision=1,
+        execution_id="execution-rotation-race",
+        content=b"rotation-race",
+        created_at=NOW,
+        retention_until=NOW + timedelta(hours=1),
+    )
+    assert quarantine.resume(race_reference, now=NOW) == b"rotation-race"
+
+
+def test_aborted_stream_erasure_resumes_after_interruption(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    keys = _keys()
+    audit_log = MissionAuditLog()
+    audit = MissionAuditRecorder(audit_log=audit_log, contexts=_AuditContexts())
+    quarantine = EncryptedRawResultQuarantine(
+        root=tmp_path / "aborted-quarantine",
+        keys=keys,
+        audit=audit,
+        max_item_bytes=1024,
+        mission_quota_bytes=16 * 1024,
+    )
+    binding = QuarantineStreamBinding(
+        mission_id="mission-aborted",
+        mission_revision=1,
+        execution_id="execution-aborted",
+        retention_until=NOW + timedelta(hours=1),
+        max_result_bytes=1024,
+        resume_mode="from_start",
+    )
+    factory = EncryptedRawResultSinkFactory(
+        quarantine=quarantine,
+        bindings=_StreamBindings(binding),
+        clock=lambda: NOW,
+    )
+    sink = factory.for_execution("execution-aborted")
+
+    async def write_chunks() -> None:
+        await sink.write_stdout(b"first-aborted-secret")
+
+        async def artifact_chunks():
+            yield b"second-aborted-secret"
+
+        await sink.write_artifact(
+            RawArtifactMetadata(
+                artifact_sequence=0,
+                suggested_name="aborted.bin",
+                media_type="application/octet-stream",
+                declared_size=len(b"second-aborted-secret"),
+            ),
+            artifact_chunks(),
+        )
+
+    asyncio.run(write_chunks())
+    chunk_metadata = tuple(
+        envelope.payload.metadata for _, envelope in sink._chunks
+    )
+    artifact_metadata = tuple(
+        envelope.payload.metadata for _, envelope in sink._artifact_terminals.values()
+    )
+    original_erase = sink._store.erase_resource
+    erased = 0
+
+    def interrupt_after_first_erasure(**kwargs) -> None:
+        nonlocal erased
+        original_erase(**kwargs)
+        erased += 1
+        if erased == 1:
+            raise ArtifactSecurityError("simulated abort erasure interruption")
+
+    monkeypatch.setattr(sink._store, "erase_resource", interrupt_after_first_erasure)
+    with pytest.raises(ArtifactSecurityError, match="abort erasure interruption"):
+        asyncio.run(sink.abort())
+    assert sink._terminal_envelope is not None
+    terminal_metadata = sink._terminal_envelope.payload.metadata
+    monkeypatch.setattr(sink._store, "erase_resource", original_erase)
+
+    recovered = factory.for_execution("execution-aborted")
+    assert recovered.recovery_metadata(updated_at=NOW).state == "ABORTED"
+    assert not list(
+        (tmp_path / "aborted-quarantine").rglob("streamchunk_*.json")
+    )
+    assert not list(
+        (tmp_path / "aborted-quarantine").rglob("streamartifact_*.json")
+    )
+    assert not list(
+        (tmp_path / "aborted-quarantine").rglob("streamterminal_*.json")
+    )
+    assert all(
+        keys.resource_key_destroyed(metadata)
+        for metadata in (*chunk_metadata, *artifact_metadata, terminal_metadata)
+    )
+    recovered_again = factory.for_execution("execution-aborted")
+    assert recovered_again.recovery_metadata(updated_at=NOW).state == "ABORTED"
+    event_types = tuple(
+        event.event_type for event in audit_log.events_for("mission-aborted")
+    )
+    assert event_types.count("raw_result_quarantine.abort") == 1
+    assert event_types.count("raw_result_quarantine.delete") == 1
 
 
 def test_secret_revocation_reconciles_interrupted_erasure(

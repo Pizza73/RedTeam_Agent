@@ -558,3 +558,93 @@ PHASE_GATE=phase-0c PASS
 - No protected governance file was modified.
 - A fresh independent Phase 0C review remains required on the resulting 40-character PR HEAD; this
   local PASS is not an independent Phase Gate PASS.
+
+## Fourteenth independent review correction cycle
+
+Current phase: `phase-0c`.
+
+Input review SHA: `705ee3bf130891f5e6aecf56fded7f0ac79fa842`.
+
+Phase base: `5cda9a5f8792ee33c3e153d8e791499f5619d82e`.
+
+### Findings addressed
+
+- [`discussion_r3899065362`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3899065362):
+  secret detection now parses the `Authorization` header before interpreting its scheme. Basic and
+  Bearer remain value-redacted, every other well-formed scheme is handled as credential-bearing,
+  and malformed headers fail closed. Complete, quoted, and cross-chunk forms cannot publish an
+  unchanged credential.
+- [`discussion_r3899065367`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3899065367):
+  non-stream quarantine resume and from-start stream replay recompute keyed verifiers using each
+  persisted envelope's resource-key metadata. Data written under a decrypt-only parent version
+  remains verifiable after the quarantine domain rotates to a new active version.
+- [`discussion_r3899065375`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3899065375):
+  atomic encrypted writes anchor both Store-root and Mission-directory descriptors and verify the
+  Mission entry's device/inode identity immediately before acknowledgement. A concurrent rename or
+  symlink substitution removes the detached publication and fails without an audit; a restored path
+  can then be written and resumed normally.
+- [`discussion_r3899065377`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3899065377):
+  stream abort now persists a bound abort-deletion intent, audits deletion idempotently, destroys
+  every quarantined chunk, Artifact-completion, and abort-terminal resource key, and resumes
+  interrupted erasure on restart before returning the durable `ABORTED` state.
+
+### Modified files and regression tests
+
+Resulting working-tree diff: `5 files changed, 757 insertions(+), 27 deletions(-)`.
+
+- `src/redteam_agent/data_security/ingestion.py`
+- `src/redteam_agent/data_security/stores.py`
+- `src/redteam_agent/data_security/streaming.py`
+- `tests/security/test_phase0c_data_security.py`
+- `docs/review/phase-0c-fix-report.md`
+
+Focused regression coverage proves complete and split-chunk unsupported authorization redaction,
+non-stream and streaming verification across quarantine-key rotation, detached-directory rollback
+plus successful retry/resume, and interrupted abort erasure plus restart reconciliation. No test was
+deleted, skipped, weakened, or marked as an expected failure.
+
+### Validation
+
+Focused regression command:
+
+```text
+/home/kali/Red_Agent/.venv/bin/python -m pytest -q \
+  tests/security/test_phase0c_data_security.py \
+  -k 'unsupported_authorization or anchored_during_mission_directory_swap or \
+  verifiers_remain_bound or aborted_stream_erasure'
+```
+
+Result: `4 passed, 26 deselected`.
+
+Complete Phase 0C security module: `30 passed`.
+
+Required phase-gate command:
+
+```text
+PATH="/home/kali/Red_Agent/.venv/bin:$PATH" \
+  bash scripts/ci/run_phase_gate.sh phase-0c
+```
+
+Result:
+
+```text
+AUTOMATION_VALIDATION=PASS
+ruff: All checks passed
+mypy: Success: no issues found in 78 source files
+unit: 200 passed
+integration: 7 passed
+security: 174 passed
+full/coverage run: 381 passed
+skipped=0, errors=0, failures=0
+coverage: 82% total (branch coverage enabled)
+pip check: No broken requirements found
+PHASE_GATE=phase-0c PASS
+```
+
+### Remaining constraints
+
+- No real C2, MCP, provider, subprocess, local-attack, credential-collection, or external-target
+  action was executed.
+- No protected governance file was modified.
+- A fresh independent Phase 0C review remains required on the resulting 40-character PR HEAD; this
+  local PASS is not an independent Phase Gate PASS.

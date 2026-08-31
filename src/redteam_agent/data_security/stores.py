@@ -283,6 +283,16 @@ class _EncryptedFileStore:
                 aad,
                 created_at=created_at,
             )
+            if (
+                self._content_digest(
+                    content,
+                    metadata=encrypted.metadata,
+                )
+                != content_digest
+            ):
+                raise ArtifactSecurityError(
+                    "resource verifier key changed during creation"
+                )
             metadata_id = self._keys.metadata_id(encrypted.metadata)
             envelope = _StoredEnvelope(
                 schema_version="encrypted-store-v1",
@@ -665,8 +675,17 @@ class _EncryptedFileStore:
         if hasattr(os, "O_NOFOLLOW"):
             directory_flags |= os.O_NOFOLLOW
         try:
-            directory_descriptor = os.open(path.parent, directory_flags)
+            root_descriptor = os.open(path.parent.parent, directory_flags)
         except OSError as exc:
+            raise ArtifactSecurityError("store root is unavailable") from exc
+        try:
+            directory_descriptor = os.open(
+                path.parent.name,
+                directory_flags,
+                dir_fd=root_descriptor,
+            )
+        except OSError as exc:
+            os.close(root_descriptor)
             raise ArtifactSecurityError("resource directory is unavailable") from exc
         temporary_name: str | None = None
         try:
@@ -721,12 +740,31 @@ class _EncryptedFileStore:
                 os.fsync(directory_descriptor)
             except OSError as exc:
                 raise ArtifactSecurityError("resource directory sync failed") from exc
+            try:
+                current_metadata = os.stat(
+                    path.parent.name,
+                    dir_fd=root_descriptor,
+                    follow_symlinks=False,
+                )
+            except OSError:
+                current_metadata = None
+            if current_metadata is None or (
+                not stat.S_ISDIR(current_metadata.st_mode)
+                or current_metadata.st_dev != directory_metadata.st_dev
+                or current_metadata.st_ino != directory_metadata.st_ino
+            ):
+                with suppress(OSError):
+                    os.unlink(path.name, dir_fd=directory_descriptor)
+                    os.fsync(directory_descriptor)
+                raise ArtifactSecurityError("resource directory changed during creation")
         finally:
             if temporary_name is not None:
                 with suppress(OSError):
                     os.unlink(temporary_name, dir_fd=directory_descriptor)
             with suppress(OSError):
                 os.close(directory_descriptor)
+            with suppress(OSError):
+                os.close(root_descriptor)
 
     @staticmethod
     def _sync_parent_directory(directory: Path) -> None:
@@ -795,9 +833,9 @@ class EncryptedRawResultQuarantine:
         resource_id = stable_id(
             "quarantine",
             {
+                "schema_version": "quarantine-reference-v2",
                 "mission_id": mission_id,
                 **binding,
-                "content_sha256": self._store._content_digest(content),
             },
         )
         digest, metadata_id = self._store.write(
@@ -830,19 +868,26 @@ class EncryptedRawResultQuarantine:
         return reference
 
     def resume(self, reference: QuarantineReference, *, now: datetime) -> bytes:
-        content = self._store.read(
+        content, envelope = self._store.read_bound(
             mission_id=reference.mission_id,
             resource_id=reference.quarantine_id,
-            binding={
+            now=now,
+        )
+        expected_binding = CanonicalJsonObject(
+            {
                 "mission_revision": reference.mission_revision,
                 "execution_id": reference.execution_id,
-            },
-            now=now,
-            expected_encryption_metadata_id=reference.encryption_metadata_id,
+            }
         )
         if not (
-            len(content) == reference.size_bytes
-            and self._store._content_digest(content) == reference.sha256
+            envelope.binding == expected_binding
+            and envelope.encryption_metadata_id == reference.encryption_metadata_id
+            and len(content) == reference.size_bytes
+            and self._store._content_digest(
+                content,
+                metadata=envelope.payload.metadata,
+            )
+            == reference.sha256
         ):
             raise DigestIntegrityError("quarantine reference integrity failed")
         self._audit.record(
