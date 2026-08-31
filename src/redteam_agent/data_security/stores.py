@@ -1538,6 +1538,10 @@ class SecretStore:
                 metadata_digest=sha256_digest(authoritative),
                 occurred_at=now,
             )
+            self._reconcile_revoked_secret_erasure(
+                authoritative,
+                source_execution_id=source_execution_id,
+            )
             return authoritative
         revoked = authoritative.model_copy(update={"verification_state": "revoked"})
         tombstone = _SecretTombstone(
@@ -1576,20 +1580,33 @@ class SecretStore:
             metadata_digest=tombstone_digest,
             occurred_at=now,
         )
+        self._reconcile_revoked_secret_erasure(
+            revoked,
+            source_execution_id=source_execution_id,
+        )
+        return revoked
+
+    def _reconcile_revoked_secret_erasure(
+        self,
+        revoked: SecretReferenceMetadata,
+        *,
+        source_execution_id: str,
+    ) -> None:
+        """Finish a deletion durably requested by the revocation tombstone."""
+
         self._store.delete(
-            mission_id=authoritative.mission_id,
-            resource_id=authoritative.secret_reference_id,
+            mission_id=revoked.mission_id,
+            resource_id=revoked.secret_reference_id,
             binding={
-                "secret_reference_id": authoritative.secret_reference_id,
-                "credential_type": authoritative.credential_type,
-                "associated_principal_ref": authoritative.associated_principal_ref,
+                "secret_reference_id": revoked.secret_reference_id,
+                "credential_type": revoked.credential_type,
+                "associated_principal_ref": revoked.associated_principal_ref,
                 "source_execution_id": source_execution_id,
                 "verification_state": "detected",
                 "metadata_version": 1,
             },
-            expected_encryption_metadata_id=authoritative.encryption_metadata_id,
+            expected_encryption_metadata_id=revoked.encryption_metadata_id,
         )
-        return revoked
 
     def _authoritative_metadata(
         self, reference: SecretReferenceMetadata

@@ -242,6 +242,51 @@ def test_secure_ingestion_exposes_only_redacted_references(tmp_path: Path) -> No
     assert audit_log.events_for("mission-a")[-1].event_type == "artifact.read"
 
 
+def test_bearer_authorization_is_redacted_before_artifact_publication(
+    tmp_path: Path,
+) -> None:
+    quarantine, artifacts, secrets, authorizer, _ = _stores(tmp_path)
+    authorizer.allow_ingestion_write("mission-bearer", "execution-bearer")
+    bearer_secret = b"eyJhbGciOiJIUzI1NiJ9.fake-signature"
+    receipt = quarantine.commit(
+        mission_id="mission-bearer",
+        mission_revision=1,
+        execution_id="execution-bearer",
+        content=b"Authorization: Bearer " + bearer_secret + b"\nstatus=ok",
+        created_at=NOW,
+        retention_until=NOW + timedelta(hours=1),
+    )
+
+    result = SecureIngestor(
+        quarantine=quarantine,
+        artifacts=artifacts,
+        secrets=secrets,
+    ).ingest(receipt, now=NOW)
+
+    assert result.redaction_metadata.redaction_count == 1
+    assert result.redacted_artifacts[0].classification == "sensitive"
+    assert result.detected_secrets[0].credential_type == "bearer"
+    assert bearer_secret.decode() not in result.model_dump_json()
+    artifact = result.redacted_artifacts[0]
+    authorizer.set_grants(
+        "mission-bearer",
+        (
+            DataAccessGrant(
+                resource_type="artifact",
+                resource=ResourceBinding(
+                    resource_id=artifact.artifact_id,
+                    resource_version="1",
+                    resource_digest=artifact.sha256,
+                ),
+                operations=frozenset({"read"}),
+            ),
+        ),
+    )
+    visible = artifacts.read(artifact, operation="read", now=NOW)
+    assert visible == b"Authorization: Bearer [REDACTED]\nstatus=ok"
+    assert bearer_secret not in visible
+
+
 def test_secret_resolution_requires_trusted_exact_mission_grant(tmp_path: Path) -> None:
     _, _, secrets, authorizer, audit_log = _stores(tmp_path)
     with pytest.raises(SecretAccessError):
@@ -362,6 +407,77 @@ def test_secret_resolution_requires_trusted_exact_mission_grant(tmp_path: Path) 
     assert b"private-value" not in b"".join(
         path.read_bytes() for path in tmp_path.rglob("*.json")
     )
+
+
+def test_secret_revocation_reconciles_interrupted_erasure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, _, secrets, authorizer, _ = _stores(tmp_path)
+    authorizer.allow_ingestion_write("mission-revoke", "execution-revoke")
+    metadata = secrets.create(
+        mission_id="mission-revoke",
+        secret_value=b"revocation-recovery-value",
+        credential_type="token",
+        associated_principal_ref=None,
+        source_execution_id="execution-revoke",
+        created_at=NOW,
+    )
+    authorizer.set_grants(
+        "mission-revoke",
+        (
+            DataAccessGrant(
+                resource_type="secret_reference",
+                resource=ResourceBinding(
+                    resource_id=metadata.secret_reference_id,
+                    resource_version="1",
+                    resource_digest=sha256_digest(metadata),
+                ),
+                operations=frozenset({"write"}),
+            ),
+        ),
+    )
+    envelope = secrets._store.verified_envelope(
+        mission_id=metadata.mission_id,
+        resource_id=metadata.secret_reference_id,
+        now=None,
+    )
+    original_delete = secrets._store.delete
+
+    def interrupt_before_delete(**kwargs) -> None:
+        del kwargs
+        raise ArtifactSecurityError("simulated crash before secret erasure")
+
+    monkeypatch.setattr(secrets._store, "delete", interrupt_before_delete)
+    with pytest.raises(ArtifactSecurityError):
+        secrets.revoke(metadata, now=NOW + timedelta(seconds=1))
+    assert secrets._store.has_resource(
+        mission_id=metadata.mission_id,
+        resource_id=metadata.secret_reference_id,
+    )
+
+    revoked = metadata.model_copy(update={"verification_state": "revoked"})
+    authorizer.set_grants(
+        "mission-revoke",
+        (
+            DataAccessGrant(
+                resource_type="secret_reference",
+                resource=ResourceBinding(
+                    resource_id=metadata.secret_reference_id,
+                    resource_version="2",
+                    resource_digest=sha256_digest(revoked),
+                ),
+                operations=frozenset({"write"}),
+            ),
+        ),
+    )
+    monkeypatch.setattr(secrets._store, "delete", original_delete)
+    assert secrets.revoke(metadata, now=NOW + timedelta(seconds=2)) == revoked
+    assert not secrets._store.has_resource(
+        mission_id=metadata.mission_id,
+        resource_id=metadata.secret_reference_id,
+    )
+    assert secrets._store._keys.resource_key_destroyed(envelope.payload.metadata)
 
 
 def test_artifact_create_audit_is_reconciled_after_write_crash(tmp_path: Path) -> None:

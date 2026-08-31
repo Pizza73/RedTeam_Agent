@@ -4,35 +4,26 @@
 
 - Current phase: `Phase 0C: Data Security and Audit`
 - Input review SHA: `6b55fe9ba6cf0453e8c8ba33af3a3a9368944df5`
-- Latest correction input SHA: `bde842bc06e61742fe2ff84e30ab21830162ff1c`
+- Latest correction input SHA: `0b9ce88d297179a765ad94f27ebb91eba3429890`
 - Trusted Phase 0B base PASS SHA: `5cda9a5f8792ee33c3e153d8e791499f5619d82e`
 - Implementation branch: `ai/redteam-agent-phase-loop`
 - Independent-review result: `CHANGES_REQUESTED`
-- Latest finding key: `CODEX-P1-83F82756B539E4B9`
+- Latest finding key: `CODEX-P1-344F930A8CCE7B53`
 - External provider, C2, MCP side effect, local attack, and external-target execution: absent
 
 ## Resulting working-tree diff
 
-The latest correction updates seven implementation/test files, adds one repository module, and
-updates this report. No protected governance file listed in `AGENTS.md` was modified. In particular,
-`SystemDesign.md`, `.github/**`, `automation/**`, requirements, acceptance criteria, safety
-invariants, implementation status, phase prompts, CI scripts, and dependency manifests are
-unchanged.
+The latest correction updates two implementation/test files and this report. No protected
+governance file listed in `AGENTS.md` was modified. In particular, `SystemDesign.md`, `.github/**`,
+`automation/**`, requirements, acceptance criteria, safety invariants, implementation status,
+phase prompts, CI scripts, and dependency manifests are unchanged.
 
 Modified files:
 
-- `src/redteam_agent/data_security/audit.py`
 - `src/redteam_agent/data_security/ingestion.py`
 - `src/redteam_agent/data_security/stores.py`
-- `src/redteam_agent/data_security/streaming.py`
-- `src/redteam_agent/storage/migrations.py`
-- `tests/security/test_gate_review_regressions.py`
 - `tests/security/test_phase0c_data_security.py`
 - `docs/review/phase-0c-fix-report.md`
-
-Added files:
-
-- `src/redteam_agent/repositories/audit.py`
 
 ## Findings addressed
 
@@ -144,6 +135,22 @@ No raw chunk, complete redacted result, secret value, or plaintext fallback is w
 storage. Partial Artifact chunks remain encrypted and idempotently resumable until the manifest is
 committed.
 
+## Fourth independent review correction cycle
+
+The review for exact HEAD `0b9ce88d297179a765ad94f27ebb91eba3429890` recorded two P1 findings
+under `CODEX-P1-344F930A8CCE7B53`. The exact-SHA Human Resume covers both findings:
+
+- [`discussion_r3894970515`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3894970515):
+  the bounded streaming detector now recognizes case-insensitive Bearer credential forms,
+  including `Authorization: Bearer ...`. The visible scheme and surrounding structured data remain
+  intact while only credential material is stored in the Secret Store and replaced by the redaction
+  marker before Artifact publication.
+- [`discussion_r3894970527`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3894970527):
+  an authenticated revocation tombstone is now also the durable pending-erasure intent. Both the
+  first revocation and any repeated `revoke()` reconcile deletion against the original encrypted
+  record binding before returning revoked metadata, so interruption before resource-key destruction
+  cannot leave the secret indefinitely decryptable.
+
 ## Regression tests added
 
 The existing Phase 0C security test module now additionally covers:
@@ -172,7 +179,11 @@ The existing Phase 0C security test module now additionally covers:
   exactly-once create-audit reconciliation;
 - idempotent Secret creation after restart; and
 - SQLite audit process restart, continued atomic sequence allocation, trusted-head persistence, and
-  deletion-tamper detection.
+  deletion-tamper detection;
+- Bearer authorization detection, sensitive classification, reference-only storage, and exact
+  credential-value redaction before Artifact publication; and
+- retry after interruption between durable secret revocation and encrypted-record deletion,
+  including confirmation that the original resource key is destroyed.
 
 No test was removed, weakened, skipped, or marked as an expected failure.
 
@@ -192,8 +203,8 @@ ruff: All checks passed
 mypy: Success: no issues found in 78 source files
 unit: 186 passed
 integration: 7 passed
-security: 151 passed
-full/coverage run: 344 passed
+security: 153 passed
+full/coverage run: 346 passed
 skipped=0, errors=0, failures=0
 coverage: 82% total (branch coverage enabled)
 pip check: No broken requirements found
@@ -209,7 +220,8 @@ PATH="$PWD/.venv/bin:$PATH" python -m pytest -q \
   tests/security/test_phase0c_data_security.py
 ```
 
-Latest focused Phase 0C and boundary result: `9 passed`.
+Latest focused Phase 0C security result: `9 passed`. The two new targeted regressions pass with
+`2 passed, 7 deselected`.
 
 ## Remaining constraints
 

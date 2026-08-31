@@ -29,6 +29,7 @@ _SECRET_KEYWORDS = (
     b"apikey",
     b"secret",
 )
+_BEARER_KEYWORD = b"bearer"
 _SECRET_TERMINATORS = frozenset(b" \t\n\r\v\f,;}]" + bytes((34, 39)))
 _SECRET_WHITESPACE = frozenset(b" \t\n\r\v\f")
 _QUOTE_BYTES = frozenset(b"\"'")
@@ -101,6 +102,13 @@ class _StreamingSecretRedactor:
         *,
         final: bool,
     ) -> tuple[int, int, int, int, int] | Literal["incomplete"] | None:
+        bearer = _StreamingSecretRedactor._bearer_candidate(
+            data,
+            index,
+            final=final,
+        )
+        if bearer is not None:
+            return bearer
         key_quote = data[index] if data[index] in _QUOTE_BYTES else None
         keyword_start = index + 1 if key_quote is not None else index
         keyword: bytes | None = None
@@ -160,6 +168,45 @@ class _StreamingSecretRedactor:
             if final:
                 raise SecretDetectionError("secret detection failed closed")
             return "incomplete"
+        secret_start = cursor
+        while cursor < len(data) and data[cursor] not in _SECRET_TERMINATORS:
+            cursor += 1
+        if cursor == len(data) and not final:
+            return "incomplete"
+        if cursor == secret_start:
+            return None
+        return keyword_start, keyword_end, secret_start, cursor, cursor
+
+    @staticmethod
+    def _bearer_candidate(
+        data: bytes,
+        index: int,
+        *,
+        final: bool,
+    ) -> tuple[int, int, int, int, int] | Literal["incomplete"] | None:
+        """Recognize a Bearer credential while preserving its visible scheme."""
+
+        wrapper_quote = data[index] if data[index] in _QUOTE_BYTES else None
+        keyword_start = index + 1 if wrapper_quote is not None else index
+        candidate = data[
+            keyword_start : keyword_start + len(_BEARER_KEYWORD)
+        ].lower()
+        if len(candidate) < len(_BEARER_KEYWORD):
+            if _BEARER_KEYWORD.startswith(candidate):
+                return None if final else "incomplete"
+            return None
+        if candidate != _BEARER_KEYWORD:
+            return None
+        keyword_end = keyword_start + len(_BEARER_KEYWORD)
+        cursor = keyword_end
+        if cursor == len(data):
+            return None if final else "incomplete"
+        if data[cursor] not in _SECRET_WHITESPACE:
+            return None
+        while cursor < len(data) and data[cursor] in _SECRET_WHITESPACE:
+            cursor += 1
+        if cursor == len(data):
+            return None if final else "incomplete"
         secret_start = cursor
         while cursor < len(data) and data[cursor] not in _SECRET_TERMINATORS:
             cursor += 1
