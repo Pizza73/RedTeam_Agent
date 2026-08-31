@@ -152,6 +152,29 @@ def test_phase_gate_has_minimal_permissions_for_pr_state_updates() -> None:
         assert forbidden_operation not in workflow
 
 
+def test_resume_workflow_can_comment_on_pr_without_merge_authority() -> None:
+    workflow = (
+        REPO_ROOT / ".github" / "workflows" / "resume-ai-loop.yml"
+    ).read_text(encoding="utf-8")
+    permissions = workflow.split("\npermissions:\n", maxsplit=1)[1].split(
+        "\njobs:\n", maxsplit=1
+    )[0]
+
+    assert permissions.strip().splitlines() == [
+        "contents: read",
+        "  issues: write",
+        "  pull-requests: write",
+        "  statuses: write",
+    ]
+    assert "github.rest.issues.createComment" in workflow
+    for forbidden_operation in (
+        "github.rest.pulls.merge",
+        "mergePullRequest",
+        "/pulls/{number}/merge",
+    ):
+        assert forbidden_operation not in workflow
+
+
 def test_documented_reviewer_login_includes_bot_suffix() -> None:
     runbook = (REPO_ROOT / "docs" / "ai-loop-runbook.md").read_text(encoding="utf-8")
 
