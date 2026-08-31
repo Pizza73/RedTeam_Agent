@@ -29,6 +29,7 @@ from redteam_agent.models.execution import (
     RawResultRecoveryMetadata,
 )
 
+from .models import SecureIngestionResult
 from .stores import EncryptedRawResultQuarantine, _StoredEnvelope
 
 
@@ -115,6 +116,20 @@ class _DeletionBinding(StrictImmutableBoundaryModel):
     chunk_count: int = Field(ge=0)
     aggregate_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
     receipt_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    ingestion_id: str = Field(min_length=1)
+    ingestion_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+
+
+class _IngestionResultBinding(StrictImmutableBoundaryModel):
+    record_type: Literal["stream_ingestion_result"]
+    mission_revision: int = Field(ge=1)
+    stream_binding_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    execution_id: str = Field(min_length=1)
+    sink_id: str = Field(min_length=1)
+    receipt_id: str = Field(min_length=1)
+    receipt_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    ingestion_id: str = Field(min_length=1)
+    ingestion_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
 
 
 class EncryptedRawResultSink:
@@ -149,6 +164,8 @@ class EncryptedRawResultSink:
             int, tuple[_ArtifactTerminalBinding, _StoredEnvelope]
         ] = {}
         self._receipt: RawResultReceipt | None = None
+        self._ingestion_result: SecureIngestionResult | None = None
+        self._ingestion_binding: _IngestionResultBinding | None = None
         self._terminal_envelope: _StoredEnvelope | None = None
         self._aborted = False
         self._recovery_required = False
@@ -158,9 +175,11 @@ class EncryptedRawResultSink:
             mission_id=self.binding.mission_id,
             resource_id=self._deletion_resource_id(),
         ):
+            self._load_ingestion_result()
             self._resume_deletion()
-            raise RawResultQuarantineError("raw-result quarantine was deleted")
+            return
         self._load_durable_state()
+        self._load_ingestion_result()
         if (
             binding.resume_mode == "from_cursor"
             and binding.resume_cursor != len(self._chunks)
@@ -419,10 +438,129 @@ class EncryptedRawResultSink:
 
         return iterate()
 
+    def _durable_ingestion_result(
+        self, receipt: RawResultReceipt
+    ) -> SecureIngestionResult | None:
+        if self._ingestion_result is None or self._ingestion_binding is None:
+            return None
+        if not (
+            self._ingestion_binding.receipt_id == receipt.receipt_id
+            and self._ingestion_binding.receipt_digest == receipt.receipt_digest
+            and receipt.execution_id == self.execution_id
+            and receipt.quarantine_id == self.quarantine_id
+            and receipt.sink_id == self.sink_id
+        ):
+            raise RawResultQuarantineError(
+                "durable ingestion result is bound to another receipt"
+            )
+        return self._ingestion_result
+
+    def _commit_ingestion_result(
+        self,
+        receipt: RawResultReceipt,
+        result: SecureIngestionResult,
+        *,
+        now: datetime,
+    ) -> None:
+        if self._receipt is None or receipt != self._receipt or self._deleted:
+            raise RawResultQuarantineError(
+                "ingestion result requires a live committed quarantine"
+            )
+        binding = _IngestionResultBinding(
+            record_type="stream_ingestion_result",
+            mission_revision=self.binding.mission_revision,
+            stream_binding_digest=self._binding_digest,
+            execution_id=self.execution_id,
+            sink_id=self.sink_id,
+            receipt_id=receipt.receipt_id,
+            receipt_digest=receipt.receipt_digest,
+            ingestion_id=result.ingestion_id,
+            ingestion_digest=result.ingestion_digest,
+        )
+        self._store.write(
+            mission_id=self.binding.mission_id,
+            resource_id=self._ingestion_result_resource_id(),
+            content=canonicalize(result.model_dump(mode="python")),
+            binding=binding.model_dump(mode="python"),
+            created_at=now,
+            retention_until=None,
+        )
+        self._audit.record(
+            mission_id=self.binding.mission_id,
+            resource_type="raw_result_quarantine",
+            resource_id=self.quarantine_id,
+            operation="commit",
+            operation_id=self._audit_operation_id("commit", "ingestion-result"),
+            metadata_digest=result.ingestion_digest,
+            occurred_at=now,
+        )
+        self._ingestion_binding = binding
+        self._ingestion_result = result
+
+    def _load_ingestion_result(self) -> None:
+        resource_id = self._ingestion_result_resource_id()
+        if not self._store.has_resource(
+            mission_id=self.binding.mission_id,
+            resource_id=resource_id,
+        ):
+            return
+        raw, envelope = self._store.read_bound(
+            mission_id=self.binding.mission_id,
+            resource_id=resource_id,
+            now=None,
+        )
+        try:
+            canonical_loads(raw)
+            result = SecureIngestionResult.model_validate_json(raw, strict=True)
+            binding = _IngestionResultBinding.model_validate(
+                envelope.binding.to_dict()
+            )
+        except (TypeError, ValueError) as exc:
+            raise RawResultQuarantineError(
+                "durable ingestion result is invalid"
+            ) from exc
+        expected_digest = sha256_digest(
+            {
+                "ingestion_id": result.ingestion_id,
+                "redacted_artifacts": result.redacted_artifacts,
+                "encrypted_raw_artifacts": result.encrypted_raw_artifacts,
+                "detected_secrets": result.detected_secrets,
+                "redaction_metadata": result.redaction_metadata,
+            }
+        )
+        if not (
+            binding.mission_revision == self.binding.mission_revision
+            and binding.stream_binding_digest == self._binding_digest
+            and binding.execution_id == self.execution_id
+            and binding.sink_id == self.sink_id
+            and binding.ingestion_id == result.ingestion_id
+            and binding.ingestion_digest
+            == result.ingestion_digest
+            == expected_digest
+        ):
+            raise RawResultQuarantineError(
+                "durable ingestion result binding is invalid"
+            )
+        self._audit.record(
+            mission_id=self.binding.mission_id,
+            resource_type="raw_result_quarantine",
+            resource_id=self.quarantine_id,
+            operation="commit",
+            operation_id=self._audit_operation_id("commit", "ingestion-result"),
+            metadata_digest=result.ingestion_digest,
+            occurred_at=envelope.created_at,
+        )
+        self._ingestion_binding = binding
+        self._ingestion_result = result
+
     def _delete_committed(self, *, now: datetime) -> None:
         if self._deleted:
             return
-        if self._receipt is None or self._terminal_envelope is None:
+        if (
+            self._receipt is None
+            or self._terminal_envelope is None
+            or self._ingestion_result is None
+        ):
             raise RawResultQuarantineError("raw-result stream is not committed")
         if self._store.has_resource(
             mission_id=self.binding.mission_id,
@@ -442,6 +580,8 @@ class EncryptedRawResultSink:
             chunk_count=len(self._chunks),
             aggregate_digest=terminal.aggregate_digest,
             receipt_digest=self._receipt.receipt_digest,
+            ingestion_id=self._ingestion_result.ingestion_id,
+            ingestion_digest=self._ingestion_result.ingestion_digest,
         )
         self._store.write(
             mission_id=self.binding.mission_id,
@@ -612,6 +752,11 @@ class EncryptedRawResultSink:
                     )
                 elif record_type in {"stream_commit", "stream_abort"}:
                     terminals.append((_TerminalBinding.model_validate(value), envelope))
+                elif record_type in {
+                    "stream_ingestion_result",
+                    "stream_delete_intent",
+                }:
+                    continue
                 else:
                     raise ValueError("unknown stream record type")
             except ValueError as exc:
@@ -814,6 +959,16 @@ class EncryptedRawResultSink:
             },
         )
 
+    def _ingestion_result_resource_id(self) -> str:
+        return stable_id(
+            "streamingestion",
+            {
+                "schema_version": "stream-ingestion-result-v1",
+                "execution_id": self.execution_id,
+                "sink_id": self.sink_id,
+            },
+        )
+
     def _audit_operation_id(self, operation: str, identity: str) -> str:
         return stable_id(
             "auditop",
@@ -827,6 +982,10 @@ class EncryptedRawResultSink:
         )
 
     def _resume_deletion(self) -> None:
+        if self._ingestion_result is None:
+            raise RawResultQuarantineError(
+                "deletion intent lacks a durable ingestion result"
+            )
         raw, envelope = self._store.read_bound(
             mission_id=self.binding.mission_id,
             resource_id=self._deletion_resource_id(),
@@ -858,6 +1017,8 @@ class EncryptedRawResultSink:
             and terminal.chunk_count == intent.chunk_count
             and terminal.aggregate_digest == intent.aggregate_digest
             and terminal.receipt_digest == intent.receipt_digest
+            and intent.ingestion_id == self._ingestion_result.ingestion_id
+            and intent.ingestion_digest == self._ingestion_result.ingestion_digest
         ):
             raise RawResultQuarantineError("deletion intent binding is invalid")
         self._audit.record(

@@ -4,15 +4,24 @@ from __future__ import annotations
 
 import hmac
 import secrets
+import sqlite3
 from datetime import datetime
 from threading import RLock
 from typing import Literal, Protocol
 
 from pydantic import Field, model_validator
 
-from redteam_agent.canonical import CanonicalJsonObject, sha256_digest, stable_id
+from redteam_agent.canonical import (
+    CanonicalJsonObject,
+    canonical_loads,
+    canonicalize,
+    sha256_digest,
+    stable_id,
+)
 from redteam_agent.errors import AuditIntegrityError, AuditSequenceConflictError
 from redteam_agent.models.base import StrictImmutableBoundaryModel
+from redteam_agent.repositories.audit import AuditLogRepository
+from redteam_agent.storage import Database
 
 from .models import AuditEvent
 
@@ -126,9 +135,11 @@ class MissionAuditRecorder:
 
 
 class MissionAuditLog:
-    """Application-level append-only log; persistence adapters can wrap this contract."""
+    """Application-level append-only log with an optional durable SQLite boundary."""
 
-    def __init__(self) -> None:
+    def __init__(self, database: Database | None = None) -> None:
+        self._database = database
+        self._repository = None if database is None else AuditLogRepository(database)
         self._events: dict[str, list[AuditEvent]] = {}
         self._event_ids: dict[str, AuditEvent] = {}
         self._heads: dict[str, tuple[int, str]] = {}
@@ -145,6 +156,16 @@ class MissionAuditLog:
         expected_sequence_number: int | None = None,
     ) -> AuditEvent:
         canonical_payload = CanonicalJsonObject(payload.model_dump(mode="python"))
+        if self._database is not None:
+            return self._append_persistent(
+                mission_id=mission_id,
+                mission_revision=mission_revision,
+                authorization_epoch=authorization_epoch,
+                payload=payload,
+                canonical_payload=canonical_payload,
+                occurred_at=occurred_at,
+                expected_sequence_number=expected_sequence_number,
+            )
         with self._lock:
             event_type = f"{payload.resource_type}.{payload.operation}"
             event_id = stable_id(
@@ -208,6 +229,22 @@ class MissionAuditLog:
             return event
 
     def events_for(self, mission_id: str) -> tuple[AuditEvent, ...]:
+        if self._database is not None:
+            if self._repository is None:
+                raise AuditIntegrityError("durable audit repository is unavailable")
+            rows = self._repository.events_for(mission_id)
+            events: list[AuditEvent] = []
+            for row in rows:
+                event = self._parse_event(str(row["payload_json"]))
+                if not (
+                    event.event_id == row["event_id"]
+                    and event.mission_id == row["mission_id"]
+                    and event.sequence_number == row["sequence_number"]
+                    and event.event_hash == row["event_hash"]
+                ):
+                    raise AuditIntegrityError("persisted audit row binding failed")
+                events.append(event)
+            return tuple(events)
         with self._lock:
             return tuple(self._events.get(mission_id, ()))
 
@@ -243,13 +280,148 @@ class MissionAuditLog:
                 raise AuditIntegrityError("mission audit event hash failed")
             seen_ids.add(event.event_id)
             previous_hash = event.event_hash
-        trusted_head = self._heads.get(mission_id)
+        trusted_head = self._trusted_head(mission_id)
         if trusted_head is None:
             if candidates:
                 raise AuditIntegrityError("mission audit chain has no trusted head")
         elif trusted_head != (len(candidates), previous_hash):
             raise AuditIntegrityError("mission audit chain head failed")
         return candidates
+
+    def _append_persistent(
+        self,
+        *,
+        mission_id: str,
+        mission_revision: int,
+        authorization_epoch: int,
+        payload: AuditReferencePayload,
+        canonical_payload: CanonicalJsonObject,
+        occurred_at: datetime,
+        expected_sequence_number: int | None,
+    ) -> AuditEvent:
+        if self._database is None or self._repository is None:
+            raise AuditIntegrityError("durable audit database is unavailable")
+        event_type = f"{payload.resource_type}.{payload.operation}"
+        event_id = stable_id(
+            "auditevent",
+            {
+                "mission_id": mission_id,
+                "mission_revision": mission_revision,
+                "authorization_epoch": authorization_epoch,
+                "event_type": event_type,
+                "canonical_payload": canonical_payload,
+                "occurred_at": occurred_at,
+            },
+        )
+        try:
+            with self._repository.transaction():
+                self.verify(mission_id)
+                existing_row = self._repository.event_by_id(event_id)
+                if existing_row is not None:
+                    existing = self._parse_event(str(existing_row["payload_json"]))
+                    if not (
+                        existing.event_id == existing_row["event_id"]
+                        and existing.mission_id == existing_row["mission_id"]
+                        and existing.sequence_number == existing_row["sequence_number"]
+                        and existing.event_hash == existing_row["event_hash"]
+                        and self._matches_request(
+                            existing,
+                            mission_id=mission_id,
+                            mission_revision=mission_revision,
+                            authorization_epoch=authorization_epoch,
+                            event_type=event_type,
+                            canonical_payload=canonical_payload,
+                            occurred_at=occurred_at,
+                        )
+                    ):
+                        raise AuditSequenceConflictError(
+                            "derived audit event identifier conflicted"
+                        )
+                    return existing
+                head = self._repository.head(mission_id)
+                sequence = 1 if head is None else int(head["sequence_number"]) + 1
+                previous_hash = None if head is None else str(head["event_hash"])
+                if (
+                    expected_sequence_number is not None
+                    and expected_sequence_number != sequence
+                ):
+                    raise AuditSequenceConflictError("audit sequence allocation conflict")
+                if head is None and self._repository.has_event(mission_id):
+                    raise AuditIntegrityError("audit chain has no trusted head")
+                base = self._event_payload(
+                    event_id=event_id,
+                    mission_id=mission_id,
+                    mission_revision=mission_revision,
+                    authorization_epoch=authorization_epoch,
+                    sequence_number=sequence,
+                    previous_event_hash=previous_hash,
+                    event_type=event_type,
+                    canonical_payload=canonical_payload,
+                    occurred_at=occurred_at,
+                )
+                event = AuditEvent(
+                    event_id=event_id,
+                    mission_id=mission_id,
+                    mission_revision=mission_revision,
+                    authorization_epoch=authorization_epoch,
+                    chain_scope="mission",
+                    sequence_number=sequence,
+                    previous_event_hash=previous_hash,
+                    event_hash=sha256_digest(base),
+                    event_type=event_type,
+                    canonical_payload=canonical_payload,
+                    occurred_at=occurred_at,
+                )
+                event_json = canonicalize(event.model_dump(mode="python")).decode(
+                    "utf-8"
+                )
+                self._repository.insert_event(
+                    event_id=event.event_id,
+                    mission_id=event.mission_id,
+                    sequence_number=event.sequence_number,
+                    event_hash=event.event_hash,
+                    payload_json=event_json,
+                )
+                if head is None:
+                    self._repository.insert_head(
+                        mission_id=mission_id,
+                        sequence_number=event.sequence_number,
+                        event_hash=event.event_hash,
+                    )
+                else:
+                    if not self._repository.update_head(
+                        mission_id=mission_id,
+                        previous_sequence_number=int(head["sequence_number"]),
+                        previous_event_hash=str(head["event_hash"]),
+                        sequence_number=event.sequence_number,
+                        event_hash=event.event_hash,
+                    ):
+                        raise AuditSequenceConflictError("audit head update conflicted")
+                return event
+        except (AuditIntegrityError, AuditSequenceConflictError):
+            raise
+        except sqlite3.IntegrityError as exc:
+            raise AuditSequenceConflictError("audit sequence allocation conflict") from exc
+
+    def _trusted_head(self, mission_id: str) -> tuple[int, str] | None:
+        if self._database is None:
+            return self._heads.get(mission_id)
+        if self._repository is None:
+            raise AuditIntegrityError("durable audit repository is unavailable")
+        row = self._repository.head(mission_id)
+        return (
+            None
+            if row is None
+            else (int(row["sequence_number"]), str(row["event_hash"]))
+        )
+
+    @staticmethod
+    def _parse_event(payload: str | bytes) -> AuditEvent:
+        try:
+            duplicate_free = canonical_loads(payload)
+            return AuditEvent.model_validate_json(canonicalize(duplicate_free), strict=True)
+        except (TypeError, ValueError) as exc:
+            raise AuditIntegrityError("persisted audit event is invalid") from exc
 
     @staticmethod
     def _event_payload(

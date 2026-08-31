@@ -547,7 +547,7 @@ def test_existing_v1_database_is_upgraded_through_current_schema(tmp_path) -> No
         versions = {
             row[0] for row in upgraded.connection.execute("SELECT version FROM schema_migrations")
         }
-        assert versions == {1, 2, 3}
+        assert versions == {1, 2, 3, 4}
         assert upgraded.connection.execute(
             "SELECT name FROM sqlite_master WHERE name='authorization_runtime_bindings'"
         ).fetchone()

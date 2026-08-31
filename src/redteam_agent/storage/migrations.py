@@ -305,4 +305,16 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             """,
         ),
     ),
+    (
+        4,
+        (
+            """
+            CREATE TABLE audit_log_heads (
+                mission_id TEXT PRIMARY KEY REFERENCES missions(mission_id),
+                sequence_number INTEGER NOT NULL CHECK (sequence_number >= 1),
+                event_hash TEXT NOT NULL
+            )
+            """,
+        ),
+    ),
 )

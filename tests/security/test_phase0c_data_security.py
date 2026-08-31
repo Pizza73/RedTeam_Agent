@@ -10,7 +10,6 @@ from pydantic import ValidationError
 
 from redteam_agent.canonical import CanonicalJsonObject, sha256_digest
 from redteam_agent.data_security import (
-    ArtifactReference,
     ArtifactStore,
     AuditContext,
     AuditReferencePayload,
@@ -44,6 +43,7 @@ from redteam_agent.models.capabilities import SandboxCapabilities
 from redteam_agent.models.context import DataAccessGrant, ResourceBinding
 from redteam_agent.models.execution import RawArtifactMetadata
 from redteam_agent.models.scope import DataAccessOperation, DataResourceType
+from redteam_agent.storage import Database
 
 NOW = datetime(2026, 8, 31, 8, 0, tzinfo=UTC)
 
@@ -177,6 +177,7 @@ def test_secure_ingestion_exposes_only_redacted_references(tmp_path: Path) -> No
     authorizer.allow_ingestion_write("mission-a", "execution-a")
     raw_secret = b"correct-horse-battery-staple"
     json_secret = b"quoted-json-private-value"
+    camel_secret = b"camel-case-private-value"
     receipt = quarantine.commit(
         mission_id="mission-a",
         mission_revision=1,
@@ -186,7 +187,9 @@ def test_secure_ingestion_exposes_only_redacted_references(tmp_path: Path) -> No
             + json_secret
             + b'"}} user=alice password='
             + raw_secret
-            + b" status=ok"
+            + b' other={"apiKey":"'
+            + camel_secret
+            + b'"} status=ok'
         ),
         created_at=NOW,
         retention_until=NOW + timedelta(hours=1),
@@ -197,15 +200,17 @@ def test_secure_ingestion_exposes_only_redacted_references(tmp_path: Path) -> No
     ).ingest(receipt, now=NOW)
 
     assert len(result.redacted_artifacts) == 1
-    assert len(result.detected_secrets) == 2
-    assert result.redaction_metadata.redaction_count == 2
+    assert len(result.detected_secrets) == 3
+    assert result.redaction_metadata.redaction_count == 3
     assert raw_secret.decode() not in result.model_dump_json()
     assert json_secret.decode() not in result.model_dump_json()
+    assert camel_secret.decode() not in result.model_dump_json()
     assert all(raw_secret not in path.read_bytes() for path in tmp_path.rglob("*.json"))
     assert not any((tmp_path / "quarantine").rglob("*.json"))
     assert tuple(event.event_type for event in audit_log.events_for("mission-a")) == (
         "raw_result_quarantine.commit",
         "raw_result_quarantine.resume",
+        "secret_reference.create",
         "secret_reference.create",
         "secret_reference.create",
         "artifact.create",
@@ -230,8 +235,10 @@ def test_secure_ingestion_exposes_only_redacted_references(tmp_path: Path) -> No
     visible = artifacts.read(artifact, operation="read", now=NOW)
     assert raw_secret not in visible
     assert json_secret not in visible
+    assert camel_secret not in visible
     assert b"password=[REDACTED]" in visible
     assert b'"api_key":"[REDACTED]"' in visible
+    assert b'"apiKey":"[REDACTED]"' in visible
     assert audit_log.events_for("mission-a")[-1].event_type == "artifact.read"
 
 
@@ -264,6 +271,22 @@ def test_secret_resolution_requires_trusted_exact_mission_grant(tmp_path: Path) 
         source_execution_id="execution-a",
         created_at=NOW,
     )
+    repeated_metadata = secrets.create(
+        mission_id="mission-a",
+        secret_value=b"private-value",
+        credential_type="token",
+        associated_principal_ref="principal-a",
+        source_execution_id="execution-a",
+        created_at=NOW + timedelta(seconds=1),
+    )
+    assert repeated_metadata == metadata
+    assert len(
+        [
+            event
+            for event in audit_log.events_for("mission-a")
+            if event.event_type == "secret_reference.create"
+        ]
+    ) == 1
     with pytest.raises(SecretAccessError):
         secrets.resolve(metadata, now=NOW)
 
@@ -336,7 +359,75 @@ def test_secret_resolution_requires_trusted_exact_mission_grant(tmp_path: Path) 
     stale = metadata.model_copy(update={"verification_state": "detected"})
     with pytest.raises(SecretAccessError):
         secrets.resolve(stale, now=NOW + timedelta(seconds=2))
-    assert b"private-value" not in b"".join(path.read_bytes() for path in tmp_path.rglob("*.json"))
+    assert b"private-value" not in b"".join(
+        path.read_bytes() for path in tmp_path.rglob("*.json")
+    )
+
+
+def test_artifact_create_audit_is_reconciled_after_write_crash(tmp_path: Path) -> None:
+    keys = _keys()
+    authorizer = _ExactEnvelopeAuthorizer()
+    authorizer.allow_ingestion_write("mission-audit", "execution-audit")
+    audit_log = MissionAuditLog()
+    durable_audit = MissionAuditRecorder(
+        audit_log=audit_log, contexts=_AuditContexts()
+    )
+
+    class FailFirstArtifactCreateAudit:
+        def __init__(self) -> None:
+            self.failed = False
+
+        def record(self, **kwargs):
+            if (
+                kwargs["resource_type"] == "artifact"
+                and kwargs["operation"] == "create"
+                and not self.failed
+            ):
+                self.failed = True
+                raise AuditIntegrityError("simulated crash before artifact audit")
+            return durable_audit.record(**kwargs)
+
+    root = tmp_path / "artifact-audit-recovery"
+    interrupted = ArtifactStore(
+        root=root,
+        keys=keys,
+        authorizer=authorizer,
+        audit=FailFirstArtifactCreateAudit(),
+        max_item_bytes=4096,
+        mission_quota_bytes=8192,
+    )
+    with pytest.raises(AuditIntegrityError):
+        interrupted.put(
+            mission_id="mission-audit",
+            content=b"already-durable",
+            media_type="text/plain",
+            classification="normal",
+            variant="redacted",
+            source_execution_id="execution-audit",
+            created_at=NOW,
+        )
+
+    restarted = ArtifactStore(
+        root=root,
+        keys=keys,
+        authorizer=authorizer,
+        audit=durable_audit,
+        max_item_bytes=4096,
+        mission_quota_bytes=8192,
+    )
+    reference = restarted.put(
+        mission_id="mission-audit",
+        content=b"already-durable",
+        media_type="text/plain",
+        classification="normal",
+        variant="redacted",
+        source_execution_id="execution-audit",
+        created_at=NOW + timedelta(seconds=1),
+    )
+    assert reference.created_at == NOW
+    assert tuple(
+        event.event_type for event in audit_log.events_for("mission-audit")
+    ) == ("artifact.create",)
 
 
 def test_key_domain_nonce_aad_tamper_and_revocation_fail_closed() -> None:
@@ -568,24 +659,21 @@ def test_storage_rejects_traversal_symlink_quota_retention_and_corruption(
         assert summary.secure_ingestion_id.startswith("secureingestion_")
         assert len(summary.redacted_artifact_references) == 1
         artifact_id = summary.redacted_artifact_references[0]
-        envelope = stream_artifacts._store.verified_envelope(
-            mission_id="mission-stream", resource_id=artifact_id, now=NOW
+        artifact = stream_artifacts._stored_reference(
+            mission_id="mission-stream", artifact_id=artifact_id, now=NOW
         )
-        artifact_binding = envelope.binding.to_dict()
-        artifact = ArtifactReference(
-            artifact_id=artifact_id,
-            mission_id="mission-stream",
-            media_type=str(artifact_binding["media_type"]),
-            size_bytes=envelope.plaintext_size,
-            sha256=envelope.plaintext_sha256,
-            classification="sensitive",
-            variant="redacted",
-            encrypted=True,
-            encryption_metadata_id=envelope.encryption_metadata_id,
-            derived_from_artifact_id=None,
-            created_at=envelope.created_at,
-            retention_until=envelope.retention_until,
-        )
+        assert artifact.classification == "sensitive"
+        assert stream_artifacts.max_observed_stream_chunk_bytes <= 4 * 1024
+        artifact_envelopes = stream_artifacts._store.envelopes_for("mission-stream")
+        artifact_chunks = [
+            envelope
+            for envelope in artifact_envelopes
+            if envelope.binding.to_dict().get("record_type")
+            == "artifact_stream_chunk"
+        ]
+        assert len(artifact_chunks) > 1
+        assert all(envelope.plaintext_size <= 4 * 1024 for envelope in artifact_chunks)
+        assert all(envelope.plaintext_size < artifact.size_bytes for envelope in artifact_chunks)
         stream_authorizer.set_grants(
             "mission-stream",
             (
@@ -613,9 +701,15 @@ def test_storage_rejects_traversal_symlink_quota_retention_and_corruption(
         assert not any(
             (tmp_path / "stream-quarantine").rglob("streamchunk_*.json")
         )
+        recovered_summary = await EncryptedSecureResultIngester(
+            ingestor=ingestor,
+            sinks=stream_factory,
+            clock=lambda: NOW + timedelta(seconds=1),
+        ).ingest(receipt)
+        assert recovered_summary == summary
         encrypted_snapshot_path.write_bytes(encrypted_snapshot)
-        with pytest.raises(RawResultQuarantineError):
-            stream_factory.for_execution("execution-stream")
+        restored_sink = stream_factory.for_execution("execution-stream")
+        assert restored_sink._durable_ingestion_result(receipt) is not None
         assert not encrypted_snapshot_path.exists()
 
     asyncio.run(stream_with_restart())
@@ -796,7 +890,6 @@ def test_storage_rejects_traversal_symlink_quota_retention_and_corruption(
         return sink, await sink.commit()
 
     delete_sink, delete_receipt = asyncio.run(commit_delete_stream())
-    del delete_receipt
     original_erase = delete_sink._store.erase_resource
     erase_calls = 0
 
@@ -808,14 +901,30 @@ def test_storage_rejects_traversal_symlink_quota_retention_and_corruption(
             raise ArtifactSecurityError("simulated crash during streamed erasure")
 
     monkeypatch.setattr(delete_sink._store, "erase_resource", interrupt_erasure)
-    with pytest.raises(ArtifactSecurityError):
-        delete_sink._delete_committed(now=NOW)
+    stream_authorizer.allow_ingestion_write(
+        "mission-delete-crash", "execution-delete-crash"
+    )
+    delete_ingestor = SecureIngestor(
+        quarantine=delete_quarantine,
+        artifacts=stream_artifacts,
+        secrets=stream_secrets,
+    )
+    with pytest.raises(SecureIngestionError):
+        asyncio.run(
+            delete_ingestor.ingest_stream(
+                delete_sink,
+                delete_receipt,
+                now=NOW,
+            )
+        )
     monkeypatch.setattr(delete_sink._store, "erase_resource", original_erase)
     delete_bindings.binding = delete_binding.model_copy(
         update={"resume_mode": "from_cursor", "resume_cursor": 3}
     )
-    with pytest.raises(RawResultQuarantineError):
-        delete_factory.for_execution("execution-delete-crash")
+    recovered_delete_sink = delete_factory.for_execution("execution-delete-crash")
+    recovered_delete = recovered_delete_sink._durable_ingestion_result(delete_receipt)
+    assert recovered_delete is not None
+    assert recovered_delete.ingestion_id.startswith("secureingestion_")
     assert not any(
         (tmp_path / "delete-crash-quarantine").rglob("streamchunk_*.json")
     )
@@ -829,6 +938,70 @@ def test_storage_rejects_traversal_symlink_quota_retention_and_corruption(
     assert all(
         raw_secret not in path.read_bytes() for path in tmp_path.rglob("*.json")
     )
+
+
+def test_sqlite_audit_chain_persists_events_and_trusted_head(tmp_path: Path) -> None:
+    database_path = tmp_path / "durable-audit.sqlite3"
+    with Database(database_path) as database:
+        database.connection.execute(
+            "INSERT INTO missions(mission_id, payload_json, created_at, created_by) "
+            "VALUES (?, ?, ?, ?)",
+            ("mission-durable", "{}", NOW.isoformat(), "test"),
+        )
+        audit = MissionAuditLog(database)
+        first = audit.append(
+            mission_id="mission-durable",
+            mission_revision=1,
+            authorization_epoch=0,
+            payload=AuditReferencePayload(
+                resource_type="artifact",
+                resource_id="artifact_" + "d" * 32,
+                operation="create",
+                operation_id="auditop_" + "1" * 32,
+                metadata_digest="sha256:" + "1" * 64,
+            ),
+            occurred_at=NOW,
+        )
+        second = audit.append(
+            mission_id="mission-durable",
+            mission_revision=1,
+            authorization_epoch=0,
+            payload=AuditReferencePayload(
+                resource_type="artifact",
+                resource_id="artifact_" + "d" * 32,
+                operation="read",
+                operation_id="auditop_" + "2" * 32,
+                metadata_digest="sha256:" + "1" * 64,
+            ),
+            occurred_at=NOW + timedelta(seconds=1),
+        )
+        assert audit.verify("mission-durable") == (first, second)
+
+    with Database(database_path) as database:
+        restarted = MissionAuditLog(database)
+        assert restarted.verify("mission-durable") == (first, second)
+        third = restarted.append(
+            mission_id="mission-durable",
+            mission_revision=1,
+            authorization_epoch=0,
+            payload=AuditReferencePayload(
+                resource_type="artifact",
+                resource_id="artifact_" + "d" * 32,
+                operation="export",
+                operation_id="auditop_" + "3" * 32,
+                metadata_digest="sha256:" + "1" * 64,
+            ),
+            occurred_at=NOW + timedelta(seconds=2),
+        )
+        assert third.sequence_number == 3
+        assert restarted.verify("mission-durable") == (first, second, third)
+
+    with Database(database_path) as database:
+        database.connection.execute(
+            "DELETE FROM audit_logs WHERE event_id = ?", (second.event_id,)
+        )
+        with pytest.raises(AuditIntegrityError):
+            MissionAuditLog(database).verify("mission-durable")
 
 
 def test_audit_chain_and_sandbox_capabilities_fail_closed(tmp_path: Path) -> None:

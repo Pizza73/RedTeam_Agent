@@ -4,38 +4,35 @@
 
 - Current phase: `Phase 0C: Data Security and Audit`
 - Input review SHA: `6b55fe9ba6cf0453e8c8ba33af3a3a9368944df5`
-- Latest correction input SHA: `6c1cd479a1d9fe1a574caaf184e5a5d2be918ddc`
+- Latest correction input SHA: `bde842bc06e61742fe2ff84e30ab21830162ff1c`
 - Trusted Phase 0B base PASS SHA: `5cda9a5f8792ee33c3e153d8e791499f5619d82e`
 - Implementation branch: `ai/redteam-agent-phase-loop`
 - Independent-review result: `CHANGES_REQUESTED`
-- Finding key: `CODEX-P1-623111B79F732153`
+- Latest finding key: `CODEX-P1-83F82756B539E4B9`
 - External provider, C2, MCP side effect, local attack, and external-target execution: absent
 
 ## Resulting working-tree diff
 
-This correction updates ten implementation/test files and adds the encrypted streaming module plus
-this report. No protected governance file listed in `AGENTS.md` was modified. In particular,
+The latest correction updates seven implementation/test files, adds one repository module, and
+updates this report. No protected governance file listed in `AGENTS.md` was modified. In particular,
 `SystemDesign.md`, `.github/**`, `automation/**`, requirements, acceptance criteria, safety
 invariants, implementation status, phase prompts, CI scripts, and dependency manifests are
 unchanged.
 
 Modified files:
 
-- `src/redteam_agent/data_security/__init__.py`
 - `src/redteam_agent/data_security/audit.py`
 - `src/redteam_agent/data_security/ingestion.py`
-- `src/redteam_agent/data_security/keys.py`
-- `src/redteam_agent/data_security/models.py`
 - `src/redteam_agent/data_security/stores.py`
-- `src/redteam_agent/executor/adapter.py`
-- `src/redteam_agent/executor/raw_results.py`
-- `src/redteam_agent/executor/service.py`
+- `src/redteam_agent/data_security/streaming.py`
+- `src/redteam_agent/storage/migrations.py`
+- `tests/security/test_gate_review_regressions.py`
 - `tests/security/test_phase0c_data_security.py`
+- `docs/review/phase-0c-fix-report.md`
 
 Added files:
 
-- `src/redteam_agent/data_security/streaming.py`
-- `docs/review/phase-0c-fix-report.md`
+- `src/redteam_agent/repositories/audit.py`
 
 ## Findings addressed
 
@@ -108,6 +105,45 @@ The independent review for correction SHA
 This cycle also permits authenticated empty ciphertext for valid empty chunks and metadata markers;
 nonce, tag, AAD, key-domain, digest, and plaintext-size checks remain mandatory.
 
+## Third independent review and post-refresh correction cycle
+
+The review for `021bfce9255def1c68cfdd8c4481aa4c2e0d1dc5` recorded four P1 findings
+under `CODEX-P1-8F2A649BA8E646D5`. After the trusted default-branch refresh, review of exact
+HEAD `bde842bc06e61742fe2ff84e30ab21830162ff1c` added one P1 under
+`CODEX-P1-83F82756B539E4B9`. The bounded Human Resume covers these findings:
+
+- [`discussion_r3893331936`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3893331936):
+  secret detection now includes the separator-free `apikey` spelling produced by lowercasing
+  camelCase `apiKey`. A JSON regression verifies that the value becomes a Secret reference and
+  only `[REDACTED]` reaches the Artifact.
+- [`discussion_r3893331943`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3893331943):
+  `MissionAuditLog(Database)` now stores canonical events in `audit_logs` and the separately trusted
+  chain tail in `audit_log_heads`. `BEGIN IMMEDIATE` covers chain verification, idempotency lookup,
+  sequence allocation, event insertion, and optimistic head update. Restart, continued append, row
+  binding, chain verification, and deletion tamper are tested. All SQL remains in the repository or
+  storage layer.
+- [`discussion_r3893331948`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3893331948):
+  secure streaming ingestion persists an authenticated `SecureIngestionResult` completion record
+  bound to the exact receipt, execution, sink, ingestion ID, and ingestion digest before writing the
+  deletion intent. A restart after partial or completed erasure returns that same verified result
+  and never reruns an external action. Secret creation is also idempotently reconciled using the
+  original encrypted record and deterministic audit operation.
+- [`discussion_r3893331953`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3893331953):
+  Artifact IDs and deterministic audit operation IDs now make the encrypted Artifact envelope a
+  durable create-audit outbox. Retry accepts only identical content and bindings, preserves the
+  original creation time, and reconciles exactly one `artifact.create` event before returning a
+  reference. Reads reconcile the same outbox before exposing content.
+- [`discussion_r3894458359`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3894458359):
+  streaming ingestion no longer retains or joins all redacted chunks. `ArtifactStore.put_stream`
+  incrementally hashes and encrypts bounded 4 KiB chunks, then commits an authenticated manifest
+  bound to the logical size, SHA-256 digest, classification, source execution, and per-chunk
+  offsets/digests/encryption metadata. Authorized read verifies the manifest and every chunk before
+  reconstructing the caller-requested Artifact.
+
+No raw chunk, complete redacted result, secret value, or plaintext fallback is written to normal
+storage. Partial Artifact chunks remain encrypted and idempotently resumable until the manifest is
+committed.
+
 ## Regression tests added
 
 The existing Phase 0C security test module now additionally covers:
@@ -127,6 +163,16 @@ The existing Phase 0C security test module now additionally covers:
 - crash after a durable commit envelope but before its audit append, followed by one-event
   reconciliation; and
 - crash after the first streamed chunk erasure, followed by automatic deletion-intent recovery.
+- camelCase JSON `apiKey` detection and reference-only redaction;
+- encrypted redacted Artifact chunks bounded to 4 KiB, authenticated manifest reconstruction, and
+  rejection of any full-result chunk;
+- recovery of the exact durable ingestion result after quarantine deletion and after interrupted
+  deletion;
+- Artifact write success followed by audit failure, process restart with a later timestamp, and
+  exactly-once create-audit reconciliation;
+- idempotent Secret creation after restart; and
+- SQLite audit process restart, continued atomic sequence allocation, trusted-head persistence, and
+  deletion-tamper detection.
 
 No test was removed, weakened, skipped, or marked as an expected failure.
 
@@ -143,11 +189,11 @@ Result:
 ```text
 AUTOMATION_VALIDATION=PASS
 ruff: All checks passed
-mypy: Success: no issues found in 77 source files
-unit: 184 passed
+mypy: Success: no issues found in 78 source files
+unit: 186 passed
 integration: 7 passed
-security: 149 passed
-full/coverage run: 340 passed
+security: 151 passed
+full/coverage run: 344 passed
 skipped=0, errors=0, failures=0
 coverage: 82% total (branch coverage enabled)
 pip check: No broken requirements found
@@ -158,19 +204,18 @@ Focused regression command:
 
 ```text
 PATH="$PWD/.venv/bin:$PATH" python -m pytest -q \
-  tests/unit/test_phase0b_execution.py \
-  tests/integration/test_phase0b_flow.py \
-  tests/security/test_phase0b_execution_safety.py \
+  tests/security/test_gate_review_regressions.py::test_existing_v1_database_is_upgraded_through_current_schema \
+  tests/security/test_phase_boundary.py::test_sql_is_confined_to_storage_and_repository_layers \
   tests/security/test_phase0c_data_security.py
 ```
 
-Focused result: `47 passed`.
+Latest focused Phase 0C and boundary result: `9 passed`.
 
 ## Remaining constraints
 
-- `InMemoryEncryptionKeyProvider` and `MissionAuditLog` are explicit development/test adapters. They
-  do not serialize key material; a deployment must supply durable OS key-store/vault and append-only
-  audit persistence adapters behind the implemented protocols.
+- `MissionAuditLog(Database)` provides durable SQLite event/head persistence. Constructing it without
+  a Database remains an explicit development/test mode. `InMemoryEncryptionKeyProvider` does not
+  serialize key material; a deployment must supply a durable OS key-store or vault implementation.
 - The streamed path rejects a request for long-term `encrypted_raw` retention until a trusted
   chunked long-term Artifact policy is configured. It keeps the quarantine and fails closed; it does
   not concatenate raw output in memory or fall back to plaintext. The compatibility full-object

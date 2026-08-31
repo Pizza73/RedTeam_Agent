@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from datetime import datetime
 from typing import Literal
 
@@ -20,7 +20,15 @@ from .models import (
 from .stores import ArtifactStore, EncryptedRawResultQuarantine, SecretStore
 from .streaming import EncryptedRawResultSink, EncryptedRawResultSinkFactory
 
-_SECRET_KEYWORDS = (b"password", b"passwd", b"token", b"api_key", b"api-key", b"secret")
+_SECRET_KEYWORDS = (
+    b"password",
+    b"passwd",
+    b"token",
+    b"api_key",
+    b"api-key",
+    b"apikey",
+    b"secret",
+)
 _SECRET_TERMINATORS = frozenset(b" \t\n\r\v\f,;}]" + bytes((34, 39)))
 _SECRET_WHITESPACE = frozenset(b" \t\n\r\v\f")
 _QUOTE_BYTES = frozenset(b"\"'")
@@ -249,6 +257,10 @@ class SecureIngestor:
                 raise SecureIngestionError(
                     "chunked encrypted-raw retention is not configured"
                 )
+            durable_result = sink._durable_ingestion_result(receipt)
+            if durable_result is not None:
+                sink._delete_committed(now=now)
+                return durable_result
             detections: list[SecretDiscoveryReference] = []
 
             def replace(keyword: bytes, secret_value: bytes) -> bytes:
@@ -263,16 +275,21 @@ class SecureIngestor:
                 return b"[REDACTED]"
 
             redactor = _StreamingSecretRedactor(replace)
-            redacted_parts: list[bytes] = []
-            async for chunk in sink._iter_committed_chunks(receipt, now=now):
-                redacted_parts.append(redactor.feed(chunk))
-            redacted_parts.append(redactor.feed(b"", final=True))
-            redacted = b"".join(redacted_parts)
-            redacted_reference = self._artifacts.put(
+
+            async def redacted_chunks() -> AsyncIterator[bytes]:
+                async for chunk in sink._iter_committed_chunks(receipt, now=now):
+                    redacted = redactor.feed(chunk)
+                    if redacted:
+                        yield redacted
+                final = redactor.feed(b"", final=True)
+                if final:
+                    yield final
+
+            redacted_reference = await self._artifacts.put_stream(
                 mission_id=sink.binding.mission_id,
-                content=redacted,
+                chunks=redacted_chunks(),
                 media_type="application/octet-stream",
-                classification="sensitive" if detections else "normal",
+                classification=lambda: "sensitive" if detections else "normal",
                 variant="redacted",
                 source_execution_id=receipt.execution_id,
                 created_at=now,
@@ -285,6 +302,7 @@ class SecureIngestor:
                 encrypted_raw=(),
                 detections=detections,
             )
+            sink._commit_ingestion_result(receipt, result, now=now)
             sink._delete_committed(now=now)
             return result
         except SecureIngestionError:

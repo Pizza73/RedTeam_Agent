@@ -6,6 +6,7 @@ import hashlib
 import os
 import re
 import tempfile
+from collections.abc import AsyncIterator, Callable
 from datetime import datetime
 from pathlib import Path
 from threading import RLock
@@ -41,6 +42,7 @@ from .models import (
 )
 
 _SAFE_TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+_ARTIFACT_STREAM_CHUNK_BYTES = 4 * 1024
 
 
 def _require_bytes(value: bytes) -> None:
@@ -98,6 +100,40 @@ class _SecretTombstone(StrictImmutableBoundaryModel):
     metadata: SecretReferenceMetadata
     source_execution_id: str = Field(min_length=1)
     metadata_version: Literal[2]
+
+
+class _ArtifactStreamChunkBinding(StrictImmutableBoundaryModel):
+    record_type: Literal["artifact_stream_chunk"]
+    stream_id: str = Field(min_length=1)
+    source_execution_id: str = Field(min_length=1)
+    sequence_number: int = Field(ge=0)
+    plaintext_offset: int = Field(ge=0)
+    plaintext_size: int = Field(ge=0)
+    plaintext_sha256: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+
+
+class _ArtifactStreamChunkReference(StrictImmutableBoundaryModel):
+    resource_id: str = Field(min_length=1)
+    sequence_number: int = Field(ge=0)
+    plaintext_offset: int = Field(ge=0)
+    plaintext_size: int = Field(ge=0)
+    plaintext_sha256: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    encryption_metadata_id: str = Field(min_length=1)
+
+
+class _ArtifactStreamManifest(StrictImmutableBoundaryModel):
+    schema_version: Literal["artifact-stream-v1"]
+    artifact_id: str = Field(min_length=1)
+    stream_id: str = Field(min_length=1)
+    mission_id: str = Field(min_length=1)
+    media_type: str = Field(min_length=1)
+    size_bytes: int = Field(ge=0)
+    sha256: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    classification: Literal["normal", "sensitive", "secret"]
+    variant: Literal["redacted", "encrypted_raw"]
+    source_execution_id: str = Field(min_length=1)
+    derived_from_artifact_id: str | None
+    chunks: tuple[_ArtifactStreamChunkReference, ...]
 
 
 class _EncryptedFileStore:
@@ -648,6 +684,7 @@ class ArtifactStore:
         )
         self._authorizer = authorizer
         self._audit = audit
+        self.max_observed_stream_chunk_bytes = 0
 
     def put(
         self,
@@ -663,38 +700,29 @@ class ArtifactStore:
         derived_from_artifact_id: str | None = None,
     ) -> ArtifactReference:
         _require_bytes(content)
-        _require_time(created_at)
-        if not media_type:
-            raise ArtifactSecurityError("artifact media type is required")
-        if classification not in {"normal", "sensitive", "secret"}:
-            raise ArtifactSecurityError("artifact classification is invalid")
-        if variant not in {"redacted", "encrypted_raw"}:
-            raise ArtifactSecurityError("artifact variant is invalid")
-        if variant == "encrypted_raw" and classification != "secret":
-            raise ArtifactSecurityError("encrypted raw artifact classification is invalid")
-        if retention_until is not None:
-            _require_time(retention_until)
-            if retention_until <= created_at:
-                raise ArtifactSecurityError("artifact retention is invalid")
-        content_digest = self._store._content_digest(content)
-        artifact_id = stable_id(
-            "artifact",
-            {
-                "mission_id": mission_id,
-                "content_sha256": content_digest,
-                "classification": classification,
-                "variant": variant,
-                "derived_from": derived_from_artifact_id,
-            },
+        self._validate_metadata(
+            media_type=media_type,
+            classification=classification,
+            variant=variant,
+            created_at=created_at,
+            retention_until=retention_until,
         )
-        binding: dict[str, object] = {
-            "artifact_id": artifact_id,
-            "media_type": media_type,
-            "classification": classification,
-            "variant": variant,
-            "derived_from_artifact_id": derived_from_artifact_id,
-            "source_execution_id": source_execution_id,
-        }
+        content_digest = self._store._content_digest(content)
+        artifact_id = self._artifact_id(
+            mission_id=mission_id,
+            content_digest=content_digest,
+            classification=classification,
+            variant=variant,
+            derived_from_artifact_id=derived_from_artifact_id,
+        )
+        binding = self._binding(
+            artifact_id=artifact_id,
+            media_type=media_type,
+            classification=classification,
+            variant=variant,
+            derived_from_artifact_id=derived_from_artifact_id,
+            source_execution_id=source_execution_id,
+        )
         self._authorizer.require_ingestion_write(
             mission_id=mission_id,
             source_execution_id=source_execution_id,
@@ -706,14 +734,34 @@ class ArtifactStore:
             ),
             now=created_at,
         )
-        _, metadata_id = self._store.write(
-            mission_id=mission_id,
-            resource_id=artifact_id,
-            content=content,
-            binding=binding,
-            created_at=created_at,
-            retention_until=retention_until,
-        )
+        if self._store.has_resource(mission_id=mission_id, resource_id=artifact_id):
+            existing_content, envelope = self._store.read_bound(
+                mission_id=mission_id,
+                resource_id=artifact_id,
+                now=None,
+            )
+            if not (
+                existing_content == content
+                and envelope.binding == CanonicalJsonObject(binding)
+                and envelope.retention_until == retention_until
+            ):
+                raise ArtifactSecurityError(
+                    "artifact identifier conflicts with stored content"
+                )
+        else:
+            self._store.write(
+                mission_id=mission_id,
+                resource_id=artifact_id,
+                content=content,
+                binding=binding,
+                created_at=created_at,
+                retention_until=retention_until,
+            )
+            envelope = self._store.verified_envelope(
+                mission_id=mission_id,
+                resource_id=artifact_id,
+                now=None,
+            )
         reference = ArtifactReference(
             artifact_id=artifact_id,
             mission_id=mission_id,
@@ -723,19 +771,254 @@ class ArtifactStore:
             classification=classification,
             variant=variant,
             encrypted=True,
-            encryption_metadata_id=metadata_id,
+            encryption_metadata_id=envelope.encryption_metadata_id,
             derived_from_artifact_id=derived_from_artifact_id,
+            created_at=envelope.created_at,
+            retention_until=envelope.retention_until,
+        )
+        self._reconcile_create_audit(reference)
+        return reference
+
+    async def put_stream(
+        self,
+        *,
+        mission_id: str,
+        chunks: AsyncIterator[bytes],
+        media_type: str,
+        classification: Callable[
+            [], Literal["normal", "sensitive", "secret"]
+        ],
+        variant: Literal["redacted", "encrypted_raw"],
+        source_execution_id: str,
+        created_at: datetime,
+        retention_until: datetime | None = None,
+        derived_from_artifact_id: str | None = None,
+    ) -> ArtifactReference:
+        """Persist a logical artifact without materializing the complete content."""
+
+        _require_time(created_at)
+        if not media_type or variant not in {"redacted", "encrypted_raw"}:
+            raise ArtifactSecurityError("artifact stream metadata is invalid")
+        if retention_until is not None:
+            _require_time(retention_until)
+            if retention_until <= created_at:
+                raise ArtifactSecurityError("artifact retention is invalid")
+        stream_id = stable_id(
+            "artifactstream",
+            {
+                "schema_version": "artifact-stream-v1",
+                "mission_id": mission_id,
+                "media_type": media_type,
+                "variant": variant,
+                "source_execution_id": source_execution_id,
+                "derived_from_artifact_id": derived_from_artifact_id,
+            },
+        )
+        stream_metadata_digest = sha256_digest(
+            {
+                "stream_id": stream_id,
+                "mission_id": mission_id,
+                "media_type": media_type,
+                "variant": variant,
+                "source_execution_id": source_execution_id,
+                "derived_from_artifact_id": derived_from_artifact_id,
+            }
+        )
+        self._authorizer.require_ingestion_write(
+            mission_id=mission_id,
+            source_execution_id=source_execution_id,
+            resource_type="artifact",
+            resource=ResourceBinding(
+                resource_id=stream_id,
+                resource_version="1",
+                resource_digest=stream_metadata_digest,
+            ),
+            now=created_at,
+        )
+        digest = hashlib.sha256()
+        size_bytes = 0
+        sequence = 0
+        pending = bytearray()
+        chunk_references: list[_ArtifactStreamChunkReference] = []
+
+        async def persist(content: bytes) -> None:
+            nonlocal sequence, size_bytes
+            next_size = size_bytes + len(content)
+            if next_size > self._store._max_item_bytes:
+                raise ArtifactSecurityError("resource exceeds its size limit")
+            content_digest = self._store._content_digest(content)
+            binding = _ArtifactStreamChunkBinding(
+                record_type="artifact_stream_chunk",
+                stream_id=stream_id,
+                source_execution_id=source_execution_id,
+                sequence_number=sequence,
+                plaintext_offset=size_bytes,
+                plaintext_size=len(content),
+                plaintext_sha256=content_digest,
+            )
+            resource_id = stable_id(
+                "artifactchunk",
+                {
+                    "schema_version": "artifact-stream-chunk-v1",
+                    "stream_id": stream_id,
+                    "sequence_number": sequence,
+                },
+            )
+            if self._store.has_resource(
+                mission_id=mission_id, resource_id=resource_id
+            ):
+                existing, envelope = self._store.read_bound(
+                    mission_id=mission_id,
+                    resource_id=resource_id,
+                    now=None,
+                )
+                if not (
+                    existing == content
+                    and envelope.binding
+                    == CanonicalJsonObject(binding.model_dump(mode="python"))
+                    and envelope.retention_until == retention_until
+                ):
+                    raise ArtifactSecurityError(
+                        "artifact stream chunk conflicts with durable content"
+                    )
+            else:
+                self._store.write(
+                    mission_id=mission_id,
+                    resource_id=resource_id,
+                    content=content,
+                    binding=binding.model_dump(mode="python"),
+                    created_at=created_at,
+                    retention_until=retention_until,
+                )
+                envelope = self._store.verified_envelope(
+                    mission_id=mission_id,
+                    resource_id=resource_id,
+                    now=None,
+                )
+            digest.update(content)
+            self.max_observed_stream_chunk_bytes = max(
+                self.max_observed_stream_chunk_bytes, len(content)
+            )
+            chunk_references.append(
+                _ArtifactStreamChunkReference(
+                    resource_id=resource_id,
+                    sequence_number=sequence,
+                    plaintext_offset=size_bytes,
+                    plaintext_size=len(content),
+                    plaintext_sha256=content_digest,
+                    encryption_metadata_id=envelope.encryption_metadata_id,
+                )
+            )
+            size_bytes = next_size
+            sequence += 1
+
+        async for chunk in chunks:
+            _require_bytes(chunk)
+            pending.extend(chunk)
+            while len(pending) >= _ARTIFACT_STREAM_CHUNK_BYTES:
+                content = bytes(pending[:_ARTIFACT_STREAM_CHUNK_BYTES])
+                del pending[:_ARTIFACT_STREAM_CHUNK_BYTES]
+                await persist(content)
+        if pending or not chunk_references:
+            await persist(bytes(pending))
+
+        content_digest = "sha256:" + digest.hexdigest()
+        resolved_classification = classification()
+        self._validate_metadata(
+            media_type=media_type,
+            classification=resolved_classification,
+            variant=variant,
             created_at=created_at,
             retention_until=retention_until,
         )
-        self._audit.record(
+        artifact_id = self._artifact_id(
             mission_id=mission_id,
-            resource_type="artifact",
-            resource_id=artifact_id,
-            operation="create",
-            metadata_digest=content_digest,
-            occurred_at=created_at,
+            content_digest=content_digest,
+            classification=resolved_classification,
+            variant=variant,
+            derived_from_artifact_id=derived_from_artifact_id,
         )
+        manifest = _ArtifactStreamManifest(
+            schema_version="artifact-stream-v1",
+            artifact_id=artifact_id,
+            stream_id=stream_id,
+            mission_id=mission_id,
+            media_type=media_type,
+            size_bytes=size_bytes,
+            sha256=content_digest,
+            classification=resolved_classification,
+            variant=variant,
+            source_execution_id=source_execution_id,
+            derived_from_artifact_id=derived_from_artifact_id,
+            chunks=tuple(chunk_references),
+        )
+        binding = self._binding(
+            artifact_id=artifact_id,
+            media_type=media_type,
+            classification=resolved_classification,
+            variant=variant,
+            derived_from_artifact_id=derived_from_artifact_id,
+            source_execution_id=source_execution_id,
+            storage_format="artifact-stream-v1",
+            logical_size=size_bytes,
+            logical_sha256=content_digest,
+            stream_id=stream_id,
+        )
+        self._authorizer.require_ingestion_write(
+            mission_id=mission_id,
+            source_execution_id=source_execution_id,
+            resource_type="artifact",
+            resource=ResourceBinding(
+                resource_id=artifact_id,
+                resource_version="1",
+                resource_digest=content_digest,
+            ),
+            now=created_at,
+        )
+        manifest_content = canonicalize(manifest.model_dump(mode="python"))
+        if self._store.has_resource(mission_id=mission_id, resource_id=artifact_id):
+            existing, envelope = self._store.read_bound(
+                mission_id=mission_id,
+                resource_id=artifact_id,
+                now=None,
+            )
+            if not (
+                existing == manifest_content
+                and envelope.binding == CanonicalJsonObject(binding)
+                and envelope.retention_until == retention_until
+            ):
+                raise ArtifactSecurityError(
+                    "artifact stream manifest conflicts with durable content"
+                )
+        else:
+            self._store.write(
+                mission_id=mission_id,
+                resource_id=artifact_id,
+                content=manifest_content,
+                binding=binding,
+                created_at=created_at,
+                retention_until=retention_until,
+            )
+            envelope = self._store.verified_envelope(
+                mission_id=mission_id,
+                resource_id=artifact_id,
+                now=None,
+            )
+        reference = ArtifactReference(
+            artifact_id=artifact_id,
+            mission_id=mission_id,
+            media_type=media_type,
+            size_bytes=size_bytes,
+            sha256=content_digest,
+            classification=resolved_classification,
+            variant=variant,
+            encrypted=True,
+            encryption_metadata_id=envelope.encryption_metadata_id,
+            derived_from_artifact_id=derived_from_artifact_id,
+            created_at=envelope.created_at,
+            retention_until=envelope.retention_until,
+        )
+        self._reconcile_create_audit(reference)
         return reference
 
     def read(
@@ -745,6 +1028,14 @@ class ArtifactStore:
         operation: Literal["read", "export"],
         now: datetime,
     ) -> bytes:
+        authoritative = self._stored_reference(
+            mission_id=reference.mission_id,
+            artifact_id=reference.artifact_id,
+            now=now,
+        )
+        if authoritative != reference:
+            raise DigestIntegrityError("artifact reference integrity failed")
+        self._reconcile_create_audit(authoritative)
         self._authorizer.require_access(
             mission_id=reference.mission_id,
             resource_type="artifact",
@@ -756,20 +1047,28 @@ class ArtifactStore:
             operation=operation,
             now=now,
         )
-        content = self._store.read(
+        envelope = self._store.verified_envelope(
             mission_id=reference.mission_id,
             resource_id=reference.artifact_id,
-            binding={
-                "artifact_id": reference.artifact_id,
-                "media_type": reference.media_type,
-                "classification": reference.classification,
-                "variant": reference.variant,
-                "derived_from_artifact_id": reference.derived_from_artifact_id,
-                "source_execution_id": self._source_execution_id(reference),
-            },
             now=now,
-            expected_encryption_metadata_id=reference.encryption_metadata_id or "",
         )
+        if envelope.binding.to_dict().get("storage_format") == "artifact-stream-v1":
+            content = self._read_stream(reference, now=now)
+        else:
+            content = self._store.read(
+                mission_id=reference.mission_id,
+                resource_id=reference.artifact_id,
+                binding=self._binding(
+                    artifact_id=reference.artifact_id,
+                    media_type=reference.media_type,
+                    classification=reference.classification,
+                    variant=reference.variant,
+                    derived_from_artifact_id=reference.derived_from_artifact_id,
+                    source_execution_id=self._source_execution_id(reference),
+                ),
+                now=now,
+                expected_encryption_metadata_id=reference.encryption_metadata_id or "",
+            )
         if not (
             len(content) == reference.size_bytes
             and self._store._content_digest(content) == reference.sha256
@@ -784,6 +1083,256 @@ class ArtifactStore:
             occurred_at=now,
         )
         return content
+
+    def _read_stream(self, reference: ArtifactReference, *, now: datetime) -> bytes:
+        raw, envelope = self._store.read_bound(
+            mission_id=reference.mission_id,
+            resource_id=reference.artifact_id,
+            now=now,
+        )
+        try:
+            canonical_loads(raw)
+            manifest = _ArtifactStreamManifest.model_validate_json(raw, strict=True)
+        except (TypeError, ValueError) as exc:
+            raise ArtifactSecurityError("artifact stream manifest is invalid") from exc
+        if not self._manifest_matches_reference(manifest, reference, envelope):
+            raise DigestIntegrityError("artifact stream manifest binding failed")
+        output = bytearray()
+        expected_offset = 0
+        for expected_sequence, chunk in enumerate(manifest.chunks):
+            content, chunk_envelope = self._store.read_bound(
+                mission_id=reference.mission_id,
+                resource_id=chunk.resource_id,
+                now=now,
+            )
+            try:
+                binding = _ArtifactStreamChunkBinding.model_validate(
+                    chunk_envelope.binding.to_dict()
+                )
+            except ValueError as exc:
+                raise ArtifactSecurityError("artifact stream chunk binding is invalid") from exc
+            if not (
+                chunk.sequence_number == expected_sequence
+                and chunk.plaintext_offset == expected_offset
+                and binding.stream_id == manifest.stream_id
+                and binding.source_execution_id == manifest.source_execution_id
+                and binding.sequence_number == chunk.sequence_number
+                and binding.plaintext_offset == chunk.plaintext_offset
+                and binding.plaintext_size == chunk.plaintext_size == len(content)
+                and binding.plaintext_sha256
+                == chunk.plaintext_sha256
+                == self._store._content_digest(content)
+                and chunk.encryption_metadata_id
+                == chunk_envelope.encryption_metadata_id
+            ):
+                raise DigestIntegrityError("artifact stream chunk integrity failed")
+            output.extend(content)
+            expected_offset += len(content)
+        result = bytes(output)
+        if not (
+            len(result) == reference.size_bytes == expected_offset
+            and self._store._content_digest(result) == reference.sha256
+        ):
+            raise DigestIntegrityError("artifact stream aggregate integrity failed")
+        return result
+
+    def _stored_reference(
+        self, *, mission_id: str, artifact_id: str, now: datetime | None
+    ) -> ArtifactReference:
+        envelope = self._store.verified_envelope(
+            mission_id=mission_id,
+            resource_id=artifact_id,
+            now=now,
+        )
+        binding = envelope.binding.to_dict()
+        if binding.get("storage_format") == "artifact-stream-v1":
+            expected_keys = {
+                "artifact_id",
+                "media_type",
+                "classification",
+                "variant",
+                "derived_from_artifact_id",
+                "source_execution_id",
+                "storage_format",
+                "logical_size",
+                "logical_sha256",
+                "stream_id",
+            }
+            if set(binding) != expected_keys:
+                raise ArtifactSecurityError("artifact stream binding is invalid")
+            logical_size = binding["logical_size"]
+            classification = binding["classification"]
+            variant = binding["variant"]
+            if not (
+                binding["artifact_id"] == artifact_id
+                and isinstance(logical_size, int)
+                and not isinstance(logical_size, bool)
+                and classification in {"normal", "sensitive", "secret"}
+                and variant in {"redacted", "encrypted_raw"}
+                and isinstance(binding["source_execution_id"], str)
+                and isinstance(binding["stream_id"], str)
+            ):
+                raise ArtifactSecurityError("artifact stream binding is invalid")
+            return ArtifactReference(
+                artifact_id=artifact_id,
+                mission_id=mission_id,
+                media_type=str(binding["media_type"]),
+                size_bytes=logical_size,
+                sha256=str(binding["logical_sha256"]),
+                classification=classification,
+                variant=variant,
+                encrypted=True,
+                encryption_metadata_id=envelope.encryption_metadata_id,
+                derived_from_artifact_id=(
+                    None
+                    if binding["derived_from_artifact_id"] is None
+                    else str(binding["derived_from_artifact_id"])
+                ),
+                created_at=envelope.created_at,
+                retention_until=envelope.retention_until,
+            )
+        expected_keys = {
+            "artifact_id",
+            "media_type",
+            "classification",
+            "variant",
+            "derived_from_artifact_id",
+            "source_execution_id",
+        }
+        if set(binding) != expected_keys:
+            raise ArtifactSecurityError("artifact binding is invalid")
+        return ArtifactReference(
+            artifact_id=artifact_id,
+            mission_id=mission_id,
+            media_type=str(binding["media_type"]),
+            size_bytes=envelope.plaintext_size,
+            sha256=envelope.plaintext_sha256,
+            classification=str(binding["classification"]),  # type: ignore[arg-type]
+            variant=str(binding["variant"]),  # type: ignore[arg-type]
+            encrypted=True,
+            encryption_metadata_id=envelope.encryption_metadata_id,
+            derived_from_artifact_id=(
+                None
+                if binding["derived_from_artifact_id"] is None
+                else str(binding["derived_from_artifact_id"])
+            ),
+            created_at=envelope.created_at,
+            retention_until=envelope.retention_until,
+        )
+
+    @staticmethod
+    def _binding(
+        *,
+        artifact_id: str,
+        media_type: str,
+        classification: Literal["normal", "sensitive", "secret"],
+        variant: Literal["redacted", "encrypted_raw"],
+        derived_from_artifact_id: str | None,
+        source_execution_id: str,
+        **extra: object,
+    ) -> dict[str, object]:
+        return {
+            "artifact_id": artifact_id,
+            "media_type": media_type,
+            "classification": classification,
+            "variant": variant,
+            "derived_from_artifact_id": derived_from_artifact_id,
+            "source_execution_id": source_execution_id,
+            **extra,
+        }
+
+    @staticmethod
+    def _artifact_id(
+        *,
+        mission_id: str,
+        content_digest: str,
+        classification: str,
+        variant: str,
+        derived_from_artifact_id: str | None,
+    ) -> str:
+        return stable_id(
+            "artifact",
+            {
+                "mission_id": mission_id,
+                "content_sha256": content_digest,
+                "classification": classification,
+                "variant": variant,
+                "derived_from": derived_from_artifact_id,
+            },
+        )
+
+    @staticmethod
+    def _validate_metadata(
+        *,
+        media_type: str,
+        classification: str,
+        variant: str,
+        created_at: datetime,
+        retention_until: datetime | None,
+    ) -> None:
+        _require_time(created_at)
+        if not media_type:
+            raise ArtifactSecurityError("artifact media type is required")
+        if classification not in {"normal", "sensitive", "secret"}:
+            raise ArtifactSecurityError("artifact classification is invalid")
+        if variant not in {"redacted", "encrypted_raw"}:
+            raise ArtifactSecurityError("artifact variant is invalid")
+        if variant == "encrypted_raw" and classification != "secret":
+            raise ArtifactSecurityError("encrypted raw artifact classification is invalid")
+        if retention_until is not None:
+            _require_time(retention_until)
+            if retention_until <= created_at:
+                raise ArtifactSecurityError("artifact retention is invalid")
+
+    def _manifest_matches_reference(
+        self,
+        manifest: _ArtifactStreamManifest,
+        reference: ArtifactReference,
+        envelope: _StoredEnvelope,
+    ) -> bool:
+        return (
+            manifest.artifact_id == reference.artifact_id == envelope.resource_id
+            and manifest.mission_id == reference.mission_id == envelope.mission_id
+            and manifest.media_type == reference.media_type
+            and manifest.size_bytes == reference.size_bytes
+            and manifest.sha256 == reference.sha256
+            and manifest.classification == reference.classification
+            and manifest.variant == reference.variant
+            and manifest.derived_from_artifact_id
+            == reference.derived_from_artifact_id
+            and envelope.binding
+            == CanonicalJsonObject(
+                self._binding(
+                    artifact_id=manifest.artifact_id,
+                    media_type=manifest.media_type,
+                    classification=manifest.classification,
+                    variant=manifest.variant,
+                    derived_from_artifact_id=manifest.derived_from_artifact_id,
+                    source_execution_id=manifest.source_execution_id,
+                    storage_format="artifact-stream-v1",
+                    logical_size=manifest.size_bytes,
+                    logical_sha256=manifest.sha256,
+                    stream_id=manifest.stream_id,
+                )
+            )
+        )
+
+    def _reconcile_create_audit(self, reference: ArtifactReference) -> None:
+        self._audit.record(
+            mission_id=reference.mission_id,
+            resource_type="artifact",
+            resource_id=reference.artifact_id,
+            operation="create",
+            operation_id=stable_id(
+                "auditop",
+                {
+                    "schema_version": "artifact-create-audit-v1",
+                    "artifact_id": reference.artifact_id,
+                },
+            ),
+            metadata_digest=reference.sha256,
+            occurred_at=reference.created_at,
+        )
 
     def _source_execution_id(self, reference: ArtifactReference) -> str:
         envelope = self._store._load_envelope(
@@ -864,21 +1413,43 @@ class SecretStore:
             resource=write_binding,
             now=created_at,
         )
-        _, metadata_id = self._store.write(
-            mission_id=mission_id,
-            resource_id=secret_reference_id,
-            content=secret_value,
-            binding=binding,
-            created_at=created_at,
-            retention_until=expires_at,
-        )
+        if self._store.has_resource(
+            mission_id=mission_id, resource_id=secret_reference_id
+        ):
+            existing, envelope = self._store.read_bound(
+                mission_id=mission_id,
+                resource_id=secret_reference_id,
+                now=None,
+            )
+            if not (
+                existing == secret_value
+                and envelope.binding == CanonicalJsonObject(binding)
+                and envelope.retention_until == expires_at
+            ):
+                raise SecretAccessError(
+                    "secret reference conflicts with durable content"
+                )
+        else:
+            self._store.write(
+                mission_id=mission_id,
+                resource_id=secret_reference_id,
+                content=secret_value,
+                binding=binding,
+                created_at=created_at,
+                retention_until=expires_at,
+            )
+            envelope = self._store.verified_envelope(
+                mission_id=mission_id,
+                resource_id=secret_reference_id,
+                now=None,
+            )
         metadata = SecretReferenceMetadata(
             secret_reference_id=secret_reference_id,
             mission_id=mission_id,
             credential_type=credential_type,
             associated_principal_ref=associated_principal_ref,
-            encryption_metadata_id=metadata_id,
-            created_at=created_at,
+            encryption_metadata_id=envelope.encryption_metadata_id,
+            created_at=envelope.created_at,
             expires_at=expires_at,
             verification_state="detected",
         )
@@ -887,8 +1458,15 @@ class SecretStore:
             resource_type="secret_reference",
             resource_id=secret_reference_id,
             operation="create",
+            operation_id=stable_id(
+                "auditop",
+                {
+                    "schema_version": "secret-create-audit-v1",
+                    "secret_reference_id": secret_reference_id,
+                },
+            ),
             metadata_digest=sha256_digest(metadata),
-            occurred_at=created_at,
+            occurred_at=envelope.created_at,
         )
         return metadata
 
