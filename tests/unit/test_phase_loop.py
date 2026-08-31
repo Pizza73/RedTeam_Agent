@@ -1385,6 +1385,43 @@ def test_blocked_current_phase_gate_authorizes_exact_base_refresh() -> None:
     ) == gate
 
 
+def test_blocked_current_phase_gate_accepts_identical_trusted_duplicates() -> None:
+    base_pass, gate = blocked_refresh_records()
+    duplicate = MarkerEvidence(
+        dict(gate.payload),
+        f"{gate.url}-duplicate",
+        gate.author,
+        gate.body,
+    )
+    loop, _github = blocked_refresh_loop({})
+
+    assert loop.blocked_base_refresh_candidate(
+        blocked_phase_state(),
+        [base_pass, gate, duplicate],
+        DEFAULT_BRANCH_SHA,
+    ) == duplicate
+
+
+def test_blocked_current_phase_gate_rejects_distinct_trusted_duplicates() -> None:
+    base_pass, gate = blocked_refresh_records()
+    conflicting_payload = dict(gate.payload)
+    conflicting_payload["finding_key"] = "CODEX-P1-DISTINCT-FINDING"
+    conflicting = MarkerEvidence(
+        conflicting_payload,
+        f"{gate.url}-conflicting",
+        gate.author,
+        gate.body,
+    )
+    loop, _github = blocked_refresh_loop({})
+
+    with pytest.raises(UntrustedEvidenceError, match="ambiguous current-head"):
+        loop.blocked_base_refresh_candidate(
+            blocked_phase_state(),
+            [base_pass, gate, conflicting],
+            DEFAULT_BRANCH_SHA,
+        )
+
+
 def test_blocked_current_phase_refresh_rejects_missing_adjacent_base_pass() -> None:
     _base_pass, gate = blocked_refresh_records()
     status = base_refresh_status(
