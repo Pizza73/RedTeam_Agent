@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import stat
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -336,9 +338,11 @@ def test_oauth_fields_are_redacted_across_stream_chunks(tmp_path: Path) -> None:
 
     async def ingest_oauth_stream():
         sink = factory.for_execution("execution-oauth")
-        await sink.write_stdout(b'{"credential":"complete-value","access_')
+        await sink.write_stdout(b'{"tokenValue":"prefix-value","credential":')
+        await sink.write_stdout(b'"complete-value","access_')
         await sink.write_stdout(b'token":"access-value","serviceCred')
-        await sink.write_stdout(b'ential":"cross-value","client')
+        await sink.write_stdout(b'ential":"cross-value","password')
+        await sink.write_stdout(b'Hash":"hash-value","client')
         await sink.write_stdout(b'Secret":"client-value","refresh_')
         await sink.write_stdout(
             b'token":"refresh-value","oauthToken":"oauth-value"}'
@@ -351,12 +355,14 @@ def test_oauth_fields_are_redacted_across_stream_chunks(tmp_path: Path) -> None:
         ).ingest_stream(sink, receipt, now=NOW)
 
     result = asyncio.run(ingest_oauth_stream())
-    assert result.redaction_metadata.redaction_count == 6
+    assert result.redaction_metadata.redaction_count == 8
     assert result.redacted_artifacts[0].classification == "sensitive"
     assert {item.credential_type for item in result.detected_secrets} == {
+        "tokenvalue",
         "credential",
         "access_token",
         "servicecredential",
+        "passwordhash",
         "clientsecret",
         "refresh_token",
         "oauthtoken",
@@ -378,20 +384,79 @@ def test_oauth_fields_are_redacted_across_stream_chunks(tmp_path: Path) -> None:
     )
     visible = artifacts.read(artifact, operation="read", now=NOW)
     assert visible == (
-        b'{"credential":"[REDACTED]","access_token":"[REDACTED]",'
-        b'"serviceCredential":"[REDACTED]","clientSecret":"[REDACTED]",'
+        b'{"tokenValue":"[REDACTED]","credential":"[REDACTED]",'
+        b'"access_token":"[REDACTED]","serviceCredential":"[REDACTED]",'
+        b'"passwordHash":"[REDACTED]","clientSecret":"[REDACTED]",'
         b'"refresh_token":"[REDACTED]","oauthToken":"[REDACTED]"}'
     )
     for value in (
+        b"prefix-value",
         b"complete-value",
         b"access-value",
         b"cross-value",
+        b"hash-value",
         b"client-value",
         b"refresh-value",
         b"oauth-value",
     ):
         assert value not in visible
         assert value.decode() not in result.model_dump_json()
+
+
+def test_encrypted_store_fsyncs_parent_before_acknowledging_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    keys = _keys()
+    audit_log = MissionAuditLog()
+    audit = MissionAuditRecorder(audit_log=audit_log, contexts=_AuditContexts())
+    quarantine = EncryptedRawResultQuarantine(
+        root=tmp_path / "durable-quarantine",
+        keys=keys,
+        audit=audit,
+        max_item_bytes=1024,
+        mission_quota_bytes=4096,
+    )
+    original_fsync = os.fsync
+    directory_sync_attempts = 0
+
+    def fail_first_directory_sync(descriptor: int) -> None:
+        nonlocal directory_sync_attempts
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            directory_sync_attempts += 1
+            if directory_sync_attempts == 1:
+                raise OSError("simulated parent-directory sync failure")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", fail_first_directory_sync)
+    with pytest.raises(ArtifactSecurityError, match="directory sync"):
+        quarantine.commit(
+            mission_id="mission-durable",
+            mission_revision=1,
+            execution_id="execution-durable",
+            content=b"encrypted-result",
+            created_at=NOW,
+            retention_until=NOW + timedelta(hours=1),
+        )
+    assert directory_sync_attempts == 1
+    assert audit_log.events_for("mission-durable") == ()
+
+    reference = quarantine.commit(
+        mission_id="mission-durable",
+        mission_revision=1,
+        execution_id="execution-durable",
+        content=b"encrypted-result",
+        created_at=NOW,
+        retention_until=NOW + timedelta(hours=1),
+    )
+    assert directory_sync_attempts == 2
+    assert quarantine.resume(reference, now=NOW) == b"encrypted-result"
+    assert tuple(
+        event.event_type for event in audit_log.events_for("mission-durable")
+    ) == (
+        "raw_result_quarantine.commit",
+        "raw_result_quarantine.resume",
+    )
 
 
 def test_secret_resolution_requires_trusted_exact_mission_grant(tmp_path: Path) -> None:

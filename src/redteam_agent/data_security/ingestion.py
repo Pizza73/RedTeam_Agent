@@ -132,16 +132,7 @@ class _StreamingSecretRedactor:
         key_quote = data[index] if data[index] in _QUOTE_BYTES else None
         keyword_start = index + 1 if key_quote is not None else index
         keyword: bytes | None = None
-        for possible in _SECRET_KEYWORDS:
-            candidate = data[
-                keyword_start : keyword_start + len(possible)
-            ].lower()
-            if len(candidate) < len(possible) and possible.startswith(candidate):
-                return None if final else "incomplete"
-            if candidate == possible:
-                keyword = possible
-                break
-        if keyword is None and key_quote is not None:
+        if key_quote is not None:
             cursor = keyword_start
             while cursor < len(data) and data[cursor] != key_quote:
                 if data[cursor] == 92:
@@ -156,11 +147,21 @@ class _StreamingSecretRedactor:
             normalized_key = structured_key.lower().replace(b"_", b"").replace(
                 b"-", b""
             )
-            if any(
+            if structured_key.lower() in _SECRET_KEYWORDS or any(
                 component in normalized_key
                 for component in _CREDENTIAL_KEY_COMPONENTS
             ):
                 keyword = structured_key
+        else:
+            for possible in _SECRET_KEYWORDS:
+                candidate = data[
+                    keyword_start : keyword_start + len(possible)
+                ].lower()
+                if len(candidate) < len(possible) and possible.startswith(candidate):
+                    return None if final else "incomplete"
+                if candidate == possible:
+                    keyword = possible
+                    break
         if keyword is None:
             return None
         keyword_end = keyword_start + len(keyword)

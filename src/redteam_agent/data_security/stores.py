@@ -211,6 +211,7 @@ class _EncryptedFileStore:
                     raise ArtifactSecurityError(
                         "resource identifier conflicts with stored content"
                     )
+                self._sync_parent_directory(path.parent)
                 return (
                     existing.plaintext_sha256,
                     existing.encryption_metadata_id,
@@ -338,7 +339,11 @@ class _EncryptedFileStore:
         return envelope
 
     def has_resource(self, *, mission_id: str, resource_id: str) -> bool:
-        return self._path(mission_id, resource_id, create_parent=False).is_file()
+        path = self._path(mission_id, resource_id, create_parent=False)
+        exists = path.is_file()
+        if exists:
+            self._sync_parent_directory(path.parent)
+        return exists
 
     def envelopes_for(self, mission_id: str) -> tuple[_StoredEnvelope, ...]:
         mission_root = self._root / mission_id
@@ -601,9 +606,39 @@ class _EncryptedFileStore:
                 ) from None
             except OSError as exc:
                 raise ArtifactSecurityError("resource creation failed") from exc
+            try:
+                temporary.unlink()
+            except OSError as exc:
+                raise ArtifactSecurityError("resource creation failed") from exc
+            _EncryptedFileStore._sync_parent_directory(path.parent)
         finally:
             if temporary.exists():
                 temporary.unlink()
+
+    @staticmethod
+    def _sync_parent_directory(directory: Path) -> None:
+        flags = os.O_RDONLY | os.O_CLOEXEC
+        if hasattr(os, "O_DIRECTORY"):
+            flags |= os.O_DIRECTORY
+        try:
+            descriptor = os.open(directory, flags)
+        except OSError as exc:
+            raise ArtifactSecurityError(
+                "resource directory is unavailable"
+            ) from exc
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise ArtifactSecurityError("resource directory is invalid")
+            try:
+                os.fsync(descriptor)
+            except OSError as exc:
+                raise ArtifactSecurityError(
+                    "resource directory sync failed"
+                ) from exc
+        finally:
+            with suppress(OSError):
+                os.close(descriptor)
 
 
 class EncryptedRawResultQuarantine:
