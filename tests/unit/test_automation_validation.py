@@ -81,6 +81,13 @@ def test_phase_gate_uses_fail_closed_native_codex_evidence_chain() -> None:
         "PR head changed while Codex review was running",
         "missing its reviewer thumbs-up reaction",
         "missing retained P0/P1 findings",
+        "Exhaustive Codex findings must be retained in one formal review",
+        "finding_count: currentFindings.length",
+        "findings: currentFindings.map",
+        "finding_reference: item.html_url",
+        "all ${currentFindings.length} retained P0/P1 finding(s)",
+        "sameFindingCount + 1 >= 5",
+        "AI_LOOP_MAX_ITERATIONS must be exactly 5",
         "parseTime(item.created_at, 'Codex finding') <= triggerTime) return false",
         "duplicate JSON key",
         "redteam/base-refresh/",
@@ -109,6 +116,19 @@ def test_phase_gate_uses_fail_closed_native_codex_evidence_chain() -> None:
     assert "await addLabels([next.label, 'ai-needs-implementation'])" not in workflow
     assert "Review evidence must contain exactly one redteam-ai-review marker" not in workflow
     assert "Current-head Codex finding predates the trusted trigger" not in workflow
+    assert "sameFindingCount + 1 >= 3" not in workflow
+
+
+def test_ci_and_review_retry_limits_are_exactly_five() -> None:
+    for relative_path in (
+        ".github/workflows/ci.yml",
+        ".github/workflows/ai-loop-control.yml",
+    ):
+        workflow = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+        assert "if (maximum !== 5)" in workflow
+        assert "AI_LOOP_MAX_ITERATIONS must be exactly 5" in workflow
+        assert "maximum < 1" not in workflow
+        assert "maximum > 20" not in workflow
 
 
 def test_phase_gate_uses_the_marker_transition_protocol() -> None:
@@ -271,6 +291,11 @@ def test_base_refresh_is_sha_bound_and_separate_from_exact_sha_final_merge() -> 
         "isBlockedCurrentPhase",
         "Blocked current Phase lacks one trusted adjacent base PASS",
         "Blocked current-Phase base PASS is not incorporated in HEAD",
+        "authorization.ready_reference",
+        "redteam-ready-for-review",
+        "Blocked current Phase lacks trusted exact-HEAD ready evidence",
+        "if (isBlockedCurrentPhase)",
+        "item.user?.login === 'github-actions[bot]'",
         "blocked_base_refresh_candidate",
         "perform_post_blocked_refresh_resume",
         "resuming {state.phase} after trusted current-Phase base refresh",

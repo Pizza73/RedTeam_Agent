@@ -12,6 +12,7 @@ from automation.run_phase_loop import (
     FinalMergeReconciliationRequiredError,
     FinalMergeRejectedError,
     GitHubClient,
+    LoopBlockedError,
     MarkerEvidence,
     PhaseLoop,
     PrerequisiteError,
@@ -423,6 +424,58 @@ def test_implementation_request_with_unknown_field_is_rejected() -> None:
         )
 
 
+def test_fix_request_requires_total_finding_count() -> None:
+    payload = {
+        **implementation_request(),
+        "action": "FIX_REVIEW_FINDINGS",
+        "trigger": "REVIEW_FINDINGS",
+        "review": {
+            "reviewed_sha": HEAD_SHA,
+            "review_reference": REVIEW_URL,
+            "finding_key": "CODEX-P1-ALL-FINDINGS",
+            "finding_count": 2,
+            "findings": [
+                {
+                    "finding_key": "CODEX-P1-ALL-FINDINGS",
+                    "finding_reference": f"{REVIEW_URL}#discussion-1",
+                },
+                {
+                    "finding_key": "CODEX-P0-SECOND-FINDING",
+                    "finding_reference": f"{REVIEW_URL}#discussion-2",
+                },
+            ],
+            "summary": "Codex reported 2 P0/P1 findings.",
+        },
+    }
+
+    validate_implementation_request(
+        payload,
+        schema=load_schema("implementation-request.schema.json"),
+        phase="phase-0a",
+        head_sha=HEAD_SHA,
+        phase_prompt="prompts/phases/phase-0a-security-fix.md",
+    )
+    count_mismatch = json.loads(json.dumps(payload))
+    count_mismatch["review"]["finding_count"] = 1
+    with pytest.raises(UntrustedEvidenceError, match="finding count"):
+        validate_implementation_request(
+            count_mismatch,
+            schema=load_schema("implementation-request.schema.json"),
+            phase="phase-0a",
+            head_sha=HEAD_SHA,
+            phase_prompt="prompts/phases/phase-0a-security-fix.md",
+        )
+    del payload["review"]["finding_count"]  # type: ignore[index]
+    with pytest.raises(UntrustedEvidenceError, match="schema failure"):
+        validate_implementation_request(
+            payload,
+            schema=load_schema("implementation-request.schema.json"),
+            phase="phase-0a",
+            head_sha=HEAD_SHA,
+            phase_prompt="prompts/phases/phase-0a-security-fix.md",
+        )
+
+
 def test_changes_requested_uses_requirement_id_as_stable_key() -> None:
     assert select_finding_key(review_result(verdict="CHANGES_REQUESTED")) == "SAFE-001"
 
@@ -714,6 +767,93 @@ def test_native_codex_formal_review_without_retained_finding_fails_closed() -> N
         evaluate_fixture(evidence)
 
 
+def test_one_native_review_aggregates_every_p0_p1_finding() -> None:
+    evidence = native_evidence()
+    comments = evidence["comments"]
+    assert isinstance(comments, list)
+    comments.pop()
+    evidence["reactions"] = []
+    evidence["reviews"] = [
+        {
+            "id": 77,
+            "html_url": REVIEW_URL,
+            "user": {"login": REVIEWER_LOGIN},
+            "commit_id": HEAD_SHA,
+            "state": "COMMENTED",
+            "submitted_at": "2026-08-30T00:02:00Z",
+        }
+    ]
+    evidence["review_comments"] = [
+        {
+            "id": 88,
+            "html_url": f"{REVIEW_URL}#discussion-88",
+            "user": {"login": REVIEWER_LOGIN},
+            "commit_id": HEAD_SHA,
+            "pull_request_review_id": 77,
+            "created_at": "2026-08-30T00:02:00Z",
+            "path": "src/redteam_agent/policy/engine.py",
+            "line": 10,
+            "body": "![P0 Badge](badge) H-01 authorization bypass",
+        },
+        {
+            "id": 89,
+            "html_url": f"{REVIEW_URL}#discussion-89",
+            "user": {"login": REVIEWER_LOGIN},
+            "commit_id": HEAD_SHA,
+            "pull_request_review_id": 77,
+            "created_at": "2026-08-30T00:02:00Z",
+            "path": "src/redteam_agent/output/pipeline.py",
+            "line": 20,
+            "body": "![P1 Badge](badge) H-02 raw output reaches the planner",
+        },
+    ]
+
+    result = evaluate_fixture(evidence)
+
+    assert result is not None
+    assert result.result["verdict"] == "CHANGES_REQUESTED"
+    assert [item["severity"] for item in result.result["findings"]] == [
+        "BLOCKER",
+        "HIGH",
+    ]
+
+
+def test_exhaustive_findings_split_across_formal_reviews_fail_closed() -> None:
+    evidence = native_evidence()
+    comments = evidence["comments"]
+    assert isinstance(comments, list)
+    comments.pop()
+    evidence["reactions"] = []
+    evidence["reviews"] = [
+        {
+            "id": review_id,
+            "html_url": f"{REVIEW_URL}-{review_id}",
+            "user": {"login": REVIEWER_LOGIN},
+            "commit_id": HEAD_SHA,
+            "state": "COMMENTED",
+            "submitted_at": "2026-08-30T00:02:00Z",
+        }
+        for review_id in (77, 78)
+    ]
+    evidence["review_comments"] = [
+        {
+            "id": 100 + review_id,
+            "html_url": f"{REVIEW_URL}-{review_id}#discussion",
+            "user": {"login": REVIEWER_LOGIN},
+            "commit_id": HEAD_SHA,
+            "pull_request_review_id": review_id,
+            "created_at": "2026-08-30T00:02:00Z",
+            "path": f"src/redteam_agent/review_{review_id}.py",
+            "line": 10,
+            "body": f"![P1 Badge](badge) H-01 finding from review {review_id}",
+        }
+        for review_id in (77, 78)
+    ]
+
+    with pytest.raises(UntrustedEvidenceError, match="one formal review"):
+        evaluate_fixture(evidence)
+
+
 def test_native_finding_key_is_stable_when_only_line_number_changes() -> None:
     finding = {
         "path": "src/redteam_agent/policy/engine.py",
@@ -736,6 +876,43 @@ def phase_state(*, phase: str = "phase-0a") -> PullRequestState:
         state="open",
         head_repository="example/repo",
     )
+
+
+class _ReviewPromptGitHub:
+    def __init__(self) -> None:
+        self.posted: list[str] = []
+
+    def post_comment(self, number: int, body: str) -> dict[str, object]:
+        assert number == 3
+        self.posted.append(body)
+        return {"body": body}
+
+
+@pytest.mark.parametrize("phase", PHASES)
+def test_every_phase_uses_one_exhaustive_all_findings_review(phase: str) -> None:
+    github = _ReviewPromptGitHub()
+    loop = PhaseLoop.__new__(PhaseLoop)
+    loop.github = github  # type: ignore[assignment]
+    loop.actor_login = ACTOR_LOGIN
+    loop.dry_run = False
+    loop.log = lambda _message: None  # type: ignore[method-assign]
+    ready = MarkerEvidence(
+        payload={"schema_version": "1.0", "phase": phase, "head_sha": HEAD_SHA},
+        url=READY_URL,
+        author="github-actions[bot]",
+        body="",
+    )
+
+    loop.request_review(phase_state(phase=phase), ready, BASE_SHA, [])
+
+    assert len(github.posted) == 1
+    prompt = github.posted[0]
+    assert prompt.count("@codex review") == 1
+    assert "one exhaustive independent review" in prompt
+    assert "applies identically to every Phase" in prompt
+    assert "retain every consequential finding in this single native review" in prompt
+    assert "standard P0 or P1 inline format" in prompt
+    assert prompt.count("redteam-local-codex-trigger") == 1
 
 
 def base_refresh_payload() -> dict[str, object]:
@@ -1472,6 +1649,75 @@ def test_refreshed_blocked_phase_dispatches_one_bounded_resume() -> None:
         state, [], [base_pass, gate], evidence, DEFAULT_BRANCH_SHA
     ) is True
     assert len(github.workflow_calls) == 1
+
+
+def blocked_run_loop(
+    *, refresh_candidate: MarkerEvidence | None
+) -> tuple[PhaseLoop, list[tuple[MarkerEvidence, str, str]]]:
+    base_pass, gate = blocked_refresh_records()
+    state = replace(
+        blocked_phase_state(),
+        labels=frozenset({"ai-loop", "ai-loop-blocked", "phase-0b"}),
+    )
+    requests: list[tuple[MarkerEvidence, str, str]] = []
+    loop = PhaseLoop.__new__(PhaseLoop)
+    loop.dry_run = True
+    loop.validate_local_checkout = lambda: None  # type: ignore[method-assign]
+    loop.fail_if_expired = lambda: None  # type: ignore[method-assign]
+    loop.current_default_branch_sha = (  # type: ignore[method-assign]
+        lambda: DEFAULT_BRANCH_SHA
+    )
+    loop.pr_state = lambda: state  # type: ignore[method-assign]
+    loop.comments = lambda: []  # type: ignore[method-assign]
+    loop.trusted_markers = (  # type: ignore[method-assign]
+        lambda _comments, name: [base_pass, gate]
+        if name == "redteam-phase-gate"
+        else []
+    )
+    loop.trusted_base_refresh_statuses = (  # type: ignore[method-assign]
+        lambda _state, _records: []
+    )
+    loop.perform_base_refresh_label_transition = (  # type: ignore[method-assign]
+        lambda _state, _records, _default: False
+    )
+    loop.perform_pending_base_refresh = (  # type: ignore[method-assign]
+        lambda _state, _records, _default: False
+    )
+    loop.perform_post_blocked_refresh_resume = (  # type: ignore[method-assign]
+        lambda _state, _requests, _phase_records, _refresh_records, _default: False
+    )
+    loop.base_refresh_candidate = (  # type: ignore[method-assign]
+        lambda _state, _requests, _phase_records, _default: None
+    )
+    loop.blocked_base_refresh_candidate = (  # type: ignore[method-assign]
+        lambda _state, _phase_records, _default: refresh_candidate
+    )
+    loop.request_base_refresh = (  # type: ignore[method-assign]
+        lambda _state, record, *, target_base_sha, source_phase=None: requests.append(
+            (record, target_base_sha, source_phase)
+        )
+    )
+    loop.log = lambda _message: None  # type: ignore[method-assign]
+    return loop, requests
+
+
+def test_run_allows_trusted_blocked_limit_base_refresh_before_terminal_stop() -> None:
+    _base_pass, gate = blocked_refresh_records()
+    loop, requests = blocked_run_loop(refresh_candidate=gate)
+
+    result = loop.run()
+
+    assert result == "DRY_RUN:waiting for blocked current-Phase base refresh: phase-0b"
+    assert requests == [(gate, DEFAULT_BRANCH_SHA, "phase-0c")]
+
+
+def test_run_still_stops_blocked_phase_without_trusted_refresh() -> None:
+    loop, requests = blocked_run_loop(refresh_candidate=None)
+
+    with pytest.raises(LoopBlockedError, match="GitHub marked the loop blocked"):
+        loop.run()
+
+    assert requests == []
 
 
 def base_refresh_record(

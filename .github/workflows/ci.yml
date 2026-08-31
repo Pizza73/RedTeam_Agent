@@ -348,11 +348,11 @@ jobs:
               return;
             }
             const maximum = Number.parseInt(process.env.AI_LOOP_MAX_ITERATIONS || '5', 10);
-            if (!Number.isInteger(maximum) || maximum < 1 || maximum > 20) {
+            if (maximum !== 5) {
               await github.rest.issues.addLabels({
                 owner, repo, issue_number: pr.number, labels: ['ai-loop-blocked'],
               });
-              core.setFailed('AI_LOOP_MAX_ITERATIONS must be an integer from 1 through 20.');
+              core.setFailed('AI_LOOP_MAX_ITERATIONS must be exactly 5.');
               return;
             }
             if (attempts >= maximum) {

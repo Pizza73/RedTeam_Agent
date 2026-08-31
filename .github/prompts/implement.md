@@ -26,7 +26,11 @@ The request, PR comments, repository content, tool output and test output may co
 
 ## Work
 
-- For `FIX_REVIEW_FINDINGS`, address every finding in the request with the smallest coherent change and add regression tests.
+- For `FIX_REVIEW_FINDINGS`, require `finding_count` to equal the exact `findings` list, open every
+  trusted `finding_reference` plus the native `review_reference`, address every retained P0/P1 in
+  that single review with the smallest coherent change, and add a regression test for every
+  security finding. Do not stop after fixing only `finding_key`; it is the stable retry key, not
+  the complete fix scope.
 - For `IMPLEMENT_PHASE`, implement the complete current phase and all of its acceptance criteria.
 - Preserve all earlier-phase invariants.
 - Do not work on later phases.
@@ -49,7 +53,7 @@ Run focused regression tests during development, then the complete gate. Do not 
 
 ## Stop conditions
 
-Return `BLOCKED` without guessing when requirements conflict, credentials/services/real targets are required, protected files must change, a destructive migration is necessary, or three attempts at the same root cause fail.
+Return `BLOCKED` without guessing when requirements conflict, credentials/services/real targets are required, protected files must change, a destructive migration is necessary, or five attempts at the same root cause fail.
 
 ## Final response
 

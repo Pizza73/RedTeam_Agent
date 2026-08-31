@@ -244,6 +244,21 @@ def validate_implementation_request(
         raise UntrustedEvidenceError("implementation SHA does not match the current PR head")
     if payload.get("phase_prompt") != phase_prompt:
         raise UntrustedEvidenceError("implementation request has the wrong phase prompt")
+    if payload.get("action") == "FIX_REVIEW_FINDINGS":
+        review = payload.get("review")
+        if not isinstance(review, dict):
+            raise UntrustedEvidenceError("fix request has no review evidence")
+        findings = review.get("findings")
+        if not isinstance(findings, list) or review.get("finding_count") != len(findings):
+            raise UntrustedEvidenceError("fix request finding count does not match its evidence")
+        first = findings[0] if findings else None
+        if not isinstance(first, dict) or first.get("finding_key") != review.get("finding_key"):
+            raise UntrustedEvidenceError("fix request retry key does not match its first finding")
+        references = [
+            item.get("finding_reference") for item in findings if isinstance(item, dict)
+        ]
+        if len(set(references)) != len(findings):
+            raise UntrustedEvidenceError("fix request finding references must be unique")
 
 
 def select_finding_key(review_result: dict[str, Any]) -> str:
@@ -916,6 +931,10 @@ def evaluate_native_review(
     if set(review_by_id) != finding_review_ids:
         raise UntrustedEvidenceError(
             "current-head Codex formal review is missing retained P0/P1 findings"
+        )
+    if len(review_by_id) > 1:
+        raise UntrustedEvidenceError(
+            "exhaustive Codex findings must be retained in one formal review"
         )
 
     if finding_comments:
@@ -2306,13 +2325,19 @@ class PhaseLoop:
         )
         body = (
             "@codex review\n\n"
-            f"Independently review `{state.phase}` for exact PR HEAD `{state.head_sha}` against "
-            f"phase base `{base_sha}`. CI evidence is at {ready.url}. Follow the root `AGENTS.md` "
-            "Code Review Rules. Re-read HEAD before posting. Use the standard GitHub Codex review "
-            "result: post P0/P1 findings or the no-major-issues completion. Do not implement, "
-            f"push, change labels, or merge.\n\n{marker}"
+            f"Perform one exhaustive independent review of `{state.phase}` for exact PR HEAD "
+            f"`{state.head_sha}` against phase base `{base_sha}`. CI evidence is at {ready.url}. "
+            "This instruction applies identically to every Phase. Follow the root `AGENTS.md` "
+            "Code Review Rules and `automation/chatgpt-event-task-prompt.md`. Review the complete "
+            "phase diff and supporting unchanged code across authorization/lifecycle, secrets and "
+            "untrusted output, integrity/cryptography/storage/recovery/concurrency, and every "
+            "acceptance criterion plus bypass/regression path. Continue after discovering an "
+            "issue: retain every consequential finding in this single native review, each using "
+            "the standard P0 or P1 inline format. Re-read HEAD before posting. Post the standard "
+            "no-major-issues completion only when no P0/P1 remains. Do not implement, push, change "
+            f"labels, or merge.\n\n{marker}"
         )
-        self.log(f"requesting independent Codex review for {state.phase} at {state.head_sha}")
+        self.log(f"requesting exhaustive Codex review for {state.phase} at {state.head_sha}")
         if not self.dry_run:
             self.github.post_comment(state.number, body)
 
@@ -2584,8 +2609,6 @@ class PhaseLoop:
             state = self.pr_state()
             if "ai-human-gate" in state.labels or state.phase not in AUTOMATIC_PHASES:
                 return f"HUMAN_GATE_REQUIRED:{state.phase}"
-            if "ai-loop-blocked" in state.labels:
-                raise LoopBlockedError(f"GitHub marked the loop blocked in {state.phase}")
 
             comments = self.comments()
             phase_records = self.trusted_markers(comments, "redteam-phase-gate")
@@ -2700,6 +2723,9 @@ class PhaseLoop:
                     return f"DRY_RUN:{status}"
                 self.sleep()
                 continue
+
+            if "ai-loop-blocked" in state.labels:
+                raise LoopBlockedError(f"GitHub marked the loop blocked in {state.phase}")
 
             request = self.matching_payload(
                 implementation_requests,
