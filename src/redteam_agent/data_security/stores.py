@@ -157,10 +157,7 @@ class _EncryptedFileStore:
     ) -> None:
         if max_item_bytes <= 0 or mission_quota_bytes <= 0:
             raise ArtifactSecurityError("storage limits must be positive")
-        if root.exists() and root.is_symlink():
-            raise ArtifactSecurityError("storage root may not be a symbolic link")
-        root.mkdir(parents=True, exist_ok=True)
-        self._root = root.resolve(strict=True)
+        self._root = self._prepare_root(root)
         self._domain = domain
         self._keys = keys
         self._max_item_bytes = max_item_bytes
@@ -172,6 +169,33 @@ class _EncryptedFileStore:
             and not self._transaction_lock_path.is_file()
         ):
             raise ArtifactSecurityError("store transaction lock is invalid")
+
+    @classmethod
+    def _prepare_root(cls, root: Path) -> Path:
+        absolute_root = Path(os.path.abspath(root))
+        missing_components: list[Path] = []
+        existing_ancestor = absolute_root
+        while not existing_ancestor.exists():
+            if existing_ancestor == existing_ancestor.parent:
+                raise ArtifactSecurityError("storage root is unavailable")
+            missing_components.append(existing_ancestor)
+            existing_ancestor = existing_ancestor.parent
+        if existing_ancestor.is_symlink() or not existing_ancestor.is_dir():
+            raise ArtifactSecurityError("storage root ancestry is invalid")
+
+        cls._sync_parent_directory(existing_ancestor.parent)
+        for directory in reversed(missing_components):
+            try:
+                directory.mkdir(mode=0o700, exist_ok=True)
+            except OSError as exc:
+                raise ArtifactSecurityError("storage root is unavailable") from exc
+            if directory.is_symlink() or not directory.is_dir():
+                raise ArtifactSecurityError("storage root ancestry is invalid")
+            cls._sync_parent_directory(directory.parent)
+        try:
+            return absolute_root.resolve(strict=True)
+        except OSError as exc:
+            raise ArtifactSecurityError("storage root is unavailable") from exc
 
     def write(
         self,

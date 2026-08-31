@@ -525,6 +525,64 @@ def test_encrypted_store_fsyncs_store_root_for_first_mission_write(
     )
 
 
+def test_encrypted_store_fsyncs_new_nested_root_before_acknowledging_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    keys = _keys()
+    audit_log = MissionAuditLog()
+    audit = MissionAuditRecorder(audit_log=audit_log, contexts=_AuditContexts())
+    nested_root = tmp_path / "new-store-parent" / "nested-quarantine"
+    original_fsync = os.fsync
+    directory_sync_attempts = 0
+
+    def fail_new_root_entry_sync(descriptor: int) -> None:
+        nonlocal directory_sync_attempts
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            directory_sync_attempts += 1
+            if directory_sync_attempts == 3:
+                raise OSError("simulated new-store-root sync failure")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", fail_new_root_entry_sync)
+    with pytest.raises(ArtifactSecurityError, match="directory sync"):
+        EncryptedRawResultQuarantine(
+            root=nested_root,
+            keys=keys,
+            audit=audit,
+            max_item_bytes=1024,
+            mission_quota_bytes=4096,
+        )
+    assert directory_sync_attempts == 3
+    assert nested_root.is_dir()
+    assert audit_log.events_for("mission-new-store") == ()
+
+    quarantine = EncryptedRawResultQuarantine(
+        root=nested_root,
+        keys=keys,
+        audit=audit,
+        max_item_bytes=1024,
+        mission_quota_bytes=4096,
+    )
+    assert directory_sync_attempts == 4
+    reference = quarantine.commit(
+        mission_id="mission-new-store",
+        mission_revision=1,
+        execution_id="execution-new-store",
+        content=b"new-store-encrypted-result",
+        created_at=NOW,
+        retention_until=NOW + timedelta(hours=1),
+    )
+    assert directory_sync_attempts == 6
+    assert quarantine.resume(reference, now=NOW) == b"new-store-encrypted-result"
+    assert tuple(
+        event.event_type for event in audit_log.events_for("mission-new-store")
+    ) == (
+        "raw_result_quarantine.commit",
+        "raw_result_quarantine.resume",
+    )
+
+
 def test_secret_resolution_requires_trusted_exact_mission_grant(tmp_path: Path) -> None:
     _, _, secrets, authorizer, audit_log = _stores(tmp_path)
     with pytest.raises(SecretAccessError):

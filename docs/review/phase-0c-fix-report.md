@@ -4,23 +4,22 @@
 
 - Current phase: `Phase 0C: Data Security and Audit`
 - Input review SHA: `6b55fe9ba6cf0453e8c8ba33af3a3a9368944df5`
-- Latest correction input SHA: `beafaff97f269472f0b629660885b1ecc65db10c`
+- Latest correction input SHA: `ea6b43bd56d305a2e7b38a8c06237582bad76af2`
 - Trusted Phase 0B base PASS SHA: `5cda9a5f8792ee33c3e153d8e791499f5619d82e`
 - Implementation branch: `ai/redteam-agent-phase-loop`
 - Independent-review result: `CHANGES_REQUESTED`
-- Latest finding key: `CODEX-P1-A09FB0D3791BC787`
+- Latest finding key: `CODEX-P1-D863C9C4AECF87D3`
 - External provider, C2, MCP side effect, local attack, and external-target execution: absent
 
 ## Resulting working-tree diff
 
-The latest correction updates three implementation/test files and this report. No protected
+The latest correction updates two implementation/test files and this report. No protected
 governance file listed in `AGENTS.md` was modified. In particular, `SystemDesign.md`, `.github/**`,
 `automation/**`, requirements, acceptance criteria, safety invariants, implementation status,
 phase prompts, CI scripts, and dependency manifests are unchanged.
 
 Modified files:
 
-- `src/redteam_agent/data_security/ingestion.py`
 - `src/redteam_agent/data_security/stores.py`
 - `tests/security/test_phase0c_data_security.py`
 - `docs/review/phase-0c-fix-report.md`
@@ -222,6 +221,21 @@ This cycle extends the streaming credential regression with complete and cross-c
 keeps the existing Mission-directory durability regression, and adds a distinct first-write
 Store-root durability failure path with verified recovery.
 
+## Ninth independent review correction cycle
+
+The review for exact HEAD `ea6b43bd56d305a2e7b38a8c06237582bad76af2` recorded one P1 finding
+under `CODEX-P1-D863C9C4AECF87D3`. The exact-SHA Human Resume covers the finding:
+
+- [`discussion_r3896563814`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3896563814):
+  Store initialization now discovers every missing root component, creates them from the nearest
+  existing ancestor downward, and synchronizes each component's parent before proceeding. An
+  existing root also has its parent synchronized before reuse, so a retry after an uncertain
+  creation sync cannot acknowledge a write without first making the root entry durable.
+
+The regression starts with a nonexistent two-level Store root, injects failure while synchronizing
+the final root entry, verifies that construction fails before ciphertext or audit creation, and
+then confirms that restart re-synchronizes the existing root before an authenticated first write.
+
 ## Regression tests added
 
 The existing Phase 0C security test module now additionally covers:
@@ -270,7 +284,9 @@ The existing Phase 0C security test module now additionally covers:
 - complete and cross-chunk unquoted credential keys whose names begin with exact shorter keywords;
   and
 - first-Mission Store-root synchronization failure before ciphertext/audit creation, followed by
-  synchronized retry recovery.
+  synchronized retry recovery; and
+- nested Store-root component creation with parent-by-parent durability, injected final-entry sync
+  failure, and restart recovery before the first acknowledged encrypted write.
 
 No test was removed, weakened, skipped, or marked as an expected failure.
 
@@ -290,8 +306,8 @@ ruff: All checks passed
 mypy: Success: no issues found in 78 source files
 unit: 186 passed
 integration: 7 passed
-security: 158 passed
-full/coverage run: 351 passed
+security: 159 passed
+full/coverage run: 352 passed
 skipped=0, errors=0, failures=0
 coverage: 82% total (branch coverage enabled)
 pip check: No broken requirements found
@@ -307,8 +323,8 @@ PATH="$PWD/.venv/bin:$PATH" python -m pytest -q \
   tests/security/test_phase0c_data_security.py
 ```
 
-Latest focused Phase 0C security result: `14 passed`. The three targeted durability/redaction
-regressions pass with `3 passed, 11 deselected`.
+Latest focused Phase 0C security result: `15 passed`. The new nested Store-root durability
+regression passes with `1 passed, 14 deselected`.
 
 ## Remaining constraints
 
