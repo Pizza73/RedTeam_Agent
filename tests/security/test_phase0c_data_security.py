@@ -345,8 +345,10 @@ def test_oauth_fields_are_redacted_across_stream_chunks(tmp_path: Path) -> None:
         await sink.write_stdout(b'Hash":"hash-value","client')
         await sink.write_stdout(b'Secret":"client-value","refresh_')
         await sink.write_stdout(
-            b'token":"refresh-value","oauthToken":"oauth-value"}'
+            b'token":"refresh-value","oauthToken":"oauth-value"} '
         )
+        await sink.write_stdout(b"passwordHash=unquoted-hash token")
+        await sink.write_stdout(b"Value: unquoted-token")
         receipt = await sink.commit()
         return await SecureIngestor(
             quarantine=quarantine,
@@ -355,7 +357,7 @@ def test_oauth_fields_are_redacted_across_stream_chunks(tmp_path: Path) -> None:
         ).ingest_stream(sink, receipt, now=NOW)
 
     result = asyncio.run(ingest_oauth_stream())
-    assert result.redaction_metadata.redaction_count == 8
+    assert result.redaction_metadata.redaction_count == 10
     assert result.redacted_artifacts[0].classification == "sensitive"
     assert {item.credential_type for item in result.detected_secrets} == {
         "tokenvalue",
@@ -387,7 +389,8 @@ def test_oauth_fields_are_redacted_across_stream_chunks(tmp_path: Path) -> None:
         b'{"tokenValue":"[REDACTED]","credential":"[REDACTED]",'
         b'"access_token":"[REDACTED]","serviceCredential":"[REDACTED]",'
         b'"passwordHash":"[REDACTED]","clientSecret":"[REDACTED]",'
-        b'"refresh_token":"[REDACTED]","oauthToken":"[REDACTED]"}'
+        b'"refresh_token":"[REDACTED]","oauthToken":"[REDACTED]"} '
+        b"passwordHash=[REDACTED] tokenValue: [REDACTED]"
     )
     for value in (
         b"prefix-value",
@@ -398,6 +401,8 @@ def test_oauth_fields_are_redacted_across_stream_chunks(tmp_path: Path) -> None:
         b"client-value",
         b"refresh-value",
         b"oauth-value",
+        b"unquoted-hash",
+        b"unquoted-token",
     ):
         assert value not in visible
         assert value.decode() not in result.model_dump_json()
@@ -420,15 +425,15 @@ def test_encrypted_store_fsyncs_parent_before_acknowledging_write(
     original_fsync = os.fsync
     directory_sync_attempts = 0
 
-    def fail_first_directory_sync(descriptor: int) -> None:
+    def fail_mission_directory_sync(descriptor: int) -> None:
         nonlocal directory_sync_attempts
         if stat.S_ISDIR(os.fstat(descriptor).st_mode):
             directory_sync_attempts += 1
-            if directory_sync_attempts == 1:
+            if directory_sync_attempts == 2:
                 raise OSError("simulated parent-directory sync failure")
         original_fsync(descriptor)
 
-    monkeypatch.setattr(os, "fsync", fail_first_directory_sync)
+    monkeypatch.setattr(os, "fsync", fail_mission_directory_sync)
     with pytest.raises(ArtifactSecurityError, match="directory sync"):
         quarantine.commit(
             mission_id="mission-durable",
@@ -438,7 +443,7 @@ def test_encrypted_store_fsyncs_parent_before_acknowledging_write(
             created_at=NOW,
             retention_until=NOW + timedelta(hours=1),
         )
-    assert directory_sync_attempts == 1
+    assert directory_sync_attempts == 2
     assert audit_log.events_for("mission-durable") == ()
 
     reference = quarantine.commit(
@@ -449,10 +454,71 @@ def test_encrypted_store_fsyncs_parent_before_acknowledging_write(
         created_at=NOW,
         retention_until=NOW + timedelta(hours=1),
     )
-    assert directory_sync_attempts == 2
+    assert directory_sync_attempts == 4
     assert quarantine.resume(reference, now=NOW) == b"encrypted-result"
     assert tuple(
         event.event_type for event in audit_log.events_for("mission-durable")
+    ) == (
+        "raw_result_quarantine.commit",
+        "raw_result_quarantine.resume",
+    )
+
+
+def test_encrypted_store_fsyncs_store_root_for_first_mission_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    keys = _keys()
+    audit_log = MissionAuditLog()
+    audit = MissionAuditRecorder(audit_log=audit_log, contexts=_AuditContexts())
+    quarantine = EncryptedRawResultQuarantine(
+        root=tmp_path / "first-mission-quarantine",
+        keys=keys,
+        audit=audit,
+        max_item_bytes=1024,
+        mission_quota_bytes=4096,
+    )
+    original_fsync = os.fsync
+    directory_sync_attempts = 0
+
+    def fail_first_directory_sync(descriptor: int) -> None:
+        nonlocal directory_sync_attempts
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            directory_sync_attempts += 1
+            if directory_sync_attempts == 1:
+                raise OSError("simulated store-root sync failure")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", fail_first_directory_sync)
+    with pytest.raises(ArtifactSecurityError, match="directory sync"):
+        quarantine.commit(
+            mission_id="mission-first-write",
+            mission_revision=1,
+            execution_id="execution-first-write",
+            content=b"first-encrypted-result",
+            created_at=NOW,
+            retention_until=NOW + timedelta(hours=1),
+        )
+    assert directory_sync_attempts == 1
+    assert audit_log.events_for("mission-first-write") == ()
+    assert not list(
+        (tmp_path / "first-mission-quarantine" / "mission-first-write").glob(
+            "*.json"
+        )
+    )
+
+    reference = quarantine.commit(
+        mission_id="mission-first-write",
+        mission_revision=1,
+        execution_id="execution-first-write",
+        content=b"first-encrypted-result",
+        created_at=NOW,
+        retention_until=NOW + timedelta(hours=1),
+    )
+    assert directory_sync_attempts == 3
+    assert quarantine.resume(reference, now=NOW) == b"first-encrypted-result"
+    assert tuple(
+        event.event_type for event in audit_log.events_for("mission-first-write")
     ) == (
         "raw_result_quarantine.commit",
         "raw_result_quarantine.resume",

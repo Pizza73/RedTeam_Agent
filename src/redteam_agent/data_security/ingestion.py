@@ -56,6 +56,7 @@ _QUOTE_BYTES = frozenset(b"\"'")
 _ASCII_WORD_BYTES = frozenset(
     b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
 )
+_STRUCTURED_KEY_BYTES = _ASCII_WORD_BYTES | frozenset(b"-")
 _MAX_PENDING_SECRET_MATCH_BYTES = 64 * 1024
 
 
@@ -153,15 +154,20 @@ class _StreamingSecretRedactor:
             ):
                 keyword = structured_key
         else:
-            for possible in _SECRET_KEYWORDS:
-                candidate = data[
-                    keyword_start : keyword_start + len(possible)
-                ].lower()
-                if len(candidate) < len(possible) and possible.startswith(candidate):
-                    return None if final else "incomplete"
-                if candidate == possible:
-                    keyword = possible
-                    break
+            cursor = keyword_start
+            while cursor < len(data) and data[cursor] in _STRUCTURED_KEY_BYTES:
+                cursor += 1
+            if cursor == len(data):
+                return None if final else "incomplete"
+            structured_key = data[keyword_start:cursor]
+            normalized_key = structured_key.lower().replace(b"_", b"").replace(
+                b"-", b""
+            )
+            if structured_key.lower() in _SECRET_KEYWORDS or any(
+                component in normalized_key
+                for component in _CREDENTIAL_KEY_COMPONENTS
+            ):
+                keyword = structured_key
         if keyword is None:
             return None
         keyword_end = keyword_start + len(keyword)

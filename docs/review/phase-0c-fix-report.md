@@ -4,11 +4,11 @@
 
 - Current phase: `Phase 0C: Data Security and Audit`
 - Input review SHA: `6b55fe9ba6cf0453e8c8ba33af3a3a9368944df5`
-- Latest correction input SHA: `8a72be08dfb5c0e969e5e6d553353e1524a9792f`
+- Latest correction input SHA: `beafaff97f269472f0b629660885b1ecc65db10c`
 - Trusted Phase 0B base PASS SHA: `5cda9a5f8792ee33c3e153d8e791499f5619d82e`
 - Implementation branch: `ai/redteam-agent-phase-loop`
 - Independent-review result: `CHANGES_REQUESTED`
-- Latest finding key: `CODEX-P1-3A13D586A0128C5B`
+- Latest finding key: `CODEX-P1-A09FB0D3791BC787`
 - External provider, C2, MCP side effect, local attack, and external-target execution: absent
 
 ## Resulting working-tree diff
@@ -203,6 +203,25 @@ under `CODEX-P1-3A13D586A0128C5B`. The exact-SHA Human Resume covers both findin
 This cycle adds complete and chunk-boundary prefix-key regressions plus a simulated directory-sync
 failure that verifies the absence of successful audit evidence and safe idempotent recovery.
 
+## Eighth independent review correction cycle
+
+The review for exact HEAD `beafaff97f269472f0b629660885b1ecc65db10c` recorded two P1 findings
+under `CODEX-P1-A09FB0D3791BC787`. The exact-SHA Human Resume covers both findings:
+
+- [`discussion_r3896450121`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3896450121):
+  unquoted structured detection now reads the complete key through its separator before matching
+  exact names or credential-bearing components. Complete `passwordHash=...` and cross-chunk
+  `tokenValue: ...` values are classified and redacted instead of being bypassed by shorter
+  `password` or `token` prefixes.
+- [`discussion_r3896450136`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3896450136):
+  every write synchronizes the Store root after ensuring the Mission directory exists and before
+  creating its encrypted resource. A first-Mission root-sync failure is typed and fails before
+  ciphertext or successful audit creation; retry re-synchronizes both root and Mission directory.
+
+This cycle extends the streaming credential regression with complete and cross-chunk unquoted keys,
+keeps the existing Mission-directory durability regression, and adds a distinct first-write
+Store-root durability failure path with verified recovery.
+
 ## Regression tests added
 
 The existing Phase 0C security test module now additionally covers:
@@ -247,7 +266,11 @@ The existing Phase 0C security test module now additionally covers:
   creation, post-commit quota re-evaluation, and surviving ciphertext integrity;
 - complete and cross-chunk credential field names that begin with exact shorter keywords; and
 - parent-directory synchronization failure before acknowledgement, with no successful audit and
-  verified retry recovery.
+  verified retry recovery;
+- complete and cross-chunk unquoted credential keys whose names begin with exact shorter keywords;
+  and
+- first-Mission Store-root synchronization failure before ciphertext/audit creation, followed by
+  synchronized retry recovery.
 
 No test was removed, weakened, skipped, or marked as an expected failure.
 
@@ -267,8 +290,8 @@ ruff: All checks passed
 mypy: Success: no issues found in 78 source files
 unit: 186 passed
 integration: 7 passed
-security: 157 passed
-full/coverage run: 350 passed
+security: 158 passed
+full/coverage run: 351 passed
 skipped=0, errors=0, failures=0
 coverage: 82% total (branch coverage enabled)
 pip check: No broken requirements found
@@ -284,8 +307,8 @@ PATH="$PWD/.venv/bin:$PATH" python -m pytest -q \
   tests/security/test_phase0c_data_security.py
 ```
 
-Latest focused Phase 0C security result: `13 passed`. The two new targeted regressions pass with
-`2 passed, 11 deselected`.
+Latest focused Phase 0C security result: `14 passed`. The three targeted durability/redaction
+regressions pass with `3 passed, 11 deselected`.
 
 ## Remaining constraints
 

@@ -511,7 +511,15 @@ class _EncryptedFileStore:
         if mission_root.exists() and mission_root.is_symlink():
             raise ArtifactSecurityError("mission storage may not be a symbolic link")
         if create_parent:
-            mission_root.mkdir(mode=0o700, exist_ok=True)
+            try:
+                mission_root.mkdir(mode=0o700, exist_ok=True)
+            except OSError as exc:
+                raise ArtifactSecurityError(
+                    "mission storage is unavailable"
+                ) from exc
+            if mission_root.is_symlink() or not mission_root.is_dir():
+                raise ArtifactSecurityError("mission storage is invalid")
+            self._sync_parent_directory(self._root)
         path = mission_root / f"{resource_id}.json"
         if path.exists() and path.is_symlink():
             raise ArtifactSecurityError("resource may not be a symbolic link")
