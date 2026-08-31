@@ -198,6 +198,12 @@ machine-readable phase record.
   the complete current-Phase gate. It then restores the source Phase with `ai-needs-review` for a
   fresh current-HEAD review. It does not synthesize a PASS or review later-Phase code as the prior
   Phase.
+- If the subsequent Codex implementation reports that the PR branch still contains the old
+  exact-HEAD prior-PASS rule, keep the current Phase label. Restart the local runner from clean,
+  current `main`; it dispatches **Prepare AI Loop Base Refresh** using the trusted current-Phase
+  `BLOCKED_LIMIT` gate as the authorization reference. The workflow validates that gate and its
+  adjacent base PASS, and the runner performs one expected-HEAD update without a Phase rollback.
+  After current-HEAD CI succeeds, only the gate-bound bounded Resume path may restart remediation.
 - Before Phase 4 or Phase 5: approve `automation/provider-gates.json` in a separate,
   human-reviewed `governance-change` PR, merge it to `main`, run **Advance AI Loop Phase**, then
   restart the local command. The approved phase is automated, but the gate itself is not.

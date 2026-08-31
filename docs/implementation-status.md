@@ -27,14 +27,15 @@ ACTIVE PR STATE: Resolve from trusted GitHub evidence; do not copy from this sna
   `6c4d973fb943fb6cd7c1e33ba2ee972c435fcdd5`
 - Current audit-only HEAD with the identical Git tree:
   `e8d3b193b662ab4f594bfa826b99fbd5b49690b7`
-- The older blocked-phase recovery control incorrectly relabeled this cumulative Phase 0B tree as
-  Phase 0A. That label is not implementation authority and must not cause Phase 0B Executor code to
-  be reviewed as Phase 0A.
+- The current-Phase recovery restored Phase 0B and produced a fresh trusted P1 gate at that HEAD:
+  `https://github.com/Pizza73/RedTeam_Agent/pull/3#issuecomment-5473651491`.
+- The P1 requires an atomic current Mission state/revision/authorization-epoch check in the same
+  transaction as the dispatch claim. The subsequent Codex task correctly stopped because the PR
+  HEAD still contains the superseded exact-current-HEAD prior-PASS governance from before the
+  recovery correction was merged to `main`.
 
-This snapshot does not itself authorize work. After this governance correction is merged, the
-approver-restricted current-Phase recovery workflow must validate the existing Phase 0B evidence
-and identical-tree audit commit, run the Phase 0B gate, and restore a fresh Phase 0B review at the
-current HEAD.
+This snapshot does not itself authorize work. The trusted current-Phase gate, adjacent Phase 0A
+base PASS, exact labels/request, and current default-branch evidence remain the active authority.
 
 ## Phase 0A evidence snapshot
 
@@ -54,14 +55,14 @@ current HEAD.
 
 After this governance change is human-reviewed and merged:
 
-1. dispatch **Recover Blocked AI Loop Current Phase** for PR #3, source `phase-0b`, reviewed HEAD
-   `6c4d973fb943fb6cd7c1e33ba2ee972c435fcdd5`, current HEAD
-   `e8d3b193b662ab4f594bfa826b99fbd5b49690b7`, and the trusted Phase 0B P1 permalink;
-2. require the recovery workflow and a fresh independent Phase 0B review to complete;
-3. restart `automation/run_phase_loop.py` so a current-HEAD Phase 0B fix request can address the
-   graph-state / Mission-state mapping finding; and
-4. continue normal bounded Phase progression. A later next-Phase boundary performs the existing
-   exact-SHA default-branch refresh if `main` remains ahead.
+1. restart `automation/run_phase_loop.py` from clean, current `main`;
+2. let it bind **Prepare AI Loop Base Refresh** to the current Phase 0B `BLOCKED_LIMIT` gate,
+   Phase 0A base PASS, exact old HEAD, and current default-branch SHA;
+3. let the local runner perform the expected-HEAD update without changing the Phase 0B label and
+   verify both required ancestries;
+4. after current-HEAD CI, use only the gate-bound bounded Resume to authorize the atomic dispatch
+   claim fix and regression test; and
+5. continue normal bounded Phase progression after a fresh Phase 0B PASS.
 
 After Phase 5 PASS, the local orchestrator revalidates all configured Phase records, the latest
 Phase status, current-HEAD checks, stop labels and current `main` ancestry. It then submits one

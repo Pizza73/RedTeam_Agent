@@ -82,6 +82,7 @@ IMPLEMENTATION_REQUESTED
        -> PASS -> NEXT_PHASE_REQUESTED or HUMAN_GATE or PROJECT_COMPLETE
        -> PROJECT_COMPLETE -> LOCAL_EXACT_SHA_MERGE or BLOCKED
        -> BLOCKED -> HUMAN_GATE
+            -> TRUSTED_CURRENT_PHASE_BASE_REFRESH -> CURRENT_PHASE_CI -> BOUNDED_RESUME
 ```
 
 `PASS` never starts an AI process inside GitHub Actions. It creates the next SHA-bound
@@ -97,6 +98,15 @@ current-Phase P0/P1 finding and gate, the adjacent phase-base PASS, Git ancestry
 trees between the reviewed and current HEADs, current checks, and the complete current-Phase gate.
 Only then does it restore the source Phase and emit a fresh current-HEAD ready marker. It never
 synthesizes a PASS and never asks a reviewer to judge later-Phase code as an earlier Phase.
+
+If the recovered current Phase is blocked and its PR HEAD does not yet contain the governing
+default-branch rules, `Prepare AI Loop Base Refresh` may use the next Phase as a withheld source
+boundary while retaining the current Phase as `revalidate_phase`. This exceptional path accepts
+only a trusted current-HEAD `BLOCKED_LIMIT` gate, validates its unique adjacent base PASS and their
+ancestry, and writes the same SHA-bound status used by the local update mechanism. The local runner
+does not roll the Phase label back. It performs one expected-HEAD branch update, verifies both the
+old HEAD and target default SHA are ancestors of the result, waits for current-HEAD checks, and can
+then dispatch only the existing bounded Resume workflow bound to the blocked gate permalink.
 
 ## Machine comments
 
