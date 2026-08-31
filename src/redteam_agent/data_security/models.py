@@ -32,7 +32,7 @@ class EncryptionMetadata(StrictImmutableBoundaryModel):
 class EncryptedPayload(StrictImmutableBoundaryModel):
     metadata: EncryptionMetadata
     nonce: str = Field(min_length=1)
-    ciphertext: str = Field(min_length=1)
+    ciphertext: str
     authentication_tag: str = Field(min_length=1)
     aad_digest: str = Field(min_length=1)
 

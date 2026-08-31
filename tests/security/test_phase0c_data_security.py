@@ -42,6 +42,7 @@ from redteam_agent.errors import (
 )
 from redteam_agent.models.capabilities import SandboxCapabilities
 from redteam_agent.models.context import DataAccessGrant, ResourceBinding
+from redteam_agent.models.execution import RawArtifactMetadata
 from redteam_agent.models.scope import DataAccessOperation, DataResourceType
 
 NOW = datetime(2026, 8, 31, 8, 0, tzinfo=UTC)
@@ -175,11 +176,18 @@ def test_secure_ingestion_exposes_only_redacted_references(tmp_path: Path) -> No
         )
     authorizer.allow_ingestion_write("mission-a", "execution-a")
     raw_secret = b"correct-horse-battery-staple"
+    json_secret = b"quoted-json-private-value"
     receipt = quarantine.commit(
         mission_id="mission-a",
         mission_revision=1,
         execution_id="execution-a",
-        content=b"user=alice password=" + raw_secret + b" status=ok",
+        content=(
+            b'{"nested":{"api_key":"'
+            + json_secret
+            + b'"}} user=alice password='
+            + raw_secret
+            + b" status=ok"
+        ),
         created_at=NOW,
         retention_until=NOW + timedelta(hours=1),
     )
@@ -189,14 +197,16 @@ def test_secure_ingestion_exposes_only_redacted_references(tmp_path: Path) -> No
     ).ingest(receipt, now=NOW)
 
     assert len(result.redacted_artifacts) == 1
-    assert len(result.detected_secrets) == 1
-    assert result.redaction_metadata.redaction_count == 1
+    assert len(result.detected_secrets) == 2
+    assert result.redaction_metadata.redaction_count == 2
     assert raw_secret.decode() not in result.model_dump_json()
+    assert json_secret.decode() not in result.model_dump_json()
     assert all(raw_secret not in path.read_bytes() for path in tmp_path.rglob("*.json"))
     assert not any((tmp_path / "quarantine").rglob("*.json"))
     assert tuple(event.event_type for event in audit_log.events_for("mission-a")) == (
         "raw_result_quarantine.commit",
         "raw_result_quarantine.resume",
+        "secret_reference.create",
         "secret_reference.create",
         "artifact.create",
         "raw_result_quarantine.delete",
@@ -219,7 +229,9 @@ def test_secure_ingestion_exposes_only_redacted_references(tmp_path: Path) -> No
     )
     visible = artifacts.read(artifact, operation="read", now=NOW)
     assert raw_secret not in visible
+    assert json_secret not in visible
     assert b"password=[REDACTED]" in visible
+    assert b'"api_key":"[REDACTED]"' in visible
     assert audit_log.events_for("mission-a")[-1].event_type == "artifact.read"
 
 
@@ -373,6 +385,7 @@ def test_key_domain_nonce_aad_tamper_and_revocation_fail_closed() -> None:
 
 def test_storage_rejects_traversal_symlink_quota_retention_and_corruption(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     keys = _keys()
     audit = MissionAuditRecorder(audit_log=MissionAuditLog(), contexts=_AuditContexts())
@@ -472,8 +485,10 @@ def test_storage_rejects_traversal_symlink_quota_retention_and_corruption(
     )
     chunks_list = [bytes([index % 251]) * 512 for index in range(64)]
     raw_secret = b"split-secret"
-    chunks_list[20] = b"A" * 498 + b" api_key=split"
-    chunks_list[21] = b"-secret " + b"B" * 504
+    quoted_prefix = b' {"api_key":"split'
+    quoted_suffix = b'-secret"} '
+    chunks_list[20] = b"A" * (512 - len(quoted_prefix)) + quoted_prefix
+    chunks_list[21] = quoted_suffix + b"B" * (512 - len(quoted_suffix))
     chunks = tuple(chunks_list)
     stream_authorizer = _ExactEnvelopeAuthorizer()
     stream_authorizer.allow_ingestion_write("mission-stream", "execution-stream")
@@ -542,7 +557,7 @@ def test_storage_rejects_traversal_symlink_quota_retention_and_corruption(
                 final_sink, receipt, now=NOW, retain_encrypted_raw=True
             )
         encrypted_snapshot_path = next(
-            (tmp_path / "stream-quarantine").rglob("*.json")
+            (tmp_path / "stream-quarantine").rglob("streamchunk_*.json")
         )
         encrypted_snapshot = encrypted_snapshot_path.read_bytes()
         summary = await EncryptedSecureResultIngester(
@@ -587,7 +602,7 @@ def test_storage_rejects_traversal_symlink_quota_retention_and_corruption(
         )
         visible = stream_artifacts.read(artifact, operation="read", now=NOW)
         assert raw_secret not in visible
-        assert b"api_key=[REDACTED]" in visible
+        assert b'"api_key":"[REDACTED]"' in visible
         assert len(
             [
                 event
@@ -595,10 +610,13 @@ def test_storage_rejects_traversal_symlink_quota_retention_and_corruption(
                 if event.event_type == "secret_reference.create"
             ]
         ) == 1
-        assert not any((tmp_path / "stream-quarantine").rglob("*.json"))
+        assert not any(
+            (tmp_path / "stream-quarantine").rglob("streamchunk_*.json")
+        )
         encrypted_snapshot_path.write_bytes(encrypted_snapshot)
-        with pytest.raises(EncryptionKeyUnavailableError):
+        with pytest.raises(RawResultQuarantineError):
             stream_factory.for_execution("execution-stream")
+        assert not encrypted_snapshot_path.exists()
 
     asyncio.run(stream_with_restart())
     assert len(
@@ -608,6 +626,206 @@ def test_storage_rejects_traversal_symlink_quota_retention_and_corruption(
             if event.event_type == "raw_result_quarantine.write_chunk"
         ]
     ) == 64
+
+    artifact_quarantine = EncryptedRawResultQuarantine(
+        root=tmp_path / "artifact-stream-quarantine",
+        keys=keys,
+        audit=stream_audit,
+        max_item_bytes=1024,
+        mission_quota_bytes=8192,
+    )
+    artifact_binding = QuarantineStreamBinding(
+        mission_id="mission-artifact",
+        mission_revision=1,
+        execution_id="execution-artifact",
+        retention_until=NOW + timedelta(hours=1),
+        max_result_bytes=4096,
+        resume_mode="from_start",
+    )
+    artifact_bindings = _StreamBindings(artifact_binding)
+    artifact_factory = EncryptedRawResultSinkFactory(
+        quarantine=artifact_quarantine,
+        bindings=artifact_bindings,
+        clock=lambda: NOW,
+    )
+
+    async def resume_inside_artifact() -> None:
+        metadata = RawArtifactMetadata(
+            artifact_sequence=0,
+            suggested_name="evidence.bin",
+            media_type="application/octet-stream",
+            declared_size=11,
+        )
+        first = artifact_factory.for_execution("execution-artifact")
+
+        async def interrupted_chunks():
+            yield b"first-"
+            raise RuntimeError("simulated provider stream interruption")
+
+        with pytest.raises(RuntimeError):
+            await first.write_artifact(metadata, interrupted_chunks())
+        artifact_bindings.binding = artifact_binding.model_copy(
+            update={"resume_mode": "from_cursor", "resume_cursor": 1}
+        )
+        resumed = artifact_factory.for_execution("execution-artifact")
+
+        async def remaining_chunks():
+            yield b"part2"
+
+        await resumed.write_artifact(metadata, remaining_chunks())
+        artifact_receipt = await resumed.commit()
+        assert artifact_receipt.artifact_count == 1
+        assert resumed.recovery_metadata(updated_at=NOW).state == "COMMITTED"
+        artifact_bindings.binding = artifact_binding.model_copy(
+            update={"resume_mode": "from_cursor", "resume_cursor": 2}
+        )
+        final_artifact_sink = artifact_factory.for_execution("execution-artifact")
+        assert await final_artifact_sink.commit() == artifact_receipt
+
+    asyncio.run(resume_inside_artifact())
+    artifact_events = stream_audit_log.events_for("mission-artifact")
+    assert len(
+        [event for event in artifact_events if event.event_type.endswith("write_chunk")]
+    ) == 2
+    assert len(
+        [
+            event
+            for event in artifact_events
+            if event.event_type.endswith("commit_artifact")
+        ]
+    ) == 1
+
+    audit_crash_log = MissionAuditLog()
+    durable_audit = MissionAuditRecorder(
+        audit_log=audit_crash_log, contexts=_AuditContexts()
+    )
+
+    class FailCommitAudit:
+        def __init__(self) -> None:
+            self.failed = False
+
+        def record(self, **kwargs):
+            if kwargs["operation"] == "commit" and not self.failed:
+                self.failed = True
+                raise AuditIntegrityError("simulated crash before commit audit")
+            return durable_audit.record(**kwargs)
+
+    audit_crash_root = tmp_path / "audit-crash-quarantine"
+    audit_crash_quarantine = EncryptedRawResultQuarantine(
+        root=audit_crash_root,
+        keys=keys,
+        audit=FailCommitAudit(),
+        max_item_bytes=1024,
+        mission_quota_bytes=8192,
+    )
+    audit_crash_binding = QuarantineStreamBinding(
+        mission_id="mission-audit-crash",
+        mission_revision=1,
+        execution_id="execution-audit-crash",
+        retention_until=NOW + timedelta(hours=1),
+        max_result_bytes=4096,
+        resume_mode="from_start",
+    )
+    audit_crash_bindings = _StreamBindings(audit_crash_binding)
+    failed_audit_factory = EncryptedRawResultSinkFactory(
+        quarantine=audit_crash_quarantine,
+        bindings=audit_crash_bindings,
+        clock=lambda: NOW,
+    )
+
+    async def crash_before_commit_audit() -> None:
+        sink = failed_audit_factory.for_execution("execution-audit-crash")
+        await sink.write_stdout(b"auditable")
+        with pytest.raises(AuditIntegrityError):
+            await sink.commit()
+
+    asyncio.run(crash_before_commit_audit())
+    recovered_quarantine = EncryptedRawResultQuarantine(
+        root=audit_crash_root,
+        keys=keys,
+        audit=durable_audit,
+        max_item_bytes=1024,
+        mission_quota_bytes=8192,
+    )
+    audit_crash_bindings.binding = audit_crash_binding.model_copy(
+        update={"resume_mode": "from_cursor", "resume_cursor": 1}
+    )
+    recovered_factory = EncryptedRawResultSinkFactory(
+        quarantine=recovered_quarantine,
+        bindings=audit_crash_bindings,
+        clock=lambda: NOW,
+    )
+    recovered_sink = recovered_factory.for_execution("execution-audit-crash")
+    recovered_receipt = asyncio.run(recovered_sink.commit())
+    assert recovered_receipt.stdout_bytes == len(b"auditable")
+    assert len(
+        [
+            event
+            for event in audit_crash_log.events_for("mission-audit-crash")
+            if event.event_type.endswith(".commit")
+        ]
+    ) == 1
+
+    delete_quarantine = EncryptedRawResultQuarantine(
+        root=tmp_path / "delete-crash-quarantine",
+        keys=keys,
+        audit=stream_audit,
+        max_item_bytes=1024,
+        mission_quota_bytes=8192,
+    )
+    delete_binding = QuarantineStreamBinding(
+        mission_id="mission-delete-crash",
+        mission_revision=1,
+        execution_id="execution-delete-crash",
+        retention_until=NOW + timedelta(hours=1),
+        max_result_bytes=4096,
+        resume_mode="from_start",
+    )
+    delete_bindings = _StreamBindings(delete_binding)
+    delete_factory = EncryptedRawResultSinkFactory(
+        quarantine=delete_quarantine,
+        bindings=delete_bindings,
+        clock=lambda: NOW,
+    )
+
+    async def commit_delete_stream():
+        sink = delete_factory.for_execution("execution-delete-crash")
+        await sink.write_stdout(b"one")
+        await sink.write_stdout(b"two")
+        await sink.write_stdout(b"three")
+        return sink, await sink.commit()
+
+    delete_sink, delete_receipt = asyncio.run(commit_delete_stream())
+    del delete_receipt
+    original_erase = delete_sink._store.erase_resource
+    erase_calls = 0
+
+    def interrupt_erasure(*, mission_id: str, resource_id: str) -> None:
+        nonlocal erase_calls
+        original_erase(mission_id=mission_id, resource_id=resource_id)
+        erase_calls += 1
+        if erase_calls == 1:
+            raise ArtifactSecurityError("simulated crash during streamed erasure")
+
+    monkeypatch.setattr(delete_sink._store, "erase_resource", interrupt_erasure)
+    with pytest.raises(ArtifactSecurityError):
+        delete_sink._delete_committed(now=NOW)
+    monkeypatch.setattr(delete_sink._store, "erase_resource", original_erase)
+    delete_bindings.binding = delete_binding.model_copy(
+        update={"resume_mode": "from_cursor", "resume_cursor": 3}
+    )
+    with pytest.raises(RawResultQuarantineError):
+        delete_factory.for_execution("execution-delete-crash")
+    assert not any(
+        (tmp_path / "delete-crash-quarantine").rglob("streamchunk_*.json")
+    )
+    assert len(
+        [
+            event
+            for event in stream_audit_log.events_for("mission-delete-crash")
+            if event.event_type.endswith(".delete")
+        ]
+    ) == 1
     assert all(
         raw_secret not in path.read_bytes() for path in tmp_path.rglob("*.json")
     )
@@ -640,6 +858,7 @@ def test_audit_chain_and_sandbox_capabilities_fail_closed(tmp_path: Path) -> Non
             resource_type="artifact",
             resource_id="artifact_" + "a" * 32,
             operation="create",
+            operation_id="auditop_" + "1" * 32,
             metadata_digest="sha256:" + "1" * 64,
         ),
         occurred_at=NOW,
@@ -658,6 +877,20 @@ def test_audit_chain_and_sandbox_capabilities_fail_closed(tmp_path: Path) -> Non
         occurred_at=NOW + timedelta(seconds=1),
         expected_sequence_number=2,
     )
+    repeated_first = audit.append(
+        mission_id="mission-a",
+        mission_revision=1,
+        authorization_epoch=0,
+        payload=AuditReferencePayload(
+            resource_type="artifact",
+            resource_id="artifact_" + "a" * 32,
+            operation="create",
+            operation_id="auditop_" + "1" * 32,
+            metadata_digest="sha256:" + "1" * 64,
+        ),
+        occurred_at=NOW,
+    )
+    assert repeated_first == first
     other = audit.append(
         mission_id="mission-b",
         mission_revision=1,

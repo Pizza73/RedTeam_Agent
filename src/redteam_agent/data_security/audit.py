@@ -10,7 +10,7 @@ from typing import Literal, Protocol
 
 from pydantic import Field, model_validator
 
-from redteam_agent.canonical import CanonicalJsonObject, sha256_digest
+from redteam_agent.canonical import CanonicalJsonObject, sha256_digest, stable_id
 from redteam_agent.errors import AuditIntegrityError, AuditSequenceConflictError
 from redteam_agent.models.base import StrictImmutableBoundaryModel
 
@@ -24,6 +24,7 @@ AuditResourceType = Literal[
 AuditOperation = Literal[
     "create",
     "write_chunk",
+    "commit_artifact",
     "commit",
     "abort",
     "resume",
@@ -41,6 +42,10 @@ class AuditReferencePayload(StrictImmutableBoundaryModel):
     resource_type: AuditResourceType
     resource_id: str = Field(min_length=1)
     operation: AuditOperation
+    operation_id: str = Field(
+        default_factory=lambda: "auditop_" + secrets.token_hex(16),
+        pattern=r"^auditop_[0-9a-f]{32}$",
+    )
     metadata_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
 
     @model_validator(mode="after")
@@ -77,6 +82,7 @@ class DataStoreAuditRecorder(Protocol):
         operation: AuditOperation,
         metadata_digest: str,
         occurred_at: datetime,
+        operation_id: str | None = None,
     ) -> AuditEvent: ...
 
 
@@ -96,12 +102,18 @@ class MissionAuditRecorder:
         operation: AuditOperation,
         metadata_digest: str,
         occurred_at: datetime,
+        operation_id: str | None = None,
     ) -> AuditEvent:
         context = self._contexts.current_context(mission_id, now=occurred_at)
         payload = AuditReferencePayload(
             resource_type=resource_type,
             resource_id=resource_id,
             operation=operation,
+            operation_id=(
+                "auditop_" + secrets.token_hex(16)
+                if operation_id is None
+                else operation_id
+            ),
             metadata_digest=metadata_digest,
         )
         return self._audit_log.append(
@@ -134,8 +146,33 @@ class MissionAuditLog:
     ) -> AuditEvent:
         canonical_payload = CanonicalJsonObject(payload.model_dump(mode="python"))
         with self._lock:
-            event_id = "auditevent_" + secrets.token_hex(16)
             event_type = f"{payload.resource_type}.{payload.operation}"
+            event_id = stable_id(
+                "auditevent",
+                {
+                    "mission_id": mission_id,
+                    "mission_revision": mission_revision,
+                    "authorization_epoch": authorization_epoch,
+                    "event_type": event_type,
+                    "canonical_payload": canonical_payload,
+                    "occurred_at": occurred_at,
+                },
+            )
+            existing = self._event_ids.get(event_id)
+            if existing is not None:
+                if not self._matches_request(
+                    existing,
+                    mission_id=mission_id,
+                    mission_revision=mission_revision,
+                    authorization_epoch=authorization_epoch,
+                    event_type=event_type,
+                    canonical_payload=canonical_payload,
+                    occurred_at=occurred_at,
+                ):
+                    raise AuditSequenceConflictError(
+                        "derived audit event identifier conflicted"
+                    )
+                return existing
             mission_events = self._events.setdefault(mission_id, [])
             sequence = len(mission_events) + 1
             if expected_sequence_number is not None and expected_sequence_number != sequence:
@@ -239,3 +276,23 @@ class MissionAuditLog:
             "canonical_payload": canonical_payload,
             "occurred_at": occurred_at,
         }
+
+    @staticmethod
+    def _matches_request(
+        event: AuditEvent,
+        *,
+        mission_id: str,
+        mission_revision: int,
+        authorization_epoch: int,
+        event_type: str,
+        canonical_payload: CanonicalJsonObject,
+        occurred_at: datetime,
+    ) -> bool:
+        return (
+            event.mission_id == mission_id
+            and event.mission_revision == mission_revision
+            and event.authorization_epoch == authorization_epoch
+            and event.event_type == event_type
+            and event.canonical_payload == canonical_payload
+            and event.occurred_at == occurred_at
+        )

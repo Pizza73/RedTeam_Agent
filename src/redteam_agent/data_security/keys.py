@@ -55,6 +55,8 @@ class EncryptionKeyProvider(Protocol):
 
     def destroy_resource_key(self, metadata: EncryptionMetadata) -> None: ...
 
+    def resource_key_destroyed(self, metadata: EncryptionMetadata) -> bool: ...
+
 
 @dataclass(frozen=True, slots=True)
 class _KeyRecord:
@@ -259,6 +261,19 @@ class InMemoryEncryptionKeyProvider:
         self.set_rotation_state(
             metadata.key_domain, metadata.key_id, metadata.key_version, "destroyed"
         )
+
+    def resource_key_destroyed(self, metadata: EncryptionMetadata) -> bool:
+        identity = (metadata.key_domain, metadata.key_id, metadata.key_version)
+        with self._lock:
+            record = self._records.get(identity)
+            if record is None or not record.resource_key:
+                raise EncryptionKeyUnavailableError("resource key is unavailable")
+            embedded = record.metadata.model_copy(
+                update={"rotation_state": metadata.rotation_state}
+            )
+            if embedded != metadata:
+                raise EncryptionKeyUnavailableError("resource key metadata does not match")
+            return record.metadata.rotation_state == "destroyed"
 
     def _seal_with_metadata(
         self,

@@ -92,6 +92,31 @@ class _TerminalBinding(StrictImmutableBoundaryModel):
     receipt_digest: str | None = None
 
 
+class _ArtifactTerminalBinding(StrictImmutableBoundaryModel):
+    record_type: Literal["stream_artifact_commit"]
+    mission_revision: int = Field(ge=1)
+    stream_binding_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    execution_id: str = Field(min_length=1)
+    sink_id: str = Field(min_length=1)
+    artifact_sequence: int = Field(ge=0)
+    artifact_metadata_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    first_chunk_sequence: int = Field(ge=0)
+    next_chunk_sequence: int = Field(ge=1)
+    chunk_count: int = Field(ge=1)
+    chunk_bindings_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+
+
+class _DeletionBinding(StrictImmutableBoundaryModel):
+    record_type: Literal["stream_delete_intent"]
+    mission_revision: int = Field(ge=1)
+    stream_binding_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    execution_id: str = Field(min_length=1)
+    sink_id: str = Field(min_length=1)
+    chunk_count: int = Field(ge=0)
+    aggregate_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    receipt_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+
+
 class EncryptedRawResultSink:
     """Persists each bounded chunk before accepting the next provider chunk."""
 
@@ -120,11 +145,21 @@ class EncryptedRawResultSink:
         )
         self._clock = clock
         self._chunks: list[tuple[_ChunkBinding, _StoredEnvelope]] = []
+        self._artifact_terminals: dict[
+            int, tuple[_ArtifactTerminalBinding, _StoredEnvelope]
+        ] = {}
         self._receipt: RawResultReceipt | None = None
         self._terminal_envelope: _StoredEnvelope | None = None
         self._aborted = False
         self._recovery_required = False
+        self._deleted = False
         self.max_observed_chunk_bytes = 0
+        if self._store.has_resource(
+            mission_id=self.binding.mission_id,
+            resource_id=self._deletion_resource_id(),
+        ):
+            self._resume_deletion()
+            raise RawResultQuarantineError("raw-result quarantine was deleted")
         self._load_durable_state()
         if (
             binding.resume_mode == "from_cursor"
@@ -170,18 +205,32 @@ class EncryptedRawResultSink:
         chunks: AsyncIterator[bytes],
     ) -> None:
         metadata_digest = digest_model(metadata)
-        existing_sequences = {
-            item.artifact_sequence
+        existing = [
+            item
             for item, _ in self._chunks
-            if item.artifact_sequence is not None
-        }
-        replaying_same = (
+            if item.artifact_sequence == metadata.artifact_sequence
+        ]
+        terminal = self._artifact_terminals.get(metadata.artifact_sequence)
+        replaying_same = bool(existing) and (
             self._input_sequence < len(self._chunks)
             and self._chunks[self._input_sequence][0].artifact_sequence
             == metadata.artifact_sequence
         )
-        if metadata.artifact_sequence in existing_sequences and not replaying_same:
+        continuing_open = bool(existing) and (
+            self._input_sequence == len(self._chunks)
+            and terminal is None
+            and self._chunks[-1][0].artifact_sequence == metadata.artifact_sequence
+        )
+        if not existing and metadata.artifact_sequence != len(
+            self._artifact_terminals
+        ):
+            raise RawResultStreamingError("artifact sequence is not monotonic")
+        if existing and not (replaying_same or continuing_open):
             raise RawResultStreamingError("artifact sequence was reused")
+        if terminal is not None and not replaying_same:
+            raise RawResultStreamingError("completed artifact sequence was reused")
+        if any(item.artifact_metadata_digest != metadata_digest for item in existing):
+            raise DigestIntegrityError("resumed artifact metadata differs from durable content")
         wrote = False
         async for chunk in chunks:
             wrote = True
@@ -191,21 +240,31 @@ class EncryptedRawResultSink:
                 artifact_sequence=metadata.artifact_sequence,
                 artifact_metadata_digest=metadata_digest,
             )
-        if not wrote:
+        if not wrote and not existing:
             self._write(
                 channel="artifact",
                 chunk=b"",
                 artifact_sequence=metadata.artifact_sequence,
                 artifact_metadata_digest=metadata_digest,
             )
+        self._commit_artifact(metadata, metadata_digest=metadata_digest)
 
     async def commit(self) -> RawResultReceipt:
+        if self._deleted:
+            raise RawResultQuarantineError("deleted quarantine cannot be committed")
         if self._aborted:
             raise RawResultQuarantineError("aborted quarantine cannot be committed")
         if self._receipt is not None:
             return self._receipt
         if self._input_sequence < len(self._chunks):
             raise RawResultQuarantineError("stream replay did not verify every durable chunk")
+        incomplete_artifacts = {
+            binding.artifact_sequence
+            for binding, _ in self._chunks
+            if binding.artifact_sequence is not None
+        } - set(self._artifact_terminals)
+        if incomplete_artifacts:
+            raise RawResultQuarantineError("artifact stream is not durably complete")
         now = self._clock()
         self._require_live(now)
         aggregate_digest = self._aggregate_digest()
@@ -254,6 +313,7 @@ class EncryptedRawResultSink:
             resource_type="raw_result_quarantine",
             resource_id=self.quarantine_id,
             operation="commit",
+            operation_id=self._audit_operation_id("commit", "terminal"),
             metadata_digest=receipt.receipt_digest,
             occurred_at=now,
         )
@@ -292,6 +352,7 @@ class EncryptedRawResultSink:
             resource_type="raw_result_quarantine",
             resource_id=self.quarantine_id,
             operation="abort",
+            operation_id=self._audit_operation_id("abort", "terminal"),
             metadata_digest=terminal.aggregate_digest,
             occurred_at=now,
         )
@@ -336,7 +397,7 @@ class EncryptedRawResultSink:
         self, receipt: RawResultReceipt, *, now: datetime
     ) -> AsyncIterator[bytes]:
         async def iterate() -> AsyncIterator[bytes]:
-            if self._receipt is None or receipt != self._receipt:
+            if self._deleted or self._receipt is None or receipt != self._receipt:
                 raise RawResultQuarantineError("raw-result stream is not committed")
             self._audit.record(
                 mission_id=self.binding.mission_id,
@@ -359,32 +420,38 @@ class EncryptedRawResultSink:
         return iterate()
 
     def _delete_committed(self, *, now: datetime) -> None:
+        if self._deleted:
+            return
         if self._receipt is None or self._terminal_envelope is None:
             raise RawResultQuarantineError("raw-result stream is not committed")
-        self._audit.record(
+        if self._store.has_resource(
             mission_id=self.binding.mission_id,
-            resource_type="raw_result_quarantine",
-            resource_id=self.quarantine_id,
-            operation="delete",
-            metadata_digest=self._receipt.receipt_digest,
-            occurred_at=now,
-        )
-        for binding, envelope in self._chunks:
-            self._store.delete(
-                mission_id=self.binding.mission_id,
-                resource_id=envelope.resource_id,
-                binding=binding.model_dump(mode="python"),
-                expected_encryption_metadata_id=envelope.encryption_metadata_id,
-            )
+            resource_id=self._deletion_resource_id(),
+        ):
+            self._resume_deletion()
+            return
         terminal = _TerminalBinding.model_validate(
             self._terminal_envelope.binding.to_dict()
         )
-        self._store.delete(
-            mission_id=self.binding.mission_id,
-            resource_id=self._terminal_envelope.resource_id,
-            binding=terminal.model_dump(mode="python"),
-            expected_encryption_metadata_id=self._terminal_envelope.encryption_metadata_id,
+        intent = _DeletionBinding(
+            record_type="stream_delete_intent",
+            mission_revision=self.binding.mission_revision,
+            stream_binding_digest=self._binding_digest,
+            execution_id=self.execution_id,
+            sink_id=self.sink_id,
+            chunk_count=len(self._chunks),
+            aggregate_digest=terminal.aggregate_digest,
+            receipt_digest=self._receipt.receipt_digest,
         )
+        self._store.write(
+            mission_id=self.binding.mission_id,
+            resource_id=self._deletion_resource_id(),
+            content=b"",
+            binding=intent.model_dump(mode="python"),
+            created_at=now,
+            retention_until=None,
+        )
+        self._resume_deletion()
 
     def _write(
         self,
@@ -432,15 +499,7 @@ class EncryptedRawResultSink:
         next_size = self.bytes_received + len(chunk)
         if next_size > self.binding.max_result_bytes:
             raise RawResultQuarantineError("raw-result quarantine size limit exceeded")
-        resource_id = stable_id(
-            "streamchunk",
-            {
-                "schema_version": "stream-chunk-v1",
-                "execution_id": self.execution_id,
-                "sink_id": self.sink_id,
-                "sequence_number": sequence,
-            },
-        )
+        resource_id = self._chunk_resource_id(sequence)
         now = self._clock()
         self._require_live(now)
         self._store.write(
@@ -461,11 +520,75 @@ class EncryptedRawResultSink:
             resource_type="raw_result_quarantine",
             resource_id=self.quarantine_id,
             operation="write_chunk",
+            operation_id=self._audit_operation_id("write_chunk", str(sequence)),
             metadata_digest=digest,
             occurred_at=now,
         )
         self._chunks.append((expected, envelope))
         self._input_sequence += 1
+
+    def _commit_artifact(
+        self,
+        metadata: RawArtifactMetadata,
+        *,
+        metadata_digest: str,
+    ) -> None:
+        chunks = [
+            binding
+            for binding, _ in self._chunks
+            if binding.artifact_sequence == metadata.artifact_sequence
+        ]
+        if not chunks or self._input_sequence <= chunks[-1].sequence_number:
+            raise RawResultQuarantineError("artifact replay did not verify durable chunks")
+        artifact_size = sum(item.plaintext_size for item in chunks)
+        if metadata.declared_size is not None and metadata.declared_size != artifact_size:
+            raise RawResultQuarantineError("artifact declared size differs from durable chunks")
+        expected = _ArtifactTerminalBinding(
+            record_type="stream_artifact_commit",
+            mission_revision=self.binding.mission_revision,
+            stream_binding_digest=self._binding_digest,
+            execution_id=self.execution_id,
+            sink_id=self.sink_id,
+            artifact_sequence=metadata.artifact_sequence,
+            artifact_metadata_digest=metadata_digest,
+            first_chunk_sequence=chunks[0].sequence_number,
+            next_chunk_sequence=chunks[-1].sequence_number + 1,
+            chunk_count=len(chunks),
+            chunk_bindings_digest=sha256_digest(tuple(chunks)),
+        )
+        durable = self._artifact_terminals.get(metadata.artifact_sequence)
+        if durable is not None:
+            if durable[0] != expected:
+                raise DigestIntegrityError("durable artifact completion binding differs")
+            return
+        now = self._clock()
+        self._require_live(now)
+        resource_id = self._artifact_terminal_resource_id(metadata.artifact_sequence)
+        self._store.write(
+            mission_id=self.binding.mission_id,
+            resource_id=resource_id,
+            content=b"",
+            binding=expected.model_dump(mode="python"),
+            created_at=now,
+            retention_until=self.binding.retention_until,
+        )
+        envelope = next(
+            item
+            for item in self._store.envelopes_for(self.binding.mission_id)
+            if item.resource_id == resource_id
+        )
+        self._audit.record(
+            mission_id=self.binding.mission_id,
+            resource_type="raw_result_quarantine",
+            resource_id=self.quarantine_id,
+            operation="commit_artifact",
+            operation_id=self._audit_operation_id(
+                "commit_artifact", str(metadata.artifact_sequence)
+            ),
+            metadata_digest=expected.chunk_bindings_digest,
+            occurred_at=now,
+        )
+        self._artifact_terminals[metadata.artifact_sequence] = (expected, envelope)
 
     def _load_durable_state(self) -> None:
         terminals: list[tuple[_TerminalBinding, _StoredEnvelope]] = []
@@ -479,6 +602,14 @@ class EncryptedRawResultSink:
             try:
                 if record_type == "stream_chunk":
                     self._chunks.append((_ChunkBinding.model_validate(value), envelope))
+                elif record_type == "stream_artifact_commit":
+                    artifact = _ArtifactTerminalBinding.model_validate(value)
+                    if artifact.artifact_sequence in self._artifact_terminals:
+                        raise ValueError("duplicate artifact completion")
+                    self._artifact_terminals[artifact.artifact_sequence] = (
+                        artifact,
+                        envelope,
+                    )
                 elif record_type in {"stream_commit", "stream_abort"}:
                     terminals.append((_TerminalBinding.model_validate(value), envelope))
                 else:
@@ -504,6 +635,30 @@ class EncryptedRawResultSink:
             ):
                 raise RawResultQuarantineError("durable stream chunk offset is invalid")
             offset += envelope.plaintext_size
+        for sequence, (artifact, _) in self._artifact_terminals.items():
+            chunks = [
+                item
+                for item, _ in self._chunks
+                if item.artifact_sequence == sequence
+            ]
+            if not (
+                chunks
+                and artifact.mission_revision == self.binding.mission_revision
+                and artifact.stream_binding_digest == self._binding_digest
+                and all(
+                    item.artifact_metadata_digest
+                    == artifact.artifact_metadata_digest
+                    for item in chunks
+                )
+                and artifact.first_chunk_sequence == chunks[0].sequence_number
+                and artifact.next_chunk_sequence == chunks[-1].sequence_number + 1
+                and artifact.chunk_count == len(chunks)
+                and artifact.chunk_bindings_digest == sha256_digest(tuple(chunks))
+            ):
+                raise RawResultQuarantineError(
+                    "durable artifact completion binding is invalid"
+                )
+        self._reconcile_nonterminal_audits()
         if self.bytes_received > self.binding.max_result_bytes or len(terminals) > 1:
             raise RawResultQuarantineError("durable stream state conflicts with policy")
         if not terminals:
@@ -517,6 +672,15 @@ class EncryptedRawResultSink:
         ):
             raise RawResultQuarantineError("durable stream terminal binding is invalid")
         if terminal.record_type == "stream_abort":
+            self._audit.record(
+                mission_id=self.binding.mission_id,
+                resource_type="raw_result_quarantine",
+                resource_id=self.quarantine_id,
+                operation="abort",
+                operation_id=self._audit_operation_id("abort", "terminal"),
+                metadata_digest=terminal.aggregate_digest,
+                occurred_at=envelope.created_at,
+            )
             self._aborted = True
             self._terminal_envelope = envelope
             return
@@ -545,20 +709,67 @@ class EncryptedRawResultSink:
             == self._receipt_counts()
         ):
             raise RawResultQuarantineError("durable stream receipt binding is invalid")
+        self._audit.record(
+            mission_id=self.binding.mission_id,
+            resource_type="raw_result_quarantine",
+            resource_id=self.quarantine_id,
+            operation="commit",
+            operation_id=self._audit_operation_id("commit", "terminal"),
+            metadata_digest=receipt.receipt_digest,
+            occurred_at=envelope.created_at,
+        )
         self._receipt = receipt
         self._terminal_envelope = envelope
 
     def _aggregate_digest(self) -> str:
         return sha256_digest(
-            tuple(
-                {
-                    "binding": binding,
-                    "encryption_metadata_id": envelope.encryption_metadata_id,
-                    "payload": envelope.payload,
-                }
-                for binding, envelope in self._chunks
-            )
+            {
+                "chunks": tuple(
+                    {
+                        "binding": binding,
+                        "encryption_metadata_id": envelope.encryption_metadata_id,
+                        "payload": envelope.payload,
+                    }
+                    for binding, envelope in self._chunks
+                ),
+                "artifact_completions": tuple(
+                    {
+                        "binding": binding,
+                        "encryption_metadata_id": envelope.encryption_metadata_id,
+                        "payload": envelope.payload,
+                    }
+                    for _, (binding, envelope) in sorted(
+                        self._artifact_terminals.items()
+                    )
+                ),
+            }
         )
+
+    def _reconcile_nonterminal_audits(self) -> None:
+        for chunk_binding, envelope in self._chunks:
+            self._audit.record(
+                mission_id=self.binding.mission_id,
+                resource_type="raw_result_quarantine",
+                resource_id=self.quarantine_id,
+                operation="write_chunk",
+                operation_id=self._audit_operation_id(
+                    "write_chunk", str(chunk_binding.sequence_number)
+                ),
+                metadata_digest=chunk_binding.chunk_digest,
+                occurred_at=envelope.created_at,
+            )
+        for artifact_binding, envelope in self._artifact_terminals.values():
+            self._audit.record(
+                mission_id=self.binding.mission_id,
+                resource_type="raw_result_quarantine",
+                resource_id=self.quarantine_id,
+                operation="commit_artifact",
+                operation_id=self._audit_operation_id(
+                    "commit_artifact", str(artifact_binding.artifact_sequence)
+                ),
+                metadata_digest=artifact_binding.chunk_bindings_digest,
+                occurred_at=envelope.created_at,
+            )
 
     def _terminal_resource_id(self, state: Literal["commit", "abort"]) -> str:
         return stable_id(
@@ -571,6 +782,100 @@ class EncryptedRawResultSink:
             },
         )
 
+    def _artifact_terminal_resource_id(self, artifact_sequence: int) -> str:
+        return stable_id(
+            "streamartifact",
+            {
+                "schema_version": "stream-artifact-terminal-v1",
+                "execution_id": self.execution_id,
+                "sink_id": self.sink_id,
+                "artifact_sequence": artifact_sequence,
+            },
+        )
+
+    def _chunk_resource_id(self, sequence: int) -> str:
+        return stable_id(
+            "streamchunk",
+            {
+                "schema_version": "stream-chunk-v1",
+                "execution_id": self.execution_id,
+                "sink_id": self.sink_id,
+                "sequence_number": sequence,
+            },
+        )
+
+    def _deletion_resource_id(self) -> str:
+        return stable_id(
+            "streamdeletion",
+            {
+                "schema_version": "stream-deletion-intent-v1",
+                "execution_id": self.execution_id,
+                "sink_id": self.sink_id,
+            },
+        )
+
+    def _audit_operation_id(self, operation: str, identity: str) -> str:
+        return stable_id(
+            "auditop",
+            {
+                "schema_version": "stream-audit-operation-v1",
+                "execution_id": self.execution_id,
+                "sink_id": self.sink_id,
+                "operation": operation,
+                "identity": identity,
+            },
+        )
+
+    def _resume_deletion(self) -> None:
+        raw, envelope = self._store.read_bound(
+            mission_id=self.binding.mission_id,
+            resource_id=self._deletion_resource_id(),
+            now=None,
+        )
+        if raw:
+            raise RawResultQuarantineError("deletion intent content is invalid")
+        try:
+            intent = _DeletionBinding.model_validate(envelope.binding.to_dict())
+        except ValueError as exc:
+            raise RawResultQuarantineError("deletion intent is invalid") from exc
+        terminal_envelope = self._store.verified_envelope(
+            mission_id=self.binding.mission_id,
+            resource_id=self._terminal_resource_id("commit"),
+            now=None,
+        )
+        try:
+            terminal = _TerminalBinding.model_validate(
+                terminal_envelope.binding.to_dict()
+            )
+        except ValueError as exc:
+            raise RawResultQuarantineError("deletion terminal is invalid") from exc
+        if not (
+            intent.mission_revision == self.binding.mission_revision
+            and intent.stream_binding_digest == self._binding_digest
+            and intent.execution_id == self.execution_id
+            and intent.sink_id == self.sink_id
+            and terminal.record_type == "stream_commit"
+            and terminal.chunk_count == intent.chunk_count
+            and terminal.aggregate_digest == intent.aggregate_digest
+            and terminal.receipt_digest == intent.receipt_digest
+        ):
+            raise RawResultQuarantineError("deletion intent binding is invalid")
+        self._audit.record(
+            mission_id=self.binding.mission_id,
+            resource_type="raw_result_quarantine",
+            resource_id=self.quarantine_id,
+            operation="delete",
+            operation_id=self._audit_operation_id("delete", "intent"),
+            metadata_digest=intent.receipt_digest,
+            occurred_at=envelope.created_at,
+        )
+        for sequence in range(intent.chunk_count):
+            self._store.erase_resource(
+                mission_id=self.binding.mission_id,
+                resource_id=self._chunk_resource_id(sequence),
+            )
+        self._deleted = True
+
     def _receipt_counts(self) -> tuple[int, int, int]:
         stdout_bytes = sum(
             envelope.plaintext_size
@@ -582,13 +887,7 @@ class EncryptedRawResultSink:
             for binding, envelope in self._chunks
             if binding.channel == "stderr"
         )
-        artifact_count = len(
-            {
-                binding.artifact_sequence
-                for binding, _ in self._chunks
-                if binding.artifact_sequence is not None
-            }
-        )
+        artifact_count = len(self._artifact_terminals)
         return stdout_bytes, stderr_bytes, artifact_count
 
     def _require_live(self, now: datetime) -> None:

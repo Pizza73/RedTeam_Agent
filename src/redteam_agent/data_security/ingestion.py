@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from collections.abc import Callable
 from datetime import datetime
 from typing import Literal
@@ -21,12 +20,10 @@ from .models import (
 from .stores import ArtifactStore, EncryptedRawResultQuarantine, SecretStore
 from .streaming import EncryptedRawResultSink, EncryptedRawResultSinkFactory
 
-_SECRET_PATTERN = re.compile(
-    rb"(?i)\b(password|passwd|token|api[_-]?key|secret)\s*([:=])\s*([^\s,;]+)"
-)
 _SECRET_KEYWORDS = (b"password", b"passwd", b"token", b"api_key", b"api-key", b"secret")
-_SECRET_TERMINATORS = frozenset(b" \t\n\r\v\f,;")
-_SECRET_WHITESPACE = _SECRET_TERMINATORS - {44, 59}
+_SECRET_TERMINATORS = frozenset(b" \t\n\r\v\f,;}]" + bytes((34, 39)))
+_SECRET_WHITESPACE = frozenset(b" \t\n\r\v\f")
+_QUOTE_BYTES = frozenset(b"\"'")
 _ASCII_WORD_BYTES = frozenset(
     b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
 )
@@ -38,7 +35,7 @@ class _StreamingSecretRedactor:
 
     def __init__(
         self,
-        replace: Callable[[bytes, bytes, bytes], bytes],
+        replace: Callable[[bytes, bytes], bytes],
     ) -> None:
         self._replace = replace
         self._pending = bytearray()
@@ -54,7 +51,9 @@ class _StreamingSecretRedactor:
         while index < len(data):
             previous = data[index - 1] if index else self._previous_byte
             candidate = None
-            if previous is None or previous not in _ASCII_WORD_BYTES:
+            if data[index] in _QUOTE_BYTES or (
+                previous is None or previous not in _ASCII_WORD_BYTES
+            ):
                 candidate = self._candidate(data, index, final=final)
             if candidate == "incomplete":
                 self._previous_byte = data[index - 1] if index else self._previous_byte
@@ -63,17 +62,22 @@ class _StreamingSecretRedactor:
                     raise SecretDetectionError("secret detection failed closed")
                 return bytes(output)
             if candidate is not None:
-                keyword_end, separator_index, secret_start, secret_end = candidate
-                output.extend(data[index:keyword_end])
-                output.extend(data[separator_index : separator_index + 1])
+                (
+                    keyword_start,
+                    keyword_end,
+                    secret_start,
+                    secret_end,
+                    match_end,
+                ) = candidate
+                output.extend(data[index:secret_start])
                 output.extend(
                     self._replace(
-                        data[index:keyword_end],
-                        data[separator_index : separator_index + 1],
+                        data[keyword_start:keyword_end],
                         data[secret_start:secret_end],
                     )
                 )
-                index = secret_end
+                output.extend(data[secret_end:match_end])
+                index = match_end
                 continue
             output.append(data[index])
             index += 1
@@ -88,10 +92,14 @@ class _StreamingSecretRedactor:
         index: int,
         *,
         final: bool,
-    ) -> tuple[int, int, int, int] | Literal["incomplete"] | None:
+    ) -> tuple[int, int, int, int, int] | Literal["incomplete"] | None:
+        key_quote = data[index] if data[index] in _QUOTE_BYTES else None
+        keyword_start = index + 1 if key_quote is not None else index
         keyword: bytes | None = None
         for possible in _SECRET_KEYWORDS:
-            candidate = data[index : index + len(possible)].lower()
+            candidate = data[
+                keyword_start : keyword_start + len(possible)
+            ].lower()
             if len(candidate) < len(possible) and possible.startswith(candidate):
                 return None if final else "incomplete"
             if candidate == possible:
@@ -99,20 +107,51 @@ class _StreamingSecretRedactor:
                 break
         if keyword is None:
             return None
-        keyword_end = index + len(keyword)
+        keyword_end = keyword_start + len(keyword)
         cursor = keyword_end
+        if key_quote is not None:
+            if cursor == len(data):
+                return None if final else "incomplete"
+            if data[cursor] != key_quote:
+                return None
+            cursor += 1
         while cursor < len(data) and data[cursor] in _SECRET_WHITESPACE:
             cursor += 1
         if cursor == len(data):
             return None if final else "incomplete"
         if data[cursor] not in b":=":
             return None
-        separator_index = cursor
         cursor += 1
         while cursor < len(data) and data[cursor] in _SECRET_WHITESPACE:
             cursor += 1
         if cursor == len(data):
             return None if final else "incomplete"
+        value_quote = data[cursor] if data[cursor] in _QUOTE_BYTES else None
+        if value_quote is not None:
+            secret_start = cursor + 1
+            cursor = secret_start
+            while cursor < len(data):
+                if data[cursor] == 92:
+                    if cursor + 1 == len(data):
+                        if final:
+                            raise SecretDetectionError("secret detection failed closed")
+                        return "incomplete"
+                    cursor += 2
+                    continue
+                if data[cursor] == value_quote:
+                    if cursor == secret_start:
+                        return None
+                    return (
+                        keyword_start,
+                        keyword_end,
+                        secret_start,
+                        cursor,
+                        cursor + 1,
+                    )
+                cursor += 1
+            if final:
+                raise SecretDetectionError("secret detection failed closed")
+            return "incomplete"
         secret_start = cursor
         while cursor < len(data) and data[cursor] not in _SECRET_TERMINATORS:
             cursor += 1
@@ -120,7 +159,7 @@ class _StreamingSecretRedactor:
             return "incomplete"
         if cursor == secret_start:
             return None
-        return keyword_end, separator_index, secret_start, cursor
+        return keyword_start, keyword_end, secret_start, cursor, cursor
 
 
 class SecureIngestor:
@@ -212,8 +251,7 @@ class SecureIngestor:
                 )
             detections: list[SecretDiscoveryReference] = []
 
-            def replace(keyword: bytes, separator: bytes, secret_value: bytes) -> bytes:
-                del separator
+            def replace(keyword: bytes, secret_value: bytes) -> bytes:
                 self._record_detection(
                     keyword=keyword,
                     secret_value=secret_value,
@@ -264,20 +302,22 @@ class SecureIngestor:
         detections: list[SecretDiscoveryReference],
         now: datetime,
     ) -> bytes:
-        def replace(match: re.Match[bytes]) -> bytes:
+        def replace(keyword: bytes, secret_value: bytes) -> bytes:
             self._record_detection(
-                keyword=match.group(1),
-                secret_value=match.group(3),
+                keyword=keyword,
+                secret_value=secret_value,
                 mission_id=mission_id,
                 source_execution_id=source_execution_id,
                 detections=detections,
                 now=now,
             )
-            return match.group(1) + match.group(2) + b"[REDACTED]"
+            return b"[REDACTED]"
 
         try:
-            return _SECRET_PATTERN.sub(replace, raw)
-        except (UnicodeError, ValueError) as exc:
+            return _StreamingSecretRedactor(replace).feed(raw, final=True)
+        except (SecretDetectionError, UnicodeError, ValueError) as exc:
+            if isinstance(exc, SecretDetectionError):
+                raise
             del exc
             raise SecretDetectionError("secret detection failed closed") from None
 

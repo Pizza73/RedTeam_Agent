@@ -356,20 +356,54 @@ class _EncryptedFileStore:
         expected_encryption_metadata_id: str,
     ) -> None:
         path = self._path(mission_id, resource_id, create_parent=False)
+        if not path.exists():
+            return
         envelope = self._load_envelope(path)
-        self._verify_envelope(
-            envelope,
-            mission_id=mission_id,
-            resource_id=resource_id,
-            binding=binding,
-            expected_encryption_metadata_id=expected_encryption_metadata_id,
-            now=None,
-        )
-        self._keys.destroy_resource_key(envelope.payload.metadata)
+        if not (
+            envelope.binding == CanonicalJsonObject(binding)
+            and envelope.encryption_metadata_id == expected_encryption_metadata_id
+        ):
+            raise ArtifactSecurityError("encrypted resource deletion binding is invalid")
+        if not self._keys.resource_key_destroyed(envelope.payload.metadata):
+            self._verify_envelope(
+                envelope,
+                mission_id=mission_id,
+                resource_id=resource_id,
+                binding=binding,
+                expected_encryption_metadata_id=expected_encryption_metadata_id,
+                now=None,
+            )
+        self.erase_resource(mission_id=mission_id, resource_id=resource_id)
+
+    def erase_resource(self, *, mission_id: str, resource_id: str) -> None:
+        """Idempotently finish cryptographic erasure after an unlink interruption."""
+
+        path = self._path(mission_id, resource_id, create_parent=False)
+        if not path.exists():
+            return
+        envelope = self._load_envelope(path)
+        if not (
+            envelope.domain == self._domain
+            and envelope.mission_id == mission_id
+            and envelope.resource_id == resource_id
+            and envelope.encryption_metadata_id
+            == self._keys.metadata_id(envelope.payload.metadata)
+        ):
+            raise ArtifactSecurityError("erasure target binding is invalid")
+        if not self._keys.resource_key_destroyed(envelope.payload.metadata):
+            self._verify_envelope(
+                envelope,
+                mission_id=mission_id,
+                resource_id=resource_id,
+                binding=envelope.binding.to_dict(),
+                expected_encryption_metadata_id=envelope.encryption_metadata_id,
+                now=None,
+            )
+            self._keys.destroy_resource_key(envelope.payload.metadata)
         try:
             path.unlink()
         except OSError as exc:
-            raise ArtifactSecurityError("encrypted resource deletion failed") from exc
+            raise ArtifactSecurityError("encrypted resource erasure failed") from exc
 
     def _path(self, mission_id: str, resource_id: str, *, create_parent: bool) -> Path:
         self._validate_token(mission_id)
