@@ -23,6 +23,7 @@ from redteam_agent.models.base import StrictImmutableBoundaryModel
 from redteam_agent.repositories.audit import AuditLogRepository
 from redteam_agent.storage import Database
 
+from .keys import EncryptionKeyProvider
 from .models import AuditEvent
 
 AuditResourceType = Literal[
@@ -43,6 +44,24 @@ AuditOperation = Literal[
     "revoke",
     "delete",
 ]
+
+
+class AuditChainAuthenticator(Protocol):
+    def digest(self, payload: dict[str, object]) -> str: ...
+
+
+class KeyedAuditChainAuthenticator:
+    """Authenticates audit events outside the mutable application database."""
+
+    def __init__(self, keys: EncryptionKeyProvider) -> None:
+        self._keys = keys
+
+    def digest(self, payload: dict[str, object]) -> str:
+        return self._keys.keyed_digest(
+            "audit_signing",
+            "mission-audit-event-v1",
+            canonicalize(payload),
+        )
 
 
 class AuditReferencePayload(StrictImmutableBoundaryModel):
@@ -135,11 +154,21 @@ class MissionAuditRecorder:
 
 
 class MissionAuditLog:
-    """Application-level append-only log with an optional durable SQLite boundary."""
+    """Application-level append-only log with an authenticated SQLite boundary."""
 
-    def __init__(self, database: Database | None = None) -> None:
+    def __init__(
+        self,
+        database: Database | None = None,
+        *,
+        authenticator: AuditChainAuthenticator | None = None,
+    ) -> None:
+        if database is not None and authenticator is None:
+            raise AuditIntegrityError(
+                "durable audit log requires an external authenticator"
+            )
         self._database = database
         self._repository = None if database is None else AuditLogRepository(database)
+        self._authenticator = authenticator
         self._events: dict[str, list[AuditEvent]] = {}
         self._event_ids: dict[str, AuditEvent] = {}
         self._heads: dict[str, tuple[int, str]] = {}
@@ -218,7 +247,7 @@ class MissionAuditLog:
                 chain_scope="mission",
                 sequence_number=sequence,
                 previous_event_hash=previous_hash,
-                event_hash=sha256_digest(base),
+                event_hash=self._event_digest(base),
                 event_type=event_type,
                 canonical_payload=canonical_payload,
                 occurred_at=occurred_at,
@@ -263,7 +292,7 @@ class MissionAuditLog:
                 and event.event_id not in seen_ids
             ):
                 raise AuditIntegrityError("mission audit chain binding failed")
-            expected_hash = sha256_digest(
+            expected_hash = self._event_digest(
                 self._event_payload(
                     event_id=event.event_id,
                     mission_id=event.mission_id,
@@ -274,7 +303,7 @@ class MissionAuditLog:
                     event_type=event.event_type,
                     canonical_payload=event.canonical_payload,
                     occurred_at=event.occurred_at,
-                )
+                ),
             )
             if not hmac.compare_digest(expected_hash, event.event_hash):
                 raise AuditIntegrityError("mission audit event hash failed")
@@ -367,7 +396,7 @@ class MissionAuditLog:
                     chain_scope="mission",
                     sequence_number=sequence,
                     previous_event_hash=previous_hash,
-                    event_hash=sha256_digest(base),
+                    event_hash=self._event_digest(base),
                     event_type=event_type,
                     canonical_payload=canonical_payload,
                     occurred_at=occurred_at,
@@ -414,6 +443,11 @@ class MissionAuditLog:
             if row is None
             else (int(row["sequence_number"]), str(row["event_hash"]))
         )
+
+    def _event_digest(self, payload: dict[str, object]) -> str:
+        if self._authenticator is None:
+            return sha256_digest(payload)
+        return self._authenticator.digest(payload)
 
     @staticmethod
     def _parse_event(payload: str | bytes) -> AuditEvent:

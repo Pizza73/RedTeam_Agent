@@ -43,6 +43,15 @@ _SECRET_KEYWORDS = (
 )
 _AUTHORIZATION_HEADER = b"authorization"
 _SUPPORTED_AUTHORIZATION_SCHEMES = (b"bearer", b"basic")
+_PRIVATE_KEY_BLOCKS = (
+    (b"-----BEGIN PRIVATE KEY-----", b"-----END PRIVATE KEY-----"),
+    (b"-----BEGIN RSA PRIVATE KEY-----", b"-----END RSA PRIVATE KEY-----"),
+    (b"-----BEGIN EC PRIVATE KEY-----", b"-----END EC PRIVATE KEY-----"),
+    (
+        b"-----BEGIN OPENSSH PRIVATE KEY-----",
+        b"-----END OPENSSH PRIVATE KEY-----",
+    ),
+)
 _CREDENTIAL_KEY_COMPONENTS = (
     b"credential",
     b"password",
@@ -141,6 +150,13 @@ class _StreamingSecretRedactor:
         *,
         final: bool,
     ) -> _SecretMatch | Literal["incomplete"] | None:
+        private_key = _StreamingSecretRedactor._private_key_candidate(
+            data,
+            index,
+            final=final,
+        )
+        if private_key is not None:
+            return private_key
         header = _StreamingSecretRedactor._authorization_header_candidate(
             data,
             index,
@@ -256,6 +272,38 @@ class _StreamingSecretRedactor:
         if cursor == secret_start:
             return None
         return keyword_start, keyword_end, secret_start, cursor, cursor, keyword
+
+    @staticmethod
+    def _private_key_candidate(
+        data: bytes,
+        index: int,
+        *,
+        final: bool,
+    ) -> _SecretMatch | Literal["incomplete"] | None:
+        """Recognize standalone PEM/OpenSSH private-key blocks across chunks."""
+
+        available = data[index:]
+        partial = any(begin.startswith(available) for begin, _ in _PRIVATE_KEY_BLOCKS)
+        for begin, end in _PRIVATE_KEY_BLOCKS:
+            if not available.startswith(begin):
+                continue
+            secret_end = data.find(end, index + len(begin))
+            if secret_end < 0:
+                if final:
+                    raise SecretDetectionError("secret detection failed closed")
+                return "incomplete"
+            secret_end += len(end)
+            return (
+                index,
+                index + len(begin),
+                index,
+                secret_end,
+                secret_end,
+                b"private_key",
+            )
+        if partial and not final:
+            return "incomplete"
+        return None
 
     @staticmethod
     def _decode_structured_key(structured_key: bytes, *, quote: int) -> bytes:

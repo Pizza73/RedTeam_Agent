@@ -1,29 +1,69 @@
 """Domain-separated authenticated encryption for trusted storage adapters.
 
-The in-memory provider is a development/test implementation of the provider boundary. It
-never serializes key material; deployments must substitute an OS key store or vault adapter.
+The in-memory provider is development-only. The wrapped-file provider persists authenticated
+ciphertext and requires its root wrapping key to come from an OS key store or external vault.
 """
 
 from __future__ import annotations
 
 import base64
+import fcntl
 import hmac
+import os
 import secrets
+import stat
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from threading import RLock
 from typing import Literal, Protocol
 
-from redteam_agent.canonical import canonicalize, sha256_digest, stable_id
+from redteam_agent.canonical import (
+    canonical_loads,
+    canonicalize,
+    sha256_digest,
+    stable_id,
+)
 from redteam_agent.errors import (
     EncryptionIntegrityError,
     EncryptionKeyUnavailableError,
     EncryptionNonceReuseError,
 )
+from redteam_agent.models.base import StrictImmutableBoundaryModel
 
 from .models import EncryptedPayload, EncryptionMetadata, KeyDomain, RotationState
 
 ALGORITHM = "HMAC-SHA256-STREAM-v1"
+_MAX_WRAPPED_STATE_BYTES = 16 * 1024 * 1024
+
+
+class _PersistedKeyRecord(StrictImmutableBoundaryModel):
+    metadata: EncryptionMetadata
+    material: str | None
+    resource_key: bool
+    parent_key: tuple[str, int] | None
+
+
+class _PersistedNonce(StrictImmutableBoundaryModel):
+    domain: KeyDomain
+    key_id: str
+    key_version: int
+    nonce: str
+
+
+class _PersistedKeyState(StrictImmutableBoundaryModel):
+    schema_version: Literal["wrapped-key-state-v1"]
+    records: tuple[_PersistedKeyRecord, ...]
+    material_fingerprints: tuple[str, ...]
+    used_nonces: tuple[_PersistedNonce, ...]
+
+
+class _WrappedKeyState(StrictImmutableBoundaryModel):
+    schema_version: Literal["wrapped-key-file-v1"]
+    nonce: str
+    ciphertext: str
+    authentication_tag: str
 
 
 class EncryptionKeyProvider(Protocol):
@@ -461,3 +501,559 @@ class InMemoryEncryptionKeyProvider:
     @staticmethod
     def _decode(value: str) -> bytes:
         return base64.b64decode(value.encode("ascii"), validate=True)
+
+
+class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
+    """Explicit local provider whose state is wrapped by an external keystore key.
+
+    The caller must obtain ``wrapping_key`` from an OS key store or vault. Only one
+    authenticated ciphertext file is persisted; plaintext key material is never
+    written to the application database, configuration, or filesystem.
+    """
+
+    def __init__(self, *, state_path: Path, wrapping_key: bytes) -> None:
+        super().__init__()
+        if len(wrapping_key) < 32:
+            raise EncryptionKeyUnavailableError(
+                "key-state wrapping material does not meet provider policy"
+            )
+        absolute_path = Path(os.path.abspath(state_path))
+        if not absolute_path.is_absolute() or absolute_path.name in {"", ".", ".."}:
+            raise EncryptionKeyUnavailableError("key-state path is invalid")
+        parent = absolute_path.parent
+        try:
+            parent_metadata = os.lstat(parent)
+        except OSError as exc:
+            raise EncryptionKeyUnavailableError(
+                "key-state directory is unavailable"
+            ) from exc
+        if (
+            stat.S_ISLNK(parent_metadata.st_mode)
+            or not stat.S_ISDIR(parent_metadata.st_mode)
+            or stat.S_IMODE(parent_metadata.st_mode) & 0o077
+        ):
+            raise EncryptionKeyUnavailableError(
+                "key-state directory permissions are invalid"
+            )
+        self._state_path = absolute_path
+        self._state_parent_identity = (
+            parent_metadata.st_dev,
+            parent_metadata.st_ino,
+        )
+        self._wrapping_key = bytes(wrapping_key)
+        self._state_lock_path = parent / f".{absolute_path.name}.lock"
+        self._state_lock = RLock()
+        if absolute_path.exists() or absolute_path.is_symlink():
+            self._load_persisted_state()
+
+    def register_key(
+        self,
+        *,
+        domain: KeyDomain,
+        key_id: str,
+        key_version: int,
+        key_separation_tag: str,
+        material: bytes,
+        created_at: datetime,
+        rotation_state: RotationState = "active",
+    ) -> EncryptionMetadata:
+        with self._state_lock:
+            snapshot = self._snapshot()
+            try:
+                metadata = super().register_key(
+                    domain=domain,
+                    key_id=key_id,
+                    key_version=key_version,
+                    key_separation_tag=key_separation_tag,
+                    material=material,
+                    created_at=created_at,
+                    rotation_state=rotation_state,
+                )
+                self._persist_state()
+                return metadata
+            except Exception:
+                self._restore(snapshot)
+                raise
+
+    def set_rotation_state(
+        self,
+        domain: KeyDomain,
+        key_id: str,
+        key_version: int,
+        state: RotationState,
+    ) -> None:
+        with self._state_lock:
+            snapshot = self._snapshot()
+            try:
+                super().set_rotation_state(domain, key_id, key_version, state)
+                self._persist_state()
+            except Exception:
+                self._restore(snapshot)
+                raise
+
+    def seal(
+        self,
+        domain: KeyDomain,
+        plaintext: bytes,
+        aad: dict[str, object],
+        *,
+        nonce: bytes | None = None,
+    ) -> EncryptedPayload:
+        with self._state_lock:
+            snapshot = self._snapshot()
+            try:
+                payload = super().seal(domain, plaintext, aad, nonce=nonce)
+                self._persist_state()
+                return payload
+            except Exception:
+                self._restore(snapshot)
+                raise
+
+    def seal_for_resource(
+        self,
+        domain: KeyDomain,
+        resource_id: str,
+        plaintext: bytes,
+        aad: dict[str, object],
+        *,
+        created_at: datetime,
+    ) -> EncryptedPayload:
+        with self._state_lock:
+            snapshot = self._snapshot()
+            try:
+                payload = super().seal_for_resource(
+                    domain,
+                    resource_id,
+                    plaintext,
+                    aad,
+                    created_at=created_at,
+                )
+                self._persist_state()
+                return payload
+            except Exception:
+                self._restore(snapshot)
+                raise
+
+    def _snapshot(self) -> tuple[
+        dict[tuple[KeyDomain, str, int], _KeyRecord],
+        dict[KeyDomain, tuple[str, int]],
+        set[str],
+        set[str],
+        set[bytes],
+        set[tuple[KeyDomain, str, int, bytes]],
+    ]:
+        with self._lock:
+            records = {
+                identity: _KeyRecord(
+                    metadata=record.metadata,
+                    material=(
+                        None
+                        if record.material is None
+                        else bytearray(record.material)
+                    ),
+                    resource_key=record.resource_key,
+                    parent_key=record.parent_key,
+                )
+                for identity, record in self._records.items()
+            }
+            return (
+                records,
+                dict(self._active),
+                set(self._key_ids),
+                set(self._separation_tags),
+                set(self._material_fingerprints),
+                set(self._used_nonces),
+            )
+
+    def _restore(
+        self,
+        snapshot: tuple[
+            dict[tuple[KeyDomain, str, int], _KeyRecord],
+            dict[KeyDomain, tuple[str, int]],
+            set[str],
+            set[str],
+            set[bytes],
+            set[tuple[KeyDomain, str, int, bytes]],
+        ],
+    ) -> None:
+        with self._lock:
+            (
+                self._records,
+                self._active,
+                self._key_ids,
+                self._separation_tags,
+                self._material_fingerprints,
+                self._used_nonces,
+            ) = snapshot
+
+    def _persisted_state(self) -> _PersistedKeyState:
+        with self._lock:
+            records = tuple(
+                _PersistedKeyRecord(
+                    metadata=record.metadata,
+                    material=(
+                        None
+                        if record.material is None
+                        else self._encode(bytes(record.material))
+                    ),
+                    resource_key=record.resource_key,
+                    parent_key=record.parent_key,
+                )
+                for _, record in sorted(
+                    self._records.items(),
+                    key=lambda item: (item[0][0], item[0][1], item[0][2]),
+                )
+            )
+            fingerprints = tuple(
+                sorted(self._encode(value) for value in self._material_fingerprints)
+            )
+            nonces = tuple(
+                _PersistedNonce(
+                    domain=domain,
+                    key_id=key_id,
+                    key_version=key_version,
+                    nonce=self._encode(nonce),
+                )
+                for domain, key_id, key_version, nonce in sorted(
+                    self._used_nonces,
+                    key=lambda item: (item[0], item[1], item[2], item[3]),
+                )
+            )
+        return _PersistedKeyState(
+            schema_version="wrapped-key-state-v1",
+            records=records,
+            material_fingerprints=fingerprints,
+            used_nonces=nonces,
+        )
+
+    def _persist_state(self) -> None:
+        plaintext = canonicalize(self._persisted_state().model_dump(mode="python"))
+        nonce = secrets.token_bytes(24)
+        encryption_key = hmac.digest(
+            self._wrapping_key,
+            b"redteam-key-state-encryption-v1",
+            "sha256",
+        )
+        authentication_key = hmac.digest(
+            self._wrapping_key,
+            b"redteam-key-state-authentication-v1",
+            "sha256",
+        )
+        ciphertext = self._xor_stream(encryption_key, nonce, plaintext)
+        tag = hmac.digest(authentication_key, nonce + ciphertext, "sha256")
+        wrapped = canonicalize(
+            _WrappedKeyState(
+                schema_version="wrapped-key-file-v1",
+                nonce=self._encode(nonce),
+                ciphertext=self._encode(ciphertext),
+                authentication_tag=self._encode(tag),
+            ).model_dump(mode="python")
+        )
+        self._write_wrapped_state(wrapped)
+
+    def _load_persisted_state(self) -> None:
+        raw = self._read_wrapped_state()
+        try:
+            duplicate_free = canonical_loads(raw)
+            wrapped = _WrappedKeyState.model_validate_json(
+                canonicalize(duplicate_free),
+                strict=True,
+            )
+            nonce = self._decode(wrapped.nonce)
+            ciphertext = self._decode(wrapped.ciphertext)
+            actual_tag = self._decode(wrapped.authentication_tag)
+        except (TypeError, ValueError) as exc:
+            raise EncryptionKeyUnavailableError("key-state file is invalid") from exc
+        if len(nonce) != 24:
+            raise EncryptionKeyUnavailableError("key-state nonce is invalid")
+        authentication_key = hmac.digest(
+            self._wrapping_key,
+            b"redteam-key-state-authentication-v1",
+            "sha256",
+        )
+        expected_tag = hmac.digest(
+            authentication_key,
+            nonce + ciphertext,
+            "sha256",
+        )
+        if not hmac.compare_digest(actual_tag, expected_tag):
+            raise EncryptionKeyUnavailableError("key-state authentication failed")
+        encryption_key = hmac.digest(
+            self._wrapping_key,
+            b"redteam-key-state-encryption-v1",
+            "sha256",
+        )
+        plaintext = self._xor_stream(encryption_key, nonce, ciphertext)
+        try:
+            duplicate_free = canonical_loads(plaintext)
+            state = _PersistedKeyState.model_validate_json(
+                canonicalize(duplicate_free),
+                strict=True,
+            )
+        except (TypeError, ValueError) as exc:
+            raise EncryptionKeyUnavailableError("key-state payload is invalid") from exc
+        self._restore_loaded_state(state)
+
+    def _restore_loaded_state(self, state: _PersistedKeyState) -> None:
+        records: dict[tuple[KeyDomain, str, int], _KeyRecord] = {}
+        active: dict[KeyDomain, tuple[str, int]] = {}
+        key_ids: set[str] = set()
+        separation_tags: set[str] = set()
+        for persisted in state.records:
+            metadata = persisted.metadata
+            identity = (metadata.key_domain, metadata.key_id, metadata.key_version)
+            try:
+                material = (
+                    None
+                    if persisted.material is None
+                    else bytearray(self._decode(persisted.material))
+                )
+            except ValueError as exc:
+                raise EncryptionKeyUnavailableError(
+                    "persisted key material is invalid"
+                ) from exc
+            if (
+                identity in records
+                or metadata.key_id in key_ids
+                or metadata.key_separation_tag in separation_tags
+                or (material is not None and len(material) < 32)
+                or (metadata.rotation_state == "destroyed") != (material is None)
+            ):
+                raise EncryptionKeyUnavailableError(
+                    "persisted key metadata is inconsistent"
+                )
+            records[identity] = _KeyRecord(
+                metadata=metadata,
+                material=material,
+                resource_key=persisted.resource_key,
+                parent_key=persisted.parent_key,
+            )
+            key_ids.add(metadata.key_id)
+            separation_tags.add(metadata.key_separation_tag)
+            if metadata.rotation_state == "active" and not persisted.resource_key:
+                if metadata.key_domain in active:
+                    raise EncryptionKeyUnavailableError(
+                        "persisted key domain has multiple active versions"
+                    )
+                active[metadata.key_domain] = (
+                    metadata.key_id,
+                    metadata.key_version,
+                )
+        try:
+            fingerprints = {
+                self._decode(value) for value in state.material_fingerprints
+            }
+            used_nonces = {
+                (
+                    item.domain,
+                    item.key_id,
+                    item.key_version,
+                    self._decode(item.nonce),
+                )
+                for item in state.used_nonces
+            }
+        except ValueError as exc:
+            raise EncryptionKeyUnavailableError(
+                "persisted key-state metadata is invalid"
+            ) from exc
+        live_fingerprints = {
+            hmac.digest(b"redteam-key-equality-v1", record.material, "sha256")
+            for record in records.values()
+            if record.material is not None
+        }
+        if (
+            len(fingerprints) != len(state.material_fingerprints)
+            or len(used_nonces) != len(state.used_nonces)
+            or not live_fingerprints.issubset(fingerprints)
+            or any(
+                len(item[3]) != 24 or item[:3] not in records for item in used_nonces
+            )
+        ):
+            raise EncryptionKeyUnavailableError(
+                "persisted key-state metadata is inconsistent"
+            )
+        for record in records.values():
+            if record.parent_key is not None and (
+                record.metadata.key_domain,
+                record.parent_key[0],
+                record.parent_key[1],
+            ) not in records:
+                raise EncryptionKeyUnavailableError(
+                    "persisted resource-key parent is unavailable"
+                )
+        with self._lock:
+            self._records = records
+            self._active = active
+            self._key_ids = key_ids
+            self._separation_tags = separation_tags
+            self._material_fingerprints = fingerprints
+            self._used_nonces = used_nonces
+
+    def _read_wrapped_state(self) -> bytes:
+        directory_flags = os.O_RDONLY | os.O_CLOEXEC
+        if hasattr(os, "O_DIRECTORY"):
+            directory_flags |= os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            directory_flags |= os.O_NOFOLLOW
+        try:
+            directory_descriptor = os.open(self._state_path.parent, directory_flags)
+        except OSError as exc:
+            raise EncryptionKeyUnavailableError(
+                "key-state directory is unavailable"
+            ) from exc
+        try:
+            directory_metadata = os.fstat(directory_descriptor)
+            if (
+                not stat.S_ISDIR(directory_metadata.st_mode)
+                or (directory_metadata.st_dev, directory_metadata.st_ino)
+                != self._state_parent_identity
+                or stat.S_IMODE(directory_metadata.st_mode) & 0o077
+            ):
+                raise EncryptionKeyUnavailableError(
+                    "key-state directory identity changed"
+                )
+            descriptor_flags = os.O_RDONLY | os.O_CLOEXEC
+            if hasattr(os, "O_NOFOLLOW"):
+                descriptor_flags |= os.O_NOFOLLOW
+            try:
+                descriptor = os.open(
+                    self._state_path.name,
+                    descriptor_flags,
+                    dir_fd=directory_descriptor,
+                )
+            except OSError as exc:
+                raise EncryptionKeyUnavailableError(
+                    "key-state file is unavailable"
+                ) from exc
+            try:
+                metadata = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_nlink != 1
+                    or stat.S_IMODE(metadata.st_mode) & 0o077
+                ):
+                    raise EncryptionKeyUnavailableError(
+                        "key-state file permissions are invalid"
+                    )
+                chunks: list[bytes] = []
+                total_size = 0
+                while True:
+                    chunk = os.read(descriptor, 64 * 1024)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    total_size += len(chunk)
+                    if total_size > _MAX_WRAPPED_STATE_BYTES:
+                        raise EncryptionKeyUnavailableError(
+                            "key-state file exceeds provider limit"
+                        )
+                return b"".join(chunks)
+            finally:
+                os.close(descriptor)
+        finally:
+            os.close(directory_descriptor)
+
+    def _write_wrapped_state(self, content: bytes) -> None:
+        with self._state_lock:
+            lock_flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC
+            if hasattr(os, "O_NOFOLLOW"):
+                lock_flags |= os.O_NOFOLLOW
+            try:
+                lock_descriptor = os.open(self._state_lock_path, lock_flags, 0o600)
+            except OSError as exc:
+                raise EncryptionKeyUnavailableError(
+                    "key-state lock is unavailable"
+                ) from exc
+            try:
+                lock_metadata = os.fstat(lock_descriptor)
+                if (
+                    not stat.S_ISREG(lock_metadata.st_mode)
+                    or lock_metadata.st_nlink != 1
+                    or stat.S_IMODE(lock_metadata.st_mode) & 0o077
+                ):
+                    raise EncryptionKeyUnavailableError("key-state lock is invalid")
+                fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+                self._write_wrapped_state_locked(content)
+            except OSError as exc:
+                raise EncryptionKeyUnavailableError("key-state write failed") from exc
+            finally:
+                with suppress(OSError):
+                    fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+                os.close(lock_descriptor)
+
+    def _write_wrapped_state_locked(self, content: bytes) -> None:
+        directory_flags = os.O_RDONLY | os.O_CLOEXEC
+        if hasattr(os, "O_DIRECTORY"):
+            directory_flags |= os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            directory_flags |= os.O_NOFOLLOW
+        try:
+            directory_descriptor = os.open(self._state_path.parent, directory_flags)
+        except OSError as exc:
+            raise EncryptionKeyUnavailableError(
+                "key-state directory is unavailable"
+            ) from exc
+        temporary_name: str | None = None
+        try:
+            directory_metadata = os.fstat(directory_descriptor)
+            if (
+                not stat.S_ISDIR(directory_metadata.st_mode)
+                or (directory_metadata.st_dev, directory_metadata.st_ino)
+                != self._state_parent_identity
+                or stat.S_IMODE(directory_metadata.st_mode) & 0o077
+            ):
+                raise EncryptionKeyUnavailableError(
+                    "key-state directory identity changed"
+                )
+            try:
+                existing = os.stat(
+                    self._state_path.name,
+                    dir_fd=directory_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                existing = None
+            if existing is not None and (
+                not stat.S_ISREG(existing.st_mode) or existing.st_nlink != 1
+            ):
+                raise EncryptionKeyUnavailableError("key-state target is invalid")
+            file_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+            if hasattr(os, "O_NOFOLLOW"):
+                file_flags |= os.O_NOFOLLOW
+            descriptor: int | None = None
+            for _ in range(128):
+                candidate = f".{self._state_path.name}.pending-{secrets.token_hex(16)}"
+                try:
+                    descriptor = os.open(
+                        candidate,
+                        file_flags,
+                        0o600,
+                        dir_fd=directory_descriptor,
+                    )
+                except FileExistsError:
+                    continue
+                temporary_name = candidate
+                break
+            if descriptor is None or temporary_name is None:
+                raise EncryptionKeyUnavailableError(
+                    "key-state temporary file is unavailable"
+                )
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(
+                temporary_name,
+                self._state_path.name,
+                src_dir_fd=directory_descriptor,
+                dst_dir_fd=directory_descriptor,
+            )
+            temporary_name = None
+            os.fsync(directory_descriptor)
+        except OSError as exc:
+            raise EncryptionKeyUnavailableError("key-state write failed") from exc
+        finally:
+            if temporary_name is not None:
+                with suppress(OSError):
+                    os.unlink(temporary_name, dir_fd=directory_descriptor)
+            os.close(directory_descriptor)

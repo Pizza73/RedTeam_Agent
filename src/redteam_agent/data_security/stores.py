@@ -158,6 +158,8 @@ class _EncryptedFileStore:
         if max_item_bytes <= 0 or mission_quota_bytes <= 0:
             raise ArtifactSecurityError("storage limits must be positive")
         self._root = self._prepare_root(root)
+        root_metadata = os.stat(self._root, follow_symlinks=False)
+        self._root_identity = (root_metadata.st_dev, root_metadata.st_ino)
         self._domain = domain
         self._keys = keys
         self._max_item_bytes = max_item_bytes
@@ -513,55 +515,151 @@ class _EncryptedFileStore:
         binding: dict[str, object],
         expected_encryption_metadata_id: str,
     ) -> None:
-        path = self._path(mission_id, resource_id, create_parent=False)
-        if not path.exists():
-            return
-        envelope = self._load_envelope(path)
-        if not (
-            envelope.binding == CanonicalJsonObject(binding)
-            and envelope.encryption_metadata_id == expected_encryption_metadata_id
-        ):
-            raise ArtifactSecurityError("encrypted resource deletion binding is invalid")
-        if not self._keys.resource_key_destroyed(envelope.payload.metadata):
-            self._verify_envelope(
-                envelope,
+        with self._lock, self._write_transaction():
+            self._erase_resource_anchored(
                 mission_id=mission_id,
                 resource_id=resource_id,
-                binding=binding,
+                expected_binding=CanonicalJsonObject(binding),
                 expected_encryption_metadata_id=expected_encryption_metadata_id,
-                now=None,
             )
-        self.erase_resource(mission_id=mission_id, resource_id=resource_id)
 
     def erase_resource(self, *, mission_id: str, resource_id: str) -> None:
         """Idempotently finish cryptographic erasure after an unlink interruption."""
 
-        path = self._path(mission_id, resource_id, create_parent=False)
-        if not path.exists():
-            return
-        envelope = self._load_envelope(path)
-        if not (
-            envelope.domain == self._domain
-            and envelope.mission_id == mission_id
-            and envelope.resource_id == resource_id
-            and envelope.encryption_metadata_id
-            == self._keys.metadata_id(envelope.payload.metadata)
-        ):
-            raise ArtifactSecurityError("erasure target binding is invalid")
-        if not self._keys.resource_key_destroyed(envelope.payload.metadata):
-            self._verify_envelope(
-                envelope,
+        with self._lock, self._write_transaction():
+            self._erase_resource_anchored(
                 mission_id=mission_id,
                 resource_id=resource_id,
-                binding=envelope.binding.to_dict(),
-                expected_encryption_metadata_id=envelope.encryption_metadata_id,
-                now=None,
+                expected_binding=None,
+                expected_encryption_metadata_id=None,
             )
-            self._keys.destroy_resource_key(envelope.payload.metadata)
+
+    def _erase_resource_anchored(
+        self,
+        *,
+        mission_id: str,
+        resource_id: str,
+        expected_binding: CanonicalJsonObject | None,
+        expected_encryption_metadata_id: str | None,
+    ) -> None:
+        self._validate_token(mission_id)
+        self._validate_token(resource_id)
+        directory_flags = os.O_RDONLY | os.O_CLOEXEC
+        if hasattr(os, "O_DIRECTORY"):
+            directory_flags |= os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            directory_flags |= os.O_NOFOLLOW
+        root_descriptor: int | None = None
+        mission_descriptor: int | None = None
         try:
-            path.unlink()
-        except OSError as exc:
-            raise ArtifactSecurityError("encrypted resource erasure failed") from exc
+            try:
+                root_descriptor = os.open(self._root, directory_flags)
+            except OSError as exc:
+                raise ArtifactSecurityError("store root is unavailable") from exc
+            root_metadata = os.fstat(root_descriptor)
+            if (
+                not stat.S_ISDIR(root_metadata.st_mode)
+                or (root_metadata.st_dev, root_metadata.st_ino)
+                != self._root_identity
+            ):
+                raise ArtifactSecurityError("store root identity changed")
+            try:
+                mission_descriptor = os.open(
+                    mission_id,
+                    directory_flags,
+                    dir_fd=root_descriptor,
+                )
+            except FileNotFoundError:
+                return
+            except OSError as exc:
+                raise ArtifactSecurityError("resource directory is unavailable") from exc
+            mission_metadata = os.fstat(mission_descriptor)
+            if not stat.S_ISDIR(mission_metadata.st_mode):
+                raise ArtifactSecurityError("resource directory is invalid")
+            file_flags = os.O_RDONLY | os.O_CLOEXEC
+            if hasattr(os, "O_NOFOLLOW"):
+                file_flags |= os.O_NOFOLLOW
+            try:
+                resource_descriptor = os.open(
+                    f"{resource_id}.json",
+                    file_flags,
+                    dir_fd=mission_descriptor,
+                )
+            except FileNotFoundError:
+                return
+            except OSError as exc:
+                raise ArtifactSecurityError("erasure target is unavailable") from exc
+            try:
+                resource_metadata = os.fstat(resource_descriptor)
+                if not stat.S_ISREG(resource_metadata.st_mode):
+                    raise ArtifactSecurityError("erasure target is invalid")
+                chunks: list[bytes] = []
+                while True:
+                    chunk = os.read(resource_descriptor, 64 * 1024)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                envelope = self._parse_envelope(b"".join(chunks))
+            finally:
+                os.close(resource_descriptor)
+            if not (
+                envelope.domain == self._domain
+                and envelope.mission_id == mission_id
+                and envelope.resource_id == resource_id
+                and envelope.encryption_metadata_id
+                == self._keys.metadata_id(envelope.payload.metadata)
+                and (
+                    expected_binding is None
+                    or envelope.binding == expected_binding
+                )
+                and (
+                    expected_encryption_metadata_id is None
+                    or envelope.encryption_metadata_id
+                    == expected_encryption_metadata_id
+                )
+            ):
+                raise ArtifactSecurityError("erasure target binding is invalid")
+            if not self._keys.resource_key_destroyed(envelope.payload.metadata):
+                self._verify_envelope(
+                    envelope,
+                    mission_id=mission_id,
+                    resource_id=resource_id,
+                    binding=envelope.binding.to_dict(),
+                    expected_encryption_metadata_id=envelope.encryption_metadata_id,
+                    now=None,
+                )
+            try:
+                current_metadata = os.stat(
+                    mission_id,
+                    dir_fd=root_descriptor,
+                    follow_symlinks=False,
+                )
+            except OSError as exc:
+                raise ArtifactSecurityError(
+                    "resource directory identity is unavailable"
+                ) from exc
+            if (
+                not stat.S_ISDIR(current_metadata.st_mode)
+                or current_metadata.st_dev != mission_metadata.st_dev
+                or current_metadata.st_ino != mission_metadata.st_ino
+            ):
+                raise ArtifactSecurityError("resource directory changed during erasure")
+            if not self._keys.resource_key_destroyed(envelope.payload.metadata):
+                self._keys.destroy_resource_key(envelope.payload.metadata)
+            try:
+                os.unlink(f"{resource_id}.json", dir_fd=mission_descriptor)
+                os.fsync(mission_descriptor)
+            except FileNotFoundError:
+                return
+            except OSError as exc:
+                raise ArtifactSecurityError("encrypted resource erasure failed") from exc
+        finally:
+            if mission_descriptor is not None:
+                with suppress(OSError):
+                    os.close(mission_descriptor)
+            if root_descriptor is not None:
+                with suppress(OSError):
+                    os.close(root_descriptor)
 
     def _path(self, mission_id: str, resource_id: str, *, create_parent: bool) -> Path:
         self._validate_token(mission_id)
@@ -639,9 +737,16 @@ class _EncryptedFileStore:
     def _load_envelope(path: Path) -> _StoredEnvelope:
         try:
             raw = path.read_bytes()
+        except OSError as exc:
+            raise ArtifactSecurityError("encrypted resource metadata is unavailable") from exc
+        return _EncryptedFileStore._parse_envelope(raw)
+
+    @staticmethod
+    def _parse_envelope(raw: bytes) -> _StoredEnvelope:
+        try:
             canonical_loads(raw)
             return _StoredEnvelope.model_validate_json(raw, strict=True)
-        except (OSError, TypeError, ValueError) as exc:
+        except (TypeError, ValueError) as exc:
             raise ArtifactSecurityError("encrypted resource metadata is unavailable") from exc
 
     def _aad(
@@ -667,8 +772,7 @@ class _EncryptedFileStore:
             "retention_until": retention_until,
         }
 
-    @staticmethod
-    def _atomic_write(path: Path, data: bytes) -> None:
+    def _atomic_write(self, path: Path, data: bytes) -> None:
         directory_flags = os.O_RDONLY | os.O_CLOEXEC
         if hasattr(os, "O_DIRECTORY"):
             directory_flags |= os.O_DIRECTORY
@@ -679,11 +783,21 @@ class _EncryptedFileStore:
         except OSError as exc:
             raise ArtifactSecurityError("store root is unavailable") from exc
         try:
+            root_metadata = os.fstat(root_descriptor)
+            if (
+                not stat.S_ISDIR(root_metadata.st_mode)
+                or (root_metadata.st_dev, root_metadata.st_ino)
+                != self._root_identity
+            ):
+                raise ArtifactSecurityError("store root identity changed")
             directory_descriptor = os.open(
                 path.parent.name,
                 directory_flags,
                 dir_fd=root_descriptor,
             )
+        except ArtifactSecurityError:
+            os.close(root_descriptor)
+            raise
         except OSError as exc:
             os.close(root_descriptor)
             raise ArtifactSecurityError("resource directory is unavailable") from exc

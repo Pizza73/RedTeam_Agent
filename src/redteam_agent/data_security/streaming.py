@@ -130,6 +130,19 @@ class _AbortDeletionBinding(StrictImmutableBoundaryModel):
     aggregate_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
 
 
+class _ExpiryDeletionBinding(StrictImmutableBoundaryModel):
+    record_type: Literal["stream_expiry_delete_intent"]
+    mission_revision: int = Field(ge=1)
+    stream_binding_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    execution_id: str = Field(min_length=1)
+    sink_id: str = Field(min_length=1)
+    terminal_state: Literal["committed", "abandoned"]
+    chunk_count: int = Field(ge=0)
+    artifact_sequences: tuple[int, ...]
+    aggregate_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    receipt_digest: str | None = None
+
+
 class _IngestionResultBinding(StrictImmutableBoundaryModel):
     record_type: Literal["stream_ingestion_result"]
     mission_revision: int = Field(ge=1)
@@ -192,6 +205,12 @@ class EncryptedRawResultSink:
         self._load_ingestion_result()
         if self._aborted:
             self._delete_aborted(now=self._clock())
+            return
+        if self._clock() >= self.binding.retention_until:
+            if self._receipt is not None and self._ingestion_result is not None:
+                self._delete_committed(now=self._clock())
+            else:
+                self._delete_expired(now=self._clock())
             return
         if (
             binding.resume_mode == "from_cursor"
@@ -369,6 +388,8 @@ class EncryptedRawResultSink:
         return receipt
 
     async def abort(self) -> None:
+        if self._deleted:
+            raise RawResultQuarantineError("deleted quarantine cannot be aborted")
         if self._receipt is not None:
             return
         now = self._clock()
@@ -663,7 +684,7 @@ class EncryptedRawResultSink:
         artifact_sequence: int | None = None,
         artifact_metadata_digest: str | None = None,
     ) -> None:
-        if self._receipt is not None or self._aborted:
+        if self._deleted or self._receipt is not None or self._aborted:
             raise RawResultStreamingError("raw-result sink is no longer writable")
         if not isinstance(chunk, bytes):
             raise RawResultStreamingError("raw-result chunks must be bytes")
@@ -902,7 +923,7 @@ class EncryptedRawResultSink:
         raw, _ = self._store.read_bound(
             mission_id=self.binding.mission_id,
             resource_id=envelope.resource_id,
-            now=self._clock(),
+            now=None,
         )
         try:
             canonical_loads(raw)
@@ -1063,6 +1084,9 @@ class EncryptedRawResultSink:
         if value.get("record_type") == "stream_abort_delete_intent":
             self._resume_abort_deletion(value, envelope=envelope)
             return
+        if value.get("record_type") == "stream_expiry_delete_intent":
+            self._resume_expiry_deletion(value, envelope=envelope)
+            return
         if self._ingestion_result is None:
             raise RawResultQuarantineError(
                 "deletion intent lacks a durable ingestion result"
@@ -1109,6 +1133,130 @@ class EncryptedRawResultSink:
                 mission_id=self.binding.mission_id,
                 resource_id=self._chunk_resource_id(sequence),
             )
+        self._deleted = True
+
+    def _delete_expired(self, *, now: datetime) -> None:
+        if self._deleted:
+            return
+        if now < self.binding.retention_until:
+            raise RawResultQuarantineError("raw-result quarantine retention is live")
+        if self._store.has_resource(
+            mission_id=self.binding.mission_id,
+            resource_id=self._deletion_resource_id(),
+        ):
+            self._resume_deletion()
+            return
+        intent = _ExpiryDeletionBinding(
+            record_type="stream_expiry_delete_intent",
+            mission_revision=self.binding.mission_revision,
+            stream_binding_digest=self._binding_digest,
+            execution_id=self.execution_id,
+            sink_id=self.sink_id,
+            terminal_state=(
+                "committed" if self._receipt is not None else "abandoned"
+            ),
+            chunk_count=len(self._chunks),
+            artifact_sequences=tuple(sorted(self._artifact_terminals)),
+            aggregate_digest=self._aggregate_digest(),
+            receipt_digest=(
+                None if self._receipt is None else self._receipt.receipt_digest
+            ),
+        )
+        self._store.write(
+            mission_id=self.binding.mission_id,
+            resource_id=self._deletion_resource_id(),
+            content=b"",
+            binding=intent.model_dump(mode="python"),
+            created_at=now,
+            retention_until=None,
+        )
+        self._resume_deletion()
+
+    def _resume_expiry_deletion(
+        self,
+        value: dict[str, object],
+        *,
+        envelope: _StoredEnvelope,
+    ) -> None:
+        try:
+            intent = _ExpiryDeletionBinding.model_validate_json(
+                canonicalize(value),
+                strict=True,
+            )
+        except (TypeError, ValueError) as exc:
+            raise RawResultQuarantineError("expiry deletion intent is invalid") from exc
+        if not (
+            intent.mission_revision == self.binding.mission_revision
+            and intent.stream_binding_digest == self._binding_digest
+            and intent.execution_id == self.execution_id
+            and intent.sink_id == self.sink_id
+            and intent.artifact_sequences
+            == tuple(sorted(set(intent.artifact_sequences)))
+            and all(sequence >= 0 for sequence in intent.artifact_sequences)
+            and (
+                (intent.terminal_state == "committed" and intent.receipt_digest)
+                or (
+                    intent.terminal_state == "abandoned"
+                    and intent.receipt_digest is None
+                )
+            )
+        ):
+            raise RawResultQuarantineError("expiry deletion intent binding is invalid")
+        terminal_resource_id = self._terminal_resource_id("commit")
+        if self._store.has_resource(
+            mission_id=self.binding.mission_id,
+            resource_id=terminal_resource_id,
+        ):
+            terminal_envelope = self._store.verified_envelope(
+                mission_id=self.binding.mission_id,
+                resource_id=terminal_resource_id,
+                now=None,
+            )
+            try:
+                terminal = _TerminalBinding.model_validate(
+                    terminal_envelope.binding.to_dict()
+                )
+            except ValueError as exc:
+                raise RawResultQuarantineError(
+                    "expiry deletion terminal is invalid"
+                ) from exc
+            if not (
+                intent.terminal_state == "committed"
+                and terminal.record_type == "stream_commit"
+                and terminal.chunk_count == intent.chunk_count
+                and terminal.aggregate_digest == intent.aggregate_digest
+                and terminal.receipt_digest == intent.receipt_digest
+            ):
+                raise RawResultQuarantineError(
+                    "expiry deletion terminal binding is invalid"
+                )
+        self._audit.record(
+            mission_id=self.binding.mission_id,
+            resource_type="raw_result_quarantine",
+            resource_id=self.quarantine_id,
+            operation="delete",
+            operation_id=self._audit_operation_id("delete", "expiry-intent"),
+            metadata_digest=intent.receipt_digest or intent.aggregate_digest,
+            occurred_at=envelope.created_at,
+        )
+        for sequence in range(intent.chunk_count):
+            self._store.erase_resource(
+                mission_id=self.binding.mission_id,
+                resource_id=self._chunk_resource_id(sequence),
+            )
+        for artifact_sequence in intent.artifact_sequences:
+            self._store.erase_resource(
+                mission_id=self.binding.mission_id,
+                resource_id=self._artifact_terminal_resource_id(artifact_sequence),
+            )
+        self._store.erase_resource(
+            mission_id=self.binding.mission_id,
+            resource_id=terminal_resource_id,
+        )
+        self._chunks.clear()
+        self._artifact_terminals.clear()
+        self._receipt = None
+        self._terminal_envelope = None
         self._deleted = True
 
     def _delete_aborted(self, *, now: datetime) -> None:

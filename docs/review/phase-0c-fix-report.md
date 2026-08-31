@@ -648,3 +648,101 @@ PHASE_GATE=phase-0c PASS
 - No protected governance file was modified.
 - A fresh independent Phase 0C review remains required on the resulting 40-character PR HEAD; this
   local PASS is not an independent Phase Gate PASS.
+
+## Fifteenth independent review correction cycle
+
+Current phase: `phase-0c`.
+
+Input review SHA: `32874b5b1140418629f3c57394eeff0533c554fc`.
+
+Phase base: `5cda9a5f8792ee33c3e153d8e791499f5619d82e`.
+
+### Findings addressed
+
+- [`discussion_r3899224225`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3899224225):
+  a persistent key-provider adapter now encrypts and authenticates its complete parent-key,
+  resource-key, rotation-state, fingerprint, and nonce registry under a root key supplied by an OS
+  key store or external vault. The state file and lock are permission checked, no-follow opened,
+  directory-identity anchored, size bounded, and atomically replaced. A newly constructed provider
+  can resume committed encrypted stream chunks without plaintext key persistence.
+- [`discussion_r3899224235`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3899224235):
+  durable Mission audit events now use a purpose-separated keyed digest whose signing key remains
+  outside mutable SQLite. Durable construction without an external authenticator fails closed, and
+  a complete database history rewritten with recomputed unkeyed hashes is rejected after restart.
+- [`discussion_r3899224244`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3899224244):
+  the bounded streaming detector now recognizes standalone PKCS#8, RSA, EC, and OpenSSH private-key
+  blocks. Complete and arbitrarily split inputs are buffered, stored only as Secret references, and
+  replaced as one redaction before Artifact publication; incomplete final blocks fail closed.
+- [`discussion_r3899224250`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3899224250):
+  encrypted erasure now opens Store root, Mission directory, and resource with no-follow
+  descriptors, authenticates the descriptor-read envelope, revalidates the root/Mission identity
+  immediately before key destruction, and unlinks relative to the validated Mission descriptor.
+  A concurrent Mission rename/symlink replacement cannot erase a matching external resource.
+- [`discussion_r3899224258`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3899224258):
+  committed but uningested and abandoned streams now persist a bound expiry-deletion intent at
+  retention expiry. Restart reconciliation idempotently audits deletion and destroys chunk,
+  Artifact-terminal, and stream-terminal keys, including after an interrupted partial erasure.
+
+### Modified files and regression tests
+
+Resulting working-tree diff: `8 files changed, 1592 insertions(+), 55 deletions(-)`.
+
+- `src/redteam_agent/data_security/__init__.py`
+- `src/redteam_agent/data_security/audit.py`
+- `src/redteam_agent/data_security/ingestion.py`
+- `src/redteam_agent/data_security/keys.py`
+- `src/redteam_agent/data_security/stores.py`
+- `src/redteam_agent/data_security/streaming.py`
+- `tests/security/test_phase0c_data_security.py`
+- `docs/review/phase-0c-fix-report.md`
+
+Five regression tests cover provider reconstruction and wrong-root-key rejection, full SQLite
+chain recomputation without the external audit key, complete and split standalone private keys,
+concurrent erasure-directory replacement, and restartable expiry deletion for both committed and
+abandoned streams. No test was deleted, skipped, weakened, or marked as an expected failure.
+
+### Validation
+
+Focused regression command:
+
+```text
+PYTHONPATH=src /home/kali/Red_Agent/.venv/bin/pytest -q \
+  tests/security/test_phase0c_data_security.py \
+  -k 'wrapped_key_provider or sqlite_audit_chain or keyed_sqlite_audit or \
+  standalone_private_key or erasure_is_anchored or expired_committed'
+```
+
+Result: `6 passed, 29 deselected`.
+
+Complete Phase 0C security module: `35 passed`.
+
+Required phase-gate command:
+
+```text
+PATH="/home/kali/Red_Agent/.venv/bin:$PATH" \
+  bash scripts/ci/run_phase_gate.sh phase-0c
+```
+
+Result:
+
+```text
+AUTOMATION_VALIDATION=PASS
+ruff: All checks passed
+mypy: Success: no issues found in 78 source files
+unit: 200 passed
+integration: 7 passed
+security: 179 passed
+full/coverage run: 386 passed
+skipped=0, errors=0, failures=0
+coverage: 81% total (branch coverage enabled)
+pip check: No broken requirements found
+PHASE_GATE=phase-0c PASS
+```
+
+### Remaining constraints
+
+- No real C2, MCP, provider, subprocess, local-attack, credential-collection, or external-target
+  action was executed.
+- No protected governance file was modified.
+- A fresh independent Phase 0C review remains required on the resulting 40-character PR HEAD; this
+  local PASS is not an independent Phase Gate PASS.
