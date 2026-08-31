@@ -295,6 +295,101 @@ def test_bearer_authorization_is_redacted_before_artifact_publication(
     assert bearer_secret not in visible
 
 
+def test_basic_authorization_is_redacted_complete_and_across_stream_chunks(
+    tmp_path: Path,
+) -> None:
+    keys = _keys()
+    authorizer = _ExactEnvelopeAuthorizer()
+    mission_id = "mission-basic"
+    execution_id = "execution-basic"
+    authorizer.allow_ingestion_write(mission_id, execution_id)
+    audit = MissionAuditRecorder(
+        audit_log=MissionAuditLog(),
+        contexts=_AuditContexts(),
+    )
+    quarantine = EncryptedRawResultQuarantine(
+        root=tmp_path / "basic-quarantine",
+        keys=keys,
+        audit=audit,
+        max_item_bytes=4096,
+        mission_quota_bytes=16 * 1024,
+    )
+    factory = EncryptedRawResultSinkFactory(
+        quarantine=quarantine,
+        bindings=_StreamBindings(
+            QuarantineStreamBinding(
+                mission_id=mission_id,
+                mission_revision=1,
+                execution_id=execution_id,
+                retention_until=NOW + timedelta(hours=1),
+                max_result_bytes=4096,
+                resume_mode="from_start",
+            )
+        ),
+        clock=lambda: NOW,
+    )
+    artifacts = ArtifactStore(
+        root=tmp_path / "basic-artifacts",
+        keys=keys,
+        authorizer=authorizer,
+        audit=audit,
+        max_item_bytes=4096,
+        mission_quota_bytes=8192,
+    )
+    secrets = SecretStore(
+        root=tmp_path / "basic-secrets",
+        keys=keys,
+        authorizer=authorizer,
+        audit=audit,
+        max_item_bytes=1024,
+        mission_quota_bytes=4096,
+    )
+    complete_secret = b"dXNlcjpwYXNz"
+    split_secret = b"YWRtaW46c2VjcmV0"
+
+    async def ingest_basic_stream():
+        sink = factory.for_execution(execution_id)
+        await sink.write_stdout(
+            b"Authorization: Basic "
+            + complete_secret
+            + b"\nAuthorization: Ba"
+        )
+        await sink.write_stdout(b"sic " + split_secret + b"\nstatus=ok")
+        receipt = await sink.commit()
+        return await SecureIngestor(
+            quarantine=quarantine,
+            artifacts=artifacts,
+            secrets=secrets,
+        ).ingest_stream(sink, receipt, now=NOW)
+
+    result = asyncio.run(ingest_basic_stream())
+    assert result.redaction_metadata.redaction_count == 2
+    assert {item.credential_type for item in result.detected_secrets} == {"basic"}
+    artifact = result.redacted_artifacts[0]
+    authorizer.set_grants(
+        mission_id,
+        (
+            DataAccessGrant(
+                resource_type="artifact",
+                resource=ResourceBinding(
+                    resource_id=artifact.artifact_id,
+                    resource_version="1",
+                    resource_digest=artifact.sha256,
+                ),
+                operations=frozenset({"read"}),
+            ),
+        ),
+    )
+    visible = artifacts.read(artifact, operation="read", now=NOW)
+    assert visible == (
+        b"Authorization: Basic [REDACTED]\n"
+        b"Authorization: Basic [REDACTED]\nstatus=ok"
+    )
+    for value in (complete_secret, split_secret):
+        assert value not in visible
+        assert value.decode() not in result.model_dump_json()
+
+
 def test_private_key_field_is_redacted_before_artifact_publication(
     tmp_path: Path,
 ) -> None:
@@ -827,6 +922,53 @@ def test_encrypted_store_fsyncs_parent_before_acknowledging_write(
     )
 
 
+def test_encrypted_store_write_is_anchored_during_mission_directory_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    keys = _keys()
+    audit = MissionAuditRecorder(
+        audit_log=MissionAuditLog(),
+        contexts=_AuditContexts(),
+    )
+    root = tmp_path / "anchored-quarantine"
+    outside = tmp_path / "outside-store"
+    outside.mkdir()
+    quarantine = EncryptedRawResultQuarantine(
+        root=root,
+        keys=keys,
+        audit=audit,
+        max_item_bytes=1024,
+        mission_quota_bytes=4096,
+    )
+    mission_root = root / "mission-swap"
+    detached_mission_root = root / "detached-mission-swap"
+    original_link = os.link
+    swapped = False
+
+    def swap_before_link(src, dst, **kwargs) -> None:
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            mission_root.rename(detached_mission_root)
+            mission_root.symlink_to(outside, target_is_directory=True)
+        original_link(src, dst, **kwargs)
+
+    monkeypatch.setattr(os, "link", swap_before_link)
+    quarantine.commit(
+        mission_id="mission-swap",
+        mission_revision=1,
+        execution_id="execution-swap",
+        content=b"anchored-content",
+        created_at=NOW,
+        retention_until=NOW + timedelta(hours=1),
+    )
+
+    assert swapped
+    assert not list(outside.iterdir())
+    assert len(list(detached_mission_root.glob("*.json"))) == 1
+
+
 def test_encrypted_store_fsyncs_store_root_for_first_mission_write(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1129,6 +1271,68 @@ def test_secret_reference_and_public_binding_do_not_expose_guess_verifiers(
     assert secret_write.resource_digest != plaintext_digest
     assert plaintext_digest.encode("ascii") not in b"".join(
         path.read_bytes() for path in (tmp_path / "secrets").rglob("*.json")
+    )
+
+
+def test_quarantine_verifiers_do_not_expose_low_entropy_plaintext_digests(
+    tmp_path: Path,
+) -> None:
+    keys = _keys()
+    audit_log = MissionAuditLog()
+    audit = MissionAuditRecorder(audit_log=audit_log, contexts=_AuditContexts())
+    root = tmp_path / "keyed-quarantine"
+    quarantine = EncryptedRawResultQuarantine(
+        root=root,
+        keys=keys,
+        audit=audit,
+        max_item_bytes=1024,
+        mission_quota_bytes=16 * 1024,
+    )
+    low_entropy = b"0"
+    plaintext_digest = "sha256:" + hashlib.sha256(low_entropy).hexdigest()
+    reference = quarantine.commit(
+        mission_id="mission-keyed",
+        mission_revision=1,
+        execution_id="execution-keyed",
+        content=low_entropy,
+        created_at=NOW,
+        retention_until=NOW + timedelta(hours=1),
+    )
+    assert reference.sha256 != plaintext_digest
+    assert quarantine.resume(reference, now=NOW) == low_entropy
+
+    binding = QuarantineStreamBinding(
+        mission_id="mission-keyed-stream",
+        mission_revision=1,
+        execution_id="execution-keyed-stream",
+        retention_until=NOW + timedelta(hours=1),
+        max_result_bytes=1024,
+        resume_mode="from_start",
+    )
+    bindings = _StreamBindings(binding)
+    factory = EncryptedRawResultSinkFactory(
+        quarantine=quarantine,
+        bindings=bindings,
+        clock=lambda: NOW,
+    )
+
+    async def write_and_resume_stream() -> None:
+        sink = factory.for_execution("execution-keyed-stream")
+        await sink.write_stdout(low_entropy)
+        receipt = await sink.commit()
+        recovered = factory.for_execution("execution-keyed-stream")
+        resumed = b"".join(
+            [chunk async for chunk in recovered._iter_committed_chunks(receipt, now=NOW)]
+        )
+        assert resumed == low_entropy
+
+    asyncio.run(write_and_resume_stream())
+    stored = b"".join(path.read_bytes() for path in root.rglob("*.json"))
+    assert plaintext_digest.encode("ascii") not in stored
+    assert all(
+        event.canonical_payload.to_dict()["metadata_digest"] != plaintext_digest
+        for mission_id in ("mission-keyed", "mission-keyed-stream")
+        for event in audit_log.events_for(mission_id)
     )
 
 

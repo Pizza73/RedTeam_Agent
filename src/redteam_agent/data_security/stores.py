@@ -7,7 +7,6 @@ import hashlib
 import os
 import re
 import stat
-import tempfile
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import contextmanager, suppress
 from datetime import datetime
@@ -592,9 +591,9 @@ class _EncryptedFileStore:
         *,
         metadata: EncryptionMetadata | None = None,
     ) -> str:
-        if self._domain == "secret_store":
+        if self._domain in {"secret_store", "raw_result_quarantine"}:
             return self._keys.keyed_digest(
-                "secret_store",
+                self._domain,
                 "stored-plaintext-integrity",
                 content,
                 metadata=metadata,
@@ -660,15 +659,53 @@ class _EncryptedFileStore:
 
     @staticmethod
     def _atomic_write(path: Path, data: bytes) -> None:
-        descriptor, temporary_name = tempfile.mkstemp(prefix=".pending-", dir=path.parent)
-        temporary = Path(temporary_name)
+        directory_flags = os.O_RDONLY | os.O_CLOEXEC
+        if hasattr(os, "O_DIRECTORY"):
+            directory_flags |= os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            directory_flags |= os.O_NOFOLLOW
         try:
+            directory_descriptor = os.open(path.parent, directory_flags)
+        except OSError as exc:
+            raise ArtifactSecurityError("resource directory is unavailable") from exc
+        temporary_name: str | None = None
+        try:
+            directory_metadata = os.fstat(directory_descriptor)
+            if not stat.S_ISDIR(directory_metadata.st_mode):
+                raise ArtifactSecurityError("resource directory is invalid")
+            file_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+            if hasattr(os, "O_NOFOLLOW"):
+                file_flags |= os.O_NOFOLLOW
+            descriptor: int | None = None
+            for _ in range(128):
+                candidate = f".pending-{os.urandom(16).hex()}"
+                try:
+                    descriptor = os.open(
+                        candidate,
+                        file_flags,
+                        0o600,
+                        dir_fd=directory_descriptor,
+                    )
+                except FileExistsError:
+                    continue
+                except OSError as exc:
+                    raise ArtifactSecurityError("resource creation failed") from exc
+                temporary_name = candidate
+                break
+            if descriptor is None or temporary_name is None:
+                raise ArtifactSecurityError("resource creation failed")
             with os.fdopen(descriptor, "wb") as stream:
                 stream.write(data)
                 stream.flush()
                 os.fsync(stream.fileno())
             try:
-                os.link(temporary, path, follow_symlinks=False)
+                os.link(
+                    temporary_name,
+                    path.name,
+                    src_dir_fd=directory_descriptor,
+                    dst_dir_fd=directory_descriptor,
+                    follow_symlinks=False,
+                )
             except FileExistsError:
                 raise ArtifactSecurityError(
                     "resource identifier already exists"
@@ -676,13 +713,20 @@ class _EncryptedFileStore:
             except OSError as exc:
                 raise ArtifactSecurityError("resource creation failed") from exc
             try:
-                temporary.unlink()
+                os.unlink(temporary_name, dir_fd=directory_descriptor)
             except OSError as exc:
                 raise ArtifactSecurityError("resource creation failed") from exc
-            _EncryptedFileStore._sync_parent_directory(path.parent)
+            temporary_name = None
+            try:
+                os.fsync(directory_descriptor)
+            except OSError as exc:
+                raise ArtifactSecurityError("resource directory sync failed") from exc
         finally:
-            if temporary.exists():
-                temporary.unlink()
+            if temporary_name is not None:
+                with suppress(OSError):
+                    os.unlink(temporary_name, dir_fd=directory_descriptor)
+            with suppress(OSError):
+                os.close(directory_descriptor)
 
     @staticmethod
     def _sync_parent_directory(directory: Path) -> None:

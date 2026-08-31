@@ -473,3 +473,88 @@ PHASE_GATE=phase-0c PASS
 - No protected governance file was modified.
 - A fresh independent Phase 0C review remains required on the resulting 40-character PR HEAD; this
   local PASS is not an independent Phase Gate PASS.
+
+## Thirteenth independent review correction cycle
+
+Current phase: `phase-0c`.
+
+Input review SHA: `aea1a99f55a93a9445e27f56a4a26ad036b312c3`.
+
+Phase base: `5cda9a5f8792ee33c3e153d8e791499f5619d82e`.
+
+### Findings addressed
+
+- [`discussion_r3898809636`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3898809636):
+  raw-result Store and stream-chunk integrity values now use the quarantine key domain's
+  purpose-separated keyed digest. Low-entropy plaintext hashes are absent from encrypted envelopes,
+  public references, and audit metadata, and resumed chunk reads verify with the persisted resource
+  key metadata.
+- [`discussion_r3898809644`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3898809644):
+  the bounded streaming secret detector now recognizes both Basic and Bearer authorization schemes.
+  It preserves the visible scheme and redacts only the credential value for complete and
+  cross-chunk inputs.
+- [`discussion_r3898809649`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3898809649):
+  encrypted resource creation now opens the validated Mission directory once with no-follow flags.
+  Temporary creation, immutable hard-link publication, cleanup, and directory synchronization all
+  use that directory descriptor, preventing a concurrent symlink replacement from redirecting the
+  ciphertext outside the configured Store root.
+
+### Modified files and regression tests
+
+Resulting working-tree diff: `5 files changed, 373 insertions(+), 28 deletions(-)`.
+
+- `src/redteam_agent/data_security/ingestion.py`
+- `src/redteam_agent/data_security/stores.py`
+- `src/redteam_agent/data_security/streaming.py`
+- `tests/security/test_phase0c_data_security.py`
+- `docs/review/phase-0c-fix-report.md`
+
+Three regression tests cover complete and split-chunk Basic authorization, concurrent Mission
+directory replacement with an external symlink, and low-entropy verifier resistance for both
+full-object quarantine and resumed encrypted streams. No test was deleted, skipped, weakened, or
+marked as an expected failure.
+
+### Validation
+
+Focused regression command:
+
+```text
+/home/kali/Red_Agent/.venv/bin/python -m pytest -q \
+  tests/security/test_phase0c_data_security.py \
+  -k 'basic_authorization or anchored_during_mission_directory_swap or quarantine_verifiers'
+```
+
+Result: `3 passed, 24 deselected`.
+
+Complete Phase 0C security module: `27 passed`.
+
+Required phase-gate command:
+
+```text
+PATH="/home/kali/Red_Agent/.venv/bin:$PATH" \
+  bash scripts/ci/run_phase_gate.sh phase-0c
+```
+
+Result:
+
+```text
+AUTOMATION_VALIDATION=PASS
+ruff: All checks passed
+mypy: Success: no issues found in 78 source files
+unit: 200 passed
+integration: 7 passed
+security: 171 passed
+full/coverage run: 378 passed
+skipped=0, errors=0, failures=0
+coverage: 82% total (branch coverage enabled)
+pip check: No broken requirements found
+PHASE_GATE=phase-0c PASS
+```
+
+### Remaining constraints
+
+- No real C2, MCP, provider, subprocess, local-attack, credential-collection, or external-target
+  action was executed.
+- No protected governance file was modified.
+- A fresh independent Phase 0C review remains required on the resulting 40-character PR HEAD; this
+  local PASS is not an independent Phase Gate PASS.

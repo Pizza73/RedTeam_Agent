@@ -41,7 +41,7 @@ _SECRET_KEYWORDS = (
     b"apikey",
     b"secret",
 )
-_BEARER_KEYWORD = b"bearer"
+_AUTHORIZATION_SCHEMES = (b"bearer", b"basic")
 _CREDENTIAL_KEY_COMPONENTS = (
     b"credential",
     b"password",
@@ -139,13 +139,13 @@ class _StreamingSecretRedactor:
         *,
         final: bool,
     ) -> _SecretMatch | Literal["incomplete"] | None:
-        bearer = _StreamingSecretRedactor._bearer_candidate(
+        authorization = _StreamingSecretRedactor._authorization_candidate(
             data,
             index,
             final=final,
         )
-        if bearer is not None:
-            return bearer
+        if authorization is not None:
+            return authorization
         key_quote = data[index] if data[index] in _QUOTE_BYTES else None
         keyword_start = index + 1 if key_quote is not None else index
         keyword: bytes | None = None
@@ -299,26 +299,33 @@ class _StreamingSecretRedactor:
         return bytes(decoded)
 
     @staticmethod
-    def _bearer_candidate(
+    def _authorization_candidate(
         data: bytes,
         index: int,
         *,
         final: bool,
     ) -> _SecretMatch | Literal["incomplete"] | None:
-        """Recognize a Bearer credential while preserving its visible scheme."""
+        """Recognize supported authorization credentials and preserve their scheme."""
 
         wrapper_quote = data[index] if data[index] in _QUOTE_BYTES else None
         keyword_start = index + 1 if wrapper_quote is not None else index
-        candidate = data[
-            keyword_start : keyword_start + len(_BEARER_KEYWORD)
-        ].lower()
-        if len(candidate) < len(_BEARER_KEYWORD):
-            if _BEARER_KEYWORD.startswith(candidate):
-                return None if final else "incomplete"
+        available = data[keyword_start:].lower()
+        matching_schemes = tuple(
+            scheme for scheme in _AUTHORIZATION_SCHEMES if scheme.startswith(available)
+        )
+        if matching_schemes and all(len(available) < len(item) for item in matching_schemes):
+            return None if final else "incomplete"
+        scheme = next(
+            (
+                item
+                for item in _AUTHORIZATION_SCHEMES
+                if available[: len(item)] == item
+            ),
+            None,
+        )
+        if scheme is None:
             return None
-        if candidate != _BEARER_KEYWORD:
-            return None
-        keyword_end = keyword_start + len(_BEARER_KEYWORD)
+        keyword_end = keyword_start + len(scheme)
         cursor = keyword_end
         if cursor == len(data):
             return None if final else "incomplete"

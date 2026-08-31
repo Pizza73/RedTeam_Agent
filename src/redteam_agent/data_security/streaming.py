@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 from collections.abc import AsyncIterator, Callable
 from datetime import datetime
 from typing import Literal, Protocol
@@ -443,7 +442,13 @@ class EncryptedRawResultSink:
                     resource_id=envelope.resource_id,
                     now=now,
                 )
-                if "sha256:" + hashlib.sha256(content).hexdigest() != binding.chunk_digest:
+                if (
+                    self._store._content_digest(
+                        content,
+                        metadata=envelope.payload.metadata,
+                    )
+                    != binding.chunk_digest
+                ):
                     raise DigestIntegrityError("committed stream chunk integrity failed")
                 yield content
 
@@ -640,7 +645,7 @@ class EncryptedRawResultSink:
         if not isinstance(chunk, bytes):
             raise RawResultStreamingError("raw-result chunks must be bytes")
         self.max_observed_chunk_bytes = max(self.max_observed_chunk_bytes, len(chunk))
-        digest = "sha256:" + hashlib.sha256(chunk).hexdigest()
+        digest = self._store._content_digest(chunk)
         sequence = self._input_sequence
         ciphertext_offset = sum(
             envelope.plaintext_size for _, envelope in self._chunks[:sequence]
