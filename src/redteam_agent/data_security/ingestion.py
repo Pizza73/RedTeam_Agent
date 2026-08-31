@@ -60,6 +60,19 @@ _ASCII_WORD_BYTES = frozenset(
 )
 _STRUCTURED_KEY_BYTES = _ASCII_WORD_BYTES | frozenset(b"-")
 _MAX_PENDING_SECRET_MATCH_BYTES = 64 * 1024
+_JSON_KEY_SIMPLE_ESCAPES = {
+    ord('"'): ord('"'),
+    ord("\\"): ord("\\"),
+    ord("/"): ord("/"),
+    ord("b"): 8,
+    ord("f"): 12,
+    ord("n"): 10,
+    ord("r"): 13,
+    ord("t"): 9,
+}
+_JSON_KEY_HEX_BYTES = frozenset(b"0123456789abcdefABCDEF")
+
+_SecretMatch = tuple[int, int, int, int, int, bytes]
 
 
 class _StreamingSecretRedactor:
@@ -100,11 +113,12 @@ class _StreamingSecretRedactor:
                     secret_start,
                     secret_end,
                     match_end,
+                    keyword,
                 ) = candidate
                 output.extend(data[index:secret_start])
                 output.extend(
                     self._replace(
-                        data[keyword_start:keyword_end],
+                        keyword,
                         data[secret_start:secret_end],
                     )
                 )
@@ -124,7 +138,7 @@ class _StreamingSecretRedactor:
         index: int,
         *,
         final: bool,
-    ) -> tuple[int, int, int, int, int] | Literal["incomplete"] | None:
+    ) -> _SecretMatch | Literal["incomplete"] | None:
         bearer = _StreamingSecretRedactor._bearer_candidate(
             data,
             index,
@@ -140,13 +154,20 @@ class _StreamingSecretRedactor:
             while cursor < len(data) and data[cursor] != key_quote:
                 if data[cursor] == 92:
                     if cursor + 1 == len(data):
-                        return None if final else "incomplete"
+                        if final:
+                            raise SecretDetectionError(
+                                "secret detection failed closed"
+                            )
+                        return "incomplete"
                     cursor += 2
                     continue
                 cursor += 1
             if cursor == len(data):
                 return None if final else "incomplete"
-            structured_key = data[keyword_start:cursor]
+            structured_key = _StreamingSecretRedactor._decode_structured_key(
+                data[keyword_start:cursor],
+                quote=key_quote,
+            )
             normalized_key = structured_key.lower().replace(b"_", b"").replace(
                 b"-", b""
             )
@@ -172,7 +193,7 @@ class _StreamingSecretRedactor:
                 keyword = structured_key
         if keyword is None:
             return None
-        keyword_end = keyword_start + len(keyword)
+        keyword_end = cursor
         cursor = keyword_end
         if key_quote is not None:
             if cursor == len(data):
@@ -212,6 +233,7 @@ class _StreamingSecretRedactor:
                         secret_start,
                         cursor,
                         cursor + 1,
+                        keyword,
                     )
                 cursor += 1
             if final:
@@ -224,7 +246,57 @@ class _StreamingSecretRedactor:
             return "incomplete"
         if cursor == secret_start:
             return None
-        return keyword_start, keyword_end, secret_start, cursor, cursor
+        return keyword_start, keyword_end, secret_start, cursor, cursor, keyword
+
+    @staticmethod
+    def _decode_structured_key(structured_key: bytes, *, quote: int) -> bytes:
+        """Decode a quoted JSON-style key before credential-name matching."""
+
+        decoded = bytearray()
+        cursor = 0
+        while cursor < len(structured_key):
+            current = structured_key[cursor]
+            if current != 92:
+                decoded.append(current)
+                cursor += 1
+                continue
+            if cursor + 1 >= len(structured_key):
+                raise SecretDetectionError("secret detection failed closed")
+            escape = structured_key[cursor + 1]
+            simple = _JSON_KEY_SIMPLE_ESCAPES.get(escape)
+            if simple is not None:
+                decoded.append(simple)
+                cursor += 2
+                continue
+            if escape == ord("'") and quote == ord("'"):
+                decoded.append(escape)
+                cursor += 2
+                continue
+            if escape != ord("u") or cursor + 6 > len(structured_key):
+                raise SecretDetectionError("secret detection failed closed")
+            digits = structured_key[cursor + 2 : cursor + 6]
+            if any(value not in _JSON_KEY_HEX_BYTES for value in digits):
+                raise SecretDetectionError("secret detection failed closed")
+            codepoint = int(digits, 16)
+            cursor += 6
+            if 0xD800 <= codepoint <= 0xDBFF:
+                if (
+                    cursor + 6 > len(structured_key)
+                    or structured_key[cursor : cursor + 2] != b"\\u"
+                ):
+                    raise SecretDetectionError("secret detection failed closed")
+                low_digits = structured_key[cursor + 2 : cursor + 6]
+                if any(value not in _JSON_KEY_HEX_BYTES for value in low_digits):
+                    raise SecretDetectionError("secret detection failed closed")
+                low = int(low_digits, 16)
+                if not 0xDC00 <= low <= 0xDFFF:
+                    raise SecretDetectionError("secret detection failed closed")
+                codepoint = 0x10000 + ((codepoint - 0xD800) << 10) + (low - 0xDC00)
+                cursor += 6
+            elif 0xDC00 <= codepoint <= 0xDFFF:
+                raise SecretDetectionError("secret detection failed closed")
+            decoded.extend(chr(codepoint).encode("utf-8"))
+        return bytes(decoded)
 
     @staticmethod
     def _bearer_candidate(
@@ -232,7 +304,7 @@ class _StreamingSecretRedactor:
         index: int,
         *,
         final: bool,
-    ) -> tuple[int, int, int, int, int] | Literal["incomplete"] | None:
+    ) -> _SecretMatch | Literal["incomplete"] | None:
         """Recognize a Bearer credential while preserving its visible scheme."""
 
         wrapper_quote = data[index] if data[index] in _QUOTE_BYTES else None
@@ -263,7 +335,14 @@ class _StreamingSecretRedactor:
             return "incomplete"
         if cursor == secret_start:
             return None
-        return keyword_start, keyword_end, secret_start, cursor, cursor
+        return (
+            keyword_start,
+            keyword_end,
+            secret_start,
+            cursor,
+            cursor,
+            data[keyword_start:keyword_end],
+        )
 
 
 class SecureIngestor:

@@ -213,10 +213,16 @@ class EncryptedRawResultSink:
             self._recovery_required = True
 
     async def write_stdout(self, chunk: bytes) -> None:
-        self._write(channel="stdout", chunk=chunk)
+        failure = self._capture_write_failure(channel="stdout", chunk=chunk)
+        del chunk
+        if failure is not None:
+            raise failure from None
 
     async def write_stderr(self, chunk: bytes) -> None:
-        self._write(channel="stderr", chunk=chunk)
+        failure = self._capture_write_failure(channel="stderr", chunk=chunk)
+        del chunk
+        if failure is not None:
+            raise failure from None
 
     async def write_artifact(
         self,
@@ -253,19 +259,24 @@ class EncryptedRawResultSink:
         wrote = False
         async for chunk in chunks:
             wrote = True
-            self._write(
+            failure = self._capture_write_failure(
                 channel="artifact",
                 chunk=chunk,
                 artifact_sequence=metadata.artifact_sequence,
                 artifact_metadata_digest=metadata_digest,
             )
+            del chunk
+            if failure is not None:
+                raise failure from None
         if not wrote and not existing:
-            self._write(
+            failure = self._capture_write_failure(
                 channel="artifact",
                 chunk=b"",
                 artifact_sequence=metadata.artifact_sequence,
                 artifact_metadata_digest=metadata_digest,
             )
+            if failure is not None:
+                raise failure from None
         self._commit_artifact(metadata, metadata_digest=metadata_digest)
 
     async def commit(self) -> RawResultReceipt:
@@ -592,6 +603,29 @@ class EncryptedRawResultSink:
             retention_until=None,
         )
         self._resume_deletion()
+
+    def _capture_write_failure(
+        self,
+        *,
+        channel: Literal["stdout", "stderr", "artifact"],
+        chunk: bytes,
+        artifact_sequence: int | None = None,
+        artifact_metadata_digest: str | None = None,
+    ) -> RawResultStreamingError | None:
+        """Return a sanitized failure after the secret-bearing frame has unwound."""
+
+        try:
+            self._write(
+                channel=channel,
+                chunk=chunk,
+                artifact_sequence=artifact_sequence,
+                artifact_metadata_digest=artifact_metadata_digest,
+            )
+        except Exception as failure:
+            failure.__traceback__ = None
+            del failure
+            return RawResultStreamingError("raw-result streaming failed closed")
+        return None
 
     def _write(
         self,

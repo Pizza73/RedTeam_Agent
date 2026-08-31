@@ -391,3 +391,85 @@ and release-audit regressions pass with `3 passed, 18 deselected`.
   the repository remains the Phase 0B Mock adapter.
 - This correction requires a new independent review bound to its resulting 40-character PR HEAD.
   The local PASS above is not an independent Phase Gate PASS for that future SHA.
+
+## Twelfth independent review and post-refresh correction cycle
+
+Current phase: `phase-0c`.
+
+Input review SHA: `e3ca45ca314c3a469b31137dd4b6e567c58f00e2`.
+
+Authorized post-refresh input HEAD: `a91790d30d34cc7a8205cd397dd1b5dba2b48574`.
+
+Phase base: `5cda9a5f8792ee33c3e153d8e791499f5619d82e`.
+
+### Findings addressed
+
+- `CODEX-P1-B9469F2665822E4D`: escaped JSON field names are now decoded with strict
+  JSON-style Unicode and surrogate validation before credential matching. Complete and cross-chunk
+  `api\u005fkey` / `client\u005fsecret` fields are detected, their values are isolated in the Secret
+  Store, and only redacted values become Artifact or result content.
+- The same gate's second retained P1: stdout, stderr, and Artifact quarantine writes now replace
+  storage, encryption, audit, and other internal failures with a typed `RawResultStreamingError`
+  only after the secret-bearing write frame has unwound and the raw `chunk` local has been deleted.
+  The original failure traceback is cleared and no plaintext fallback is introduced.
+
+Review findings:
+
+- https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3897157815
+- https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3897157819
+
+### Modified files and regression tests
+
+Resulting working-tree diff: `4 files changed, 331 insertions(+), 15 deletions(-)`.
+
+- `src/redteam_agent/data_security/ingestion.py`
+- `src/redteam_agent/data_security/streaming.py`
+- `tests/security/test_phase0c_data_security.py`
+- `docs/review/phase-0c-fix-report.md`
+
+The Phase 0C security suite now proves complete and cross-chunk escaped credential-key redaction,
+reference-only result serialization, and absence of raw provider chunks from sanitized streaming
+traceback frames for storage, encryption, and audit failures across stdout, stderr, and Artifact
+writes. No test was deleted, skipped, weakened, or marked as an expected failure.
+
+### Validation
+
+Focused regression command:
+
+```text
+/home/kali/Red_Agent/.venv/bin/python -m pytest -q \
+  tests/security/test_phase0c_data_security.py -k 'oauth_fields or raw_chunk_failures'
+```
+
+Result: `4 passed, 20 deselected`.
+
+Required phase-gate command:
+
+```text
+PATH="/home/kali/Red_Agent/.venv/bin:$PATH" \
+  bash scripts/ci/run_phase_gate.sh phase-0c
+```
+
+Result:
+
+```text
+AUTOMATION_VALIDATION=PASS
+ruff: All checks passed
+mypy: Success: no issues found in 78 source files
+unit: 200 passed
+integration: 7 passed
+security: 168 passed
+full/coverage run: 375 passed
+skipped=0, errors=0, failures=0
+coverage: 82% total (branch coverage enabled)
+pip check: No broken requirements found
+PHASE_GATE=phase-0c PASS
+```
+
+### Remaining constraints
+
+- No real C2, MCP, provider, subprocess, local-attack, credential-collection, or external-target
+  action was executed.
+- No protected governance file was modified.
+- A fresh independent Phase 0C review remains required on the resulting 40-character PR HEAD; this
+  local PASS is not an independent Phase Gate PASS.

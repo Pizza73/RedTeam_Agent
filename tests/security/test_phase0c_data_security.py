@@ -40,6 +40,7 @@ from redteam_agent.errors import (
     EncryptionKeyUnavailableError,
     EncryptionNonceReuseError,
     RawResultQuarantineError,
+    RawResultStreamingError,
     SandboxCapabilityStaleError,
     SecretAccessError,
     SecureIngestionError,
@@ -585,7 +586,11 @@ def test_oauth_fields_are_redacted_across_stream_chunks(tmp_path: Path) -> None:
         await sink.write_stdout(
             b'token":"refresh-value","oauthToken":"oauth-value","sshPrivate'
         )
-        await sink.write_stdout(b'Key":"ssh-value"} ')
+        await sink.write_stdout(
+            b'Key":"ssh-value","api\\u005fkey":"escaped-api-value",'
+            b'"client\\u00'
+        )
+        await sink.write_stdout(b'5fsecret":"escaped-client-value"} ')
         await sink.write_stdout(b"passwordHash=unquoted-hash token")
         await sink.write_stdout(b"Value: unquoted-token")
         receipt = await sink.commit()
@@ -596,7 +601,7 @@ def test_oauth_fields_are_redacted_across_stream_chunks(tmp_path: Path) -> None:
         ).ingest_stream(sink, receipt, now=NOW)
 
     result = asyncio.run(ingest_oauth_stream())
-    assert result.redaction_metadata.redaction_count == 11
+    assert result.redaction_metadata.redaction_count == 13
     assert result.redacted_artifacts[0].classification == "sensitive"
     assert {item.credential_type for item in result.detected_secrets} == {
         "tokenvalue",
@@ -608,6 +613,8 @@ def test_oauth_fields_are_redacted_across_stream_chunks(tmp_path: Path) -> None:
         "refresh_token",
         "oauthtoken",
         "sshprivatekey",
+        "api_key",
+        "client_secret",
     }
     artifact = result.redacted_artifacts[0]
     authorizer.set_grants(
@@ -630,7 +637,8 @@ def test_oauth_fields_are_redacted_across_stream_chunks(tmp_path: Path) -> None:
         b'"access_token":"[REDACTED]","serviceCredential":"[REDACTED]",'
         b'"passwordHash":"[REDACTED]","clientSecret":"[REDACTED]",'
         b'"refresh_token":"[REDACTED]","oauthToken":"[REDACTED]",'
-        b'"sshPrivateKey":"[REDACTED]"} '
+        b'"sshPrivateKey":"[REDACTED]","api\\u005fkey":"[REDACTED]",'
+        b'"client\\u005fsecret":"[REDACTED]"} '
         b"passwordHash=[REDACTED] tokenValue: [REDACTED]"
     )
     for value in (
@@ -643,11 +651,124 @@ def test_oauth_fields_are_redacted_across_stream_chunks(tmp_path: Path) -> None:
         b"refresh-value",
         b"oauth-value",
         b"ssh-value",
+        b"escaped-api-value",
+        b"escaped-client-value",
         b"unquoted-hash",
         b"unquoted-token",
     ):
         assert value not in visible
         assert value.decode() not in result.model_dump_json()
+
+
+@pytest.mark.parametrize(
+    ("channel", "failure_mode"),
+    (
+        ("stdout", "storage"),
+        ("stderr", "encryption"),
+        ("artifact", "audit"),
+    ),
+)
+def test_raw_chunk_failures_leave_no_secret_in_streaming_traceback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    channel: str,
+    failure_mode: str,
+) -> None:
+    mission_id = f"mission-stream-failure-{failure_mode}"
+    execution_id = f"execution-stream-failure-{failure_mode}"
+    keys = _keys()
+    audit = MissionAuditRecorder(
+        audit_log=MissionAuditLog(),
+        contexts=_AuditContexts(),
+    )
+    quarantine = EncryptedRawResultQuarantine(
+        root=tmp_path / f"{failure_mode}-quarantine",
+        keys=keys,
+        audit=audit,
+        max_item_bytes=4096,
+        mission_quota_bytes=16 * 1024,
+    )
+    sink = EncryptedRawResultSinkFactory(
+        quarantine=quarantine,
+        bindings=_StreamBindings(
+            QuarantineStreamBinding(
+                mission_id=mission_id,
+                mission_revision=1,
+                execution_id=execution_id,
+                retention_until=NOW + timedelta(hours=1),
+                max_result_bytes=4096,
+                resume_mode="from_start",
+            )
+        ),
+        clock=lambda: NOW,
+    ).for_execution(execution_id)
+
+    if failure_mode == "storage":
+
+        def fail_storage(**kwargs) -> None:
+            del kwargs
+            raise ArtifactSecurityError("simulated storage failure")
+
+        monkeypatch.setattr(sink._store, "write", fail_storage)
+    elif failure_mode == "encryption":
+
+        def fail_encryption(*args, **kwargs) -> None:
+            del args, kwargs
+            raise EncryptionKeyUnavailableError("simulated encryption failure")
+
+        monkeypatch.setattr(
+            sink._store._keys,
+            "seal_for_resource",
+            fail_encryption,
+        )
+    else:
+
+        def fail_audit(**kwargs) -> None:
+            del kwargs
+            raise AuditIntegrityError("simulated audit failure")
+
+        monkeypatch.setattr(sink._audit, "record", fail_audit)
+
+    raw_chunk = b"raw-provider-secret-must-not-enter-traceback"
+
+    async def write_failing_chunk() -> None:
+        if channel == "stdout":
+            await sink.write_stdout(raw_chunk)
+        elif channel == "stderr":
+            await sink.write_stderr(raw_chunk)
+        else:
+
+            async def chunks():
+                yield raw_chunk
+
+            await sink.write_artifact(
+                RawArtifactMetadata(
+                    artifact_sequence=0,
+                    suggested_name="result.bin",
+                    media_type="application/octet-stream",
+                    declared_size=len(raw_chunk),
+                ),
+                chunks(),
+            )
+
+    with pytest.raises(RawResultStreamingError) as captured:
+        asyncio.run(write_failing_chunk())
+
+    error = captured.value
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert raw_chunk.decode() not in str(error)
+    traceback = error.__traceback__
+    checked_streaming_frame = False
+    while traceback is not None:
+        if traceback.tb_frame.f_code.co_filename.endswith(
+            "data_security/streaming.py"
+        ):
+            checked_streaming_frame = True
+            assert "chunk" not in traceback.tb_frame.f_locals
+            assert raw_chunk not in traceback.tb_frame.f_locals.values()
+        traceback = traceback.tb_next
+    assert checked_streaming_frame
 
 
 def test_encrypted_store_fsyncs_parent_before_acknowledging_write(
