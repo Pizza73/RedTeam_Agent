@@ -4,7 +4,10 @@
 
 This repository implements a safety-first Red Team orchestration agent for authorized, isolated training environments. Do not add payload generation, implants, credential theft workflows, persistence, destructive actions, or live-target attack execution unless a later, explicitly authorized phase specification requires a safe adapter interface and test double.
 
-The current starting phase is Phase 0A. Phase 0B must not be implemented until the independent Phase 0A gate returns PASS for the latest commit.
+The starting phase is Phase 0A. Phase 0B must not begin until the independent Phase 0A gate returns
+PASS for the Phase 0B entry commit. Later cumulative Phase 0B commits keep that PASS as their
+trusted phase-base ancestor; they must not be relabeled or reviewed as Phase 0A merely because the
+pull-request HEAD advanced.
 
 ## Source of Truth
 
@@ -30,13 +33,16 @@ all of the following matching evidence:
 2. the latest `redteam-implementation-request` authored by `github-actions[bot]`, bound to the
    current input HEAD SHA and the trusted phase prompt; and
 3. for Phase 0B and later, the adjacent prior phase's `redteam-phase-gate` PASS authored by
-   `github-actions[bot]` and bound to that same HEAD SHA.
+   `github-actions[bot]` whose `reviewed_sha` is incorporated in the current input HEAD. If more
+   than one such PASS exists, the unique maximal PASS under Git ancestry is the phase base;
+   missing or incomparable maximal candidates are ambiguous and must be rejected.
 
 This narrow rule overrides only the snapshot fields in `docs/implementation-status.md`. It never
 overrides requirements, acceptance criteria, safety invariants, phase ordering, protected-file
 rules, Human Gates, or stop conditions. If the complete evidence chain is missing, stale,
 ambiguous, or inconsistent, stop with `BLOCKED`. After a default-branch refresh changes the PR
-HEAD, every earlier PASS for the old HEAD is stale and the rolled-back phase must pass again.
+HEAD, the rolled-back phase must pass again on the refreshed HEAD; an adjacent earlier-phase PASS
+may remain only as that phase's incorporated base, never as a PASS for the rolled-back phase.
 
 ## Protected Files
 

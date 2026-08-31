@@ -15,8 +15,10 @@ Implement or fix only the current `redteam-agent` phase.
 5. Inspect the current branch and relevant implementation/tests before editing.
 6. Require the request `head_sha` to equal the input branch SHA and require exactly one matching
    `phase-*` pull-request label when PR metadata is available.
-7. For Phase 0B and later, require the adjacent prior phase's trusted `redteam-phase-gate` PASS to
-   bind `reviewed_sha` to that same input SHA. The Phase fields in
+7. For Phase 0B and later, require the adjacent prior phase's trusted `redteam-phase-gate` PASS
+   `reviewed_sha` to be an ancestor of the input SHA. When multiple incorporated PASS records
+   exist, require exactly one maximal candidate under Git ancestry; never choose by comment order.
+   The Phase fields in
    `docs/implementation-status.md` are a bootstrap snapshot; the active PR evidence chain defined
    by `AGENTS.md` is authoritative only for current Phase/status resolution.
 

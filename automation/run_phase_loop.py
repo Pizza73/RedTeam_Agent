@@ -1762,16 +1762,43 @@ class PhaseLoop:
                 )
             return str(maximal[0].payload["target_base_sha"])
         previous = PHASES[index - 1]
-        passes = [
-            record
-            for record in phase_records
-            if record.payload.get("phase") == previous
-            and record.payload.get("verdict") == "PASS"
-            and SHA_PATTERN.fullmatch(str(record.payload.get("reviewed_sha", "")))
-        ]
-        if not passes:
+        pass_heads: set[str] = set()
+        for record in phase_records:
+            candidate_head = str(record.payload.get("reviewed_sha", ""))
+            if (
+                record.payload.get("phase") != previous
+                or record.payload.get("verdict") != "PASS"
+                or not SHA_PATTERN.fullmatch(candidate_head)
+                or not self.github.is_ancestor(candidate_head, state.head_sha)
+            ):
+                continue
+            validate_phase_gate_pass_record(
+                record,
+                phase=previous,
+                reviewed_sha=candidate_head,
+                reviewer_login=self.reviewer_login,
+                approver_login=self.approver_login,
+                pull_request_prefix=(
+                    f"https://github.com/{self.github.repository}/pull/{state.number}"
+                ),
+            )
+            pass_heads.add(candidate_head)
+        if not pass_heads:
             raise UntrustedEvidenceError(f"no trusted PASS record exists for {previous}")
-        return str(passes[-1].payload["reviewed_sha"])
+
+        maximal_heads = [
+            candidate
+            for candidate in pass_heads
+            if not any(
+                candidate != other and self.github.is_ancestor(candidate, other)
+                for other in pass_heads
+            )
+        ]
+        if len(maximal_heads) != 1:
+            raise UntrustedEvidenceError(
+                f"incorporated PASS evidence for {previous} is ambiguous"
+            )
+        return maximal_heads[0]
 
     def base_refresh_candidate(
         self,

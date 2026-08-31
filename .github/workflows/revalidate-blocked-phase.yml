@@ -1,14 +1,14 @@
-name: Revalidate Blocked AI Loop Prior Phase
+name: Recover Blocked AI Loop Current Phase
 
 on:
   workflow_dispatch:
     inputs:
       pull_request_number:
-        description: Blocked AI-loop pull request number
+        description: AI-loop pull request number
         required: true
         type: number
       source_phase:
-        description: Blocked phase whose adjacent prior phase must be revalidated
+        description: Current cumulative phase to recover
         required: true
         type: choice
         options:
@@ -17,27 +17,31 @@ on:
           - phase-1
           - phase-2
           - phase-3
+      reviewed_head_sha:
+        description: Exact 40-character HEAD carrying the trusted current-phase finding
+        required: true
+        type: string
       expected_head_sha:
-        description: Exact current 40-character PR head SHA
+        description: Exact current 40-character PR HEAD (same tree as reviewed HEAD)
         required: true
         type: string
       finding_reference:
-        description: Current-head Codex P0/P1 finding permalink
+        description: Trusted Codex P0/P1 finding permalink for the source phase
         required: true
         type: string
       confirmation:
-        description: Type REVALIDATE_PRIOR_PHASE
+        description: Type RECOVER_CURRENT_PHASE
         required: true
         type: string
 
 concurrency:
-  group: redteam-prior-phase-revalidation-${{ inputs.pull_request_number }}
+  group: redteam-current-phase-recovery-${{ inputs.pull_request_number }}
   cancel-in-progress: false
 
 permissions: {}
 
 jobs:
-  revalidate:
+  validate:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -46,8 +50,14 @@ jobs:
       pull-requests: read
     outputs:
       default_sha: ${{ steps.authorize.outputs.default_sha }}
+      evidence_digest: ${{ steps.authorize.outputs.evidence_digest }}
+      labels_digest: ${{ steps.authorize.outputs.labels_digest }}
+      phase_base_sha: ${{ steps.authorize.outputs.phase_base_sha }}
       phase_prompt: ${{ steps.authorize.outputs.phase_prompt }}
-      revalidate_phase: ${{ steps.authorize.outputs.revalidate_phase }}
+      prior_pass_comment_id: ${{ steps.authorize.outputs.prior_pass_comment_id }}
+      source_gate_comment_id: ${{ steps.authorize.outputs.source_gate_comment_id }}
+      source_review_id: ${{ steps.authorize.outputs.source_review_id }}
+      finding_comment_id: ${{ steps.authorize.outputs.finding_comment_id }}
     env:
       AI_GATE_APPROVER_LOGIN: ${{ vars.AI_GATE_APPROVER_LOGIN }}
       AI_REVIEWER_LOGIN: ${{ vars.AI_REVIEWER_LOGIN }}
@@ -55,36 +65,40 @@ jobs:
       EXPECTED_HEAD_SHA: ${{ inputs.expected_head_sha }}
       FINDING_REFERENCE: ${{ inputs.finding_reference }}
       PR_NUMBER: ${{ inputs.pull_request_number }}
+      REVIEWED_HEAD_SHA: ${{ inputs.reviewed_head_sha }}
       SOURCE_PHASE: ${{ inputs.source_phase }}
     steps:
-      - name: Authorize exact blocked-phase revalidation
+      - name: Authorize exact current-phase recovery
         id: authorize
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
         with:
           script: |
-            if (process.env.CONFIRMATION !== 'REVALIDATE_PRIOR_PHASE') {
+            const crypto = require('crypto');
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const pull_number = Number.parseInt(process.env.PR_NUMBER, 10);
+            const currentHead = process.env.EXPECTED_HEAD_SHA.trim();
+            const reviewedHead = process.env.REVIEWED_HEAD_SHA.trim();
+            const sourcePhase = process.env.SOURCE_PHASE.trim();
+            const findingReference = process.env.FINDING_REFERENCE.trim();
+
+            if (process.env.CONFIRMATION !== 'RECOVER_CURRENT_PHASE') {
               core.setFailed('Confirmation text does not match.');
               return;
             }
             if (!process.env.AI_GATE_APPROVER_LOGIN ||
                 context.actor !== process.env.AI_GATE_APPROVER_LOGIN) {
-              core.setFailed(`Untrusted prior-phase revalidation actor: ${context.actor}`);
+              core.setFailed(`Untrusted current-phase recovery actor: ${context.actor}`);
               return;
             }
             if (!process.env.AI_REVIEWER_LOGIN) {
               core.setFailed('AI_REVIEWER_LOGIN is not configured.');
               return;
             }
-
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
-            const pull_number = Number.parseInt(process.env.PR_NUMBER, 10);
-            const headSha = process.env.EXPECTED_HEAD_SHA.trim();
-            const sourcePhase = process.env.SOURCE_PHASE.trim();
-            const findingReference = process.env.FINDING_REFERENCE.trim();
             if (!Number.isInteger(pull_number) || pull_number < 1 ||
-                !/^[0-9a-f]{40}$/.test(headSha)) {
-              core.setFailed('Pull request number or head SHA is invalid.');
+                !/^[0-9a-f]{40}$/.test(currentHead) ||
+                !/^[0-9a-f]{40}$/.test(reviewedHead)) {
+              core.setFailed('Pull request number or recovery SHA is invalid.');
               return;
             }
             const expectedFindingPrefix =
@@ -94,17 +108,43 @@ jobs:
               return;
             }
 
-            const {data: pr} = await github.rest.pulls.get({owner, repo, pull_number});
-            const labels = pr.labels.map((item) => item.name);
-            const phases = labels.filter((name) => /^phase-(0a|0b|0c|[1-5])$/.test(name));
-            if (pr.state !== 'open' || pr.head.repo.full_name !== `${owner}/${repo}` ||
-                pr.base.ref !== context.payload.repository.default_branch ||
-                pr.head.sha !== headSha || phases.length !== 1 ||
-                phases[0] !== sourcePhase || !labels.includes('ai-loop') ||
-                !labels.includes('ai-loop-blocked') ||
-                labels.includes('ai-project-complete') || labels.includes('ai-human-gate')) {
-              core.setFailed('PR state does not match an exact blocked automatic-phase revalidation.');
-              return;
+            function singleMarker(body, name) {
+              const pattern = new RegExp(`<!--\\s*${name}\\s*([\\s\\S]*?)-->`, 'g');
+              const matches = [...(body || '').matchAll(pattern)];
+              if (matches.length !== 1) throw new Error(`${name} marker must occur exactly once.`);
+              const raw = matches[0][1].trim();
+              const keys = [...raw.matchAll(/"((?:\\.|[^"\\])*)"\\s*:/g)]
+                .map((item) => JSON.parse(`"${item[1]}"`));
+              if (new Set(keys).size !== keys.length) {
+                throw new Error(`${name} marker contains a duplicate JSON key.`);
+              }
+              return JSON.parse(raw);
+            }
+            function exactKeys(value, expected) {
+              return value && typeof value === 'object' && !Array.isArray(value) &&
+                JSON.stringify(Object.keys(value).sort()) ===
+                  JSON.stringify([...expected].sort());
+            }
+            function hasPassingRequiredChecks(record) {
+              return JSON.stringify(record.required_checks) === JSON.stringify([
+                {name: 'tests (3.12)', status: 'PASS'},
+                {name: 'tests (3.14)', status: 'PASS'},
+                {name: 'quality', status: 'PASS'},
+                {name: 'governance-integrity', status: 'PASS'},
+              ]);
+            }
+            function digest(value) {
+              return crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex');
+            }
+            async function isAncestor(ancestorSha, descendantSha) {
+              if (ancestorSha === descendantSha) return true;
+              const comparison = await github.request(
+                'GET /repos/{owner}/{repo}/compare/{basehead}',
+                {owner, repo, basehead: `${ancestorSha}...${descendantSha}`}
+              );
+              return comparison.data.merge_base_commit?.sha === ancestorSha &&
+                comparison.data.behind_by === 0 &&
+                ['ahead', 'identical'].includes(comparison.data.status);
             }
 
             const {data: planFile} = await github.rest.repos.getContent({
@@ -124,53 +164,125 @@ jobs:
             if (plan.schema_version !== '1.0' ||
                 plan.phases?.length !== expectedPhaseIds.length ||
                 plan.phases.some((item, index) => item.id !== expectedPhaseIds[index]) ||
-                sourceIndex < 1 || sourceIndex > 5) {
+                sourceIndex < 1 || sourceIndex > 5 ||
+                plan.phases[sourceIndex].label !== sourcePhase ||
+                typeof plan.phases[sourceIndex].prompt !== 'string') {
               core.setFailed('Trusted phase plan or automatic source phase is invalid.');
               return;
             }
-            const revalidatePhase = plan.phases[sourceIndex - 1];
-            if (typeof revalidatePhase.prompt !== 'string' ||
-                revalidatePhase.label !== revalidatePhase.id) {
-              core.setFailed('Adjacent prior-phase configuration is invalid.');
+            const priorPhase = plan.phases[sourceIndex - 1].id;
+
+            const {data: pr} = await github.rest.pulls.get({owner, repo, pull_number});
+            const labels = pr.labels.map((item) => item.name);
+            const phases = labels.filter((name) => /^phase-(0a|0b|0c|[1-5])$/.test(name));
+            if (pr.state !== 'open' || pr.head.repo.full_name !== `${owner}/${repo}` ||
+                pr.base.ref !== context.payload.repository.default_branch ||
+                pr.head.sha !== currentHead || phases.length !== 1 ||
+                ![sourcePhase, priorPhase].includes(phases[0]) ||
+                !labels.includes('ai-loop') || labels.includes('ai-project-complete') ||
+                labels.includes('ai-human-gate')) {
+              core.setFailed('PR state does not match an exact current-phase recovery.');
               return;
             }
-            const {data: defaultCommit} = await github.rest.repos.getCommit({
-              owner, repo, ref: context.payload.repository.default_branch,
-            });
+
+            const [{data: reviewedCommit}, {data: currentCommit}] = await Promise.all([
+              github.rest.repos.getCommit({owner, repo, ref: reviewedHead}),
+              github.rest.repos.getCommit({owner, repo, ref: currentHead}),
+            ]);
+            if (!await isAncestor(reviewedHead, currentHead) ||
+                reviewedCommit.commit.tree.sha !== currentCommit.commit.tree.sha) {
+              core.setFailed('Current HEAD must descend from and have the same tree as reviewed HEAD.');
+              return;
+            }
 
             const reviewComments = await github.paginate(
               github.rest.pulls.listReviewComments,
               {owner, repo, pull_number, per_page: 100}
             );
-            const finding = reviewComments.find(
-              (item) => item.html_url === findingReference
-            );
+            const finding = reviewComments.find((item) => item.html_url === findingReference);
             const priorities = new Set(
               [...(finding?.body || '').matchAll(/!\[P([01]) Badge\]/g)].map(
                 (match) => match[1]
               )
             );
             if (!finding || finding.user?.login !== process.env.AI_REVIEWER_LOGIN ||
-                finding.original_commit_id !== headSha || priorities.size !== 1 ||
+                finding.original_commit_id !== reviewedHead || priorities.size !== 1 ||
                 !Number.isInteger(finding.pull_request_review_id)) {
-              core.setFailed('Finding is not one unambiguous current-head Codex P0/P1.');
+              core.setFailed('Finding is not one unambiguous reviewed-head Codex P0/P1.');
               return;
             }
             const {data: review} = await github.rest.pulls.getReview({
-              owner, repo, pull_number,
-              review_id: finding.pull_request_review_id,
+              owner, repo, pull_number, review_id: finding.pull_request_review_id,
             });
             if (review.user?.login !== process.env.AI_REVIEWER_LOGIN ||
-                review.commit_id !== headSha || review.state !== 'COMMENTED') {
-              core.setFailed('Finding review is not bound to the exact current head.');
+                review.commit_id !== reviewedHead || review.state !== 'COMMENTED') {
+              core.setFailed('Finding review is not bound to the reviewed HEAD.');
               return;
             }
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number: pull_number, per_page: 100,
+            });
+            const gateKeys = [
+              'schema_version', 'phase', 'reviewed_sha', 'base_sha', 'verdict', 'summary',
+              'evidence_format', 'ready_reference', 'review_trigger_reference',
+              'review_reference', 'reviewer_login', 'recorded_by', 'finding_key',
+              'required_checks', 'loop_state'
+            ];
+            const gateCandidates = [];
+            const passCandidates = [];
+            for (const comment of comments) {
+              if (comment.user?.login !== 'github-actions[bot]' ||
+                  !comment.body?.includes('redteam-phase-gate')) continue;
+              let record;
+              try {
+                record = singleMarker(comment.body, 'redteam-phase-gate');
+              } catch (_) {
+                continue;
+              }
+              if (!exactKeys(record, gateKeys) || record.schema_version !== '1.0' ||
+                  record.evidence_format !== 'codex-native-v1') continue;
+              const evidence = {comment, record};
+              if (record.phase === sourcePhase && record.reviewed_sha === reviewedHead &&
+                  record.verdict === 'CHANGES_REQUESTED' &&
+                  ['CHANGES_REQUESTED', 'BLOCKED_LIMIT'].includes(record.loop_state) &&
+                  record.review_reference === review.html_url &&
+                  record.reviewer_login === process.env.AI_REVIEWER_LOGIN &&
+                  record.recorded_by === process.env.AI_GATE_APPROVER_LOGIN &&
+                  hasPassingRequiredChecks(record) &&
+                  /^[A-Z0-9][A-Z0-9._-]{0,63}$/.test(record.finding_key)) {
+                gateCandidates.push(evidence);
+              }
+              if (record.phase === priorPhase && record.verdict === 'PASS' &&
+                  record.loop_state === 'PASS' && record.finding_key === null &&
+                  record.reviewer_login === process.env.AI_REVIEWER_LOGIN &&
+                  record.recorded_by === process.env.AI_GATE_APPROVER_LOGIN &&
+                  hasPassingRequiredChecks(record)) {
+                passCandidates.push(evidence);
+              }
+            }
+            if (gateCandidates.length !== 1) {
+              core.setFailed('Exactly one trusted current-phase CHANGES_REQUESTED gate is required.');
+              return;
+            }
+            const sourceGate = gateCandidates[0];
+            const priorPasses = passCandidates.filter(
+              (item) => item.record.reviewed_sha === sourceGate.record.base_sha
+            );
+            if (priorPasses.length !== 1 ||
+                !/^[0-9a-f]{40}$/.test(sourceGate.record.base_sha) ||
+                !await isAncestor(sourceGate.record.base_sha, reviewedHead) ||
+                !await isAncestor(sourceGate.record.base_sha, currentHead)) {
+              core.setFailed('Current-phase gate is not bound to one incorporated adjacent PASS.');
+              return;
+            }
+            const priorPass = priorPasses[0];
 
             const requiredCheckNames = [
               'tests (3.12)', 'tests (3.14)', 'quality', 'governance-integrity',
             ];
             const checkRuns = await github.paginate(github.rest.checks.listForRef, {
-              owner, repo, ref: headSha, filter: 'latest', per_page: 100,
+              owner, repo, ref: currentHead, filter: 'latest', per_page: 100,
             });
             for (const name of requiredCheckNames) {
               const matches = checkRuns.filter(
@@ -182,11 +294,31 @@ jobs:
                 return;
               }
             }
-            core.setOutput('default_sha', defaultCommit.sha);
-            core.setOutput('phase_prompt', revalidatePhase.prompt);
-            core.setOutput('revalidate_phase', revalidatePhase.id);
 
-      - name: Check out exact PR head
+            const evidenceDigest = digest({
+              finding: [finding.id, finding.updated_at, finding.body, finding.html_url,
+                finding.original_commit_id, finding.pull_request_review_id, finding.user?.login],
+              review: [review.id, review.submitted_at, review.html_url, review.commit_id,
+                review.state, review.user?.login],
+              gate: [sourceGate.comment.id, sourceGate.comment.updated_at,
+                sourceGate.comment.body, sourceGate.comment.html_url],
+              pass: [priorPass.comment.id, priorPass.comment.updated_at,
+                priorPass.comment.body, priorPass.comment.html_url],
+            });
+            const {data: defaultCommit} = await github.rest.repos.getCommit({
+              owner, repo, ref: context.payload.repository.default_branch,
+            });
+            core.setOutput('default_sha', defaultCommit.sha);
+            core.setOutput('evidence_digest', evidenceDigest);
+            core.setOutput('labels_digest', digest([...labels].sort()));
+            core.setOutput('phase_base_sha', sourceGate.record.base_sha);
+            core.setOutput('phase_prompt', plan.phases[sourceIndex].prompt);
+            core.setOutput('prior_pass_comment_id', String(priorPass.comment.id));
+            core.setOutput('source_gate_comment_id', String(sourceGate.comment.id));
+            core.setOutput('source_review_id', String(review.id));
+            core.setOutput('finding_comment_id', String(finding.id));
+
+      - name: Check out exact current PR head
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
           ref: ${{ inputs.expected_head_sha }}
@@ -205,14 +337,14 @@ jobs:
           python -m pip install -r requirements.lock
           python -m pip install -e . --no-deps
 
-      - name: Run complete adjacent prior-phase gate
+      - name: Run complete current-phase gate
         env:
-          REVALIDATE_PHASE: ${{ steps.authorize.outputs.revalidate_phase }}
+          SOURCE_PHASE: ${{ inputs.source_phase }}
         shell: bash
-        run: bash scripts/ci/run_phase_gate.sh "$REVALIDATE_PHASE"
+        run: bash scripts/ci/run_phase_gate.sh "$SOURCE_PHASE"
 
   publish:
-    needs: revalidate
+    needs: validate
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -224,80 +356,93 @@ jobs:
     env:
       AI_GATE_APPROVER_LOGIN: ${{ vars.AI_GATE_APPROVER_LOGIN }}
       AI_REVIEWER_LOGIN: ${{ vars.AI_REVIEWER_LOGIN }}
-      AUTHORIZED_DEFAULT_SHA: ${{ needs.revalidate.outputs.default_sha }}
+      AUTHORIZED_DEFAULT_SHA: ${{ needs.validate.outputs.default_sha }}
+      AUTHORIZED_EVIDENCE_DIGEST: ${{ needs.validate.outputs.evidence_digest }}
+      AUTHORIZED_LABELS_DIGEST: ${{ needs.validate.outputs.labels_digest }}
       CONFIRMATION: ${{ inputs.confirmation }}
       EXPECTED_HEAD_SHA: ${{ inputs.expected_head_sha }}
+      FINDING_COMMENT_ID: ${{ needs.validate.outputs.finding_comment_id }}
       FINDING_REFERENCE: ${{ inputs.finding_reference }}
-      PHASE_PROMPT: ${{ needs.revalidate.outputs.phase_prompt }}
+      PHASE_BASE_SHA: ${{ needs.validate.outputs.phase_base_sha }}
+      PHASE_PROMPT: ${{ needs.validate.outputs.phase_prompt }}
+      PRIOR_PASS_COMMENT_ID: ${{ needs.validate.outputs.prior_pass_comment_id }}
       PR_NUMBER: ${{ inputs.pull_request_number }}
-      REVALIDATE_PHASE: ${{ needs.revalidate.outputs.revalidate_phase }}
+      REVIEWED_HEAD_SHA: ${{ inputs.reviewed_head_sha }}
+      SOURCE_GATE_COMMENT_ID: ${{ needs.validate.outputs.source_gate_comment_id }}
       SOURCE_PHASE: ${{ inputs.source_phase }}
+      SOURCE_REVIEW_ID: ${{ needs.validate.outputs.source_review_id }}
     steps:
-      - name: Publish exact revalidation evidence and roll back one phase
+      - name: Publish current-phase recovery evidence
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
         with:
           script: |
+            const crypto = require('crypto');
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const pull_number = Number.parseInt(process.env.PR_NUMBER, 10);
-            const headSha = process.env.EXPECTED_HEAD_SHA.trim();
+            const currentHead = process.env.EXPECTED_HEAD_SHA.trim();
+            const reviewedHead = process.env.REVIEWED_HEAD_SHA.trim();
             const sourcePhase = process.env.SOURCE_PHASE.trim();
-            const findingReference = process.env.FINDING_REFERENCE.trim();
-            const revalidatePhase = process.env.REVALIDATE_PHASE.trim();
-            const phasePrompt = process.env.PHASE_PROMPT.trim();
-            if (process.env.CONFIRMATION !== 'REVALIDATE_PRIOR_PHASE' ||
+            function digest(value) {
+              return crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex');
+            }
+            if (process.env.CONFIRMATION !== 'RECOVER_CURRENT_PHASE' ||
                 context.actor !== process.env.AI_GATE_APPROVER_LOGIN) {
-              core.setFailed('Revalidation authority changed before publication.');
+              core.setFailed('Current-phase recovery authority changed before publication.');
               return;
             }
 
-            const {data: defaultCommit} = await github.rest.repos.getCommit({
-              owner, repo, ref: context.payload.repository.default_branch,
+            const [{data: defaultCommit}, {data: pr}, {data: reviewedCommit},
+              {data: currentCommit}, {data: finding}, {data: review},
+              {data: gateComment}, {data: passComment}] = await Promise.all([
+              github.rest.repos.getCommit({
+                owner, repo, ref: context.payload.repository.default_branch,
+              }),
+              github.rest.pulls.get({owner, repo, pull_number}),
+              github.rest.repos.getCommit({owner, repo, ref: reviewedHead}),
+              github.rest.repos.getCommit({owner, repo, ref: currentHead}),
+              github.rest.pulls.getReviewComment({
+                owner, repo, comment_id: Number(process.env.FINDING_COMMENT_ID),
+              }),
+              github.rest.pulls.getReview({
+                owner, repo, pull_number, review_id: Number(process.env.SOURCE_REVIEW_ID),
+              }),
+              github.rest.issues.getComment({
+                owner, repo, comment_id: Number(process.env.SOURCE_GATE_COMMENT_ID),
+              }),
+              github.rest.issues.getComment({
+                owner, repo, comment_id: Number(process.env.PRIOR_PASS_COMMENT_ID),
+              }),
+            ]);
+            const labels = pr.labels.map((item) => item.name);
+            const phases = labels.filter((name) => /^phase-(0a|0b|0c|[1-5])$/.test(name));
+            if (defaultCommit.sha !== process.env.AUTHORIZED_DEFAULT_SHA ||
+                pr.state !== 'open' || pr.head.repo.full_name !== `${owner}/${repo}` ||
+                pr.head.sha !== currentHead || phases.length !== 1 ||
+                !labels.includes('ai-loop') || labels.includes('ai-project-complete') ||
+                labels.includes('ai-human-gate') ||
+                digest([...labels].sort()) !== process.env.AUTHORIZED_LABELS_DIGEST ||
+                reviewedCommit.commit.tree.sha !== currentCommit.commit.tree.sha) {
+              core.setFailed('Repository or PR state changed during current-phase validation.');
+              return;
+            }
+            const evidenceDigest = digest({
+              finding: [finding.id, finding.updated_at, finding.body, finding.html_url,
+                finding.original_commit_id, finding.pull_request_review_id, finding.user?.login],
+              review: [review.id, review.submitted_at, review.html_url, review.commit_id,
+                review.state, review.user?.login],
+              gate: [gateComment.id, gateComment.updated_at, gateComment.body,
+                gateComment.html_url],
+              pass: [passComment.id, passComment.updated_at, passComment.body,
+                passComment.html_url],
             });
-            if (defaultCommit.sha !== process.env.AUTHORIZED_DEFAULT_SHA) {
-              core.setFailed('Default branch changed during prior-phase validation.');
-              return;
-            }
-            const {data: pr} = await github.rest.pulls.get({owner, repo, pull_number});
-            const originalLabels = pr.labels.map((item) => item.name);
-            const phases = originalLabels.filter(
-              (name) => /^phase-(0a|0b|0c|[1-5])$/.test(name)
-            );
-            if (pr.state !== 'open' || pr.head.repo.full_name !== `${owner}/${repo}` ||
-                pr.head.sha !== headSha || phases.length !== 1 ||
-                phases[0] !== sourcePhase || !originalLabels.includes('ai-loop') ||
-                !originalLabels.includes('ai-loop-blocked') ||
-                originalLabels.includes('ai-project-complete') ||
-                originalLabels.includes('ai-human-gate')) {
-              core.setFailed('PR state changed during prior-phase validation.');
-              return;
-            }
-
-            const reviewComments = await github.paginate(
-              github.rest.pulls.listReviewComments,
-              {owner, repo, pull_number, per_page: 100}
-            );
-            const finding = reviewComments.find(
-              (item) => item.html_url === findingReference
-            );
-            const priorities = new Set(
-              [...(finding?.body || '').matchAll(/!\[P([01]) Badge\]/g)].map(
-                (match) => match[1]
-              )
-            );
-            if (!finding || finding.user?.login !== process.env.AI_REVIEWER_LOGIN ||
-                finding.original_commit_id !== headSha || priorities.size !== 1 ||
-                !Number.isInteger(finding.pull_request_review_id)) {
-              core.setFailed('Finding is not one unambiguous current-head Codex P0/P1.');
-              return;
-            }
-            const {data: review} = await github.rest.pulls.getReview({
-              owner, repo, pull_number,
-              review_id: finding.pull_request_review_id,
-            });
-            if (review.user?.login !== process.env.AI_REVIEWER_LOGIN ||
-                review.commit_id !== headSha || review.state !== 'COMMENTED') {
-              core.setFailed('Finding review is not bound to the exact current head.');
+            if (evidenceDigest !== process.env.AUTHORIZED_EVIDENCE_DIGEST ||
+                finding.html_url !== process.env.FINDING_REFERENCE ||
+                finding.user?.login !== process.env.AI_REVIEWER_LOGIN ||
+                review.user?.login !== process.env.AI_REVIEWER_LOGIN ||
+                finding.original_commit_id !== reviewedHead ||
+                review.commit_id !== reviewedHead) {
+              core.setFailed('Current-phase review evidence changed during validation.');
               return;
             }
 
@@ -305,7 +450,7 @@ jobs:
               'tests (3.12)', 'tests (3.14)', 'quality', 'governance-integrity',
             ];
             const checkRuns = await github.paginate(github.rest.checks.listForRef, {
-              owner, repo, ref: headSha, filter: 'latest', per_page: 100,
+              owner, repo, ref: currentHead, filter: 'latest', per_page: 100,
             });
             for (const name of requiredCheckNames) {
               const matches = checkRuns.filter(
@@ -313,7 +458,7 @@ jobs:
               );
               if (matches.length !== 1 || matches[0].status !== 'completed' ||
                   matches[0].conclusion !== 'success') {
-                core.setFailed(`Required current-head check is not uniquely successful: ${name}`);
+                core.setFailed(`Required current-head check changed: ${name}`);
                 return;
               }
             }
@@ -322,14 +467,14 @@ jobs:
               schema_version: '1.0',
               action: 'IMPLEMENT_PHASE',
               trigger: 'HUMAN_RESUME',
-              phase: revalidatePhase,
-              head_sha: headSha,
-              phase_prompt: phasePrompt,
+              phase: sourcePhase,
+              head_sha: currentHead,
+              phase_prompt: process.env.PHASE_PROMPT.trim(),
             };
             const ready = {
               schema_version: '1.0',
-              phase: revalidatePhase,
-              head_sha: headSha,
+              phase: sourcePhase,
+              head_sha: currentHead,
             };
             const requestMarker =
               `<!-- redteam-implementation-request\n${JSON.stringify(request)}\n-->`;
@@ -345,34 +490,24 @@ jobs:
             if (!duplicate) {
               await github.rest.issues.createComment({
                 owner, repo, issue_number: pull_number,
-                body: `Human-authorized adjacent prior-phase revalidation passed for \`${revalidatePhase}\` at \`${headSha}\`. The PR remains subject to an independent SHA-bound Codex review.\n\nBlocked-phase finding: ${findingReference}\n\n${requestMarker}\n\n${readyMarker}`,
+                body: `Human-authorized current-phase recovery passed for \`${sourcePhase}\` at \`${currentHead}\`. The current tree is identical to reviewed HEAD \`${reviewedHead}\`; a new independent current-HEAD review is still required.\n\nPrior finding: ${process.env.FINDING_REFERENCE}\nPhase base: \`${process.env.PHASE_BASE_SHA}\`\n\n${requestMarker}\n\n${readyMarker}`,
               });
             }
             await github.rest.repos.createCommitStatus({
-              owner, repo, sha: headSha, state: 'pending',
+              owner, repo, sha: currentHead, state: 'pending',
               context: 'redteam/phase-review',
-              description: `${revalidatePhase}: independent revalidation review pending`.slice(0, 140),
+              description: `${sourcePhase}: recovered review pending`.slice(0, 140),
             });
 
-            const {data: beforeLabels} = await github.rest.pulls.get({
-              owner, repo, pull_number,
-            });
-            const liveLabels = beforeLabels.labels.map((item) => item.name);
-            if (beforeLabels.head.sha !== headSha ||
-                JSON.stringify([...liveLabels].sort()) !==
-                JSON.stringify([...originalLabels].sort())) {
-              core.setFailed('PR changed before the exact prior-phase label transition.');
-              return;
-            }
             const controlLabels = new Set([
               'ai-needs-implementation', 'ai-needs-fix', 'ai-needs-review',
               'ai-review-passed', 'ai-loop-blocked', 'ai-human-gate',
             ]);
-            const desiredLabels = liveLabels.filter(
+            const desiredLabels = labels.filter(
               (name) => !/^phase-(0a|0b|0c|[1-5])$/.test(name) &&
                 !controlLabels.has(name)
             );
-            desiredLabels.push(revalidatePhase, 'ai-needs-review');
+            desiredLabels.push(sourcePhase, 'ai-needs-review');
             desiredLabels.sort();
             await github.rest.issues.setLabels({
               owner, repo, issue_number: pull_number, labels: desiredLabels,
@@ -381,8 +516,8 @@ jobs:
               owner, repo, pull_number,
             });
             const updatedLabels = updated.labels.map((item) => item.name).sort();
-            if (updated.head.sha !== headSha ||
+            if (updated.head.sha !== currentHead ||
                 JSON.stringify(updatedLabels) !== JSON.stringify(desiredLabels)) {
-              core.setFailed('PR changed during the exact prior-phase label transition.');
+              core.setFailed('PR changed during the exact current-phase label transition.');
               return;
             }
