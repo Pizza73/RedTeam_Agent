@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from threading import Event
 
 import pytest
 from pydantic import ValidationError
@@ -334,8 +336,9 @@ def test_oauth_fields_are_redacted_across_stream_chunks(tmp_path: Path) -> None:
 
     async def ingest_oauth_stream():
         sink = factory.for_execution("execution-oauth")
-        await sink.write_stdout(b'{"access_')
-        await sink.write_stdout(b'token":"access-value","client')
+        await sink.write_stdout(b'{"credential":"complete-value","access_')
+        await sink.write_stdout(b'token":"access-value","serviceCred')
+        await sink.write_stdout(b'ential":"cross-value","client')
         await sink.write_stdout(b'Secret":"client-value","refresh_')
         await sink.write_stdout(
             b'token":"refresh-value","oauthToken":"oauth-value"}'
@@ -348,10 +351,12 @@ def test_oauth_fields_are_redacted_across_stream_chunks(tmp_path: Path) -> None:
         ).ingest_stream(sink, receipt, now=NOW)
 
     result = asyncio.run(ingest_oauth_stream())
-    assert result.redaction_metadata.redaction_count == 4
+    assert result.redaction_metadata.redaction_count == 6
     assert result.redacted_artifacts[0].classification == "sensitive"
     assert {item.credential_type for item in result.detected_secrets} == {
+        "credential",
         "access_token",
+        "servicecredential",
         "clientsecret",
         "refresh_token",
         "oauthtoken",
@@ -373,10 +378,18 @@ def test_oauth_fields_are_redacted_across_stream_chunks(tmp_path: Path) -> None:
     )
     visible = artifacts.read(artifact, operation="read", now=NOW)
     assert visible == (
-        b'{"access_token":"[REDACTED]","clientSecret":"[REDACTED]",'
+        b'{"credential":"[REDACTED]","access_token":"[REDACTED]",'
+        b'"serviceCredential":"[REDACTED]","clientSecret":"[REDACTED]",'
         b'"refresh_token":"[REDACTED]","oauthToken":"[REDACTED]"}'
     )
-    for value in (b"access-value", b"client-value", b"refresh-value", b"oauth-value"):
+    for value in (
+        b"complete-value",
+        b"access-value",
+        b"cross-value",
+        b"client-value",
+        b"refresh-value",
+        b"oauth-value",
+    ):
         assert value not in visible
         assert value.decode() not in result.model_dump_json()
 
@@ -1148,6 +1161,111 @@ def test_storage_rejects_traversal_symlink_quota_retention_and_corruption(
     assert all(
         raw_secret not in path.read_bytes() for path in tmp_path.rglob("*.json")
     )
+
+
+def test_artifact_quota_is_serialized_across_store_instances(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    keys = _keys()
+    authorizer = _ExactEnvelopeAuthorizer()
+    authorizer.allow_ingestion_write("mission-quota", "execution-first")
+    authorizer.allow_ingestion_write("mission-quota", "execution-second")
+    audit = MissionAuditRecorder(audit_log=MissionAuditLog(), contexts=_AuditContexts())
+    artifact_root = tmp_path / "concurrent-artifacts"
+    first_store = ArtifactStore(
+        root=artifact_root,
+        keys=keys,
+        authorizer=authorizer,
+        audit=audit,
+        max_item_bytes=10,
+        mission_quota_bytes=10,
+    )
+    second_store = ArtifactStore(
+        root=artifact_root,
+        keys=keys,
+        authorizer=authorizer,
+        audit=audit,
+        max_item_bytes=10,
+        mission_quota_bytes=10,
+    )
+    first_atomic_started = Event()
+    release_first_write = Event()
+    second_call_started = Event()
+    second_atomic_started = Event()
+    original_first_atomic_write = first_store._store._atomic_write
+    original_second_atomic_write = second_store._store._atomic_write
+
+    def pause_first_atomic_write(path: Path, data: bytes) -> None:
+        first_atomic_started.set()
+        if not release_first_write.wait(timeout=5):
+            raise AssertionError("timed out waiting to release the first write")
+        original_first_atomic_write(path, data)
+
+    def observe_second_atomic_write(path: Path, data: bytes) -> None:
+        second_atomic_started.set()
+        original_second_atomic_write(path, data)
+
+    monkeypatch.setattr(first_store._store, "_atomic_write", pause_first_atomic_write)
+    monkeypatch.setattr(
+        second_store._store,
+        "_atomic_write",
+        observe_second_atomic_write,
+    )
+
+    def put_first():
+        return first_store.put(
+            mission_id="mission-quota",
+            content=b"first!",
+            media_type="text/plain",
+            classification="normal",
+            variant="redacted",
+            source_execution_id="execution-first",
+            created_at=NOW,
+        )
+
+    def put_second():
+        second_call_started.set()
+        return second_store.put(
+            mission_id="mission-quota",
+            content=b"second",
+            media_type="text/plain",
+            classification="normal",
+            variant="redacted",
+            source_execution_id="execution-second",
+            created_at=NOW,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first_future = executor.submit(put_first)
+        assert first_atomic_started.wait(timeout=5)
+        second_future = executor.submit(put_second)
+        assert second_call_started.wait(timeout=5)
+        try:
+            assert not second_atomic_started.wait(timeout=0.2)
+        finally:
+            release_first_write.set()
+        first_reference = first_future.result(timeout=5)
+        with pytest.raises(ArtifactSecurityError, match="quota"):
+            second_future.result(timeout=5)
+
+    assert not second_atomic_started.is_set()
+    assert len(list((artifact_root / "mission-quota").glob("*.json"))) == 1
+    authorizer.set_grants(
+        "mission-quota",
+        (
+            DataAccessGrant(
+                resource_type="artifact",
+                resource=ResourceBinding(
+                    resource_id=first_reference.artifact_id,
+                    resource_version="1",
+                    resource_digest=first_reference.sha256,
+                ),
+                operations=frozenset({"read"}),
+            ),
+        ),
+    )
+    assert first_store.read(first_reference, operation="read", now=NOW) == b"first!"
 
 
 def test_artifact_expiry_is_audited_and_resumes_cryptographic_erasure(

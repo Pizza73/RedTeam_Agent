@@ -4,16 +4,16 @@
 
 - Current phase: `Phase 0C: Data Security and Audit`
 - Input review SHA: `6b55fe9ba6cf0453e8c8ba33af3a3a9368944df5`
-- Latest correction input SHA: `68a47875eb5b77ea2ab5d2ee0570f57d7706f867`
+- Latest correction input SHA: `29a9f11fc316cb348ef685c96abed8e09a5f9bc1`
 - Trusted Phase 0B base PASS SHA: `5cda9a5f8792ee33c3e153d8e791499f5619d82e`
 - Implementation branch: `ai/redteam-agent-phase-loop`
 - Independent-review result: `CHANGES_REQUESTED`
-- Latest finding key: `CODEX-P1-0B4FA62084F27547`
+- Latest finding key: `CODEX-P1-59D132BD598A7EFA`
 - External provider, C2, MCP side effect, local attack, and external-target execution: absent
 
 ## Resulting working-tree diff
 
-The latest correction updates two implementation/test files and this report. No protected
+The latest correction updates three implementation/test files and this report. No protected
 governance file listed in `AGENTS.md` was modified. In particular, `SystemDesign.md`, `.github/**`,
 `automation/**`, requirements, acceptance criteria, safety invariants, implementation status,
 phase prompts, CI scripts, and dependency manifests are unchanged.
@@ -166,6 +166,25 @@ under `CODEX-P1-0B4FA62084F27547`. The exact-SHA Human Resume covers both findin
   idempotent delete audit and resource-key destruction. Stream chunks are erased before the
   manifest; symlinked intent paths fail closed, and restart or repeated calls resume safely.
 
+## Sixth independent review correction cycle
+
+The review for exact HEAD `29a9f11fc316cb348ef685c96abed8e09a5f9bc1` recorded two P1 findings
+under `CODEX-P1-59D132BD598A7EFA`. The exact-SHA Human Resume covers both findings:
+
+- [`discussion_r3895731854`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3895731854):
+  quoted structured keys containing credential-bearing components are now detected without relying
+  on a finite exact-field allowlist. Complete `credential` and cross-chunk `serviceCredential`
+  values become Secret references; raw values never enter the redacted Artifact or result model.
+- [`discussion_r3895731866`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3895731866):
+  encrypted writes now hold a store-root filesystem transaction lock across the existence check,
+  verified idempotency decision, mission quota reservation, encryption, and immutable creation.
+  Final creation uses an atomic no-replace hard link, so separate Store instances and processes
+  cannot race an overwrite or independently admit writes beyond the shared quota.
+
+This cycle adds complete and chunk-boundary generic credential regressions plus a controlled
+two-instance concurrent write that proves the second write cannot reach creation while the first
+transaction is pending and is rejected once the committed quota is re-evaluated.
+
 ## Regression tests added
 
 The existing Phase 0C security test module now additionally covers:
@@ -203,7 +222,11 @@ The existing Phase 0C security test module now additionally covers:
   reference-only results, and exact redacted Artifact output; and
 - Artifact expiry before retention and without write authority rejection, deletion-intent symlink
   rejection, interrupted erasure, process reconstruction, idempotent audit, and restored-ciphertext
-  failure after per-resource key destruction.
+  failure after per-resource key destruction;
+- complete and cross-chunk generic credential-bearing structured keys, with raw-value exclusion
+  from both redacted Artifact and result serialization; and
+- two concurrent Artifact Store instances sharing one quota, including serialization before atomic
+  creation, post-commit quota re-evaluation, and surviving ciphertext integrity.
 
 No test was removed, weakened, skipped, or marked as an expected failure.
 
@@ -223,8 +246,8 @@ ruff: All checks passed
 mypy: Success: no issues found in 78 source files
 unit: 186 passed
 integration: 7 passed
-security: 155 passed
-full/coverage run: 348 passed
+security: 156 passed
+full/coverage run: 349 passed
 skipped=0, errors=0, failures=0
 coverage: 82% total (branch coverage enabled)
 pip check: No broken requirements found
@@ -240,8 +263,8 @@ PATH="$PWD/.venv/bin:$PATH" python -m pytest -q \
   tests/security/test_phase0c_data_security.py
 ```
 
-Latest focused Phase 0C security result: `11 passed`. The two new targeted regressions pass with
-`2 passed, 9 deselected`.
+Latest focused Phase 0C security result: `12 passed`. The two new targeted regressions pass with
+`2 passed, 10 deselected`.
 
 ## Remaining constraints
 

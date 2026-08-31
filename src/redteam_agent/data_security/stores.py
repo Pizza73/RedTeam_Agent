@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import os
 import re
+import stat
 import tempfile
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Iterator
+from contextlib import contextmanager, suppress
 from datetime import datetime
 from pathlib import Path
 from threading import RLock
@@ -163,6 +166,12 @@ class _EncryptedFileStore:
         self._max_item_bytes = max_item_bytes
         self._mission_quota_bytes = mission_quota_bytes
         self._lock = RLock()
+        self._transaction_lock_path = self._root / ".write-transaction.lock"
+        if self._transaction_lock_path.is_symlink() or (
+            self._transaction_lock_path.exists()
+            and not self._transaction_lock_path.is_file()
+        ):
+            raise ArtifactSecurityError("store transaction lock is invalid")
 
     def write(
         self,
@@ -177,8 +186,8 @@ class _EncryptedFileStore:
         _require_bytes(content)
         if len(content) > self._max_item_bytes:
             raise ArtifactSecurityError("resource exceeds its size limit")
-        path = self._path(mission_id, resource_id, create_parent=True)
-        with self._lock:
+        with self._lock, self._write_transaction():
+            path = self._path(mission_id, resource_id, create_parent=True)
             if path.exists():
                 existing = self._load_envelope(path)
                 if not (
@@ -193,13 +202,23 @@ class _EncryptedFileStore:
                     mission_id=mission_id,
                     resource_id=resource_id,
                     binding=binding,
-                    expected_encryption_metadata_id=existing.encryption_metadata_id,
+                    expected_encryption_metadata_id=(
+                        existing.encryption_metadata_id
+                    ),
                     now=None,
                 )
                 if plaintext != content:
-                    raise ArtifactSecurityError("resource identifier conflicts with stored content")
-                return existing.plaintext_sha256, existing.encryption_metadata_id
-            if self._mission_usage(path.parent) + len(content) > self._mission_quota_bytes:
+                    raise ArtifactSecurityError(
+                        "resource identifier conflicts with stored content"
+                    )
+                return (
+                    existing.plaintext_sha256,
+                    existing.encryption_metadata_id,
+                )
+            if (
+                self._mission_usage(path.parent) + len(content)
+                > self._mission_quota_bytes
+            ):
                 raise ArtifactSecurityError("mission storage quota exceeded")
             content_digest = self._content_digest(content)
             aad = self._aad(
@@ -232,8 +251,41 @@ class _EncryptedFileStore:
                 encryption_metadata_id=metadata_id,
                 payload=encrypted,
             )
-            self._atomic_write(path, canonicalize(envelope.model_dump(mode="python")))
+            self._atomic_write(
+                path,
+                canonicalize(envelope.model_dump(mode="python")),
+            )
             return envelope.plaintext_sha256, metadata_id
+
+    @contextmanager
+    def _write_transaction(self) -> Iterator[None]:
+        flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(self._transaction_lock_path, flags, 0o600)
+        except OSError as exc:
+            raise ArtifactSecurityError(
+                "store transaction lock is unavailable"
+            ) from exc
+        locked = False
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                raise ArtifactSecurityError("store transaction lock is invalid")
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+            except OSError as exc:
+                raise ArtifactSecurityError(
+                    "store transaction lock acquisition failed"
+                ) from exc
+            locked = True
+            yield
+        finally:
+            if locked:
+                with suppress(OSError):
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
 
     def read(
         self,
@@ -541,9 +593,14 @@ class _EncryptedFileStore:
                 stream.write(data)
                 stream.flush()
                 os.fsync(stream.fileno())
-            if path.exists() or path.is_symlink():
-                raise ArtifactSecurityError("resource identifier already exists")
-            os.replace(temporary, path)
+            try:
+                os.link(temporary, path, follow_symlinks=False)
+            except FileExistsError:
+                raise ArtifactSecurityError(
+                    "resource identifier already exists"
+                ) from None
+            except OSError as exc:
+                raise ArtifactSecurityError("resource creation failed") from exc
         finally:
             if temporary.exists():
                 temporary.unlink()

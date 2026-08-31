@@ -42,6 +42,14 @@ _SECRET_KEYWORDS = (
     b"secret",
 )
 _BEARER_KEYWORD = b"bearer"
+_CREDENTIAL_KEY_COMPONENTS = (
+    b"credential",
+    b"password",
+    b"passwd",
+    b"secret",
+    b"token",
+    b"apikey",
+)
 _SECRET_TERMINATORS = frozenset(b" \t\n\r\v\f,;}]" + bytes((34, 39)))
 _SECRET_WHITESPACE = frozenset(b" \t\n\r\v\f")
 _QUOTE_BYTES = frozenset(b"\"'")
@@ -133,6 +141,26 @@ class _StreamingSecretRedactor:
             if candidate == possible:
                 keyword = possible
                 break
+        if keyword is None and key_quote is not None:
+            cursor = keyword_start
+            while cursor < len(data) and data[cursor] != key_quote:
+                if data[cursor] == 92:
+                    if cursor + 1 == len(data):
+                        return None if final else "incomplete"
+                    cursor += 2
+                    continue
+                cursor += 1
+            if cursor == len(data):
+                return None if final else "incomplete"
+            structured_key = data[keyword_start:cursor]
+            normalized_key = structured_key.lower().replace(b"_", b"").replace(
+                b"-", b""
+            )
+            if any(
+                component in normalized_key
+                for component in _CREDENTIAL_KEY_COMPONENTS
+            ):
+                keyword = structured_key
         if keyword is None:
             return None
         keyword_end = keyword_start + len(keyword)
