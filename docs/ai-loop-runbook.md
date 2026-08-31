@@ -189,6 +189,15 @@ machine-readable phase record.
 - `BLOCKED`: resolve the recorded cause. For Phase 0A through Phase 3, run **Resume AI Loop** with
   the current HEAD SHA and a repository permalink documenting the resolution, then restart the
   local command.
+- If the active-PR authority rule requires the adjacent prior-Phase PASS on the current blocked
+  HEAD, do not use Resume AI Loop first and do not change labels manually. Run **Revalidate Blocked
+  AI Loop Prior Phase** with the blocked source Phase, exact current HEAD, current-head Codex P0/P1
+  permalink, and `REVALIDATE_PRIOR_PHASE`. The approver-restricted workflow revalidates the live
+  finding and required checks, runs the complete adjacent prior-Phase gate, posts a same-HEAD
+  implementation/ready evidence pair, and replaces the blocked source Phase label with exactly the
+  adjacent prior Phase plus `ai-needs-review`. Restart the local runner to obtain a fresh independent
+  PASS. Normal Phase advancement then recreates the source-Phase request on that same SHA. If
+  `main` also advanced, the existing exact-SHA base-refresh flow runs only after that fresh PASS.
 - Before Phase 4 or Phase 5: approve `automation/provider-gates.json` in a separate,
   human-reviewed `governance-change` PR, merge it to `main`, run **Advance AI Loop Phase**, then
   restart the local command. The approved phase is automated, but the gate itself is not.

@@ -175,6 +175,63 @@ def test_resume_workflow_can_comment_on_pr_without_merge_authority() -> None:
         assert forbidden_operation not in workflow
 
 
+def test_blocked_phase_revalidation_is_exact_head_and_fail_closed() -> None:
+    workflow = (
+        REPO_ROOT / ".github" / "workflows" / "revalidate-blocked-phase.yml"
+    ).read_text(encoding="utf-8")
+    assert "\npermissions: {}\n" in workflow
+    assert """  revalidate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      checks: read
+      contents: read
+      pull-requests: read
+""" in workflow
+    assert """  publish:
+    needs: revalidate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      checks: read
+      contents: read
+      issues: write
+      pull-requests: write
+      statuses: write
+""" in workflow
+    for required_control in (
+        "REVALIDATE_PRIOR_PHASE",
+        "AI_GATE_APPROVER_LOGIN",
+        "AI_REVIEWER_LOGIN",
+        "ai-loop-blocked",
+        "original_commit_id !== headSha",
+        "review.commit_id !== headSha",
+        "Required current-head check is not uniquely successful",
+        "Default branch changed during prior-phase validation",
+        'run: bash scripts/ci/run_phase_gate.sh "$REVALIDATE_PHASE"',
+        "redteam-implementation-request",
+        "redteam-ready-for-review",
+        "github.rest.issues.setLabels",
+        "PR changed before the exact prior-phase label transition",
+        "PR changed during the exact prior-phase label transition",
+    ):
+        assert required_control in workflow
+    read_only_job = workflow.split("\n  publish:\n", maxsplit=1)[0]
+    assert "issues: write" not in read_only_job
+    assert "pull-requests: write" not in read_only_job
+    assert "statuses: write" not in read_only_job
+    assert "sourceIndex < 1 || sourceIndex > 5" in workflow
+    assert "contents: write" not in workflow
+    assert "secrets." not in workflow
+    for forbidden_operation in (
+        "github.rest.pulls.merge",
+        "mergePullRequest",
+        "updateBranch",
+        "/pulls/{number}/merge",
+    ):
+        assert forbidden_operation not in workflow
+
+
 def test_documented_reviewer_login_includes_bot_suffix() -> None:
     runbook = (REPO_ROOT / "docs" / "ai-loop-runbook.md").read_text(encoding="utf-8")
 
