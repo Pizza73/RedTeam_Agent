@@ -12,6 +12,7 @@ from automation.run_phase_loop import (
     FinalMergeReconciliationRequiredError,
     FinalMergeRejectedError,
     GitHubClient,
+    LoopBlockedError,
     MarkerEvidence,
     PhaseLoop,
     PrerequisiteError,
@@ -1648,6 +1649,75 @@ def test_refreshed_blocked_phase_dispatches_one_bounded_resume() -> None:
         state, [], [base_pass, gate], evidence, DEFAULT_BRANCH_SHA
     ) is True
     assert len(github.workflow_calls) == 1
+
+
+def blocked_run_loop(
+    *, refresh_candidate: MarkerEvidence | None
+) -> tuple[PhaseLoop, list[tuple[MarkerEvidence, str, str]]]:
+    base_pass, gate = blocked_refresh_records()
+    state = replace(
+        blocked_phase_state(),
+        labels=frozenset({"ai-loop", "ai-loop-blocked", "phase-0b"}),
+    )
+    requests: list[tuple[MarkerEvidence, str, str]] = []
+    loop = PhaseLoop.__new__(PhaseLoop)
+    loop.dry_run = True
+    loop.validate_local_checkout = lambda: None  # type: ignore[method-assign]
+    loop.fail_if_expired = lambda: None  # type: ignore[method-assign]
+    loop.current_default_branch_sha = (  # type: ignore[method-assign]
+        lambda: DEFAULT_BRANCH_SHA
+    )
+    loop.pr_state = lambda: state  # type: ignore[method-assign]
+    loop.comments = lambda: []  # type: ignore[method-assign]
+    loop.trusted_markers = (  # type: ignore[method-assign]
+        lambda _comments, name: [base_pass, gate]
+        if name == "redteam-phase-gate"
+        else []
+    )
+    loop.trusted_base_refresh_statuses = (  # type: ignore[method-assign]
+        lambda _state, _records: []
+    )
+    loop.perform_base_refresh_label_transition = (  # type: ignore[method-assign]
+        lambda _state, _records, _default: False
+    )
+    loop.perform_pending_base_refresh = (  # type: ignore[method-assign]
+        lambda _state, _records, _default: False
+    )
+    loop.perform_post_blocked_refresh_resume = (  # type: ignore[method-assign]
+        lambda _state, _requests, _phase_records, _refresh_records, _default: False
+    )
+    loop.base_refresh_candidate = (  # type: ignore[method-assign]
+        lambda _state, _requests, _phase_records, _default: None
+    )
+    loop.blocked_base_refresh_candidate = (  # type: ignore[method-assign]
+        lambda _state, _phase_records, _default: refresh_candidate
+    )
+    loop.request_base_refresh = (  # type: ignore[method-assign]
+        lambda _state, record, *, target_base_sha, source_phase=None: requests.append(
+            (record, target_base_sha, source_phase)
+        )
+    )
+    loop.log = lambda _message: None  # type: ignore[method-assign]
+    return loop, requests
+
+
+def test_run_allows_trusted_blocked_limit_base_refresh_before_terminal_stop() -> None:
+    _base_pass, gate = blocked_refresh_records()
+    loop, requests = blocked_run_loop(refresh_candidate=gate)
+
+    result = loop.run()
+
+    assert result == "DRY_RUN:waiting for blocked current-Phase base refresh: phase-0b"
+    assert requests == [(gate, DEFAULT_BRANCH_SHA, "phase-0c")]
+
+
+def test_run_still_stops_blocked_phase_without_trusted_refresh() -> None:
+    loop, requests = blocked_run_loop(refresh_candidate=None)
+
+    with pytest.raises(LoopBlockedError, match="GitHub marked the loop blocked"):
+        loop.run()
+
+    assert requests == []
 
 
 def base_refresh_record(
