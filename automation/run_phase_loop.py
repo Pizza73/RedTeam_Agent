@@ -2609,8 +2609,6 @@ class PhaseLoop:
             state = self.pr_state()
             if "ai-human-gate" in state.labels or state.phase not in AUTOMATIC_PHASES:
                 return f"HUMAN_GATE_REQUIRED:{state.phase}"
-            if "ai-loop-blocked" in state.labels:
-                raise LoopBlockedError(f"GitHub marked the loop blocked in {state.phase}")
 
             comments = self.comments()
             phase_records = self.trusted_markers(comments, "redteam-phase-gate")
@@ -2725,6 +2723,9 @@ class PhaseLoop:
                     return f"DRY_RUN:{status}"
                 self.sleep()
                 continue
+
+            if "ai-loop-blocked" in state.labels:
+                raise LoopBlockedError(f"GitHub marked the loop blocked in {state.phase}")
 
             request = self.matching_payload(
                 implementation_requests,
