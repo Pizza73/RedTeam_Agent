@@ -448,6 +448,15 @@ class Executor:
         ):
             self._record_raw_result_failure(record, sink=sink, now=now)
             raise RawResultStreamingError("adapter result metadata binding mismatch")
+        current = self._require_execution(execution_id)
+        if (
+            current.provider_execution_state in {"SUCCEEDED", "FAILED", "CANCELLED"}
+            and metadata.provider_status != current.provider_execution_state
+        ):
+            self._record_raw_result_failure(record, sink=sink, now=now)
+            raise RawResultStreamingError(
+                "adapter result status conflicts with confirmed provider state"
+            )
         adapter_metadata_digest = sha256_digest(
             metadata.model_dump(mode="python", exclude={"receipt"})
         )
@@ -463,7 +472,6 @@ class Executor:
         self.receipts.add(metadata.receipt)
         if isinstance(sink, MockRawResultSink):
             self.recovery.set_current(sink.recovery_metadata(updated_at=now))
-        current = self._require_execution(execution_id)
         if ingestion is None:
             provisional = ResultIngestionRecord(
                 ingestion_id=stable_id(

@@ -806,6 +806,80 @@ def test_collection_retry_rejects_metadata_changed_after_ingestion_commit_crash(
     assert adapter.collect_calls == 2
 
 
+@pytest.mark.parametrize(
+    ("reconcile_status", "provider_status"),
+    [
+        ("SUCCEEDED", "FAILED"),
+        ("FAILED", "SUCCEEDED"),
+        ("CANCELLED", "FAILED"),
+    ],
+)
+def test_collection_rejects_metadata_conflicting_with_reconciled_terminal_state(
+    reconcile_status: str,
+    provider_status: str,
+) -> None:
+    harness = build_execution_harness()
+    adapter = MockExecutionAdapter(
+        capabilities=harness.environment.adapter_snapshot.adapters[0],
+        now=FIXED_TIME + timedelta(minutes=3),
+        stdout_chunks=(b"conflicting-terminal-result",),
+        provider_status=provider_status,  # type: ignore[arg-type]
+        submit_uncertain=True,
+        reconcile_status=reconcile_status,  # type: ignore[arg-type]
+    )
+    harness.executor = executor_with_adapter(harness, adapter)
+    prepared = prepare_execution(harness)
+    later = prepare_additional_execution(harness)
+    reconciled = asyncio.run(
+        harness.executor.dispatch(
+            prepared.execution_id,
+            now=FIXED_TIME + timedelta(minutes=3),
+        )
+    )
+    assert reconciled.provider_execution_state == reconcile_status
+    assert reconciled.provider_task_id is not None
+
+    ingester = MockSecureResultIngester(
+        summary=SecureIngestionSummary(secure_ingestion_id="must-not-run")
+    )
+    with pytest.raises(
+        RawResultStreamingError,
+        match="status conflicts with confirmed provider state",
+    ):
+        asyncio.run(
+            harness.executor.ingest_result(
+                reconciled.execution_id,
+                ingester=ingester,
+                now=FIXED_TIME + timedelta(minutes=4),
+            )
+        )
+
+    current = harness.executions.get(reconciled.execution_id)
+    sink = harness.sink_factory.mock_sink(reconciled.execution_id)
+    assert current is not None and current.provider_execution_state == reconcile_status
+    assert harness.ingestions.get_by_execution(reconciled.execution_id) is None
+    assert harness.receipts.get_by_execution(reconciled.execution_id) is None
+    assert harness.results.get_by_execution(reconciled.execution_id) is None
+    assert ingester.calls == 0
+    assert sink is not None and sink.committed
+    recovery = harness.recovery.get(
+        sink.recovery_metadata(updated_at=FIXED_TIME + timedelta(minutes=4)).recovery_id
+    )
+    assert recovery is not None and recovery.state == "COMMITTED"
+    assert harness.finalization.missions.current(reconciled.mission_id).state == "PAUSED"
+    blocked = asyncio.run(
+        harness.executor.dispatch(
+            later.execution_id,
+            now=FIXED_TIME + timedelta(minutes=5),
+        )
+    )
+    assert blocked.provider_execution_state == "BLOCKED"
+    assert blocked.pre_dispatch_block_reason == "AUTHORIZATION_EPOCH_MISMATCH"
+    assert adapter.submit_calls == 1
+    assert adapter.reconcile_calls == 1
+    assert adapter.collect_calls == 1
+
+
 def test_expired_ingestion_lease_is_taken_over_without_action_resubmit() -> None:
     harness = build_execution_harness()
     prepared = prepare_execution(harness)

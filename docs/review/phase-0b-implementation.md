@@ -4,9 +4,9 @@
 
 - Current phase: `Phase 0B: Execution Safety`
 - Input independent-review SHA: `9060c6c7ded3158072989035cab78c5f97946642`
-- Latest correction input SHA: `1e2270d0307b63d01b55f1b640f20f8300e986c8`
+- Latest correction input SHA: `b2cf87f2af5d6bb241431c82cf22ef5d629815fc`
 - Human-resume implementation request:
-  [`issuecomment-5472230358`](https://github.com/Pizza73/RedTeam_Agent/pull/3#issuecomment-5472230358)
+  [`issuecomment-5472321574`](https://github.com/Pizza73/RedTeam_Agent/pull/3#issuecomment-5472321574)
 - Implementation branch: `ai/redteam-agent-phase-loop`
 - External execution boundary: `MockExecutionAdapter` only
 - Real provider, C2, MCP side effect, local shell execution, and external-target calls: absent
@@ -166,6 +166,20 @@ workflow:
   then verifies that changed terminal metadata cannot become authoritative and does not resubmit the
   external action.
 
+## Sixth independent review correction cycle
+
+The independent review for correction SHA
+`b2cf87f2af5d6bb241431c82cf22ef5d629815fc` returned one distinct P1 finding. A second bounded
+same-phase Human Resume was explicitly approved and issued for that exact SHA:
+
+- [`discussion_r3891003668`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3891003668):
+  after Adapter collection returns, Executor now reloads the current Execution record and compares
+  collection metadata with every terminal provider state already confirmed by reconciliation.
+  Conflicting `SUCCEEDED`, `FAILED`, or `CANCELLED` metadata routes through Mission `PAUSED` and
+  raw-result recovery before receipt/ingestion persistence or secure-ingester invocation. The
+  latest-state reload also closes a concurrent reconciliation window that could otherwise begin
+  collection from `RUNNING` and finish after a conflicting terminal state was committed.
+
 ## Regression tests added
 
 The Phase 0B test set covers positive, negative, and failure paths, including:
@@ -197,7 +211,9 @@ The Phase 0B test set covers positive, negative, and failure paths, including:
 - self-consistent but unbound Adapter receipt rejection against the exact sink commit; and
 - committed-sink task metadata mismatch routing to PAUSED recovery without receipt persistence; and
 - changed Adapter terminal metadata on a post-ingestion crash retry being rejected before provider
-  transition or result normalization, with no external action resubmit.
+  transition or result normalization, with no external action resubmit; and
+- conflicting initial collection metadata after reconciliation to each of `SUCCEEDED`, `FAILED`,
+  and `CANCELLED` being rejected with no secure ingestion, normal persistence, or later dispatch.
 
 No test was skipped, weakened, deleted, or marked as an expected failure.
 
@@ -217,8 +233,8 @@ ruff: All checks passed
 mypy: Success: no issues found in 69 source files
 unit: 172 passed
 integration: 7 passed
-security: 137 passed
-full/coverage run: 316 passed
+security: 140 passed
+full/coverage run: 319 passed
 skipped=0, errors=0, failures=0
 coverage: 83% total (branch coverage enabled)
 pip check: No broken requirements found
@@ -248,6 +264,16 @@ Additional latest-correction commands:
 
 Latest-correction results: `3 passed`, Ruff `All checks passed`, and mypy
 `Success: no issues found in 69 source files`.
+
+Additional sixth-correction command:
+
+```text
+.venv/bin/python -m pytest -q tests/security/test_phase0b_execution_safety.py \
+  -k 'conflicting_with_reconciled_terminal_state or \
+  collection_retry_rejects_metadata_changed_after_ingestion_commit_crash' --strict-markers
+```
+
+Sixth-correction focused result: `4 passed, 27 deselected`.
 
 ## Remaining findings and constraints
 
