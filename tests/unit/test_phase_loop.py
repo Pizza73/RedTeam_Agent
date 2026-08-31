@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -565,6 +566,78 @@ def test_native_codex_pass_ignores_stale_commit_before_trusted_trigger() -> None
     assert result.url == NO_FINDINGS_URL
 
 
+def test_native_codex_pass_ignores_remapped_finding_before_trusted_trigger() -> None:
+    evidence = native_evidence()
+    review_comments = evidence["review_comments"]
+    assert isinstance(review_comments, list)
+    review_comments.append(
+        {
+            "id": 6,
+            "html_url": f"{REVIEW_URL}#discussion-old",
+            "user": {"login": REVIEWER_LOGIN},
+            "commit_id": HEAD_SHA,
+            "original_commit_id": "c" * 40,
+            "pull_request_review_id": 66,
+            "created_at": "2026-08-30T00:00:30Z",
+            "path": "src/redteam_agent/executor/service.py",
+            "line": 10,
+            "body": "![P1 Badge](badge) historical finding remapped to current head",
+        }
+    )
+
+    result = evaluate_fixture(evidence)
+
+    assert result is not None
+    assert result.result["verdict"] == "PASS"
+    assert result.url == NO_FINDINGS_URL
+
+
+def test_native_codex_pass_ignores_malformed_finding_before_trusted_trigger() -> None:
+    evidence = native_evidence()
+    review_comments = evidence["review_comments"]
+    assert isinstance(review_comments, list)
+    review_comments.append(
+        {
+            "id": 7,
+            "html_url": f"{REVIEW_URL}#discussion-old-malformed",
+            "user": {"login": REVIEWER_LOGIN},
+            "commit_id": HEAD_SHA,
+            "pull_request_review_id": 67,
+            "created_at": "2026-08-30T00:00:30Z",
+            "path": "src/redteam_agent/executor/service.py",
+            "line": 11,
+            "body": "![P0 Badge](badge) ![P1 Badge](badge) ambiguous historical finding",
+        }
+    )
+
+    result = evaluate_fixture(evidence)
+
+    assert result is not None
+    assert result.result["verdict"] == "PASS"
+
+
+def test_native_codex_finding_after_trigger_requires_trusted_review() -> None:
+    evidence = native_evidence()
+    review_comments = evidence["review_comments"]
+    assert isinstance(review_comments, list)
+    review_comments.append(
+        {
+            "id": 8,
+            "html_url": f"{REVIEW_URL}#discussion-unbound",
+            "user": {"login": REVIEWER_LOGIN},
+            "commit_id": HEAD_SHA,
+            "pull_request_review_id": 68,
+            "created_at": "2026-08-30T00:01:30Z",
+            "path": "src/redteam_agent/executor/service.py",
+            "line": 12,
+            "body": "![P1 Badge](badge) unbound post-trigger finding",
+        }
+    )
+
+    with pytest.raises(UntrustedEvidenceError, match="not bound to a trusted"):
+        evaluate_fixture(evidence)
+
+
 def test_native_codex_pass_rejects_head_change_during_review() -> None:
     evidence = native_evidence()
     evidence["timeline"] = [
@@ -804,6 +877,7 @@ class _BaseTransitionGitHub(_StatusGitHub):
         super().__init__(statuses)
         self.label_calls: list[tuple[int, frozenset[str]]] = []
         self.update_calls: list[tuple[int, str]] = []
+        self.workflow_calls: list[tuple[str, str, dict[str, str]]] = []
         self.ancestors: set[tuple[str, str]] = set()
 
     def set_pull_request_labels(
@@ -815,8 +889,17 @@ class _BaseTransitionGitHub(_StatusGitHub):
     def update_pull_request_branch(self, number: int, expected_head_sha: str) -> None:
         self.update_calls.append((number, expected_head_sha))
 
+    def dispatch_workflow(
+        self, workflow: str, branch: str, inputs: dict[str, str]
+    ) -> None:
+        self.workflow_calls.append((workflow, branch, inputs))
+
     def is_ancestor(self, ancestor_sha: str, descendant_sha: str) -> bool:
         return (ancestor_sha, descendant_sha) in self.ancestors
+
+    def compare(self, base_sha: str, head_sha: str) -> dict[str, object]:
+        assert (base_sha, head_sha) == (HEAD_SHA, DEFAULT_BRANCH_SHA)
+        return {"ahead_by": 1}
 
 
 def test_trusted_status_drives_exact_local_phase_label_rollback() -> None:
@@ -1241,8 +1324,117 @@ def test_base_refresh_status_without_referenced_prior_pass_fails_closed() -> Non
     loop = PhaseLoop.__new__(PhaseLoop)
     loop.github = _StatusGitHub({HEAD_SHA: [base_refresh_status()]})  # type: ignore[assignment]
 
-    with pytest.raises(UntrustedEvidenceError, match="not bound to its trusted prior PASS"):
+    with pytest.raises(UntrustedEvidenceError, match="not bound to trusted Phase evidence"):
         loop.trusted_base_refresh_statuses(phase_state(), [])
+
+
+def blocked_refresh_records() -> tuple[MarkerEvidence, MarkerEvidence]:
+    base_pass, gate = chained_phase_passes()[:2]
+    gate.payload.update(
+        {
+            "reviewed_sha": HEAD_SHA,
+            "base_sha": base_pass.payload["reviewed_sha"],
+            "verdict": "CHANGES_REQUESTED",
+            "finding_key": "CODEX-P1-ATOMIC-DISPATCH",
+            "loop_state": "BLOCKED_LIMIT",
+        }
+    )
+    return base_pass, gate
+
+
+def blocked_phase_state() -> PullRequestState:
+    state = phase_state(phase="phase-0b")
+    return replace(
+        state,
+        labels=frozenset({"ai-loop", "ai-needs-implementation", "phase-0b"}),
+    )
+
+
+def blocked_refresh_loop(
+    statuses: dict[str, list[dict[str, object]]],
+) -> tuple[PhaseLoop, _BaseTransitionGitHub]:
+    base_pass, _gate = blocked_refresh_records()
+    github = _BaseTransitionGitHub(statuses)
+    github.repository = "example/repo"  # type: ignore[attr-defined]
+    github.ancestors = {(str(base_pass.payload["reviewed_sha"]), HEAD_SHA)}
+    loop = PhaseLoop.__new__(PhaseLoop)
+    loop.github = github  # type: ignore[assignment]
+    loop.pull_request_number = 3
+    loop.reviewer_login = REVIEWER_LOGIN
+    loop.approver_login = ACTOR_LOGIN
+    return loop, github
+
+
+def test_blocked_current_phase_gate_authorizes_exact_base_refresh() -> None:
+    base_pass, gate = blocked_refresh_records()
+    status = base_refresh_status(
+        from_phase="phase-0c",
+        revalidate_phase="phase-0b",
+        target_url=gate.url,
+    )
+    loop, _github = blocked_refresh_loop({HEAD_SHA: [status]})
+
+    evidence = loop.trusted_base_refresh_statuses(
+        blocked_phase_state(), [base_pass, gate]
+    )
+
+    assert len(evidence) == 1
+    assert evidence[0].payload["prior_pass_reference"] == gate.url
+    assert loop.blocked_base_refresh_candidate(
+        blocked_phase_state(), [base_pass, gate], DEFAULT_BRANCH_SHA
+    ) == gate
+
+
+def test_blocked_current_phase_refresh_rejects_missing_adjacent_base_pass() -> None:
+    _base_pass, gate = blocked_refresh_records()
+    status = base_refresh_status(
+        from_phase="phase-0c",
+        revalidate_phase="phase-0b",
+        target_url=gate.url,
+    )
+    loop, _github = blocked_refresh_loop({HEAD_SHA: [status]})
+
+    with pytest.raises(UntrustedEvidenceError, match="adjacent PASS"):
+        loop.trusted_base_refresh_statuses(blocked_phase_state(), [gate])
+
+
+def test_refreshed_blocked_phase_dispatches_one_bounded_resume() -> None:
+    base_pass, gate = blocked_refresh_records()
+    status = base_refresh_status(
+        from_phase="phase-0c",
+        revalidate_phase="phase-0b",
+        target_url=gate.url,
+    )
+    loop, github = blocked_refresh_loop({HEAD_SHA: [status]})
+    github.ancestors.update(
+        {(HEAD_SHA, REFRESHED_HEAD_SHA), (DEFAULT_BRANCH_SHA, REFRESHED_HEAD_SHA)}
+    )
+    state = replace(
+        blocked_phase_state(),
+        head_sha=REFRESHED_HEAD_SHA,
+        base_sha=DEFAULT_BRANCH_SHA,
+        labels=frozenset({"ai-loop", "ai-loop-blocked", "phase-0b"}),
+    )
+    evidence = loop.trusted_base_refresh_statuses(state, [base_pass, gate])
+    loop.default_branch = "main"
+    loop.dispatched_blocked_resumes = set()
+    loop.dry_run = False
+    loop.log = lambda _message: None  # type: ignore[method-assign]
+    loop.check_state = lambda _head: "success"  # type: ignore[method-assign]
+
+    assert loop.perform_post_blocked_refresh_resume(
+        state, [], [base_pass, gate], evidence, DEFAULT_BRANCH_SHA
+    ) is True
+    assert len(github.workflow_calls) == 1
+    workflow, branch, inputs = github.workflow_calls[0]
+    assert (workflow, branch) == ("resume-ai-loop.yml", "main")
+    assert inputs["head_sha"] == REFRESHED_HEAD_SHA
+    assert inputs["resolution_reference"] == gate.url
+
+    assert loop.perform_post_blocked_refresh_resume(
+        state, [], [base_pass, gate], evidence, DEFAULT_BRANCH_SHA
+    ) is True
+    assert len(github.workflow_calls) == 1
 
 
 def base_refresh_record(
@@ -1371,6 +1563,83 @@ def test_initial_phase_zero_a_review_keeps_original_pr_base_sha() -> None:
     loop = PhaseLoop.__new__(PhaseLoop)
 
     assert loop.expected_base_sha(phase_state(), [], [], DEFAULT_BRANCH_SHA) == BASE_SHA
+
+
+def prior_pass(head_sha: str) -> MarkerEvidence:
+    payload = chained_phase_passes()[0].payload.copy()
+    payload["reviewed_sha"] = head_sha
+    return MarkerEvidence(
+        payload,
+        f"{PULL_REQUEST_PREFIX}#issuecomment-pass-{head_sha[:8]}",
+        "github-actions[bot]",
+        "",
+    )
+
+
+def later_phase_loop(ancestors: set[tuple[str, str]]) -> PhaseLoop:
+    loop = PhaseLoop.__new__(PhaseLoop)
+    github = _AncestorGitHub(ancestors)
+    github.repository = "example/repo"  # type: ignore[attr-defined]
+    loop.github = github  # type: ignore[assignment]
+    loop.reviewer_login = REVIEWER_LOGIN
+    loop.approver_login = ACTOR_LOGIN
+    return loop
+
+
+def test_later_phase_review_uses_unique_maximal_ancestor_pass() -> None:
+    earlier = "1" * 40
+    later = "2" * 40
+    loop = later_phase_loop({(earlier, HEAD_SHA), (later, HEAD_SHA), (earlier, later)})
+
+    assert (
+        loop.expected_base_sha(
+            phase_state(phase="phase-0b"),
+            [prior_pass(later), prior_pass(earlier)],
+            [],
+            DEFAULT_BRANCH_SHA,
+        )
+        == later
+    )
+
+
+def test_later_phase_review_rejects_incomparable_prior_passes() -> None:
+    first = "1" * 40
+    second = "2" * 40
+    loop = later_phase_loop({(first, HEAD_SHA), (second, HEAD_SHA)})
+
+    with pytest.raises(UntrustedEvidenceError, match="PASS evidence.*ambiguous"):
+        loop.expected_base_sha(
+            phase_state(phase="phase-0b"),
+            [prior_pass(first), prior_pass(second)],
+            [],
+            DEFAULT_BRANCH_SHA,
+        )
+
+
+def test_later_phase_review_rejects_unincorporated_prior_pass() -> None:
+    loop = later_phase_loop(set())
+
+    with pytest.raises(UntrustedEvidenceError, match="no trusted PASS"):
+        loop.expected_base_sha(
+            phase_state(phase="phase-0b"),
+            [prior_pass("1" * 40)],
+            [],
+            DEFAULT_BRANCH_SHA,
+        )
+
+
+def test_later_phase_review_rejects_malformed_incorporated_prior_pass() -> None:
+    pass_record = prior_pass("1" * 40)
+    del pass_record.payload["loop_state"]
+    loop = later_phase_loop({("1" * 40, HEAD_SHA)})
+
+    with pytest.raises(UntrustedEvidenceError, match="missing or unknown fields"):
+        loop.expected_base_sha(
+            phase_state(phase="phase-0b"),
+            [pass_record],
+            [],
+            DEFAULT_BRANCH_SHA,
+        )
 
 
 @pytest.mark.parametrize(

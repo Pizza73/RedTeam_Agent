@@ -43,6 +43,7 @@ jobs:
     timeout-minutes: 5
     env:
       AI_GATE_APPROVER_LOGIN: ${{ vars.AI_GATE_APPROVER_LOGIN }}
+      AI_REVIEWER_LOGIN: ${{ vars.AI_REVIEWER_LOGIN }}
       CONFIRMATION: ${{ inputs.confirmation }}
       EXPECTED_HEAD_SHA: ${{ inputs.expected_head_sha }}
       PR_NUMBER: ${{ inputs.pull_request_number }}
@@ -245,68 +246,143 @@ jobs:
               core.setFailed('Current Phase is not the source or revalidation Phase.');
               return;
             }
-            if (!labels.includes('ai-needs-implementation')) {
-              core.setFailed('Base refresh is allowed only before current-phase implementation.');
-              return;
-            }
-
             const comments = await github.paginate(github.rest.issues.listComments, {
               owner, repo, issue_number: pull_number, per_page: 100,
             });
-            if (currentPhase === previousPhase) {
-              const statuses = await github.paginate(
-                github.rest.repos.listCommitStatusesForRef,
-                {owner, repo, ref: expectedHeadSha, per_page: 100}
-              );
-              let priorRefreshExists = false;
-              for (const status of statuses) {
-                if (status.creator?.login !== 'github-actions[bot]' ||
-                    !status.context?.startsWith('redteam/base-refresh/')) continue;
-                const match = status.context.match(refreshStatusPattern);
-                if (
-                  !match || status.state !== 'success' ||
-                  status.description !== refreshStatusDescription ||
-                  status.target_url !== priorPassReference
-                ) {
-                  core.setFailed('Trusted prior base-refresh status is malformed.');
-                  return;
-                }
-                if (match[1] === sourcePhase && match[2] === previousPhase) {
-                  priorRefreshExists = true;
-                }
-              }
-              if (!priorRefreshExists) {
-                core.setFailed('Reauthorization requires a trusted prior base-refresh status.');
-                return;
-              }
-            }
-            const passComment = comments.find(
+            const authorizationComment = comments.find(
               (item) => item.html_url === priorPassReference &&
                 item.user?.login === 'github-actions[bot]'
             );
-            if (!passComment) {
-              core.setFailed('Prior PASS reference is not a trusted workflow comment.');
+            if (!authorizationComment) {
+              core.setFailed('Phase authorization reference is not a trusted workflow comment.');
               return;
             }
-            const pass = singleMarker(passComment.body, 'redteam-phase-gate');
+            const authorization = singleMarker(
+              authorizationComment.body, 'redteam-phase-gate'
+            );
             const passKeys = [
               'schema_version', 'phase', 'reviewed_sha', 'base_sha', 'verdict', 'summary',
               'evidence_format', 'ready_reference', 'review_trigger_reference',
               'review_reference', 'reviewer_login', 'recorded_by', 'finding_key',
               'required_checks', 'loop_state'
             ];
-            if (
-              !exactKeys(pass, passKeys) || pass.schema_version !== '1.0' ||
-              pass.phase !== previousPhase || pass.reviewed_sha !== expectedHeadSha ||
-              pass.verdict !== 'PASS' || pass.loop_state !== 'PASS' ||
-              pass.evidence_format !== 'codex-native-v1'
-            ) {
-              core.setFailed('Prior phase PASS is malformed, stale, or not adjacent.');
+            const passingChecks = JSON.stringify([
+              {name: 'tests (3.12)', status: 'PASS'},
+              {name: 'tests (3.14)', status: 'PASS'},
+              {name: 'quality', status: 'PASS'},
+              {name: 'governance-integrity', status: 'PASS'},
+            ]);
+            const commonAuthorizationValid =
+              exactKeys(authorization, passKeys) &&
+              authorization.schema_version === '1.0' &&
+              authorization.phase === previousPhase &&
+              authorization.reviewed_sha === expectedHeadSha &&
+              authorization.evidence_format === 'codex-native-v1' &&
+              authorization.reviewer_login === process.env.AI_REVIEWER_LOGIN &&
+              authorization.recorded_by === process.env.AI_GATE_APPROVER_LOGIN &&
+              JSON.stringify(authorization.required_checks) === passingChecks;
+            const isPriorPass = commonAuthorizationValid &&
+              authorization.verdict === 'PASS' &&
+              authorization.loop_state === 'PASS' && authorization.finding_key === null;
+            const isBlockedCurrentPhase = commonAuthorizationValid &&
+              currentPhase === previousPhase && sourceIndex > 1 && sourceIndex <= 6 &&
+              authorization.verdict === 'CHANGES_REQUESTED' &&
+              authorization.loop_state === 'BLOCKED_LIMIT' &&
+              /^[A-Z0-9][A-Z0-9._-]{0,63}$/.test(authorization.finding_key) &&
+              labels.some((name) =>
+                ['ai-loop-blocked', 'ai-needs-implementation'].includes(name)
+              );
+            if (!isPriorPass && !isBlockedCurrentPhase) {
+              core.setFailed(
+                'Phase authorization is neither the exact prior PASS nor a bounded current gate.'
+              );
               return;
+            }
+
+            if (isBlockedCurrentPhase) {
+              if (!process.env.AI_REVIEWER_LOGIN ||
+                  !/^[0-9a-f]{40}$/.test(authorization.base_sha)) {
+                core.setFailed('Blocked current-Phase authorization is incomplete.');
+                return;
+              }
+              const basePhase = plan.phases[sourceIndex - 2].id;
+              const basePasses = [];
+              for (const comment of comments) {
+                if (comment.user?.login !== 'github-actions[bot]' ||
+                    !comment.body?.includes('redteam-phase-gate')) continue;
+                let record;
+                try {
+                  record = singleMarker(comment.body, 'redteam-phase-gate');
+                } catch (_) {
+                  continue;
+                }
+                if (exactKeys(record, passKeys) && record.schema_version === '1.0' &&
+                    record.phase === basePhase &&
+                    record.reviewed_sha === authorization.base_sha &&
+                    record.verdict === 'PASS' && record.loop_state === 'PASS' &&
+                    record.evidence_format === 'codex-native-v1' &&
+                    record.reviewer_login === process.env.AI_REVIEWER_LOGIN &&
+                    record.recorded_by === process.env.AI_GATE_APPROVER_LOGIN &&
+                    record.finding_key === null &&
+                    JSON.stringify(record.required_checks) === passingChecks) {
+                  basePasses.push(record);
+                }
+              }
+              if (basePasses.length !== 1) {
+                core.setFailed('Blocked current Phase lacks one trusted adjacent base PASS.');
+                return;
+              }
+              const baseComparison = await github.request(
+                'GET /repos/{owner}/{repo}/compare/{basehead}',
+                {owner, repo,
+                  basehead: `${authorization.base_sha}...${expectedHeadSha}`}
+              );
+              if (baseComparison.data.merge_base_commit?.sha !== authorization.base_sha ||
+                  baseComparison.data.behind_by !== 0 ||
+                  !['ahead', 'identical'].includes(baseComparison.data.status)) {
+                core.setFailed('Blocked current-Phase base PASS is not incorporated in HEAD.');
+                return;
+              }
+            } else {
+              if (!labels.includes('ai-needs-implementation')) {
+                core.setFailed(
+                  'Normal base refresh is allowed only before current-phase implementation.'
+                );
+                return;
+              }
+              if (currentPhase === previousPhase) {
+                const statuses = await github.paginate(
+                  github.rest.repos.listCommitStatusesForRef,
+                  {owner, repo, ref: expectedHeadSha, per_page: 100}
+                );
+                let priorRefreshExists = false;
+                for (const status of statuses) {
+                  if (status.creator?.login !== 'github-actions[bot]' ||
+                      !status.context?.startsWith('redteam/base-refresh/')) continue;
+                  const match = status.context.match(refreshStatusPattern);
+                  if (!match || status.state !== 'success' ||
+                      status.description !== refreshStatusDescription ||
+                      status.target_url !== priorPassReference) {
+                    core.setFailed('Trusted prior base-refresh status is malformed.');
+                    return;
+                  }
+                  if (match[1] === sourcePhase && match[2] === previousPhase) {
+                    priorRefreshExists = true;
+                  }
+                }
+                if (!priorRefreshExists) {
+                  core.setFailed(
+                    'Reauthorization requires a trusted prior base-refresh status.'
+                  );
+                  return;
+                }
+              }
             }
 
             const requestPattern = /<!--\s*redteam-implementation-request\s*([\s\S]*?)-->/g;
             const currentRequests = [];
+            const requestPhase = isBlockedCurrentPhase ? currentPhase : sourcePhase;
+            const requestConfig = plan.phases.find((item) => item.id === requestPhase);
             for (const comment of comments) {
               if (comment.user?.login !== 'github-actions[bot]') continue;
               for (const match of (comment.body || '').matchAll(requestPattern)) {
@@ -314,13 +390,15 @@ jobs:
                 if (
                   exactKeys(request, ['schema_version', 'action', 'trigger', 'phase', 'head_sha', 'phase_prompt']) &&
                   request.schema_version === '1.0' && request.action === 'IMPLEMENT_PHASE' &&
-                  request.phase === sourcePhase && request.head_sha === expectedHeadSha &&
-                  request.phase_prompt === plan.phases[sourceIndex].prompt
-                ) currentRequests.push(request);
+                  request.phase === requestPhase && request.head_sha === expectedHeadSha &&
+                  request.phase_prompt === requestConfig?.prompt
+                ) currentRequests.push(JSON.stringify(request));
               }
             }
-            if (currentRequests.length !== 1) {
-              core.setFailed('Exactly one trusted current-phase implementation request is required.');
+            if (new Set(currentRequests).size !== 1) {
+              core.setFailed(
+                'Exactly one unique trusted current-phase implementation request is required.'
+              );
               return;
             }
 

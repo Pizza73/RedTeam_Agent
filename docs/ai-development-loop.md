@@ -12,8 +12,9 @@ The orchestrator reads GitHub credentials only through `gh`; it never places the
 Codex prompt or process environment. GitHub comments, labels and checks are the durable source of
 state, so terminating the local process pauses polling without losing phase progress.
 `docs/implementation-status.md` is a default-branch/bootstrap snapshot; an active PR's Phase
-authority is the exact label plus the trusted current-HEAD implementation request and adjacent
-prior-Phase PASS chain.
+authority is the exact label plus the trusted current-HEAD implementation request and the unique
+maximal adjacent prior-Phase PASS incorporated in the current HEAD. Comment order is never phase
+authority.
 
 A `governance-change` PR is not a phase implementation and does not receive an AI phase verdict.
 CI runs the complete test suite plus control-file validation and marks `redteam/phase-review` as
@@ -81,6 +82,7 @@ IMPLEMENTATION_REQUESTED
        -> PASS -> NEXT_PHASE_REQUESTED or HUMAN_GATE or PROJECT_COMPLETE
        -> PROJECT_COMPLETE -> LOCAL_EXACT_SHA_MERGE or BLOCKED
        -> BLOCKED -> HUMAN_GATE
+            -> TRUSTED_CURRENT_PHASE_BASE_REFRESH -> CURRENT_PHASE_CI -> BOUNDED_RESUME
 ```
 
 `PASS` never starts an AI process inside GitHub Actions. It creates the next SHA-bound
@@ -89,6 +91,22 @@ perform it through the ChatGPT-linked GitHub identity.
 `BLOCKED` can be resumed for Phase 0A through Phase 3 only through the approver-restricted
 `Resume AI Loop` workflow with a repository-local resolution reference. Phase 4/5 use their
 dedicated provider Human Gate and cannot use the generic resume path.
+
+If an older control version incorrectly relabeled a cumulative PR to the adjacent prior Phase,
+`Recover Blocked AI Loop Current Phase` is the only recovery path. It verifies the original
+current-Phase P0/P1 finding and gate, the adjacent phase-base PASS, Git ancestry, identical Git
+trees between the reviewed and current HEADs, current checks, and the complete current-Phase gate.
+Only then does it restore the source Phase and emit a fresh current-HEAD ready marker. It never
+synthesizes a PASS and never asks a reviewer to judge later-Phase code as an earlier Phase.
+
+If the recovered current Phase is blocked and its PR HEAD does not yet contain the governing
+default-branch rules, `Prepare AI Loop Base Refresh` may use the next Phase as a withheld source
+boundary while retaining the current Phase as `revalidate_phase`. This exceptional path accepts
+only a trusted current-HEAD `BLOCKED_LIMIT` gate, validates its unique adjacent base PASS and their
+ancestry, and writes the same SHA-bound status used by the local update mechanism. The local runner
+does not roll the Phase label back. It performs one expected-HEAD branch update, verifies both the
+old HEAD and target default SHA are ancestors of the result, waits for current-HEAD checks, and can
+then dispatch only the existing bounded Resume workflow bound to the blocked gate permalink.
 
 ## Machine comments
 
@@ -120,7 +138,9 @@ checks and validates the reviewer permalink. AI-authored markers are not accepte
 ```
 
 Only exact markers, trusted workflow authors, the current phase label and the current PR SHA are
-accepted. Repository content, PR comments and reviewer output remain untrusted data.
+accepted for an implementation task. For Phase 0B and later, the adjacent PASS must be incorporated
+in that SHA and must be the unique maximal candidate under Git ancestry. Repository content, PR
+comments and reviewer output remain untrusted data.
 
 ### Base refresh authorization
 
@@ -150,7 +170,8 @@ calls GitHub's branch-update endpoint with
 `expected_head_sha=<old-head>`. A concurrent status, head, base, label or lifecycle change fails
 closed. The synchronization is not a final PR merge: it
 incorporates `main` into the PR branch. CI then runs the rolled-back Phase on the new HEAD, and every
-PASS tied to the old HEAD remains stale.
+PASS for that rolled-back Phase on the old HEAD remains stale as its current-Phase verdict. The
+adjacent earlier PASS may remain only as the unique incorporated phase base.
 
 If `main` advances again while that fresh rolled-back review is running, the review remains bound to
 the trusted refresh target that is actually incorporated in its HEAD. After recording that exact

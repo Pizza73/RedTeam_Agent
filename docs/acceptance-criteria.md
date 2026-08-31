@@ -36,7 +36,15 @@
 - Phase 4/5は`ai-human-gate`中に停止し、承認済みProvider Gate遷移後だけ再開する
 - OpenAI API Keyを要求せず、GitHub CredentialをCodex Promptまたは実行環境へ渡さない
 - Active PRのCurrent Phaseは、exact phase label、`github-actions[bot]`のCurrent-HEAD
-  Implementation Request、隣接するPrior-Phase PASSの完全一致でのみ解決する
+  Implementation Request、Current HEADへ包含された隣接Prior-Phase PASSでのみ解決する。
+  複数の包含PASSはGit祖先関係で唯一の最大候補を要求し、コメント順や互いに比較不能な候補を拒否する
+- 累積PRのCurrent Phaseを回復するときは、trusted current-Phase finding/gate、Phase Base、
+  reviewed HEADからcurrent HEADへの祖先関係、両HEADの同一Git tree、Current-HEAD Checkを検証し、
+  Current Phaseの完全Gateを実行してから同じPhaseのfresh reviewへ戻す。隣接Prior Phaseへは戻さない
+- Phase 0B～3の`BLOCKED_LIMIT` HEADがCurrent default branchの必須Governanceを含まない場合、
+  trusted current-Phase Gateとその唯一の隣接Base PASSを検証したStatusだけが、Phase Labelを維持した
+  exact-HEAD base refreshを認可する。取込み後は旧HEADとtarget baseの両方を祖先に持つこと、
+  Current-HEAD Check成功、同Gateへのbounded Resume bindingを要求する
 - Default BranchをPRへ取り込む前にCurrent Phaseを1つ戻し、旧HEADのPASSを再利用せず、
   取込み後HEADで同Phase Gateを再実行する
 - Base-refresh Workflowは旧HEAD、Current default-branch SHA、隣接Prior PASSを固定したStatusのみ

@@ -81,6 +81,7 @@ def test_phase_gate_uses_fail_closed_native_codex_evidence_chain() -> None:
         "PR head changed while Codex review was running",
         "missing its reviewer thumbs-up reaction",
         "missing retained P0/P1 findings",
+        "parseTime(item.created_at, 'Codex finding') <= triggerTime) return false",
         "duplicate JSON key",
         "redteam/base-refresh/",
         "listCommitStatusesForRef",
@@ -92,6 +93,9 @@ def test_phase_gate_uses_fail_closed_native_codex_evidence_chain() -> None:
         "Reviewed Phase 0A head is not descended from a trusted base refresh",
         "Incorporated Phase 0A base-refresh evidence is ambiguous",
         "maximalRefreshes.length !== 1",
+        "incorporatedPassHeads",
+        "maximalPassHeads.length !== 1",
+        "Incorporated PASS evidence for previous phase",
         "Pull request head or phase changed before recording the gate",
         "phase_transition",
         "automation/transition_phase.py",
@@ -100,9 +104,11 @@ def test_phase_gate_uses_fail_closed_native_codex_evidence_chain() -> None:
     assert "liveDefaultCommit.sha !== refreshTargetSha" not in workflow
     assert "Default branch changed before recording the refreshed Phase 0A gate" not in workflow
     assert "status.sha !== pass.reviewed_sha" not in workflow
+    assert "previousPasses.at(-1).reviewed_sha" not in workflow
     assert "await removeLabel(phase)" not in workflow
     assert "await addLabels([next.label, 'ai-needs-implementation'])" not in workflow
     assert "Review evidence must contain exactly one redteam-ai-review marker" not in workflow
+    assert "Current-head Codex finding predates the trusted trigger" not in workflow
 
 
 def test_phase_gate_uses_the_marker_transition_protocol() -> None:
@@ -150,6 +156,91 @@ def test_phase_gate_has_minimal_permissions_for_pr_state_updates() -> None:
         assert forbidden_operation not in workflow
 
 
+def test_resume_workflow_can_comment_on_pr_without_merge_authority() -> None:
+    workflow = (
+        REPO_ROOT / ".github" / "workflows" / "resume-ai-loop.yml"
+    ).read_text(encoding="utf-8")
+    permissions = workflow.split("\npermissions:\n", maxsplit=1)[1].split(
+        "\njobs:\n", maxsplit=1
+    )[0]
+
+    assert permissions.strip().splitlines() == [
+        "contents: read",
+        "  issues: write",
+        "  pull-requests: write",
+        "  statuses: write",
+    ]
+    assert "github.rest.issues.createComment" in workflow
+    for forbidden_operation in (
+        "github.rest.pulls.merge",
+        "mergePullRequest",
+        "/pulls/{number}/merge",
+    ):
+        assert forbidden_operation not in workflow
+
+
+def test_current_phase_recovery_is_identical_tree_and_fail_closed() -> None:
+    workflow = (
+        REPO_ROOT / ".github" / "workflows" / "revalidate-blocked-phase.yml"
+    ).read_text(encoding="utf-8")
+    assert "\npermissions: {}\n" in workflow
+    assert """  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      checks: read
+      contents: read
+      pull-requests: read
+""" in workflow
+    assert """  publish:
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      checks: read
+      contents: read
+      issues: write
+      pull-requests: write
+      statuses: write
+""" in workflow
+    for required_control in (
+        "RECOVER_CURRENT_PHASE",
+        "AI_GATE_APPROVER_LOGIN",
+        "AI_REVIEWER_LOGIN",
+        "reviewed_head_sha",
+        "reviewedCommit.commit.tree.sha !== currentCommit.commit.tree.sha",
+        "isAncestor(reviewedHead, currentHead)",
+        "original_commit_id !== reviewedHead",
+        "review.commit_id !== reviewedHead",
+        "Exactly one trusted current-phase CHANGES_REQUESTED gate is required",
+        "Current-phase gate is not bound to one incorporated adjacent PASS",
+        "Required current-head check is not uniquely successful",
+        "Repository or PR state changed during current-phase validation",
+        'run: bash scripts/ci/run_phase_gate.sh "$SOURCE_PHASE"',
+        "redteam-implementation-request",
+        "redteam-ready-for-review",
+        "github.rest.issues.setLabels",
+        "AUTHORIZED_EVIDENCE_DIGEST",
+        "AUTHORIZED_LABELS_DIGEST",
+        "PR changed during the exact current-phase label transition",
+    ):
+        assert required_control in workflow
+    read_only_job = workflow.split("\n  publish:\n", maxsplit=1)[0]
+    assert "issues: write" not in read_only_job
+    assert "pull-requests: write" not in read_only_job
+    assert "statuses: write" not in read_only_job
+    assert "sourceIndex < 1 || sourceIndex > 5" in workflow
+    assert "contents: write" not in workflow
+    assert "secrets." not in workflow
+    for forbidden_operation in (
+        "github.rest.pulls.merge",
+        "mergePullRequest",
+        "updateBranch",
+        "/pulls/{number}/merge",
+    ):
+        assert forbidden_operation not in workflow
+
+
 def test_documented_reviewer_login_includes_bot_suffix() -> None:
     runbook = (REPO_ROOT / "docs" / "ai-loop-runbook.md").read_text(encoding="utf-8")
 
@@ -165,6 +256,7 @@ def test_base_refresh_is_sha_bound_and_separate_from_exact_sha_final_merge() -> 
     for required_control in (
         "REFRESH_AI_LOOP_BASE",
         "AI_GATE_APPROVER_LOGIN",
+        "AI_REVIEWER_LOGIN",
         "source_phase",
         "expected_head_sha",
         "target_base_sha",
@@ -176,6 +268,12 @@ def test_base_refresh_is_sha_bound_and_separate_from_exact_sha_final_merge() -> 
         "trusted exact-SHA base refresh authorization",
         "contains a duplicate JSON key",
         "Reauthorization requires a trusted prior base-refresh status",
+        "isBlockedCurrentPhase",
+        "Blocked current Phase lacks one trusted adjacent base PASS",
+        "Blocked current-Phase base PASS is not incorporated in HEAD",
+        "blocked_base_refresh_candidate",
+        "perform_post_blocked_refresh_resume",
+        "resuming {state.phase} after trusted current-Phase base refresh",
     ):
         assert required_control in workflow or required_control in runner
     permissions = workflow.split("\npermissions:\n", maxsplit=1)[1].split(

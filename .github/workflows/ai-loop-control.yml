@@ -222,6 +222,43 @@ jobs:
               } catch (_) {}
             }
 
+            const ancestry = new Map();
+            const phaseGateKeys = [
+              'schema_version', 'phase', 'reviewed_sha', 'base_sha', 'verdict', 'summary',
+              'evidence_format', 'ready_reference', 'review_trigger_reference',
+              'review_reference', 'reviewer_login', 'recorded_by', 'finding_key',
+              'required_checks', 'loop_state'
+            ];
+            function isExactPhaseGate(record) {
+              return JSON.stringify(
+                Object.keys(record).filter((key) => key !== '_comment_url').sort()
+              ) === JSON.stringify([...phaseGateKeys].sort());
+            }
+            function hasPassingRequiredChecks(record) {
+              return JSON.stringify(record.required_checks) === JSON.stringify([
+                {name: 'tests (3.12)', status: 'PASS'},
+                {name: 'tests (3.14)', status: 'PASS'},
+                {name: 'quality', status: 'PASS'},
+                {name: 'governance-integrity', status: 'PASS'},
+              ]);
+            }
+            async function isAncestor(ancestorSha, descendantSha) {
+              if (ancestorSha === descendantSha) return true;
+              const key = `${ancestorSha}:${descendantSha}`;
+              if (!ancestry.has(key)) {
+                ancestry.set(key, (async () => {
+                  const comparison = await github.request(
+                    'GET /repos/{owner}/{repo}/compare/{basehead}',
+                    {owner, repo, basehead: `${ancestorSha}...${descendantSha}`}
+                  );
+                  return comparison.data.merge_base_commit?.sha === ancestorSha &&
+                    comparison.data.behind_by === 0 &&
+                    ['ahead', 'identical'].includes(comparison.data.status);
+                })());
+              }
+              return await ancestry.get(key);
+            }
+
             let expectedBaseSha;
             if (phaseIndex === 0) {
               const refreshStatusDescription =
@@ -268,24 +305,6 @@ jobs:
               }
               expectedBaseSha = pr.base.sha;
               if (refreshes.length > 0) {
-                const ancestry = new Map();
-                async function isAncestor(ancestorSha, descendantSha) {
-                  if (ancestorSha === descendantSha) return true;
-                  const key = `${ancestorSha}:${descendantSha}`;
-                  if (!ancestry.has(key)) {
-                    ancestry.set(key, (async () => {
-                      const comparison = await github.request(
-                        'GET /repos/{owner}/{repo}/compare/{basehead}',
-                        {owner, repo, basehead: `${ancestorSha}...${descendantSha}`}
-                      );
-                      return comparison.data.merge_base_commit?.sha === ancestorSha &&
-                        comparison.data.behind_by === 0 &&
-                        ['ahead', 'identical'].includes(comparison.data.status);
-                    })());
-                  }
-                  return await ancestry.get(key);
-                }
-
                 const uniqueRefreshes = [...new Map(
                   refreshes.map((refresh) => [JSON.stringify(refresh), refresh])
                 ).values()];
@@ -329,14 +348,48 @@ jobs:
               }
             } else {
               const previousPhase = plan.phases[phaseIndex - 1].id;
-              const previousPasses = priorRecords.filter(
-                (record) => record.phase === previousPhase && record.verdict === 'PASS'
-              );
-              if (previousPasses.length === 0) {
-                core.setFailed(`No trusted PASS record exists for previous phase ${previousPhase}.`);
+              const previousPassHeads = [...new Set(
+                priorRecords.filter(
+                  (record) => isExactPhaseGate(record) &&
+                    record.phase === previousPhase &&
+                    record.verdict === 'PASS' && record.loop_state === 'PASS' &&
+                    record.evidence_format === 'codex-native-v1' &&
+                    record.reviewer_login === process.env.AI_REVIEWER_LOGIN &&
+                    record.recorded_by === process.env.AI_GATE_APPROVER_LOGIN &&
+                    record.finding_key === null && hasPassingRequiredChecks(record) &&
+                    /^[0-9a-f]{40}$/.test(record.reviewed_sha)
+                ).map((record) => record.reviewed_sha)
+              )];
+              const incorporatedPassHeads = [];
+              for (const passHead of previousPassHeads) {
+                if (await isAncestor(passHead, reviewedSha)) {
+                  incorporatedPassHeads.push(passHead);
+                }
+              }
+              if (incorporatedPassHeads.length === 0) {
+                core.setFailed(
+                  `No incorporated trusted PASS record exists for previous phase ${previousPhase}.`
+                );
                 return;
               }
-              expectedBaseSha = previousPasses.at(-1).reviewed_sha;
+              const maximalPassHeads = [];
+              for (const candidate of incorporatedPassHeads) {
+                let dominated = false;
+                for (const other of incorporatedPassHeads) {
+                  if (candidate !== other && await isAncestor(candidate, other)) {
+                    dominated = true;
+                    break;
+                  }
+                }
+                if (!dominated) maximalPassHeads.push(candidate);
+              }
+              if (maximalPassHeads.length !== 1) {
+                core.setFailed(
+                  `Incorporated PASS evidence for previous phase ${previousPhase} is ambiguous.`
+                );
+                return;
+              }
+              expectedBaseSha = maximalPassHeads[0];
             }
             if (suppliedBaseSha !== expectedBaseSha) {
               core.setFailed(`Review base SHA mismatch: ${suppliedBaseSha}; expected: ${expectedBaseSha}`);
@@ -506,10 +559,14 @@ jobs:
               if (changed) throw new Error('PR head changed while Codex review was running.');
             }
 
-            const currentFindings = reviewComments.filter((item) =>
-              item.user?.login === process.env.AI_REVIEWER_LOGIN &&
-              item.commit_id === reviewedSha && codexPriority(item.body)
-            ).sort((left, right) => left.id - right.id);
+            const currentFindings = reviewComments.filter((item) => {
+              if (
+                item.user?.login !== process.env.AI_REVIEWER_LOGIN ||
+                item.commit_id !== reviewedSha
+              ) return false;
+              if (parseTime(item.created_at, 'Codex finding') <= triggerTime) return false;
+              return codexPriority(item.body);
+            }).sort((left, right) => left.id - right.id);
             const validReviews = new Map();
             for (const item of reviews) {
               if (
@@ -519,10 +576,6 @@ jobs:
               ) validReviews.set(item.id, item);
             }
             for (const finding of currentFindings) {
-              if (parseTime(finding.created_at, 'Codex finding') <= triggerTime) {
-                core.setFailed('Current-head Codex finding predates the trusted trigger.');
-                return;
-              }
               if (!validReviews.has(finding.pull_request_review_id)) {
                 core.setFailed('Codex finding is not bound to a trusted current-head review.');
                 return;
