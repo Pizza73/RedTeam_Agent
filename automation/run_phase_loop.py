@@ -1936,16 +1936,18 @@ class PhaseLoop:
         ]
         if not candidates:
             return None
-        if len(candidates) != 1:
+        identities = {canonical_digest(record.payload) for record in candidates}
+        if len(identities) != 1:
             raise UntrustedEvidenceError(
                 "blocked current Phase has ambiguous current-head gate evidence"
             )
-        self.validate_blocked_refresh_gate(candidates[0], phase_records)
+        record = candidates[-1]
+        self.validate_blocked_refresh_gate(record, phase_records)
         comparison = self.github.compare(state.head_sha, default_branch_sha)
         ahead_by = comparison.get("ahead_by")
         if not isinstance(ahead_by, int) or ahead_by < 0:
             raise UntrustedEvidenceError("GitHub comparison has an invalid ahead_by value")
-        return candidates[0] if ahead_by > 0 else None
+        return record if ahead_by > 0 else None
 
     def perform_post_blocked_refresh_resume(
         self,
