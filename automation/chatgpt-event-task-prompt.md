@@ -33,6 +33,13 @@ invalidates all review evidence for the old HEAD; review only the resulting curr
 
 ## Independent review procedure
 
+For every Phase, the local orchestrator requests one exhaustive review against one exact HEAD.
+Complete all review categories in that single pass, continue after the first issue, and retain every
+consequential finding in the same native review. Each finding must use the standard P0 or P1 inline
+format. Finish the complete procedure before submitting the formal review; do not submit a partial
+review and then open another. The orchestrator aggregates all retained findings and requests one
+fix that covers all of them.
+
 1. Resolve the current PR head SHA immediately before review.
 2. Read the `phase-*` label; exactly one phase label must exist.
 3. Resolve the review base:
@@ -73,7 +80,7 @@ Use when:
 - Requirements conflict.
 - A protected governance file changed.
 - The current SHA/phase/CI evidence is missing or inconsistent.
-- The same root-cause finding survived three Codex attempts.
+- The same root-cause finding survived five Codex attempts.
 - Five implementation cycles occurred in the same phase.
 - A new external service, credential, real target, destructive operation or product-level choice is required.
 - Phase 4/5 provider preconditions are not explicitly configured and approved.
@@ -81,6 +88,8 @@ Use when:
 ## Output
 
 - Post only consequential P0/P1 findings as native inline GitHub review comments.
+- Continue inspection after finding an issue and retain all consequential P0/P1 findings
+  discovered in the single review.
 - Include the applicable B/H/M/L requirement identifier in each finding when one exists.
 - If no P0/P1 finding remains, use Codex's standard no-major-issues completion.
 - Do not emit a custom `redteam-ai-review` marker. The GitHub integration does not guarantee

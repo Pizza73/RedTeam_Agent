@@ -27,7 +27,13 @@
 - PASSはCodex標準no-major-issues comment、10文字以上のmatching commit prefix、botの👍、Current HEADのP0/P1/formal finding review不在をすべて要求する
 - Native Review判定はtrusted current-HEAD triggerより後のCodex出力だけを候補とし、trigger前の
   stale/malformedな履歴は権限として使わず、trigger後のstale evidenceはFail Closedにする
-- CHANGES_REQUESTEDはCurrent HEADへ完全BindingされたCodex formal reviewとP0/P1 inline findingを要求し、root-cause keyを決定論的に導出する
+- 全Phaseで1回の網羅Reviewを要求し、Codexは最初の指摘で停止せず、全P0/P1を同じ1件のFormal
+  Reviewへ保持する。P0/P1が複数Formal Reviewへ分散した場合はFail Closedにする
+- CHANGES_REQUESTEDはCurrent HEADへ完全BindingされたCodex formal reviewと全P0/P1 inline
+  findingを要求し、root-cause keyを決定論的に導出する。Fix Requestは全Findingの件数とPermalinkを
+  列挙し、Codexは`finding_key`だけでなく全件を修正する
+- Phase Cycle、同一Root Cause、CI Failureの自動Loop上限はすべて5回とし、設定値が5以外なら
+  Fail Closedにする
 - Required Check成功前にReview Gateを記録しない
 - 自動Phase遷移は`ai-review-passed` markerを解除するまでRunnerが待機し、next追加後にcurrentを削除する。
   各境界でfreshなopen PR、exact HEAD、marker、隣接Phaseを再検証し、無関係Labelを完全置換で消さない。

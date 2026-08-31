@@ -580,6 +580,10 @@ jobs:
                 core.setFailed('Codex finding is not bound to a trusted current-head review.');
                 return;
               }
+              if (typeof finding.html_url !== 'string' || !finding.html_url) {
+                core.setFailed('Codex finding is missing its permalink.');
+                return;
+              }
             }
             const findingReviewIds = new Set(
               currentFindings.map((item) => item.pull_request_review_id)
@@ -589,6 +593,10 @@ jobs:
               [...validReviews.keys()].some((id) => !findingReviewIds.has(id))
             ) {
               core.setFailed('Current-head Codex formal review is missing retained P0/P1 findings.');
+              return;
+            }
+            if (validReviews.size > 1) {
+              core.setFailed('Exhaustive Codex findings must be retained in one formal review.');
               return;
             }
 
@@ -650,8 +658,8 @@ jobs:
             rejectSynchronize(triggerTime, completedTime);
 
             const maximum = Number.parseInt(process.env.AI_LOOP_MAX_ITERATIONS || '5', 10);
-            if (!Number.isInteger(maximum) || maximum < 1 || maximum > 20) {
-              core.setFailed('AI_LOOP_MAX_ITERATIONS must be an integer from 1 through 20.');
+            if (maximum !== 5) {
+              core.setFailed('AI_LOOP_MAX_ITERATIONS must be exactly 5.');
               return;
             }
             const priorChanges = priorRecords.filter(
@@ -661,7 +669,7 @@ jobs:
               (record) => record.finding_key === findingKey
             ).length;
             const limitReached = verdict === 'CHANGES_REQUESTED' && (
-              priorChanges.length + 1 >= maximum || sameFindingCount + 1 >= 3
+              priorChanges.length + 1 >= maximum || sameFindingCount + 1 >= 5
             );
 
             const { data: livePr } = await github.rest.pulls.get({owner, repo, pull_number});
@@ -748,6 +756,11 @@ jobs:
                   reviewed_sha: reviewedSha,
                   review_reference: reviewReference,
                   finding_key: findingKey,
+                  finding_count: currentFindings.length,
+                  findings: currentFindings.map((item) => ({
+                    finding_key: nativeFindingKey(item),
+                    finding_reference: item.html_url,
+                  })),
                   summary,
                 },
               };
@@ -756,7 +769,7 @@ jobs:
                 owner,
                 repo,
                 issue_number: pull_number,
-                body: `A bounded fix is required for \`${findingKey}\`. The local phase orchestrator will request the Codex fix from this trusted marker; the AI does not run inside GitHub Actions.\n\n${requestMarker}`,
+                body: `A bounded fix is required for all ${currentFindings.length} retained P0/P1 finding(s) in ${reviewReference}. \`${findingKey}\` is the retry key only. The local phase orchestrator will request the Codex fix from this trusted marker; the AI does not run inside GitHub Actions.\n\n${requestMarker}`,
               });
               return;
             }
