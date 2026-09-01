@@ -393,8 +393,10 @@ def test_repository_authorizer_revalidates_decision_execution_and_current_policy
         approval_rule="always",
         data_access_policy=policy,
     )
+    authorization_time = [FIXED_TIME + timedelta(minutes=4, seconds=30)]
     authorizer = RepositoryDataAccessAuthorizer(
         database=harness.database,
+        clock=lambda: authorization_time[0],
     )
 
     def authorize_ingestion_outputs(
@@ -462,7 +464,7 @@ def test_repository_authorizer_revalidates_decision_execution_and_current_policy
         requested_data_access_factory=authorize_ingestion_outputs,
         approval_expires_at=FIXED_TIME + timedelta(minutes=6),
     )
-    written_at = FIXED_TIME + timedelta(minutes=4, seconds=30)
+    written_at = authorization_time[0]
     quarantine = EncryptedRawResultQuarantine(
         root=tmp_path / "repository-authorized-quarantine",
         keys=_keys(),
@@ -569,6 +571,45 @@ def test_repository_authorizer_revalidates_decision_execution_and_current_policy
                     source_execution_id=receipt.execution_id,
                     created_at=written_at,
                 )
+            evidence = authorizer._begin_ingestion_write(
+                receipt=receipt,
+                now=written_at,
+            )
+            with pytest.raises(TypeError, match="ingestion_evidence"):
+                artifacts._put(
+                    mission_id=running.mission_id,
+                    content=b"evidence-backed-arbitrary-artifact",
+                    media_type="text/plain",
+                    classification="normal",
+                    variant="redacted",
+                    source_execution_id=receipt.execution_id,
+                    created_at=written_at,
+                    ingestion_evidence=evidence,  # type: ignore[call-arg]
+                    retention_until=None,
+                    derived_from_artifact_id=None,
+                )
+            with pytest.raises(TypeError, match="ingestion_evidence"):
+                secrets._create(
+                    mission_id=running.mission_id,
+                    secret_value=b"evidence-backed-arbitrary-secret",
+                    credential_type="password",
+                    associated_principal_ref=None,
+                    source_execution_id=receipt.execution_id,
+                    created_at=written_at,
+                    ingestion_evidence=evidence,  # type: ignore[call-arg]
+                    detected_publication=None,
+                    expires_at=None,
+                )
+            with pytest.raises(
+                ArtifactSecurityError,
+                match="publication transaction is not trusted",
+            ):
+                await artifacts._publish_redacted_stream(object())
+            with pytest.raises(
+                SecretAccessError,
+                match="publication is not trusted",
+            ):
+                secrets._create_detected(object())
             return await trusted_ingester.ingest(receipt)
 
         async def acknowledge_persisted(self, receipt, result) -> None:
@@ -674,6 +715,7 @@ def test_repository_authorizer_revalidates_decision_execution_and_current_policy
         approval_expires_at=FIXED_TIME + timedelta(minutes=6),
     )
     assert prepared_reader.provider_execution_state == "AUTHORIZED"
+    authorization_time[0] = FIXED_TIME + timedelta(minutes=5)
     with pytest.raises(SecretAccessError, match="exact resource grant"):
         artifacts.read(
             reference,
@@ -754,6 +796,7 @@ def test_repository_authorizer_revalidates_decision_execution_and_current_policy
             execution_id=prepared_reader.execution_id,
             now=FIXED_TIME + timedelta(minutes=5, seconds=3),
         )
+    authorization_time[0] = FIXED_TIME + timedelta(minutes=6, seconds=1)
     with pytest.raises(SecretAccessError, match="approval is stale"):
         authorizer.require_access(
             mission_id=running.mission_id,
@@ -761,9 +804,10 @@ def test_repository_authorizer_revalidates_decision_execution_and_current_policy
             resource_type="artifact",
             resource=persisted,
             operation="read",
-            now=FIXED_TIME + timedelta(minutes=6, seconds=1),
+            now=FIXED_TIME + timedelta(minutes=5),
         )
 
+    authorization_time[0] = FIXED_TIME + timedelta(minutes=7)
     PolicyStateRepository(harness.database).set_current(
         build_policy_state(
             mission_id=running.mission_id,
@@ -7100,14 +7144,33 @@ def test_live_store_operation_sweeps_expired_resources_without_access_or_restart
             resource_id=reference.secret_reference_id,
             now=None,
         )
-        secrets.create(
+        live_reference = secrets.create(
             mission_id=mission_id,
-            secret_value=b"operation-triggering-secret-sweep",
+            secret_value=b"read-only-operation-trigger",
             credential_type="password",
             associated_principal_ref=None,
             source_execution_id=trigger_execution_id,
-            created_at=trigger_time,
+            created_at=NOW,
         )
+        authorizer.set_grants(
+            mission_id,
+            (
+                DataAccessGrant(
+                    resource_type="secret_reference",
+                    resource=ResourceBinding(
+                        resource_id=live_reference.secret_reference_id,
+                        resource_version="1",
+                        resource_digest=sha256_digest(live_reference),
+                    ),
+                    operations=frozenset({"resolve"}),
+                ),
+            ),
+        )
+        assert secrets.resolve(
+            live_reference,
+            execution_id=trigger_execution_id,
+            now=trigger_time,
+        ) == b"read-only-operation-trigger"
         resource_id = reference.secret_reference_id
         store = secrets._store
     else:

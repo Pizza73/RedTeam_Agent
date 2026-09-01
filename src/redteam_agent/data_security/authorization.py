@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from datetime import datetime
+from collections.abc import Callable
+from datetime import UTC, datetime
 from typing import Literal, final
 
 from pydantic import Field
@@ -122,7 +123,12 @@ class RepositoryDataAccessAuthorizer(DataAccessAuthorizer):
         "OUTCOME_UNKNOWN",
     )
 
-    def __init__(self, *, database: Database) -> None:
+    def __init__(
+        self,
+        *,
+        database: Database,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
         self._runtime_resolver = AuthorizationRuntimeContextResolver(
             revisions=MissionRevisionRepository(database),
             states=MissionStateRepository(database),
@@ -143,6 +149,7 @@ class RepositoryDataAccessAuthorizer(DataAccessAuthorizer):
         self._ingestions = ResultIngestionRepository(database)
         self._receipts = RawResultReceiptRepository(database)
         self._evaluator = DataAccessEvaluator()
+        self._clock = clock or (lambda: datetime.now(UTC))
 
     def require_access(
         self,
@@ -154,6 +161,7 @@ class RepositoryDataAccessAuthorizer(DataAccessAuthorizer):
         operation: DataAccessOperation,
         now: datetime,
     ) -> None:
+        now = self._authorization_time()
         runtime = self._current_runtime(mission_id=mission_id, now=now)
         requested = DataAccessGrant(
             resource_type=resource_type,
@@ -211,6 +219,7 @@ class RepositoryDataAccessAuthorizer(DataAccessAuthorizer):
         evidence: _IngestionWriteEvidence | None,
         now: datetime,
     ) -> None:
+        now = self._authorization_time()
         runtime = self._current_runtime(mission_id=mission_id, now=now)
         requested = DataAccessGrant(
             resource_type=resource_type,
@@ -280,7 +289,7 @@ class RepositoryDataAccessAuthorizer(DataAccessAuthorizer):
         now: datetime,
     ) -> _IngestionWriteEvidence:
         try:
-            require_utc(now)
+            now = self._authorization_time()
             execution = self._executions.get(receipt.execution_id)
             persisted_receipt = self._receipts.get(receipt.receipt_id)
             if execution is None or persisted_receipt != receipt:
@@ -305,6 +314,16 @@ class RepositoryDataAccessAuthorizer(DataAccessAuthorizer):
         except Exception as exc:
             raise SecretAccessError(
                 "trusted ingestion evidence is unavailable"
+            ) from exc
+
+    def _authorization_time(self) -> datetime:
+        try:
+            now = self._clock()
+            require_utc(now)
+            return now
+        except Exception as exc:
+            raise SecretAccessError(
+                "trusted authorization clock is unavailable"
             ) from exc
 
     def _current_ingestion_evidence(

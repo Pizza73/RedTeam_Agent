@@ -2165,3 +2165,109 @@ PHASE_GATE=phase-0c PASS
 - No protected governance file was modified.
 - A fresh independent Phase 0C review remains required on the resulting 40-character PR HEAD; this
   local PASS is not an independent Phase Gate PASS.
+
+## Thirtieth independent review correction cycle
+
+Current phase: `phase-0c`.
+
+Input review SHA: `47a58ab068c092ddff320fc17387ce053cf46215`.
+
+Phase base: `5cda9a5f8792ee33c3e153d8e791499f5619d82e`.
+
+### Findings addressed
+
+- [`discussion_r3901278173`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3901278173):
+  repository-backed Artifact and Secret authorization now obtains the decision time from an
+  injected trusted Clock inside `RepositoryDataAccessAuthorizer`. Caller-supplied timestamps are no
+  longer authorization evidence for Mission/runtime, PolicyDecision, grant, approval, or ingestion
+  lease freshness. The concrete repository regression advances the trusted Clock beyond Approval
+  expiry while passing a backdated access timestamp and proves the read is rejected as stale.
+- [`discussion_r3901278180`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3901278180):
+  Store methods that accepted arbitrary bytes/streams together with ingestion evidence were
+  removed. Streaming publication now requires a one-shot runtime-checked transaction constructed
+  only from the exact encrypted Quarantine sink and persisted receipt; the transaction itself owns
+  streaming secret detection, Secret isolation, and redaction. Artifact Store ignores all
+  caller-provided stream content for that path and consumes only the transaction's redacted stream,
+  while Secret Store accepts only one-shot detected-secret publications created inside the same
+  redactor. The active-receipt regression proves that even directly obtaining current evidence does
+  not provide a callable arbitrary Artifact/Secret publication API and that forged transactions
+  fail closed before storage.
+- [`discussion_r3901278184`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3901278184):
+  Secret `resolve` and `revoke` entry points now run the same Mission-scoped crash-safe expiry sweep
+  used by creation. The sweep resumes durable expiry intents before scanning detected secrets,
+  audits deletion, erases ciphertext, and destroys the resource key. The live-store regression now
+  expires one Secret while the only subsequent workload resolves a different live Secret; no
+  restart, expired-resource access, or new Secret creation is used to trigger cleanup.
+
+### Modified files and regression tests
+
+Resulting working-tree diff: `5 files changed, 490 insertions(+), 163 deletions(-)`.
+
+- `src/redteam_agent/data_security/authorization.py`
+- `src/redteam_agent/data_security/ingestion.py`
+- `src/redteam_agent/data_security/stores.py`
+- `tests/security/test_phase0c_data_security.py`
+- `docs/review/phase-0c-fix-report.md`
+
+Regression coverage exercises backdated authorization attempts after trusted-clock expiry,
+direct active-receipt/evidence publication attempts, forged publication objects, successful
+Quarantine-bound redaction and Secret isolation, and Secret expiry during an unrelated read-only
+resolve workload. Existing directory anchoring, key destruction, audit recovery, quota, streaming,
+lifecycle, scope, and detector regressions continue to pass. No test was deleted, skipped, weakened,
+or marked as an expected failure.
+
+### Validation
+
+Focused review regressions:
+
+```text
+PYTHONPATH=. /home/kali/Red_Agent/.venv/bin/pytest -q \
+  tests/security/test_phase0c_data_security.py::test_repository_authorizer_revalidates_decision_execution_and_current_policy \
+  tests/security/test_phase0c_data_security.py::test_live_store_operation_sweeps_expired_resources_without_access_or_restart \
+  -x
+```
+
+Result: `4 passed`.
+
+Phase 0C data-security module: `82 passed`.
+
+Required phase-gate command:
+
+```text
+PATH=/home/kali/Red_Agent/.venv/bin:$PATH \
+  scripts/ci/run_phase_gate.sh phase-0c
+```
+
+Result:
+
+```text
+AUTOMATION_VALIDATION=PASS
+ruff: All checks passed
+mypy: Success: no issues found in 79 source files
+unit: 200 passed
+integration: 7 passed
+security: 228 passed
+full/coverage run: 435 passed
+skipped=0, errors=0, failures=0
+coverage: 81% total (branch coverage enabled)
+pip check: No broken requirements found
+PHASE_GATE=phase-0c PASS
+```
+
+### Remaining constraints
+
+- Runtime publication transactions protect the in-process Store boundary from ordinary callers;
+  they do not attempt to defend against arbitrary interpreter memory mutation or monkey-patching.
+  Process/OS isolation of mutually hostile Python code is outside Phase 0C.
+- Retention cleanup remains operation-driven per active Mission plus a full startup recovery sweep.
+  An entirely idle long-lived Mission relies on the next same-Mission Store operation.
+- Resource-creation and expiry recovery assume the configured key provider performs durable
+  cryptographic destruction. The wrapped-file provider supplies that property through its
+  externally anchored generation protocol.
+- The key-state and audit-head external generation adapters remain integration boundaries supplied
+  by an OS keystore, vault, or equivalently protected monotonic service.
+- No real C2, MCP, provider, subprocess, local-attack, credential-collection, or external-target
+  action was executed.
+- No protected governance file was modified.
+- A fresh independent Phase 0C review remains required on the resulting 40-character PR HEAD; this
+  local PASS is not an independent Phase Gate PASS.

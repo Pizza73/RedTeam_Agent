@@ -14,7 +14,7 @@ from contextlib import asynccontextmanager, contextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import RLock
-from typing import Literal
+from typing import Any, Literal, cast
 
 from pydantic import Field
 
@@ -33,13 +33,9 @@ from redteam_agent.errors import (
 from redteam_agent.models.base import StrictImmutableBoundaryModel
 from redteam_agent.models.common import UtcDatetime, require_utc
 from redteam_agent.models.context import ResourceBinding
-from redteam_agent.models.execution import RawResultReceipt
 
 from .audit import DataStoreAuditRecorder
-from .authorization import (
-    RepositoryDataAccessAuthorizer,
-    _IngestionWriteEvidence,
-)
+from .authorization import RepositoryDataAccessAuthorizer
 from .keys import EncryptionKeyProvider
 from .models import (
     ArtifactReference,
@@ -2723,17 +2719,6 @@ class ArtifactStore:
         self._resume_pending_stream_cleanups()
         self._sweep_expired_artifacts()
 
-    def _begin_ingestion_write(
-        self,
-        *,
-        receipt: RawResultReceipt,
-        now: datetime,
-    ) -> _IngestionWriteEvidence:
-        return self._authorizer._begin_ingestion_write(
-            receipt=receipt,
-            now=now,
-        )
-
     def _reconcile_pending_creation_audits(self) -> None:
         for mission_id, resource_id in self._store.pending_creation_audits():
             if not resource_id.startswith("artifact_"):
@@ -2769,34 +2754,6 @@ class ArtifactStore:
             variant=variant,
             source_execution_id=source_execution_id,
             created_at=created_at,
-            ingestion_evidence=None,
-            retention_until=retention_until,
-            derived_from_artifact_id=derived_from_artifact_id,
-        )
-
-    def _put_ingested(
-        self,
-        *,
-        mission_id: str,
-        content: bytes,
-        media_type: str,
-        classification: Literal["normal", "sensitive", "secret"],
-        variant: Literal["redacted", "encrypted_raw"],
-        source_execution_id: str,
-        created_at: datetime,
-        ingestion_evidence: _IngestionWriteEvidence,
-        retention_until: datetime | None = None,
-        derived_from_artifact_id: str | None = None,
-    ) -> ArtifactReference:
-        return self._put(
-            mission_id=mission_id,
-            content=content,
-            media_type=media_type,
-            classification=classification,
-            variant=variant,
-            source_execution_id=source_execution_id,
-            created_at=created_at,
-            ingestion_evidence=ingestion_evidence,
             retention_until=retention_until,
             derived_from_artifact_id=derived_from_artifact_id,
         )
@@ -2811,7 +2768,6 @@ class ArtifactStore:
         variant: Literal["redacted", "encrypted_raw"],
         source_execution_id: str,
         created_at: datetime,
-        ingestion_evidence: _IngestionWriteEvidence | None,
         retention_until: datetime | None,
         derived_from_artifact_id: str | None,
     ) -> ArtifactReference:
@@ -2854,7 +2810,7 @@ class ArtifactStore:
                 resource_version="1",
                 resource_digest=content_digest,
             ),
-            evidence=ingestion_evidence,
+            evidence=None,
             now=created_at,
         )
         if self._store.has_resource(mission_id=mission_id, resource_id=artifact_id):
@@ -2926,45 +2882,43 @@ class ArtifactStore:
             variant=variant,
             source_execution_id=source_execution_id,
             created_at=created_at,
-            ingestion_evidence=None,
+            publication=None,
             retention_until=retention_until,
             derived_from_artifact_id=derived_from_artifact_id,
         )
 
-    async def _put_ingested_stream(
+    async def _publish_redacted_stream(
         self,
-        *,
-        mission_id: str,
-        chunks: AsyncIterator[bytes],
-        media_type: str,
-        classification: Callable[
-            [], Literal["normal", "sensitive", "secret"]
-        ],
-        variant: Literal["redacted", "encrypted_raw"],
-        source_execution_id: str,
-        created_at: datetime,
-        ingestion_evidence: _IngestionWriteEvidence,
-        retention_until: datetime | None = None,
-        derived_from_artifact_id: str | None = None,
+        publication: object,
     ) -> ArtifactReference:
+        from .ingestion import _RedactedArtifactPublication
+
+        if type(publication) is not _RedactedArtifactPublication:
+            raise ArtifactSecurityError(
+                "artifact publication transaction is not trusted"
+            )
+        trusted_publication = cast(Any, publication)
+        _, mission_id, source_execution_id, created_at = (
+            trusted_publication._binding()
+        )
         return await self._put_stream(
             mission_id=mission_id,
-            chunks=chunks,
-            media_type=media_type,
-            classification=classification,
-            variant=variant,
+            chunks=None,
+            media_type="application/octet-stream",
+            classification=trusted_publication._classification,
+            variant="redacted",
             source_execution_id=source_execution_id,
             created_at=created_at,
-            ingestion_evidence=ingestion_evidence,
-            retention_until=retention_until,
-            derived_from_artifact_id=derived_from_artifact_id,
+            publication=publication,
+            retention_until=None,
+            derived_from_artifact_id=None,
         )
 
     async def _put_stream(
         self,
         *,
         mission_id: str,
-        chunks: AsyncIterator[bytes],
+        chunks: AsyncIterator[bytes] | None,
         media_type: str,
         classification: Callable[
             [], Literal["normal", "sensitive", "secret"]
@@ -2972,7 +2926,7 @@ class ArtifactStore:
         variant: Literal["redacted", "encrypted_raw"],
         source_execution_id: str,
         created_at: datetime,
-        ingestion_evidence: _IngestionWriteEvidence | None,
+        publication: object | None,
         retention_until: datetime | None,
         derived_from_artifact_id: str | None,
     ) -> ArtifactReference:
@@ -3005,7 +2959,7 @@ class ArtifactStore:
                     variant=variant,
                     source_execution_id=source_execution_id,
                     created_at=created_at,
-                    ingestion_evidence=ingestion_evidence,
+                    publication=publication,
                     retention_until=retention_until,
                     derived_from_artifact_id=derived_from_artifact_id,
                     attempt_id=cleanup_id,
@@ -3031,7 +2985,7 @@ class ArtifactStore:
         self,
         *,
         mission_id: str,
-        chunks: AsyncIterator[bytes],
+        chunks: AsyncIterator[bytes] | None,
         media_type: str,
         classification: Callable[
             [], Literal["normal", "sensitive", "secret"]
@@ -3039,7 +2993,7 @@ class ArtifactStore:
         variant: Literal["redacted", "encrypted_raw"],
         source_execution_id: str,
         created_at: datetime,
-        ingestion_evidence: _IngestionWriteEvidence | None,
+        publication: object | None,
         retention_until: datetime | None = None,
         derived_from_artifact_id: str | None = None,
         attempt_id: str,
@@ -3047,6 +3001,38 @@ class ArtifactStore:
         """Persist a logical artifact without materializing the complete content."""
 
         _require_time(created_at)
+        ingestion_evidence = None
+        if publication is not None:
+            from .ingestion import _RedactedArtifactPublication
+
+            if type(publication) is not _RedactedArtifactPublication:
+                raise ArtifactSecurityError(
+                    "artifact publication transaction is not trusted"
+                )
+            trusted_publication = cast(Any, publication)
+            receipt, bound_mission_id, bound_execution_id, bound_now = (
+                trusted_publication._binding()
+            )
+            if not (
+                mission_id == bound_mission_id
+                and source_execution_id == bound_execution_id
+                and created_at == bound_now
+                and media_type == "application/octet-stream"
+                and variant == "redacted"
+                and retention_until is None
+                and derived_from_artifact_id is None
+            ):
+                raise ArtifactSecurityError(
+                    "artifact publication binding is invalid"
+                )
+            chunks = trusted_publication._chunks()
+            classification = trusted_publication._classification
+            ingestion_evidence = self._authorizer._begin_ingestion_write(
+                receipt=receipt,
+                now=created_at,
+            )
+        if chunks is None:
+            raise ArtifactSecurityError("artifact stream content is unavailable")
         if not media_type or variant not in {"redacted", "encrypted_raw"}:
             raise ArtifactSecurityError("artifact stream metadata is invalid")
         if retention_until is not None:
@@ -4524,31 +4510,23 @@ class SecretStore:
             associated_principal_ref=associated_principal_ref,
             source_execution_id=source_execution_id,
             created_at=created_at,
-            ingestion_evidence=None,
+            detected_publication=None,
             expires_at=expires_at,
         )
 
-    def _create_ingested(
+    def _create_detected(
         self,
-        *,
-        mission_id: str,
-        secret_value: bytes,
-        credential_type: str,
-        associated_principal_ref: str | None,
-        source_execution_id: str,
-        created_at: datetime,
-        ingestion_evidence: _IngestionWriteEvidence,
-        expires_at: datetime | None = None,
+        publication: object,
     ) -> SecretReferenceMetadata:
         return self._create(
-            mission_id=mission_id,
-            secret_value=secret_value,
-            credential_type=credential_type,
-            associated_principal_ref=associated_principal_ref,
-            source_execution_id=source_execution_id,
-            created_at=created_at,
-            ingestion_evidence=ingestion_evidence,
-            expires_at=expires_at,
+            mission_id="publication-pending",
+            secret_value=b"",
+            credential_type="publication-pending",
+            associated_principal_ref=None,
+            source_execution_id="publication-pending",
+            created_at=datetime.min.replace(tzinfo=UTC),
+            detected_publication=publication,
+            expires_at=None,
         )
 
     def _create(
@@ -4560,9 +4538,32 @@ class SecretStore:
         associated_principal_ref: str | None,
         source_execution_id: str,
         created_at: datetime,
-        ingestion_evidence: _IngestionWriteEvidence | None,
+        detected_publication: object | None,
         expires_at: datetime | None,
     ) -> SecretReferenceMetadata:
+        ingestion_evidence = None
+        if detected_publication is not None:
+            from .ingestion import _DetectedSecretPublication
+
+            if type(detected_publication) is not _DetectedSecretPublication:
+                raise SecretAccessError(
+                    "detected-secret publication is not trusted"
+                )
+            trusted_publication = cast(Any, detected_publication)
+            (
+                receipt,
+                mission_id,
+                secret_value,
+                credential_type,
+                associated_principal_ref,
+                created_at,
+            ) = trusted_publication._consume()
+            source_execution_id = receipt.execution_id
+            expires_at = None
+            ingestion_evidence = self._authorizer._begin_ingestion_write(
+                receipt=receipt,
+                now=created_at,
+            )
         _require_bytes(secret_value)
         _require_time(created_at)
         self._sweep_expired_secrets(
@@ -4694,6 +4695,10 @@ class SecretStore:
         execution_id: str,
         now: datetime,
     ) -> bytes:
+        self._sweep_expired_secrets(
+            now=now,
+            mission_id=reference.mission_id,
+        )
         authoritative, source_execution_id, version = self._authoritative_metadata(reference)
         if authoritative.verification_state == "revoked":
             raise SecretAccessError("secret reference is revoked")
@@ -4771,6 +4776,10 @@ class SecretStore:
         execution_id: str,
         now: datetime,
     ) -> SecretReferenceMetadata:
+        self._sweep_expired_secrets(
+            now=now,
+            mission_id=reference.mission_id,
+        )
         authoritative, source_execution_id, version = self._authoritative_metadata(reference)
         self._authorizer.require_access(
             mission_id=authoritative.mission_id,

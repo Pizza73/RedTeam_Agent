@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Callable
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 from redteam_agent.canonical import sha256_digest, stable_id
 from redteam_agent.errors import SecretDetectionError, SecureIngestionError
@@ -14,7 +14,6 @@ from redteam_agent.models.execution import (
     SecureIngestionSummary,
 )
 
-from .authorization import _IngestionWriteEvidence
 from .models import (
     ArtifactReference,
     QuarantineReference,
@@ -691,6 +690,182 @@ class _StreamingSecretRedactor:
         )
 
 
+def _trusted_publication_types() -> tuple[Any, Any, Any]:
+    construction_token = object()
+
+    class DetectedSecretPublication:
+        __slots__ = (
+            "_associated_principal_ref",
+            "_consumed",
+            "_credential_type",
+            "_mission_id",
+            "_now",
+            "_receipt",
+            "_secret_value",
+        )
+
+        def __init__(
+            self,
+            token: object,
+            *,
+            receipt: RawResultReceipt,
+            mission_id: str,
+            secret_value: bytes,
+            credential_type: str,
+            associated_principal_ref: str | None,
+            now: datetime,
+        ) -> None:
+            if token is not construction_token:
+                raise SecureIngestionError(
+                    "detected-secret publication is not trusted"
+                )
+            self._receipt = receipt
+            self._mission_id = mission_id
+            self._secret_value = secret_value
+            self._credential_type = credential_type
+            self._associated_principal_ref = associated_principal_ref
+            self._now = now
+            self._consumed = False
+
+        def _consume(
+            self,
+        ) -> tuple[RawResultReceipt, str, bytes, str, str | None, datetime]:
+            if self._consumed:
+                raise SecureIngestionError(
+                    "detected-secret publication was already consumed"
+                )
+            self._consumed = True
+            return (
+                self._receipt,
+                self._mission_id,
+                self._secret_value,
+                self._credential_type,
+                self._associated_principal_ref,
+                self._now,
+            )
+
+    class RedactedArtifactPublication:
+        __slots__ = (
+            "_consumed",
+            "_detections",
+            "_now",
+            "_receipt",
+            "_secrets",
+            "_sink",
+        )
+
+        def __init__(
+            self,
+            token: object,
+            *,
+            sink: EncryptedRawResultSink,
+            receipt: RawResultReceipt,
+            secrets: SecretStore,
+            now: datetime,
+        ) -> None:
+            if token is not construction_token or type(sink) is not EncryptedRawResultSink:
+                raise SecureIngestionError(
+                    "redacted-artifact publication is not trusted"
+                )
+            self._sink = sink
+            self._receipt = receipt
+            self._secrets = secrets
+            self._now = now
+            self._detections: list[SecretDiscoveryReference] = []
+            self._consumed = False
+
+        def _binding(
+            self,
+        ) -> tuple[RawResultReceipt, str, str, datetime]:
+            return (
+                self._receipt,
+                self._sink.binding.mission_id,
+                self._receipt.execution_id,
+                self._now,
+            )
+
+        def _classification(self) -> Literal["normal", "sensitive", "secret"]:
+            return "sensitive" if self._detections else "normal"
+
+        def _detected_secrets(self) -> tuple[SecretDiscoveryReference, ...]:
+            if not self._consumed:
+                raise SecureIngestionError(
+                    "redacted-artifact publication is incomplete"
+                )
+            return tuple(self._detections)
+
+        async def _chunks(self) -> AsyncIterator[bytes]:
+            if self._consumed:
+                raise SecureIngestionError(
+                    "redacted-artifact publication was already consumed"
+                )
+            self._consumed = True
+
+            def replace(keyword: bytes, secret_value: bytes) -> bytes:
+                credential_type = keyword.decode("ascii").lower().replace("-", "_")
+                secret = self._secrets._create_detected(
+                    DetectedSecretPublication(
+                        construction_token,
+                        receipt=self._receipt,
+                        mission_id=self._sink.binding.mission_id,
+                        secret_value=secret_value,
+                        credential_type=credential_type,
+                        associated_principal_ref=None,
+                        now=self._now,
+                    )
+                )
+                self._detections.append(
+                    SecretDiscoveryReference(
+                        secret_reference_id=secret.secret_reference_id,
+                        credential_type=secret.credential_type,
+                        associated_principal_ref=secret.associated_principal_ref,
+                        source_execution_id=self._receipt.execution_id,
+                        verification_state=secret.verification_state,
+                    )
+                )
+                return b"[REDACTED]"
+
+            redactor = _StreamingSecretRedactor(replace)
+            async for chunk in self._sink._iter_committed_chunks(
+                self._receipt,
+                now=self._now,
+            ):
+                redacted = redactor.feed(chunk)
+                if redacted:
+                    yield redacted
+            final = redactor.feed(b"", final=True)
+            if final:
+                yield final
+
+    def create_redacted_artifact_publication(
+        *,
+        sink: EncryptedRawResultSink,
+        receipt: RawResultReceipt,
+        secrets: SecretStore,
+        now: datetime,
+    ) -> RedactedArtifactPublication:
+        return RedactedArtifactPublication(
+            construction_token,
+            sink=sink,
+            receipt=receipt,
+            secrets=secrets,
+            now=now,
+        )
+
+    return (
+        DetectedSecretPublication,
+        RedactedArtifactPublication,
+        create_redacted_artifact_publication,
+    )
+
+
+(
+    _DetectedSecretPublication,
+    _RedactedArtifactPublication,
+    _create_redacted_artifact_publication,
+) = _trusted_publication_types()
+
+
 class SecureIngestor:
     def __init__(
         self,
@@ -740,7 +915,6 @@ class SecureIngestor:
             mission_id=reference.mission_id,
             source_execution_id=reference.execution_id,
             detections=detections,
-            ingestion_evidence=None,
             now=now,
         )
         redacted_reference = self._artifacts.put(
@@ -814,46 +988,16 @@ class SecureIngestor:
         if durable_result is not None:
             sink._delete_committed(now=now)
             return durable_result
-        ingestion_evidence = self._artifacts._begin_ingestion_write(
+        publication = _create_redacted_artifact_publication(
+            sink=sink,
             receipt=receipt,
+            secrets=self._secrets,
             now=now,
         )
-        detections: list[SecretDiscoveryReference] = []
-
-        def replace(keyword: bytes, secret_value: bytes) -> bytes:
-            self._record_detection(
-                keyword=keyword,
-                secret_value=secret_value,
-                mission_id=sink.binding.mission_id,
-                source_execution_id=receipt.execution_id,
-                detections=detections,
-                ingestion_evidence=ingestion_evidence,
-                now=now,
-            )
-            return b"[REDACTED]"
-
-        redactor = _StreamingSecretRedactor(replace)
-
-        async def redacted_chunks() -> AsyncIterator[bytes]:
-            async for chunk in sink._iter_committed_chunks(receipt, now=now):
-                redacted = redactor.feed(chunk)
-                if redacted:
-                    yield redacted
-            final = redactor.feed(b"", final=True)
-            if final:
-                yield final
-
-        redacted_reference = await self._artifacts._put_ingested_stream(
-            mission_id=sink.binding.mission_id,
-            chunks=redacted_chunks(),
-            media_type="application/octet-stream",
-            classification=lambda: "sensitive" if detections else "normal",
-            variant="redacted",
-            source_execution_id=receipt.execution_id,
-            created_at=now,
-            ingestion_evidence=ingestion_evidence,
-            derived_from_artifact_id=None,
+        redacted_reference = await self._artifacts._publish_redacted_stream(
+            publication
         )
+        detections = list(publication._detected_secrets())
         result = self._result(
             quarantine_id=receipt.quarantine_id,
             quarantine_digest=receipt.ciphertext_digest,
@@ -872,7 +1016,6 @@ class SecureIngestor:
         mission_id: str,
         source_execution_id: str,
         detections: list[SecretDiscoveryReference],
-        ingestion_evidence: _IngestionWriteEvidence | None,
         now: datetime,
     ) -> bytes:
         def replace(keyword: bytes, secret_value: bytes) -> bytes:
@@ -882,7 +1025,6 @@ class SecureIngestor:
                 mission_id=mission_id,
                 source_execution_id=source_execution_id,
                 detections=detections,
-                ingestion_evidence=ingestion_evidence,
                 now=now,
             )
             return b"[REDACTED]"
@@ -903,29 +1045,17 @@ class SecureIngestor:
         mission_id: str,
         source_execution_id: str,
         detections: list[SecretDiscoveryReference],
-        ingestion_evidence: _IngestionWriteEvidence | None,
         now: datetime,
     ) -> None:
         credential_type = keyword.decode("ascii").lower().replace("-", "_")
-        if ingestion_evidence is None:
-            secret = self._secrets.create(
-                mission_id=mission_id,
-                secret_value=secret_value,
-                credential_type=credential_type,
-                associated_principal_ref=None,
-                source_execution_id=source_execution_id,
-                created_at=now,
-            )
-        else:
-            secret = self._secrets._create_ingested(
-                mission_id=mission_id,
-                secret_value=secret_value,
-                credential_type=credential_type,
-                associated_principal_ref=None,
-                source_execution_id=source_execution_id,
-                created_at=now,
-                ingestion_evidence=ingestion_evidence,
-            )
+        secret = self._secrets.create(
+            mission_id=mission_id,
+            secret_value=secret_value,
+            credential_type=credential_type,
+            associated_principal_ref=None,
+            source_execution_id=source_execution_id,
+            created_at=now,
+        )
         detections.append(
             SecretDiscoveryReference(
                 secret_reference_id=secret.secret_reference_id,
