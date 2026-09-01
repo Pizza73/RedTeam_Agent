@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import fcntl
 import hashlib
 import os
@@ -9,7 +10,7 @@ import re
 import secrets
 import stat
 from collections.abc import AsyncIterator, Callable, Iterator
-from contextlib import contextmanager, suppress
+from contextlib import asynccontextmanager, contextmanager, suppress
 from datetime import datetime
 from pathlib import Path
 from threading import RLock
@@ -109,6 +110,7 @@ class _SecretTombstone(StrictImmutableBoundaryModel):
 class _ArtifactStreamChunkBinding(StrictImmutableBoundaryModel):
     record_type: Literal["artifact_stream_chunk"]
     stream_id: str = Field(min_length=1)
+    attempt_id: str = Field(min_length=1)
     source_execution_id: str = Field(min_length=1)
     sequence_number: int = Field(ge=0)
     plaintext_offset: int = Field(ge=0)
@@ -129,6 +131,7 @@ class _ArtifactStreamManifest(StrictImmutableBoundaryModel):
     schema_version: Literal["artifact-stream-v1"]
     artifact_id: str = Field(min_length=1)
     stream_id: str = Field(min_length=1)
+    attempt_id: str = Field(min_length=1)
     mission_id: str = Field(min_length=1)
     media_type: str = Field(min_length=1)
     size_bytes: int = Field(ge=0)
@@ -1215,40 +1218,42 @@ class ArtifactStore:
             source_execution_id=source_execution_id,
             derived_from_artifact_id=derived_from_artifact_id,
         )
-        cleanup_id = self._begin_stream_cleanup(
-            mission_id=mission_id,
-            stream_id=stream_id,
-            source_execution_id=source_execution_id,
-            created_at=created_at,
-        )
-        try:
-            reference = await self._put_stream_unreconciled(
+        async with self._serialized_artifact_stream(stream_id):
+            cleanup_id = self._begin_stream_cleanup(
                 mission_id=mission_id,
-                chunks=chunks,
-                media_type=media_type,
-                classification=classification,
-                variant=variant,
+                stream_id=stream_id,
                 source_execution_id=source_execution_id,
                 created_at=created_at,
-                retention_until=retention_until,
-                derived_from_artifact_id=derived_from_artifact_id,
             )
-        except Exception:
-            with suppress(Exception):
-                self._resume_stream_cleanup(
+            try:
+                reference = await self._put_stream_unreconciled(
                     mission_id=mission_id,
-                    cleanup_id=cleanup_id,
-                    stream_id=stream_id,
+                    chunks=chunks,
+                    media_type=media_type,
+                    classification=classification,
+                    variant=variant,
                     source_execution_id=source_execution_id,
+                    created_at=created_at,
+                    retention_until=retention_until,
+                    derived_from_artifact_id=derived_from_artifact_id,
+                    attempt_id=cleanup_id,
                 )
-            raise
-        self._finish_stream_cleanup(
-            mission_id=mission_id,
-            cleanup_id=cleanup_id,
-            stream_id=stream_id,
-            source_execution_id=source_execution_id,
-        )
-        return reference
+            except Exception:
+                with suppress(Exception):
+                    self._resume_stream_cleanup(
+                        mission_id=mission_id,
+                        cleanup_id=cleanup_id,
+                        stream_id=stream_id,
+                        source_execution_id=source_execution_id,
+                    )
+                raise
+            self._finish_stream_cleanup(
+                mission_id=mission_id,
+                cleanup_id=cleanup_id,
+                stream_id=stream_id,
+                source_execution_id=source_execution_id,
+            )
+            return reference
 
     async def _put_stream_unreconciled(
         self,
@@ -1264,6 +1269,7 @@ class ArtifactStore:
         created_at: datetime,
         retention_until: datetime | None = None,
         derived_from_artifact_id: str | None = None,
+        attempt_id: str,
     ) -> ArtifactReference:
         """Persist a logical artifact without materializing the complete content."""
 
@@ -1317,13 +1323,18 @@ class ArtifactStore:
             binding = _ArtifactStreamChunkBinding(
                 record_type="artifact_stream_chunk",
                 stream_id=stream_id,
+                attempt_id=attempt_id,
                 source_execution_id=source_execution_id,
                 sequence_number=sequence,
                 plaintext_offset=size_bytes,
                 plaintext_size=len(content),
                 plaintext_sha256=content_digest,
             )
-            resource_id = self._artifact_stream_chunk_id(stream_id, sequence)
+            resource_id = self._artifact_stream_chunk_id(
+                stream_id,
+                attempt_id,
+                sequence,
+            )
             if self._store.has_resource(
                 mission_id=mission_id, resource_id=resource_id
             ):
@@ -1402,6 +1413,7 @@ class ArtifactStore:
             schema_version="artifact-stream-v1",
             artifact_id=artifact_id,
             stream_id=stream_id,
+            attempt_id=attempt_id,
             mission_id=mission_id,
             media_type=media_type,
             size_bytes=size_bytes,
@@ -1423,6 +1435,7 @@ class ArtifactStore:
             logical_size=size_bytes,
             logical_sha256=content_digest,
             stream_id=stream_id,
+            attempt_id=attempt_id,
         )
         self._authorizer.require_ingestion_write(
             mission_id=mission_id,
@@ -1442,9 +1455,32 @@ class ArtifactStore:
                 resource_id=artifact_id,
                 now=None,
             )
+            try:
+                canonical_loads(existing)
+                existing_manifest = _ArtifactStreamManifest.model_validate_json(
+                    existing,
+                    strict=True,
+                )
+            except (TypeError, ValueError) as exc:
+                raise ArtifactSecurityError(
+                    "artifact stream manifest is invalid"
+                ) from exc
+            equivalent_manifest = existing_manifest.model_copy(
+                update={
+                    "attempt_id": attempt_id,
+                    "chunks": tuple(chunk_references),
+                }
+            )
+            expected_existing_binding = {
+                **binding,
+                "attempt_id": existing_manifest.attempt_id,
+            }
             if not (
-                existing == manifest_content
-                and envelope.binding == CanonicalJsonObject(binding)
+                equivalent_manifest == manifest
+                and existing
+                == canonicalize(existing_manifest.model_dump(mode="python"))
+                and envelope.binding
+                == CanonicalJsonObject(expected_existing_binding)
                 and envelope.retention_until == retention_until
             ):
                 raise ArtifactSecurityError(
@@ -1491,12 +1527,119 @@ class ArtifactStore:
                     mission_id=mission_id,
                     cleanup_id=cleanup_id,
                 )
-                self._resume_stream_cleanup(
-                    mission_id=mission_id,
-                    cleanup_id=cleanup_id,
-                    stream_id=intent.stream_id,
-                    source_execution_id=intent.source_execution_id,
+                with self._try_serialized_artifact_stream(
+                    intent.stream_id
+                ) as acquired:
+                    if not acquired or not self._store.has_resource(
+                        mission_id=mission_id,
+                        resource_id=cleanup_id,
+                    ):
+                        continue
+                    self._resume_stream_cleanup(
+                        mission_id=mission_id,
+                        cleanup_id=cleanup_id,
+                        stream_id=intent.stream_id,
+                        source_execution_id=intent.source_execution_id,
+                    )
+
+    @asynccontextmanager
+    async def _serialized_artifact_stream(
+        self,
+        stream_id: str,
+    ) -> AsyncIterator[None]:
+        descriptor = self._open_stream_lock(stream_id)
+        locked = False
+        try:
+            while not locked:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    locked = True
+                except BlockingIOError:
+                    await asyncio.sleep(0.01)
+                except OSError as exc:
+                    raise ArtifactSecurityError(
+                        "artifact stream lock acquisition failed"
+                    ) from exc
+            yield
+        finally:
+            if locked:
+                with suppress(OSError):
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+
+    @contextmanager
+    def _try_serialized_artifact_stream(
+        self,
+        stream_id: str,
+    ) -> Iterator[bool]:
+        descriptor = self._open_stream_lock(stream_id)
+        locked = False
+        try:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+            except BlockingIOError:
+                pass
+            except OSError as exc:
+                raise ArtifactSecurityError(
+                    "artifact stream lock acquisition failed"
+                ) from exc
+            yield locked
+        finally:
+            if locked:
+                with suppress(OSError):
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+
+    def _open_stream_lock(self, stream_id: str) -> int:
+        self._store._validate_token(stream_id)
+        directory_flags = os.O_RDONLY | os.O_CLOEXEC
+        if hasattr(os, "O_DIRECTORY"):
+            directory_flags |= os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            directory_flags |= os.O_NOFOLLOW
+        try:
+            directory_descriptor = os.open(self._store._root, directory_flags)
+        except OSError as exc:
+            raise ArtifactSecurityError(
+                "artifact stream lock directory is unavailable"
+            ) from exc
+        lock_name = f".{stream_id}.lock"
+        lock_flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            lock_flags |= os.O_NOFOLLOW
+        try:
+            directory_metadata = os.fstat(directory_descriptor)
+            if (
+                not stat.S_ISDIR(directory_metadata.st_mode)
+                or (directory_metadata.st_dev, directory_metadata.st_ino)
+                != self._store._root_identity
+            ):
+                raise ArtifactSecurityError(
+                    "artifact stream lock directory identity changed"
                 )
+            try:
+                descriptor = os.open(
+                    lock_name,
+                    lock_flags,
+                    0o600,
+                    dir_fd=directory_descriptor,
+                )
+            except OSError as exc:
+                raise ArtifactSecurityError(
+                    "artifact stream lock is unavailable"
+                ) from exc
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or stat.S_IMODE(metadata.st_mode) & 0o077
+            ):
+                os.close(descriptor)
+                raise ArtifactSecurityError("artifact stream lock is invalid")
+            return descriptor
+        finally:
+            os.close(directory_descriptor)
 
     def _begin_stream_cleanup(
         self,
@@ -1597,6 +1740,7 @@ class ArtifactStore:
             if (
                 binding.get("storage_format") == "artifact-stream-v1"
                 and binding.get("stream_id") == stream_id
+                and binding.get("attempt_id") == cleanup_id
                 and binding.get("source_execution_id") == source_execution_id
             ):
                 completed = True
@@ -1608,7 +1752,11 @@ class ArtifactStore:
                 // _ARTIFACT_STREAM_CHUNK_BYTES,
             )
             for sequence in range(maximum_chunks):
-                resource_id = self._artifact_stream_chunk_id(stream_id, sequence)
+                resource_id = self._artifact_stream_chunk_id(
+                    stream_id,
+                    cleanup_id,
+                    sequence,
+                )
                 if self._store.has_resource(
                     mission_id=mission_id,
                     resource_id=resource_id,
@@ -1890,6 +2038,7 @@ class ArtifactStore:
                 chunk.sequence_number == expected_sequence
                 and chunk.plaintext_offset == expected_offset
                 and binding.stream_id == manifest.stream_id
+                and binding.attempt_id == manifest.attempt_id
                 and binding.source_execution_id == manifest.source_execution_id
                 and binding.sequence_number == chunk.sequence_number
                 and binding.plaintext_offset == chunk.plaintext_offset
@@ -1950,6 +2099,7 @@ class ArtifactStore:
                 chunk.sequence_number == expected_sequence
                 and chunk.plaintext_offset == expected_offset
                 and binding.stream_id == manifest.stream_id
+                and binding.attempt_id == manifest.attempt_id
                 and binding.source_execution_id == manifest.source_execution_id
                 and binding.sequence_number == chunk.sequence_number
                 and binding.plaintext_offset == chunk.plaintext_offset
@@ -1992,6 +2142,7 @@ class ArtifactStore:
                 "logical_size",
                 "logical_sha256",
                 "stream_id",
+                "attempt_id",
             }
             if set(binding) != expected_keys:
                 raise ArtifactSecurityError("artifact stream binding is invalid")
@@ -2006,6 +2157,7 @@ class ArtifactStore:
                 and variant in {"redacted", "encrypted_raw"}
                 and isinstance(binding["source_execution_id"], str)
                 and isinstance(binding["stream_id"], str)
+                and isinstance(binding["attempt_id"], str)
             ):
                 raise ArtifactSecurityError("artifact stream binding is invalid")
             return ArtifactReference(
@@ -2118,12 +2270,17 @@ class ArtifactStore:
         )
 
     @staticmethod
-    def _artifact_stream_chunk_id(stream_id: str, sequence_number: int) -> str:
+    def _artifact_stream_chunk_id(
+        stream_id: str,
+        attempt_id: str,
+        sequence_number: int,
+    ) -> str:
         return stable_id(
             "artifactchunk",
             {
                 "schema_version": "artifact-stream-chunk-v1",
                 "stream_id": stream_id,
+                "attempt_id": attempt_id,
                 "sequence_number": sequence_number,
             },
         )
@@ -2180,6 +2337,7 @@ class ArtifactStore:
                     logical_size=manifest.size_bytes,
                     logical_sha256=manifest.sha256,
                     stream_id=manifest.stream_id,
+                    attempt_id=manifest.attempt_id,
                 )
             )
         )

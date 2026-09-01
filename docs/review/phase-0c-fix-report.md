@@ -848,3 +848,97 @@ PHASE_GATE=phase-0c PASS
 - No protected governance file was modified.
 - A fresh independent Phase 0C review remains required on the resulting 40-character PR HEAD; this
   local PASS is not an independent Phase Gate PASS.
+
+## Seventeenth independent review correction cycle
+
+Current phase: `phase-0c`.
+
+Input review SHA: `20b8ab5c8339bafadc3daf1030794417e4e4050b`.
+
+Phase base: `5cda9a5f8792ee33c3e153d8e791499f5619d82e`.
+
+### Findings addressed
+
+- [`discussion_r3899574060`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3899574060):
+  quoted structured keys are now fully buffered and JSON-decoded before Authorization dispatch.
+  Complete and arbitrarily split Unicode escapes such as `authoriz\\u0061tion` therefore reach the
+  scheme-aware parser, and Bearer, Basic, and unknown schemes are redacted before any Artifact is
+  LLM-visible.
+- [`discussion_r3899574062`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3899574062):
+  standalone PEM detection now derives the matching END delimiter for every label containing
+  `PRIVATE KEY` rather than relying on four allowlisted labels. Encrypted, DSA, PKCS#8, RSA, EC,
+  OpenSSH, and future explicit private-key labels are buffered across chunks and fail closed when
+  incomplete.
+- [`discussion_r3899574067`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3899574067):
+  wrapped key state now alternates authenticated generations across two durable slots. A candidate
+  generation is fsynced without replacing the externally anchored prior slot, then the OS-keystore
+  or vault generation is advanced by compare-and-set. Restart selects only the anchored slot, so an
+  interruption before anchor advancement recovers generation N and an interruption after
+  advancement recovers generation N+1 while rollback remains rejected.
+- [`discussion_r3899574071`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3899574071):
+  Artifact streams with identical authorization metadata are serialized by a no-follow,
+  identity-anchored OS file lock. Chunk IDs, chunk bindings, manifests, and cleanup decisions are
+  also bound to a unique authenticated attempt ID, so a losing attempt can erase only its own keys
+  and chunks. Same-content retries safely converge on the existing manifest.
+
+### Modified files and regression tests
+
+Resulting working-tree diff: `5 files changed, 707 insertions(+), 106 deletions(-)`.
+
+- `src/redteam_agent/data_security/ingestion.py`
+- `src/redteam_agent/data_security/keys.py`
+- `src/redteam_agent/data_security/stores.py`
+- `tests/security/test_phase0c_data_security.py`
+- `docs/review/phase-0c-fix-report.md`
+
+Regression coverage includes complete and split escaped Authorization keys, complete encrypted and
+split DSA private-key PEM blocks, wrapped-state recovery on both sides of the external-generation
+commit boundary, and two conflicting concurrent Artifact streams followed by an idempotent retry.
+No test was deleted, skipped, weakened, or marked as an expected failure.
+
+### Validation
+
+Focused regression command:
+
+```text
+PYTHONPATH=src:. /home/kali/Red_Agent/.venv/bin/pytest -q \
+  tests/security/test_phase0c_data_security.py \
+  -k 'unsupported_authorization or additional_private_key or \
+  wrapped_key_state_recovers_both or conflicting_artifact_stream or \
+  partial_artifact_stream'
+```
+
+Result: `6 passed, 35 deselected`.
+
+Combined Phase 0B execution-safety and Phase 0C data-security modules: `77 passed`.
+
+Required phase-gate command:
+
+```text
+PATH="/home/kali/Red_Agent/.venv/bin:$PATH" \
+  bash scripts/ci/run_phase_gate.sh phase-0c
+```
+
+Result:
+
+```text
+AUTOMATION_VALIDATION=PASS
+ruff: All checks passed
+mypy: Success: no issues found in 78 source files
+unit: 200 passed
+integration: 7 passed
+security: 186 passed
+full/coverage run: 393 passed
+skipped=0, errors=0, failures=0
+coverage: 82% total (branch coverage enabled)
+pip check: No broken requirements found
+PHASE_GATE=phase-0c PASS
+```
+
+### Remaining constraints
+
+- No real C2, MCP, provider, subprocess, local-attack, credential-collection, or external-target
+  action was executed.
+- No protected governance file was modified.
+- A fresh independent Phase 0C review remains required on the resulting 40-character PR HEAD; this
+  local PASS is not an independent Phase Gate PASS.

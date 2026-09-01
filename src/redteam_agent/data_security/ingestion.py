@@ -43,15 +43,8 @@ _SECRET_KEYWORDS = (
 )
 _AUTHORIZATION_HEADER = b"authorization"
 _SUPPORTED_AUTHORIZATION_SCHEMES = (b"bearer", b"basic")
-_PRIVATE_KEY_BLOCKS = (
-    (b"-----BEGIN PRIVATE KEY-----", b"-----END PRIVATE KEY-----"),
-    (b"-----BEGIN RSA PRIVATE KEY-----", b"-----END RSA PRIVATE KEY-----"),
-    (b"-----BEGIN EC PRIVATE KEY-----", b"-----END EC PRIVATE KEY-----"),
-    (
-        b"-----BEGIN OPENSSH PRIVATE KEY-----",
-        b"-----END OPENSSH PRIVATE KEY-----",
-    ),
-)
+_PEM_BEGIN_PREFIX = b"-----BEGIN "
+_PEM_LABEL_SUFFIX = b"-----"
 _CREDENTIAL_KEY_COMPONENTS = (
     b"credential",
     b"password",
@@ -283,27 +276,39 @@ class _StreamingSecretRedactor:
         """Recognize standalone PEM/OpenSSH private-key blocks across chunks."""
 
         available = data[index:]
-        partial = any(begin.startswith(available) for begin, _ in _PRIVATE_KEY_BLOCKS)
-        for begin, end in _PRIVATE_KEY_BLOCKS:
-            if not available.startswith(begin):
-                continue
-            secret_end = data.find(end, index + len(begin))
-            if secret_end < 0:
-                if final:
-                    raise SecretDetectionError("secret detection failed closed")
+        if len(available) < len(_PEM_BEGIN_PREFIX):
+            if _PEM_BEGIN_PREFIX.startswith(available) and not final:
                 return "incomplete"
-            secret_end += len(end)
-            return (
-                index,
-                index + len(begin),
-                index,
-                secret_end,
-                secret_end,
-                b"private_key",
-            )
-        if partial and not final:
+            return None
+        if not available.startswith(_PEM_BEGIN_PREFIX):
+            return None
+        label_start = index + len(_PEM_BEGIN_PREFIX)
+        label_end = data.find(_PEM_LABEL_SUFFIX, label_start)
+        if label_end < 0:
+            if final:
+                if b"PRIVATE KEY" in data[label_start:].upper():
+                    raise SecretDetectionError("secret detection failed closed")
+                return None
             return "incomplete"
-        return None
+        label = data[label_start:label_end]
+        if not label or b"PRIVATE KEY" not in label.upper():
+            return None
+        begin_end = label_end + len(_PEM_LABEL_SUFFIX)
+        end = b"-----END " + label + b"-----"
+        secret_end = data.find(end, begin_end)
+        if secret_end < 0:
+            if final:
+                raise SecretDetectionError("secret detection failed closed")
+            return "incomplete"
+        secret_end += len(end)
+        return (
+            index,
+            begin_end,
+            index,
+            secret_end,
+            secret_end,
+            b"private_key",
+        )
 
     @staticmethod
     def _decode_structured_key(structured_key: bytes, *, quote: int) -> bytes:
@@ -366,22 +371,39 @@ class _StreamingSecretRedactor:
 
         key_quote = data[index] if data[index] in _QUOTE_BYTES else None
         keyword_start = index + 1 if key_quote is not None else index
-        candidate = data[
-            keyword_start : keyword_start + len(_AUTHORIZATION_HEADER)
-        ].lower()
-        if len(candidate) < len(_AUTHORIZATION_HEADER):
-            if _AUTHORIZATION_HEADER.startswith(candidate):
-                return None if final else "incomplete"
-            return None
-        if candidate != _AUTHORIZATION_HEADER:
-            return None
-        cursor = keyword_start + len(_AUTHORIZATION_HEADER)
         if key_quote is not None:
+            cursor = keyword_start
+            while cursor < len(data) and data[cursor] != key_quote:
+                if data[cursor] == 92:
+                    if cursor + 1 == len(data):
+                        if final:
+                            raise SecretDetectionError(
+                                "secret detection failed closed"
+                            )
+                        return "incomplete"
+                    cursor += 2
+                    continue
+                cursor += 1
             if cursor == len(data):
                 return None if final else "incomplete"
-            if data[cursor] != key_quote:
+            encoded_key_end = cursor
+            decoded_key = _StreamingSecretRedactor._decode_structured_key(
+                data[keyword_start:encoded_key_end],
+                quote=key_quote,
+            )
+            if decoded_key.lower() != _AUTHORIZATION_HEADER:
                 return None
             cursor += 1
+        else:
+            cursor = keyword_start
+            while cursor < len(data) and data[cursor] in _STRUCTURED_KEY_BYTES:
+                cursor += 1
+            candidate = data[keyword_start:cursor].lower()
+            if cursor == len(data) and _AUTHORIZATION_HEADER.startswith(candidate):
+                return None if final else "incomplete"
+            if candidate != _AUTHORIZATION_HEADER:
+                return None
+            encoded_key_end = cursor
         while cursor < len(data) and data[cursor] in _SECRET_WHITESPACE:
             cursor += 1
         if cursor == len(data):
@@ -447,7 +469,7 @@ class _StreamingSecretRedactor:
         )
         return (
             keyword_start,
-            keyword_start + len(_AUTHORIZATION_HEADER),
+            encoded_key_end,
             secret_start,
             cursor,
             match_end,

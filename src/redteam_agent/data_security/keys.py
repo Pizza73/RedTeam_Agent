@@ -574,6 +574,10 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
                 "key-state directory permissions are invalid"
             )
         self._state_path = absolute_path
+        self._state_paths = (
+            absolute_path,
+            parent / f".{absolute_path.name}.alternate",
+        )
         self._state_parent_identity = (
             parent_metadata.st_dev,
             parent_metadata.st_ino,
@@ -585,12 +589,8 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
         self._state_lock = RLock()
         self._updating = False
         with self._state_lock, self._locked_state_file():
-            if absolute_path.exists() or absolute_path.is_symlink():
+            if self._external_generation() > 0:
                 self._load_persisted_state()
-            elif self._external_generation() != 0:
-                raise EncryptionKeyUnavailableError(
-                    "key-state file is missing for external generation"
-                )
 
     def register_key(
         self,
@@ -722,12 +722,8 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
     @contextmanager
     def _update_state(self) -> Iterator[None]:
         with self._state_lock, self._locked_state_file():
-            if self._state_path.exists() or self._state_path.is_symlink():
+            if self._external_generation() > 0:
                 self._load_persisted_state()
-            elif self._external_generation() != 0:
-                raise EncryptionKeyUnavailableError(
-                    "key-state file is missing for external generation"
-                )
             snapshot = self._snapshot()
             generation = self._generation
             self._updating = True
@@ -746,7 +742,7 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
             if self._updating:
                 return
             with self._locked_state_file():
-                if not (self._state_path.exists() or self._state_path.is_symlink()):
+                if self._external_generation() == 0:
                     raise EncryptionKeyUnavailableError("key-state file is unavailable")
                 self._load_persisted_state()
 
@@ -876,7 +872,8 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
                 authentication_tag=self._encode(tag),
             ).model_dump(mode="python")
         )
-        self._write_wrapped_state_locked(wrapped)
+        target_path = self._state_path_for_generation(generation)
+        self._write_wrapped_state_locked(target_path, wrapped)
         try:
             advanced = self._generation_store.compare_and_set_generation(
                 expected=expected_generation,
@@ -893,7 +890,12 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
         self._generation = generation
 
     def _load_persisted_state(self) -> None:
-        raw = self._read_wrapped_state()
+        external_generation = self._external_generation()
+        if external_generation == 0:
+            raise EncryptionKeyUnavailableError("key-state file is unavailable")
+        raw = self._read_wrapped_state(
+            self._state_path_for_generation(external_generation)
+        )
         try:
             duplicate_free = canonical_loads(raw)
             wrapped = _WrappedKeyState.model_validate_json(
@@ -935,13 +937,17 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
             raise EncryptionKeyUnavailableError("key-state payload is invalid") from exc
         if state.generation != wrapped.generation:
             raise EncryptionKeyUnavailableError("key-state generation binding failed")
-        external_generation = self._external_generation()
         if state.generation != external_generation:
             raise EncryptionKeyUnavailableError(
                 "key-state rollback or generation mismatch detected"
             )
         self._restore_loaded_state(state)
         self._generation = state.generation
+
+    def _state_path_for_generation(self, generation: int) -> Path:
+        if generation <= 0:
+            raise EncryptionKeyUnavailableError("key-state generation is invalid")
+        return self._state_paths[0 if generation % 2 else 1]
 
     def _external_generation(self) -> int:
         try:
@@ -1056,7 +1062,7 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
             self._material_fingerprints = fingerprints
             self._used_nonces = used_nonces
 
-    def _read_wrapped_state(self) -> bytes:
+    def _read_wrapped_state(self, state_path: Path) -> bytes:
         directory_flags = os.O_RDONLY | os.O_CLOEXEC
         if hasattr(os, "O_DIRECTORY"):
             directory_flags |= os.O_DIRECTORY
@@ -1084,7 +1090,7 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
                 descriptor_flags |= os.O_NOFOLLOW
             try:
                 descriptor = os.open(
-                    self._state_path.name,
+                    state_path.name,
                     descriptor_flags,
                     dir_fd=directory_descriptor,
                 )
@@ -1148,7 +1154,7 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
                 fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
             os.close(lock_descriptor)
 
-    def _write_wrapped_state_locked(self, content: bytes) -> None:
+    def _write_wrapped_state_locked(self, state_path: Path, content: bytes) -> None:
         directory_flags = os.O_RDONLY | os.O_CLOEXEC
         if hasattr(os, "O_DIRECTORY"):
             directory_flags |= os.O_DIRECTORY
@@ -1174,7 +1180,7 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
                 )
             try:
                 existing = os.stat(
-                    self._state_path.name,
+                    state_path.name,
                     dir_fd=directory_descriptor,
                     follow_symlinks=False,
                 )
@@ -1189,7 +1195,7 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
                 file_flags |= os.O_NOFOLLOW
             descriptor: int | None = None
             for _ in range(128):
-                candidate = f".{self._state_path.name}.pending-{secrets.token_hex(16)}"
+                candidate = f".{state_path.name}.pending-{secrets.token_hex(16)}"
                 try:
                     descriptor = os.open(
                         candidate,
@@ -1211,7 +1217,7 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
                 os.fsync(stream.fileno())
             os.replace(
                 temporary_name,
-                self._state_path.name,
+                state_path.name,
                 src_dir_fd=directory_descriptor,
                 dst_dir_fd=directory_descriptor,
             )

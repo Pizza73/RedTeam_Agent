@@ -10,12 +10,14 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Event, Lock
+from typing import Literal
 
 import pytest
 from pydantic import ValidationError
 
 from redteam_agent.canonical import CanonicalJsonObject, sha256_digest, stable_id
 from redteam_agent.data_security import (
+    ArtifactReference,
     ArtifactStore,
     AuditContext,
     AuditReferencePayload,
@@ -135,6 +137,20 @@ class _GenerationStore:
             return True
 
 
+class _FaultingGenerationStore(_GenerationStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.failure: Literal["before", "after"] | None = None
+
+    def compare_and_set_generation(self, *, expected: int, new: int) -> bool:
+        if self.failure == "before":
+            raise RuntimeError("simulated anchor failure before commit")
+        advanced = super().compare_and_set_generation(expected=expected, new=new)
+        if self.failure == "after" and advanced:
+            raise RuntimeError("simulated anchor failure after commit")
+        return advanced
+
+
 def _keys() -> InMemoryEncryptionKeyProvider:
     provider = InMemoryEncryptionKeyProvider()
     for index, domain in enumerate(
@@ -157,7 +173,7 @@ def _wrapped_keys(
     generation_store: _GenerationStore,
     wrapping_key: bytes = b"wrapped-provider-root-key-material",
 ) -> WrappedFileEncryptionKeyProvider:
-    first_creation = not state_path.exists()
+    first_creation = generation_store.current_generation() == 0
     provider = WrappedFileEncryptionKeyProvider(
         state_path=state_path,
         wrapping_key=wrapping_key,
@@ -476,7 +492,13 @@ def test_unsupported_authorization_schemes_are_redacted_complete_and_split(
         mission_quota_bytes=4096,
     )
 
-    async def ingest(case: str, chunks: tuple[bytes, ...], secret: bytes) -> None:
+    async def ingest(
+        case: str,
+        chunks: tuple[bytes, ...],
+        secret: bytes,
+        *,
+        credential_type: str | None = None,
+    ) -> None:
         mission_id = f"mission-unsupported-{case}"
         execution_id = f"execution-unsupported-{case}"
         authorizer.allow_ingestion_write(mission_id, execution_id)
@@ -503,7 +525,9 @@ def test_unsupported_authorization_schemes_are_redacted_complete_and_split(
             secrets=secrets,
         ).ingest_stream(sink, receipt, now=NOW)
         assert result.redaction_metadata.redaction_count == 1
-        assert result.detected_secrets[0].credential_type == case
+        assert result.detected_secrets[0].credential_type == (
+            credential_type or case
+        )
         assert secret.decode() not in result.model_dump_json()
         artifact = result.redacted_artifacts[0]
         authorizer.set_grants(
@@ -539,6 +563,25 @@ def test_unsupported_authorization_schemes_are_redacted_complete_and_split(
                 b'gest username=admin, response=response-value"',
             ),
             b"username=admin, response=response-value",
+        )
+    )
+    asyncio.run(
+        ingest(
+            "escaped-bearer",
+            (b'{"authoriz\\u0061tion":"Bearer complete-escaped-secret"}',),
+            b"complete-escaped-secret",
+            credential_type="bearer",
+        )
+    )
+    asyncio.run(
+        ingest(
+            "escaped-basic-split",
+            (
+                b'{"authoriz\\u00',
+                b'61tion":"Basic split-escaped-secret"}',
+            ),
+            b"split-escaped-secret",
+            credential_type="basic",
         )
     )
 
@@ -671,6 +714,87 @@ def test_standalone_private_key_blocks_are_redacted_complete_and_split(
         visible = artifacts.read(artifact, operation="read", now=NOW)
         assert visible == b"[REDACTED]"
         assert block not in visible
+
+
+@pytest.mark.parametrize(
+    ("case", "chunks", "private_key_block"),
+    (
+        (
+            "encrypted",
+            (
+                b"-----BEGIN ENCRYPTED PRIVATE KEY-----\ncomplete-material\n"
+                b"-----END ENCRYPTED PRIVATE KEY-----",
+            ),
+            b"-----BEGIN ENCRYPTED PRIVATE KEY-----\ncomplete-material\n"
+            b"-----END ENCRYPTED PRIVATE KEY-----",
+        ),
+        (
+            "dsa-split",
+            (
+                b"-----BEGIN DSA PRI",
+                b"VATE KEY-----\nsplit-material\n-----END DSA PRIVATE",
+                b" KEY-----",
+            ),
+            b"-----BEGIN DSA PRIVATE KEY-----\nsplit-material\n"
+            b"-----END DSA PRIVATE KEY-----",
+        ),
+    ),
+)
+def test_additional_private_key_pem_labels_are_redacted_complete_and_split(
+    tmp_path: Path,
+    case: str,
+    chunks: tuple[bytes, ...],
+    private_key_block: bytes,
+) -> None:
+    quarantine, artifacts, secrets, authorizer, _ = _stores(tmp_path)
+    mission_id = f"mission-pem-{case}"
+    execution_id = f"execution-pem-{case}"
+    authorizer.allow_ingestion_write(mission_id, execution_id)
+    sink = EncryptedRawResultSinkFactory(
+        quarantine=quarantine,
+        bindings=_StreamBindings(
+            QuarantineStreamBinding(
+                mission_id=mission_id,
+                mission_revision=1,
+                execution_id=execution_id,
+                retention_until=NOW + timedelta(hours=1),
+                max_result_bytes=1024,
+                resume_mode="from_start",
+            )
+        ),
+        clock=lambda: NOW,
+    ).for_execution(execution_id)
+
+    async def ingest_private_key():
+        for chunk in chunks:
+            await sink.write_stdout(chunk)
+        receipt = await sink.commit()
+        return await SecureIngestor(
+            quarantine=quarantine,
+            artifacts=artifacts,
+            secrets=secrets,
+        ).ingest_stream(sink, receipt, now=NOW)
+
+    result = asyncio.run(ingest_private_key())
+    assert result.redaction_metadata.redaction_count == 1
+    assert result.detected_secrets[0].credential_type == "private_key"
+    assert private_key_block.decode() not in result.model_dump_json()
+    artifact = result.redacted_artifacts[0]
+    authorizer.set_grants(
+        mission_id,
+        (
+            DataAccessGrant(
+                resource_type="artifact",
+                resource=ResourceBinding(
+                    resource_id=artifact.artifact_id,
+                    resource_version="1",
+                    resource_digest=artifact.sha256,
+                ),
+                operations=frozenset({"read"}),
+            ),
+        ),
+    )
+    assert artifacts.read(artifact, operation="read", now=NOW) == b"[REDACTED]"
 
 
 def test_encrypted_raw_artifact_cannot_be_used_as_context_read(
@@ -2003,10 +2127,19 @@ def test_wrapped_key_provider_recovers_committed_stream_after_restart(
         return await sink.commit()
 
     receipt = asyncio.run(commit_before_restart())
-    persisted = key_state_path.read_bytes()
-    assert stat.S_IMODE(key_state_path.stat().st_mode) == 0o600
+    persisted_slots = tuple(
+        path.read_bytes() for path in first_keys._state_paths if path.exists()
+    )
+    assert len(persisted_slots) == 2
+    assert all(
+        stat.S_IMODE(path.stat().st_mode) == 0o600
+        for path in first_keys._state_paths
+    )
     for index in range(1, 5):
-        assert base64.b64encode(bytes([index]) * 32) not in persisted
+        assert all(
+            base64.b64encode(bytes([index]) * 32) not in persisted
+            for persisted in persisted_slots
+        )
 
     restarted_keys = _wrapped_keys(
         key_state_path,
@@ -2075,18 +2208,108 @@ def test_wrapped_key_provider_recovers_committed_stream_after_restart(
         restarted_keys.open("artifact_store", second_resource, aad)
         == b"second-concurrent-resource"
     )
-    pre_destruction_state = key_state_path.read_bytes()
+    pre_destruction_generation = generation_store.current_generation()
+    pre_destruction_state = concurrent_keys._state_path_for_generation(
+        pre_destruction_generation
+    ).read_bytes()
     concurrent_keys.destroy_resource_key(first_resource.metadata)
     with pytest.raises(EncryptionKeyUnavailableError, match="unavailable"):
         restarted_keys.open("artifact_store", first_resource, aad)
 
-    key_state_path.write_bytes(pre_destruction_state)
+    concurrent_keys._state_path_for_generation(
+        generation_store.current_generation()
+    ).write_bytes(pre_destruction_state)
     with pytest.raises(EncryptionKeyUnavailableError, match="rollback"):
         WrappedFileEncryptionKeyProvider(
             state_path=key_state_path,
             wrapping_key=wrapping_key,
             generation_store=generation_store,
         )
+
+
+def test_wrapped_key_state_recovers_both_generation_commit_boundaries(
+    tmp_path: Path,
+) -> None:
+    key_state_directory = tmp_path / "recoverable-key-state"
+    key_state_directory.mkdir(mode=0o700)
+    key_state_path = key_state_directory / "provider.json"
+    wrapping_key = b"recoverable-os-keystore-root-key-material"
+    generation_store = _FaultingGenerationStore()
+    provider = WrappedFileEncryptionKeyProvider(
+        state_path=key_state_path,
+        wrapping_key=wrapping_key,
+        generation_store=generation_store,
+    )
+    provider.register_key(
+        domain="artifact_store",
+        key_id="artifact-key-v1",
+        key_version=1,
+        key_separation_tag="artifact-separation-v1",
+        material=b"A" * 32,
+        created_at=NOW,
+    )
+    assert generation_store.current_generation() == 1
+
+    generation_store.failure = "before"
+    with pytest.raises(EncryptionKeyUnavailableError, match="unavailable"):
+        provider.register_key(
+            domain="secret_store",
+            key_id="secret-key-v1",
+            key_version=1,
+            key_separation_tag="secret-separation-v1",
+            material=b"S" * 32,
+            created_at=NOW,
+        )
+    assert generation_store.current_generation() == 1
+    generation_store.failure = None
+    recovered_before_anchor = WrappedFileEncryptionKeyProvider(
+        state_path=key_state_path,
+        wrapping_key=wrapping_key,
+        generation_store=generation_store,
+    )
+    assert (
+        recovered_before_anchor.get_active_key_metadata("artifact_store").key_id
+        == "artifact-key-v1"
+    )
+    with pytest.raises(EncryptionKeyUnavailableError, match="unavailable"):
+        recovered_before_anchor.get_active_key_metadata("secret_store")
+    recovered_before_anchor.register_key(
+        domain="secret_store",
+        key_id="secret-key-v1",
+        key_version=1,
+        key_separation_tag="secret-separation-v1",
+        material=b"S" * 32,
+        created_at=NOW,
+    )
+    assert generation_store.current_generation() == 2
+
+    generation_store.failure = "after"
+    with pytest.raises(EncryptionKeyUnavailableError, match="unavailable"):
+        recovered_before_anchor.register_key(
+            domain="raw_result_quarantine",
+            key_id="quarantine-key-v1",
+            key_version=1,
+            key_separation_tag="quarantine-separation-v1",
+            material=b"Q" * 32,
+            created_at=NOW,
+        )
+    assert generation_store.current_generation() == 3
+    generation_store.failure = None
+    recovered_after_anchor = WrappedFileEncryptionKeyProvider(
+        state_path=key_state_path,
+        wrapping_key=wrapping_key,
+        generation_store=generation_store,
+    )
+    assert (
+        recovered_after_anchor.get_active_key_metadata(
+            "raw_result_quarantine"
+        ).key_id
+        == "quarantine-key-v1"
+    )
+    assert (
+        recovered_after_anchor.get_active_key_metadata("secret_store").key_id
+        == "secret-key-v1"
+    )
 
 
 def test_expired_committed_and_abandoned_streams_are_erased_after_restart(
@@ -3158,6 +3381,104 @@ def test_partial_artifact_stream_cleanup_resumes_after_restart(
     assert not list((artifact_root / "mission-partial").glob("*.json"))
     assert all(keys.resource_key_destroyed(metadata) for metadata in pending_metadata)
     assert audit_log.events_for("mission-partial") == ()
+
+
+def test_conflicting_artifact_stream_attempts_are_serialized_before_cleanup(
+    tmp_path: Path,
+) -> None:
+    keys = _keys()
+    authorizer = _ExactEnvelopeAuthorizer()
+    mission_id = "mission-concurrent-artifact"
+    execution_id = "execution-concurrent-artifact"
+    authorizer.allow_ingestion_write(mission_id, execution_id)
+    audit = MissionAuditRecorder(
+        audit_log=MissionAuditLog(),
+        contexts=_AuditContexts(),
+    )
+    artifacts = ArtifactStore(
+        root=tmp_path / "concurrent-artifacts",
+        keys=keys,
+        authorizer=authorizer,
+        audit=audit,
+        max_item_bytes=16 * 1024,
+        mission_quota_bytes=64 * 1024,
+    )
+
+    async def exercise_conflict() -> ArtifactReference:
+        first_started = asyncio.Event()
+        release_failure = asyncio.Event()
+
+        async def failing_chunks():
+            first_started.set()
+            yield b"A" * 4096
+            await release_failure.wait()
+            raise ArtifactSecurityError("simulated concurrent stream failure")
+
+        async def winning_chunks():
+            yield b"B" * 4096
+            yield b"winning-tail"
+
+        common = {
+            "mission_id": mission_id,
+            "media_type": "application/octet-stream",
+            "classification": lambda: "normal",
+            "variant": "redacted",
+            "source_execution_id": execution_id,
+            "created_at": NOW,
+        }
+        failing_task = asyncio.create_task(
+            artifacts.put_stream(chunks=failing_chunks(), **common)
+        )
+        await first_started.wait()
+        winning_task = asyncio.create_task(
+            artifacts.put_stream(chunks=winning_chunks(), **common)
+        )
+        await asyncio.sleep(0.03)
+        assert not winning_task.done()
+        release_failure.set()
+        with pytest.raises(ArtifactSecurityError, match="concurrent stream failure"):
+            await failing_task
+        return await winning_task
+
+    winner = asyncio.run(exercise_conflict())
+
+    async def retry_winner() -> ArtifactReference:
+        async def chunks():
+            yield b"B" * 4096
+            yield b"winning-tail"
+
+        return await artifacts.put_stream(
+            mission_id=mission_id,
+            chunks=chunks(),
+            media_type="application/octet-stream",
+            classification=lambda: "normal",
+            variant="redacted",
+            source_execution_id=execution_id,
+            created_at=NOW,
+        )
+
+    assert asyncio.run(retry_winner()) == winner
+    authorizer.set_grants(
+        mission_id,
+        (
+            DataAccessGrant(
+                resource_type="artifact",
+                resource=ResourceBinding(
+                    resource_id=winner.artifact_id,
+                    resource_version="1",
+                    resource_digest=winner.sha256,
+                ),
+                operations=frozenset({"read"}),
+            ),
+        ),
+    )
+    assert artifacts.read(winner, operation="read", now=NOW) == (
+        b"B" * 4096 + b"winning-tail"
+    )
+    assert not artifacts._store.resource_ids_with_prefix(
+        mission_id=mission_id,
+        prefix="artifactcleanup_",
+    )
 
 
 def test_sqlite_audit_chain_persists_events_and_trusted_head(tmp_path: Path) -> None:
