@@ -14,7 +14,7 @@ from contextlib import asynccontextmanager, contextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import RLock
-from typing import Literal, Protocol
+from typing import Literal
 
 from pydantic import Field
 
@@ -33,9 +33,9 @@ from redteam_agent.errors import (
 from redteam_agent.models.base import StrictImmutableBoundaryModel
 from redteam_agent.models.common import UtcDatetime, require_utc
 from redteam_agent.models.context import ResourceBinding
-from redteam_agent.models.scope import DataAccessOperation, DataResourceType
 
 from .audit import DataStoreAuditRecorder
+from .authorization import RepositoryDataAccessAuthorizer
 from .keys import EncryptionKeyProvider
 from .models import (
     ArtifactReference,
@@ -68,30 +68,6 @@ def _require_time(value: datetime) -> None:
         raise ArtifactSecurityError("storage time must be UTC") from exc
 
 
-class DataAccessAuthorizer(Protocol):
-    """Trusted adapter that revalidates a complete authorization envelope."""
-
-    def require_access(
-        self,
-        *,
-        mission_id: str,
-        resource_type: DataResourceType,
-        resource: ResourceBinding,
-        operation: DataAccessOperation,
-        now: datetime,
-    ) -> None: ...
-
-    def require_ingestion_write(
-        self,
-        *,
-        mission_id: str,
-        source_execution_id: str,
-        resource_type: Literal["artifact", "secret_reference"],
-        resource: ResourceBinding,
-        now: datetime,
-    ) -> None: ...
-
-
 class _StoredEnvelope(StrictImmutableBoundaryModel):
     schema_version: Literal["encrypted-store-v1"]
     domain: KeyDomain
@@ -114,6 +90,7 @@ class _ResourceCreationIntentBody(StrictImmutableBoundaryModel):
     key_resource_id: str = Field(
         pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"
     )
+    audit_required: bool
 
 
 class _ResourceCreationIntent(StrictImmutableBoundaryModel):
@@ -132,6 +109,12 @@ class _SecretTombstone(StrictImmutableBoundaryModel):
 class _QuarantineExpiryIntent(StrictImmutableBoundaryModel):
     record_type: Literal["quarantine_expiry_intent"]
     reference: QuarantineReference
+
+
+class _SecretExpiryIntent(StrictImmutableBoundaryModel):
+    record_type: Literal["secret_expiry_intent"]
+    reference: SecretReferenceMetadata
+    source_execution_id: str = Field(min_length=1)
 
 
 class _StreamDeletionBinding(StrictImmutableBoundaryModel):
@@ -325,6 +308,7 @@ class _EncryptedFileStore:
         binding: dict[str, object],
         created_at: datetime,
         retention_until: datetime | None,
+        require_creation_audit: bool = False,
     ) -> tuple[str, str]:
         return self._write(
             mission_id=mission_id,
@@ -334,6 +318,7 @@ class _EncryptedFileStore:
             created_at=created_at,
             retention_until=retention_until,
             enforce_quota=True,
+            require_creation_audit=require_creation_audit,
         )
 
     def write_artifact_deletion_intent(
@@ -374,6 +359,7 @@ class _EncryptedFileStore:
             created_at=created_at,
             retention_until=None,
             enforce_quota=False,
+            require_creation_audit=False,
         )
 
     def write_quarantine_cleanup_intent(
@@ -448,6 +434,52 @@ class _EncryptedFileStore:
             created_at=created_at,
             retention_until=None,
             enforce_quota=False,
+            require_creation_audit=False,
+        )
+
+    def write_secret_cleanup_intent(
+        self,
+        *,
+        mission_id: str,
+        resource_id: str,
+        binding: dict[str, object],
+        created_at: datetime,
+    ) -> tuple[str, str]:
+        """Persist a strictly typed secret-expiry intent outside caller quota."""
+
+        try:
+            intent = _SecretExpiryIntent.model_validate_json(
+                canonicalize(binding),
+                strict=True,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ArtifactSecurityError(
+                "cleanup record binding is invalid"
+            ) from exc
+        expected_id = stable_id(
+            "secretexpiry",
+            {
+                "schema_version": "secret-expiry-intent-v1",
+                "secret_reference_id": intent.reference.secret_reference_id,
+            },
+        )
+        if not (
+            resource_id == expected_id
+            and intent.reference.mission_id == mission_id
+            and intent.reference.expires_at is not None
+            and intent.reference.verification_state == "detected"
+            and binding == intent.model_dump(mode="json")
+        ):
+            raise ArtifactSecurityError("cleanup record binding is invalid")
+        return self._write(
+            mission_id=mission_id,
+            resource_id=resource_id,
+            content=b"",
+            binding=binding,
+            created_at=created_at,
+            retention_until=None,
+            enforce_quota=False,
+            require_creation_audit=False,
         )
 
     def _write(
@@ -460,6 +492,7 @@ class _EncryptedFileStore:
         created_at: datetime,
         retention_until: datetime | None,
         enforce_quota: bool,
+        require_creation_audit: bool,
     ) -> tuple[str, str]:
         _require_bytes(content)
         if len(content) > self._max_item_bytes:
@@ -518,7 +551,10 @@ class _EncryptedFileStore:
                 if enforce_quota and (
                     mission_usage + _MIN_ENCRYPTED_ENVELOPE_QUOTA_BYTES
                     > self._mission_quota_bytes
-                    or self._mission_record_count_anchored(mission_descriptor)
+                    or self._mission_record_count_anchored(
+                        mission_id=mission_id,
+                        mission_descriptor=mission_descriptor,
+                    )
                     + 1
                     > max(
                         1,
@@ -543,6 +579,7 @@ class _EncryptedFileStore:
                     root_descriptor=root_descriptor,
                     mission_descriptor=mission_descriptor,
                     mission_metadata=mission_metadata,
+                    audit_required=require_creation_audit,
                 )
                 try:
                     encrypted = self._keys.seal_for_resource(
@@ -630,12 +667,13 @@ class _EncryptedFileStore:
                             mission_metadata=mission_metadata,
                         )
                     raise
-                self._finish_resource_creation_intent_anchored(
-                    intent=creation_intent,
-                    root_descriptor=root_descriptor,
-                    mission_descriptor=mission_descriptor,
-                    mission_metadata=mission_metadata,
-                )
+                if not require_creation_audit:
+                    self._finish_resource_creation_intent_anchored(
+                        intent=creation_intent,
+                        root_descriptor=root_descriptor,
+                        mission_descriptor=mission_descriptor,
+                        mission_metadata=mission_metadata,
+                    )
                 return envelope.plaintext_sha256, metadata_id
 
     @contextmanager
@@ -935,6 +973,14 @@ class _EncryptedFileStore:
                 raise ArtifactSecurityError("mission storage is unavailable") from exc
             resource_ids: list[str] = []
             for entry in entries:
+                intent_resource_id = self._creation_intent_resource_id(entry)
+                if intent_resource_id is not None:
+                    self._load_resource_creation_intent_anchored(
+                        mission_id=mission_id,
+                        resource_id=intent_resource_id,
+                        mission_descriptor=mission_descriptor,
+                    )
+                    continue
                 if not entry.endswith(".json"):
                     raise ArtifactSecurityError(
                         "unexpected mission storage entry"
@@ -1321,6 +1367,14 @@ class _EncryptedFileStore:
         except OSError as exc:
             raise ArtifactSecurityError("mission storage is unavailable") from exc
         for entry in entries:
+            intent_resource_id = self._creation_intent_resource_id(entry)
+            if intent_resource_id is not None:
+                self._load_resource_creation_intent_anchored(
+                    mission_id=mission_id,
+                    resource_id=intent_resource_id,
+                    mission_descriptor=mission_descriptor,
+                )
+                continue
             if not entry.endswith(".json"):
                 raise ArtifactSecurityError("unexpected mission storage entry")
             resource_id = entry.removesuffix(".json")
@@ -1368,15 +1422,30 @@ class _EncryptedFileStore:
             total += resource_metadata.st_size
         return total
 
-    @staticmethod
-    def _mission_record_count_anchored(mission_descriptor: int) -> int:
+    def _mission_record_count_anchored(
+        self,
+        *,
+        mission_id: str,
+        mission_descriptor: int,
+    ) -> int:
         try:
             entries = os.listdir(mission_descriptor)
         except OSError as exc:
             raise ArtifactSecurityError("mission storage is unavailable") from exc
-        if any(not entry.endswith(".json") for entry in entries):
-            raise ArtifactSecurityError("unexpected mission storage entry")
-        return len(entries)
+        record_count = 0
+        for entry in entries:
+            intent_resource_id = self._creation_intent_resource_id(entry)
+            if intent_resource_id is not None:
+                self._load_resource_creation_intent_anchored(
+                    mission_id=mission_id,
+                    resource_id=intent_resource_id,
+                    mission_descriptor=mission_descriptor,
+                )
+                continue
+            if not entry.endswith(".json"):
+                raise ArtifactSecurityError("unexpected mission storage entry")
+            record_count += 1
+        return record_count
 
     @staticmethod
     def _quota_charge(serialized_envelope: bytes) -> int:
@@ -1558,6 +1627,20 @@ class _EncryptedFileStore:
     def _creation_intent_name(resource_id: str) -> str:
         return f"{_CREATION_INTENT_PREFIX}{resource_id}{_CREATION_INTENT_SUFFIX}"
 
+    def _creation_intent_resource_id(self, entry: str) -> str | None:
+        if not (
+            entry.startswith(_CREATION_INTENT_PREFIX)
+            and entry.endswith(_CREATION_INTENT_SUFFIX)
+        ):
+            return None
+        resource_id = entry[
+            len(_CREATION_INTENT_PREFIX) : -len(_CREATION_INTENT_SUFFIX)
+        ]
+        self._validate_token(resource_id)
+        if entry != self._creation_intent_name(resource_id):
+            raise ArtifactSecurityError("resource creation intent is invalid")
+        return resource_id
+
     def _recover_all_resource_creations(self) -> None:
         for mission_id in self.mission_ids():
             with self._anchored_mission_directory(mission_id) as (
@@ -1571,6 +1654,107 @@ class _EncryptedFileStore:
                     mission_descriptor=mission_descriptor,
                     mission_metadata=mission_metadata,
                 )
+
+    def pending_creation_audits(self) -> tuple[tuple[str, str], ...]:
+        """Return fully verified committed resources awaiting their required audit."""
+
+        pending: list[tuple[str, str]] = []
+        with self._lock, self._write_transaction():
+            self._recover_all_resource_creations()
+            for mission_id in self.mission_ids():
+                with self._anchored_mission_directory(mission_id) as (
+                    _,
+                    mission_descriptor,
+                    _,
+                ):
+                    try:
+                        entries = sorted(os.listdir(mission_descriptor))
+                    except OSError as exc:
+                        raise ArtifactSecurityError(
+                            "mission storage is unavailable"
+                        ) from exc
+                    for entry in entries:
+                        if not (
+                            entry.startswith(_CREATION_INTENT_PREFIX)
+                            and entry.endswith(_CREATION_INTENT_SUFFIX)
+                        ):
+                            continue
+                        resource_id = entry[
+                            len(_CREATION_INTENT_PREFIX) : -len(
+                                _CREATION_INTENT_SUFFIX
+                            )
+                        ]
+                        self._validate_token(resource_id)
+                        intent = self._load_resource_creation_intent_anchored(
+                            mission_id=mission_id,
+                            resource_id=resource_id,
+                            mission_descriptor=mission_descriptor,
+                        )
+                        if not (
+                            intent.body.audit_required
+                            and self._resource_exists_anchored(
+                                mission_descriptor=mission_descriptor,
+                                resource_id=resource_id,
+                            )
+                        ):
+                            raise ArtifactSecurityError(
+                                "creation-audit recovery state is invalid"
+                            )
+                        pending.append((mission_id, resource_id))
+        return tuple(pending)
+
+    def acknowledge_creation_audit(
+        self,
+        *,
+        mission_id: str,
+        resource_id: str,
+    ) -> None:
+        """Erase an audit-pending intent only after its deterministic append."""
+
+        with self._lock, self._write_transaction():
+            self._validate_token(mission_id)
+            self._validate_token(resource_id)
+            try:
+                with self._anchored_mission_directory(mission_id) as (
+                    root_descriptor,
+                    mission_descriptor,
+                    mission_metadata,
+                ):
+                    try:
+                        os.stat(
+                            self._creation_intent_name(resource_id),
+                            dir_fd=mission_descriptor,
+                            follow_symlinks=False,
+                        )
+                    except FileNotFoundError:
+                        return
+                    except OSError as exc:
+                        raise ArtifactSecurityError(
+                            "resource creation intent is unavailable"
+                        ) from exc
+                    intent = self._load_resource_creation_intent_anchored(
+                        mission_id=mission_id,
+                        resource_id=resource_id,
+                        mission_descriptor=mission_descriptor,
+                    )
+                    if not (
+                        intent.body.audit_required
+                        and self._resource_exists_anchored(
+                            mission_descriptor=mission_descriptor,
+                            resource_id=resource_id,
+                        )
+                    ):
+                        raise ArtifactSecurityError(
+                            "creation-audit acknowledgment is invalid"
+                        )
+                    self._finish_resource_creation_intent_anchored(
+                        intent=intent,
+                        root_descriptor=root_descriptor,
+                        mission_descriptor=mission_descriptor,
+                        mission_metadata=mission_metadata,
+                    )
+            except FileNotFoundError:
+                return
 
     def _recover_resource_creations_anchored(
         self,
@@ -1670,12 +1854,19 @@ class _EncryptedFileStore:
                     self._domain,
                     intent.body.key_resource_id,
                 )
-            self._finish_resource_creation_intent_anchored(
-                intent=intent,
-                root_descriptor=root_descriptor,
-                mission_descriptor=mission_descriptor,
-                mission_metadata=mission_metadata,
-            )
+            if not (
+                intent.body.audit_required
+                and self._resource_exists_anchored(
+                    mission_descriptor=mission_descriptor,
+                    resource_id=resource_id,
+                )
+            ):
+                self._finish_resource_creation_intent_anchored(
+                    intent=intent,
+                    root_descriptor=root_descriptor,
+                    mission_descriptor=mission_descriptor,
+                    mission_metadata=mission_metadata,
+                )
 
     def _prepare_resource_creation_intent_anchored(
         self,
@@ -1685,6 +1876,7 @@ class _EncryptedFileStore:
         root_descriptor: int,
         mission_descriptor: int,
         mission_metadata: os.stat_result,
+        audit_required: bool,
     ) -> _ResourceCreationIntent:
         body = _ResourceCreationIntentBody(
             schema_version="resource-creation-intent-v1",
@@ -1701,6 +1893,7 @@ class _EncryptedFileStore:
                     "nonce": secrets.token_hex(32),
                 },
             ),
+            audit_required=audit_required,
         )
         verifier_metadata = self._keys.get_active_key_metadata(self._domain)
         intent = _ResourceCreationIntent(
@@ -1727,27 +1920,62 @@ class _EncryptedFileStore:
         file_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
         if hasattr(os, "O_NOFOLLOW"):
             file_flags |= os.O_NOFOLLOW
+        temporary_name: str | None = None
         try:
-            descriptor = os.open(
-                name,
-                file_flags,
-                0o600,
-                dir_fd=mission_descriptor,
-            )
-        except FileExistsError:
-            raise ArtifactSecurityError(
-                "resource creation intent already exists"
-            ) from None
-        except OSError as exc:
-            raise ArtifactSecurityError(
-                "resource creation intent is unavailable"
-            ) from exc
-        try:
-            with os.fdopen(descriptor, "wb") as stream:
-                stream.write(serialized)
-                stream.flush()
-                os.fsync(stream.fileno())
+            descriptor: int | None = None
+            for _ in range(128):
+                candidate = f".pending-{os.urandom(16).hex()}"
+                try:
+                    descriptor = os.open(
+                        candidate,
+                        file_flags,
+                        0o600,
+                        dir_fd=mission_descriptor,
+                    )
+                except FileExistsError:
+                    continue
+                except OSError as exc:
+                    raise ArtifactSecurityError(
+                        "resource creation intent is unavailable"
+                    ) from exc
+                temporary_name = candidate
+                break
+            if descriptor is None or temporary_name is None:
+                raise ArtifactSecurityError(
+                    "resource creation intent is unavailable"
+                )
             try:
+                offset = 0
+                while offset < len(serialized):
+                    written = os.write(descriptor, serialized[offset:])
+                    if written <= 0:
+                        raise ArtifactSecurityError(
+                            "resource creation intent write failed"
+                        )
+                    offset += written
+                os.fsync(descriptor)
+            finally:
+                with suppress(OSError):
+                    os.close(descriptor)
+            try:
+                os.link(
+                    temporary_name,
+                    name,
+                    src_dir_fd=mission_descriptor,
+                    dst_dir_fd=mission_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileExistsError:
+                raise ArtifactSecurityError(
+                    "resource creation intent already exists"
+                ) from None
+            except OSError as exc:
+                raise ArtifactSecurityError(
+                    "resource creation intent is unavailable"
+                ) from exc
+            try:
+                os.unlink(temporary_name, dir_fd=mission_descriptor)
+                temporary_name = None
                 os.fsync(mission_descriptor)
             except OSError as exc:
                 raise ArtifactSecurityError(
@@ -1760,8 +1988,9 @@ class _EncryptedFileStore:
                 operation="resource creation preparation",
             )
         except Exception:
-            with suppress(OSError):
-                os.close(descriptor)
+            if temporary_name is not None:
+                with suppress(OSError):
+                    os.unlink(temporary_name, dir_fd=mission_descriptor)
             raise
         return intent
 
@@ -2052,7 +2281,23 @@ class EncryptedRawResultQuarantine:
         )
         self._audit = audit
         self._clock = clock or (lambda: datetime.now(UTC))
+        self._reconcile_pending_creation_audits()
         self._sweep_expired()
+
+    def _reconcile_pending_creation_audits(self) -> None:
+        for mission_id, resource_id in self._store.pending_creation_audits():
+            if not resource_id.startswith("quarantine_"):
+                raise ArtifactSecurityError(
+                    "quarantine creation-audit recovery is invalid"
+                )
+            envelope = self._store.verified_envelope(
+                mission_id=mission_id,
+                resource_id=resource_id,
+                now=None,
+            )
+            self._reconcile_commit_audit(
+                self._reference_from_envelope(envelope)
+            )
 
     def _sweep_expired(self) -> None:
         now = self._clock()
@@ -2117,6 +2362,7 @@ class EncryptedRawResultQuarantine:
             binding=binding,
             created_at=created_at,
             retention_until=retention_until,
+            require_creation_audit=True,
         )
         reference = QuarantineReference(
             quarantine_id=resource_id,
@@ -2129,15 +2375,33 @@ class EncryptedRawResultQuarantine:
             created_at=created_at,
             retention_until=retention_until,
         )
-        self._audit.record(
-            mission_id=mission_id,
-            resource_type="raw_result_quarantine",
-            resource_id=resource_id,
-            operation="commit",
-            metadata_digest=digest,
-            occurred_at=created_at,
-        )
+        self._reconcile_commit_audit(reference)
         return reference
+
+    def _reconcile_commit_audit(self, reference: QuarantineReference) -> None:
+        self._audit.record(
+            mission_id=reference.mission_id,
+            resource_type="raw_result_quarantine",
+            resource_id=reference.quarantine_id,
+            operation="commit",
+            operation_id=stable_id(
+                "auditop",
+                {
+                    "schema_version": "quarantine-commit-audit-v1",
+                    "quarantine_id": reference.quarantine_id,
+                    "encryption_metadata_id": (
+                        reference.encryption_metadata_id
+                    ),
+                    "created_at": reference.created_at,
+                },
+            ),
+            metadata_digest=reference.sha256,
+            occurred_at=reference.created_at,
+        )
+        self._store.acknowledge_creation_audit(
+            mission_id=reference.mission_id,
+            resource_id=reference.quarantine_id,
+        )
 
     def resume(self, reference: QuarantineReference, *, now: datetime) -> bytes:
         _require_time(now)
@@ -2373,12 +2637,16 @@ class ArtifactStore:
         *,
         root: Path,
         keys: EncryptionKeyProvider,
-        authorizer: DataAccessAuthorizer,
+        authorizer: RepositoryDataAccessAuthorizer,
         audit: DataStoreAuditRecorder,
         max_item_bytes: int,
         mission_quota_bytes: int,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
+        if type(authorizer) is not RepositoryDataAccessAuthorizer:
+            raise SecretAccessError(
+                "artifact store requires a trusted data access authorizer"
+            )
         self._store = _EncryptedFileStore(
             root=root,
             domain="artifact_store",
@@ -2390,8 +2658,23 @@ class ArtifactStore:
         self._audit = audit
         self._clock = clock or (lambda: datetime.now(UTC))
         self.max_observed_stream_chunk_bytes = 0
+        self._reconcile_pending_creation_audits()
         self._resume_pending_stream_cleanups()
         self._sweep_expired_artifacts()
+
+    def _reconcile_pending_creation_audits(self) -> None:
+        for mission_id, resource_id in self._store.pending_creation_audits():
+            if not resource_id.startswith("artifact_"):
+                raise ArtifactSecurityError(
+                    "artifact creation-audit recovery is invalid"
+                )
+            self._reconcile_create_audit(
+                self._stored_reference(
+                    mission_id=mission_id,
+                    artifact_id=resource_id,
+                    now=None,
+                )
+            )
 
     def put(
         self,
@@ -2465,6 +2748,7 @@ class ArtifactStore:
                 binding=binding,
                 created_at=created_at,
                 retention_until=retention_until,
+                require_creation_audit=True,
             )
             envelope = self._store.verified_envelope(
                 mission_id=mission_id,
@@ -2790,6 +3074,7 @@ class ArtifactStore:
                 binding=binding,
                 created_at=created_at,
                 retention_until=retention_until,
+                require_creation_audit=True,
             )
             envelope = self._store.verified_envelope(
                 mission_id=mission_id,
@@ -3767,6 +4052,10 @@ class ArtifactStore:
             metadata_digest=reference.sha256,
             occurred_at=reference.created_at,
         )
+        self._store.acknowledge_creation_audit(
+            mission_id=reference.mission_id,
+            resource_id=reference.artifact_id,
+        )
 
     def _source_execution_id(self, reference: ArtifactReference) -> str:
         envelope = self._store._load_envelope_anchored(
@@ -3785,11 +4074,16 @@ class SecretStore:
         *,
         root: Path,
         keys: EncryptionKeyProvider,
-        authorizer: DataAccessAuthorizer,
+        authorizer: RepositoryDataAccessAuthorizer,
         audit: DataStoreAuditRecorder,
         max_item_bytes: int,
         mission_quota_bytes: int,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
+        if type(authorizer) is not RepositoryDataAccessAuthorizer:
+            raise SecretAccessError(
+                "secret store requires a trusted data access authorizer"
+            )
         self._store = _EncryptedFileStore(
             root=root,
             domain="secret_store",
@@ -3800,6 +4094,191 @@ class SecretStore:
         self._authorizer = authorizer
         self._audit = audit
         self._keys = keys
+        self._clock = clock or (lambda: datetime.now(UTC))
+        self._reconcile_pending_creation_audits()
+        self._sweep_expired_secrets()
+
+    def _reconcile_pending_creation_audits(self) -> None:
+        for mission_id, resource_id in self._store.pending_creation_audits():
+            if not resource_id.startswith("secret_"):
+                raise SecretAccessError(
+                    "secret creation-audit recovery is invalid"
+                )
+            envelope = self._store.verified_envelope(
+                mission_id=mission_id,
+                resource_id=resource_id,
+                now=None,
+            )
+            metadata, _ = self._metadata_from_detected_envelope(envelope)
+            self._reconcile_create_audit(metadata)
+
+    def _sweep_expired_secrets(self) -> None:
+        now = self._clock()
+        _require_time(now)
+        for mission_id in self._store.mission_ids():
+            for intent_id in self._store.resource_ids_with_prefix(
+                mission_id=mission_id,
+                prefix="secretexpiry_",
+            ):
+                intent, envelope = self._load_expiry_intent(
+                    mission_id=mission_id,
+                    intent_id=intent_id,
+                )
+                self._resume_secret_expiry(intent, envelope)
+            for secret_reference_id in self._store.resource_ids_with_prefix(
+                mission_id=mission_id,
+                prefix="secret_",
+            ):
+                envelope = self._store.verified_envelope(
+                    mission_id=mission_id,
+                    resource_id=secret_reference_id,
+                    now=None,
+                )
+                metadata, source_execution_id = (
+                    self._metadata_from_detected_envelope(envelope)
+                )
+                if metadata.expires_at is not None and now >= metadata.expires_at:
+                    self._expire_detected_secret(
+                        metadata,
+                        source_execution_id=source_execution_id,
+                        now=now,
+                    )
+
+    def _expire_detected_secret(
+        self,
+        reference: SecretReferenceMetadata,
+        *,
+        source_execution_id: str,
+        now: datetime,
+    ) -> None:
+        if reference.expires_at is None or now < reference.expires_at:
+            raise SecretAccessError("secret expiry has not elapsed")
+        self._reconcile_create_audit(reference)
+        intent_id = self._expiry_intent_id(reference.secret_reference_id)
+        if not self._store.has_resource(
+            mission_id=reference.mission_id,
+            resource_id=intent_id,
+        ):
+            intent = _SecretExpiryIntent(
+                record_type="secret_expiry_intent",
+                reference=reference,
+                source_execution_id=source_execution_id,
+            )
+            self._store.write_secret_cleanup_intent(
+                mission_id=reference.mission_id,
+                resource_id=intent_id,
+                binding=intent.model_dump(mode="json"),
+                created_at=now,
+            )
+        intent, envelope = self._load_expiry_intent(
+            mission_id=reference.mission_id,
+            intent_id=intent_id,
+        )
+        if not (
+            intent.reference == reference
+            and intent.source_execution_id == source_execution_id
+        ):
+            raise SecretAccessError("secret expiry binding is invalid")
+        self._resume_secret_expiry(intent, envelope)
+
+    def _resume_secret_expiry(
+        self,
+        intent: _SecretExpiryIntent,
+        intent_envelope: _StoredEnvelope,
+    ) -> None:
+        reference = intent.reference
+        if (
+            reference.expires_at is None
+            or intent_envelope.created_at < reference.expires_at
+        ):
+            raise SecretAccessError("secret expiry intent predates expiry")
+        if self._store.has_resource(
+            mission_id=reference.mission_id,
+            resource_id=reference.secret_reference_id,
+        ):
+            envelope = self._store.verified_envelope(
+                mission_id=reference.mission_id,
+                resource_id=reference.secret_reference_id,
+                now=None,
+            )
+            authoritative, source_execution_id = (
+                self._metadata_from_detected_envelope(envelope)
+            )
+            if not (
+                authoritative == reference
+                and source_execution_id == intent.source_execution_id
+            ):
+                raise SecretAccessError("secret expiry target binding is invalid")
+        metadata_digest = sha256_digest(reference)
+        self._audit.record(
+            mission_id=reference.mission_id,
+            resource_type="secret_reference",
+            resource_id=reference.secret_reference_id,
+            operation="delete",
+            operation_id=self._expiry_audit_operation_id(reference),
+            metadata_digest=metadata_digest,
+            occurred_at=intent_envelope.created_at,
+        )
+        self._store.erase_resource(
+            mission_id=reference.mission_id,
+            resource_id=reference.secret_reference_id,
+        )
+        self._store.erase_resource(
+            mission_id=reference.mission_id,
+            resource_id=self._expiry_intent_id(reference.secret_reference_id),
+        )
+
+    def _load_expiry_intent(
+        self,
+        *,
+        mission_id: str,
+        intent_id: str,
+    ) -> tuple[_SecretExpiryIntent, _StoredEnvelope]:
+        raw, envelope = self._store.read_bound(
+            mission_id=mission_id,
+            resource_id=intent_id,
+            now=None,
+        )
+        if raw:
+            raise SecretAccessError("secret expiry intent content is invalid")
+        try:
+            intent = _SecretExpiryIntent.model_validate_json(
+                canonicalize(envelope.binding.to_dict()),
+                strict=True,
+            )
+        except (TypeError, ValueError) as exc:
+            raise SecretAccessError("secret expiry intent is invalid") from exc
+        if not (
+            intent.reference.mission_id == mission_id
+            and intent_id
+            == self._expiry_intent_id(intent.reference.secret_reference_id)
+        ):
+            raise SecretAccessError("secret expiry intent binding is invalid")
+        return intent, envelope
+
+    @staticmethod
+    def _expiry_intent_id(secret_reference_id: str) -> str:
+        return stable_id(
+            "secretexpiry",
+            {
+                "schema_version": "secret-expiry-intent-v1",
+                "secret_reference_id": secret_reference_id,
+            },
+        )
+
+    @staticmethod
+    def _expiry_audit_operation_id(
+        reference: SecretReferenceMetadata,
+    ) -> str:
+        return stable_id(
+            "auditop",
+            {
+                "schema_version": "secret-expiry-audit-v1",
+                "secret_reference_id": reference.secret_reference_id,
+                "encryption_metadata_id": reference.encryption_metadata_id,
+                "expires_at": reference.expires_at,
+            },
+        )
 
     def create(
         self,
@@ -3887,6 +4366,7 @@ class SecretStore:
                 binding=binding,
                 created_at=created_at,
                 retention_until=expires_at,
+                require_creation_audit=True,
             )
             envelope = self._store.verified_envelope(
                 mission_id=mission_id,
@@ -3903,22 +4383,32 @@ class SecretStore:
             expires_at=expires_at,
             verification_state="detected",
         )
+        self._reconcile_create_audit(metadata)
+        return metadata
+
+    def _reconcile_create_audit(
+        self,
+        metadata: SecretReferenceMetadata,
+    ) -> None:
         self._audit.record(
-            mission_id=mission_id,
+            mission_id=metadata.mission_id,
             resource_type="secret_reference",
-            resource_id=secret_reference_id,
+            resource_id=metadata.secret_reference_id,
             operation="create",
             operation_id=stable_id(
                 "auditop",
                 {
                     "schema_version": "secret-create-audit-v1",
-                    "secret_reference_id": secret_reference_id,
+                    "secret_reference_id": metadata.secret_reference_id,
                 },
             ),
             metadata_digest=sha256_digest(metadata),
-            occurred_at=envelope.created_at,
+            occurred_at=metadata.created_at,
         )
-        return metadata
+        self._store.acknowledge_creation_audit(
+            mission_id=metadata.mission_id,
+            resource_id=metadata.secret_reference_id,
+        )
 
     def resolve(
         self,
@@ -3929,6 +4419,16 @@ class SecretStore:
         authoritative, source_execution_id, version = self._authoritative_metadata(reference)
         if authoritative.verification_state == "revoked":
             raise SecretAccessError("secret reference is revoked")
+        if (
+            authoritative.expires_at is not None
+            and now >= authoritative.expires_at
+        ):
+            self._expire_detected_secret(
+                authoritative,
+                source_execution_id=source_execution_id,
+                now=now,
+            )
+            raise SecretAccessError("secret reference has expired")
         self._authorizer.require_access(
             mission_id=authoritative.mission_id,
             resource_type="secret_reference",
@@ -4116,6 +4616,17 @@ class SecretStore:
             resource_id=reference.secret_reference_id,
             now=None,
         )
+        authoritative, source_execution_id = (
+            self._metadata_from_detected_envelope(envelope)
+        )
+        if authoritative.secret_reference_id != reference.secret_reference_id:
+            raise SecretAccessError("secret metadata binding is invalid")
+        return authoritative, source_execution_id, 1
+
+    @staticmethod
+    def _metadata_from_detected_envelope(
+        envelope: _StoredEnvelope,
+    ) -> tuple[SecretReferenceMetadata, str]:
         binding = envelope.binding.to_dict()
         expected_keys = {
             "secret_reference_id",
@@ -4128,7 +4639,7 @@ class SecretStore:
         principal = binding.get("associated_principal_ref")
         if not (
             set(binding) == expected_keys
-            and binding.get("secret_reference_id") == reference.secret_reference_id
+            and binding.get("secret_reference_id") == envelope.resource_id
             and isinstance(binding.get("credential_type"), str)
             and (principal is None or isinstance(principal, str))
             and isinstance(binding.get("source_execution_id"), str)
@@ -4140,8 +4651,8 @@ class SecretStore:
         source_execution_id = binding["source_execution_id"]
         assert isinstance(credential_type, str) and isinstance(source_execution_id, str)
         authoritative = SecretReferenceMetadata(
-            secret_reference_id=reference.secret_reference_id,
-            mission_id=reference.mission_id,
+            secret_reference_id=envelope.resource_id,
+            mission_id=envelope.mission_id,
             credential_type=credential_type,
             associated_principal_ref=principal,
             encryption_metadata_id=envelope.encryption_metadata_id,
@@ -4149,7 +4660,7 @@ class SecretStore:
             expires_at=envelope.retention_until,
             verification_state="detected",
         )
-        return authoritative, source_execution_id, 1
+        return authoritative, source_execution_id
 
     @staticmethod
     def _tombstone_id(secret_reference_id: str) -> str:

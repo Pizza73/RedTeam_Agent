@@ -13,6 +13,7 @@ from .audit import (
     MissionAuditLog,
     MissionAuditRecorder,
 )
+from .authorization import DataAccessAuthorizer, RepositoryDataAccessAuthorizer
 from .ingestion import EncryptedSecureResultIngester, SecureIngestor
 from .keys import (
     EncryptionKeyProvider,
@@ -35,7 +36,6 @@ from .models import (
 from .sandbox import SandboxPolicy, SandboxRequirement, require_sandbox_capabilities
 from .stores import (
     ArtifactStore,
-    DataAccessAuthorizer,
     EncryptedRawResultQuarantine,
     SecretStore,
 )
@@ -76,6 +76,7 @@ __all__ = [
     "QuarantineStreamBinding",
     "QuarantineStreamBindingResolver",
     "RedactionMetadata",
+    "RepositoryDataAccessAuthorizer",
     "SandboxPolicy",
     "SandboxRequirement",
     "SecretDiscoveryReference",

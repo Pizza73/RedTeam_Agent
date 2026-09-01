@@ -16,7 +16,9 @@ from redteam_agent.executor import (
     create_workflow_run,
 )
 from redteam_agent.mission import MissionManager
+from redteam_agent.models.context import DataAccessGrant
 from redteam_agent.models.execution import WorkflowRunBinding
+from redteam_agent.models.scope import DataAccessPolicy
 from redteam_agent.policy.issuance import PolicyDecisionIssuanceService
 from redteam_agent.policy.plans import create_execution_plan
 from redteam_agent.repositories import (
@@ -57,9 +59,16 @@ class ExecutionHarness:
     adapter_registry: TrustedExecutionAdapterRegistry
 
 
-def build_execution_harness(*, approval_rule: str = "policy") -> ExecutionHarness:
+def build_execution_harness(
+    *,
+    approval_rule: str = "policy",
+    data_access_policy: DataAccessPolicy | None = None,
+) -> ExecutionHarness:
     database = Database()
-    environment = build_environment(approval_rule=approval_rule)
+    environment = build_environment(
+        approval_rule=approval_rule,
+        data_access_policy=data_access_policy,
+    )
     kernel = persist_environment(database, environment)
     run = create_workflow_run(
         mission_id=environment.plan.mission_id,
@@ -188,7 +197,11 @@ def prepare_execution(harness: ExecutionHarness):
     )
 
 
-def prepare_additional_execution(harness: ExecutionHarness):
+def prepare_additional_execution(
+    harness: ExecutionHarness,
+    *,
+    requested_data_access: tuple[DataAccessGrant, ...] = (),
+):
     """Prepare another independently authorized action before a safety pause."""
 
     proposal = harness.environment.proposal.model_copy(
@@ -209,6 +222,7 @@ def prepare_additional_execution(harness: ExecutionHarness):
         resources=harness.kernel.resources,
     ).issue(
         plan_id=plan.plan_id,
+        requested_data_access=requested_data_access,
         issued_at=FIXED_TIME + timedelta(minutes=1),
         expires_at=FIXED_TIME + timedelta(minutes=30),
     )

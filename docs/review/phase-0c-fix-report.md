@@ -1834,3 +1834,122 @@ PHASE_GATE=phase-0c PASS
 - No protected governance file was modified.
 - A fresh independent Phase 0C review remains required on the resulting 40-character PR HEAD; this
   local PASS is not an independent Phase Gate PASS.
+
+## Twenty-seventh independent review correction cycle
+
+Current phase: `phase-0c`.
+
+Input review SHA: `343f6edf54b065faabab702cbf485ff93cdf81b5`.
+
+Phase base: `5cda9a5f8792ee33c3e153d8e791499f5619d82e`.
+
+### Findings addressed
+
+- [`discussion_r3900814207`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3900814207):
+  resource-creation intent publication now writes a uniquely named same-directory temporary file to
+  completion, synchronizes it, atomically hard-links the complete authenticated record at its final
+  name, removes the temporary link, and synchronizes the Mission directory before sealing a resource
+  key. Recovery removes only strictly named pending files and validates link count, intent digest,
+  key domain, Mission, and resource bindings. Partial-write and pre-fsync process-interruption
+  regressions prove that no truncated final intent, envelope, or unreachable resource key survives.
+- [`discussion_r3900814212`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3900814212):
+  every public Artifact, Secret, and non-stream Quarantine creation marks its authenticated creation
+  intent as audit-required. The intent remains after the encrypted envelope commits and is removed
+  only after the deterministic create/commit audit append succeeds. Store reconstruction verifies
+  the complete envelope and reconciles the pending audit before exposing normal wrapper operation;
+  regressions interrupt each store between envelope commit and audit append and prove exactly one
+  event is recovered before the intent is acknowledged.
+- [`discussion_r3900814217`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3900814217):
+  Secret Store startup now enumerates expired Secret envelopes and authenticated expiry intents.
+  Expiry persists a quota-independent reference-only intent, appends one deterministic delete audit,
+  cryptographically erases the target resource key, and finally erases the intent key. Resolution
+  also invokes this path before authorization when expiry has elapsed. A restart regression
+  interrupts target erasure, then proves both keys are destroyed and the delete audit remains
+  exactly-once across repeated reconstruction.
+- [`discussion_r3900814222`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3900814222):
+  `RepositoryDataAccessAuthorizer` now constructs its current-state resolver exclusively from the
+  supplied trusted Database. It reloads and verifies immutable PolicyDecision child grants,
+  current Mission revision/epoch/lifecycle/TTL, policy and capability bindings, snapshot TTL, and
+  exact resource version/digest/operation. Ingestion writes additionally require a persisted,
+  post-dispatch ExecutionRecord bound to its current non-denied decision and current Data Access
+  Policy. Artifact and Secret constructors accept only the exact final repository-backed type;
+  structural lookalikes and subclasses cannot become production authorization adapters. The
+  regression uses a real SQLite repository set and Artifact Store for execution-bound creation,
+  persisted exact-grant reading, missing-execution denial, stale-resource denial, and policy-state
+  invalidation.
+
+### Modified files and regression tests
+
+Resulting working-tree diff: `8 files changed, 1547 insertions(+), 103 deletions(-)`.
+
+- `src/redteam_agent/data_security/authorization.py`
+- `src/redteam_agent/data_security/__init__.py`
+- `src/redteam_agent/data_security/stores.py`
+- `src/redteam_agent/repositories/policy.py`
+- `tests/helpers.py`
+- `tests/phase0b_helpers.py`
+- `tests/security/test_phase0c_data_security.py`
+- `docs/review/phase-0c-fix-report.md`
+
+Regression coverage exercises partial and pre-sync intent publication interruptions, creation-audit
+recovery for all three public stores, restartable Secret expiry and key destruction, rejection of
+structural authorization lookalikes, and a repository-backed Artifact create/read flow with stale
+and missing authority failures. Existing concurrency, quota, directory-swap, stream cleanup, key,
+audit, ingestion, and detector regressions continue to pass. No test was deleted, skipped, weakened,
+or marked as an expected failure.
+
+### Validation
+
+Focused regression command:
+
+```text
+PYTHONPATH=/tmp/redteam-phase0c-a91790d3 \
+  /home/kali/Red_Agent/.venv/bin/python -m pytest -q \
+  tests/security/test_phase0c_data_security.py \
+  -k 'creation_intent_publication or creation_audit_pending \
+      or expired_secret_erasure or repository_authorizer \
+      or structural_authorizer'
+```
+
+Result: `8 passed, 70 deselected`.
+
+Phase 0C data-security module: `78 passed`.
+
+Required phase-gate command:
+
+```text
+source /home/kali/Red_Agent/.venv/bin/activate
+scripts/ci/run_phase_gate.sh phase-0c
+```
+
+Result:
+
+```text
+AUTOMATION_VALIDATION=PASS
+ruff: All checks passed
+mypy: Success: no issues found in 79 source files
+unit: 200 passed
+integration: 7 passed
+security: 224 passed
+full/coverage run: 431 passed
+skipped=0, errors=0, failures=0
+coverage: 81% total (branch coverage enabled)
+pip check: No broken requirements found
+PHASE_GATE=phase-0c PASS
+```
+
+### Remaining constraints
+
+- The repository-backed authorizer intentionally accepts only immutable PolicyDecision grants for
+  direct store access; LLM Context grants continue through the separately identity-bound
+  `ContextAccessGate` and cannot resolve Secret values.
+- Resource-creation and Secret-expiry recovery assume the configured key provider performs durable
+  cryptographic destruction. The wrapped-file provider supplies that property through its externally
+  anchored generation protocol.
+- The key-state and audit-head external generation adapters remain integration boundaries supplied by
+  an OS keystore, vault, or equivalently protected monotonic service.
+- No real C2, MCP, provider, subprocess, local-attack, credential-collection, or external-target
+  action was executed.
+- No protected governance file was modified.
+- A fresh independent Phase 0C review remains required on the resulting 40-character PR HEAD; this
+  local PASS is not an independent Phase Gate PASS.

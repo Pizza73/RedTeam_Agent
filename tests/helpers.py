@@ -9,6 +9,7 @@ from redteam_agent.mission import AuthorizationReferenceRegistry, MissionManager
 from redteam_agent.models.common import OperationalPhase
 from redteam_agent.models.plans import ExecutionPlan, ExecutionPlanProposal
 from redteam_agent.models.policy import PolicyDecision
+from redteam_agent.models.scope import DataAccessPolicy
 from redteam_agent.models.tools import AvailableToolSnapshot, ToolDefinition, ToolRegistryRevision
 from redteam_agent.policy.engine import PolicyEngine
 from redteam_agent.policy.issuance import PolicyDecisionIssuanceService
@@ -83,8 +84,13 @@ def build_environment(
     *,
     target: str = "10.0.0.10",
     approval_rule: str = "policy",
+    data_access_policy: DataAccessPolicy | None = None,
 ) -> KernelEnvironment:
     mission = mock_mission()
+    if data_access_policy is not None:
+        mission = mission.model_copy(
+            update={"data_access_policy": data_access_policy}
+        )
     tool = mock_network_tool(approval_rule=approval_rule)
     extractors = TrustedTargetExtractorRegistry()
     registry = build_registry_revision(

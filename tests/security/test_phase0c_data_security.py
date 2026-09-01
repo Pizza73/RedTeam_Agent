@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Event, Lock
-from typing import Literal
+from typing import Literal, Protocol, cast
 
 import pytest
 from pydantic import ValidationError
@@ -30,6 +30,7 @@ from redteam_agent.data_security import (
     MissionAuditLog,
     MissionAuditRecorder,
     QuarantineStreamBinding,
+    RepositoryDataAccessAuthorizer,
     SandboxPolicy,
     SandboxRequirement,
     SecretStore,
@@ -53,34 +54,69 @@ from redteam_agent.errors import (
 )
 from redteam_agent.executor import MockExecutionAdapter
 from redteam_agent.models.capabilities import SandboxCapabilities
-from redteam_agent.models.context import DataAccessGrant, ResourceBinding
+from redteam_agent.models.context import (
+    ContextResourceIndexRecord,
+    DataAccessGrant,
+    ResourceBinding,
+)
 from redteam_agent.models.execution import RawArtifactMetadata
-from redteam_agent.models.scope import DataAccessOperation, DataResourceType
+from redteam_agent.models.scope import (
+    DataAccessOperation,
+    DataAccessPolicy,
+    DataAccessRule,
+    DataResourceType,
+)
+from redteam_agent.repositories import PolicyStateRepository
+from redteam_agent.repositories.runtime import build_policy_state
 from redteam_agent.seeds import FIXED_TIME
 from redteam_agent.storage import Database
 from tests.phase0b_helpers import (
     build_execution_harness,
     executor_with_adapter,
+    prepare_additional_execution,
     prepare_execution,
 )
 
 NOW = datetime(2026, 8, 31, 8, 0, tzinfo=UTC)
 
 
-class _ExactEnvelopeAuthorizer:
-    def __init__(self) -> None:
-        self._grants: dict[str, tuple[DataAccessGrant, ...]] = {}
-        self._ingestion_writes: set[tuple[str, str]] = set()
-        self.ingestion_write_resources: list[tuple[str, ResourceBinding]] = []
+class _TestAuthorizer(Protocol):
+    ingestion_write_resources: list[tuple[str, ResourceBinding]]
 
-    def set_grants(self, mission_id: str, grants: tuple[DataAccessGrant, ...]) -> None:
-        self._grants[mission_id] = grants
+    def set_grants(
+        self,
+        mission_id: str,
+        grants: tuple[DataAccessGrant, ...],
+    ) -> None: ...
 
-    def allow_ingestion_write(self, mission_id: str, source_execution_id: str) -> None:
-        self._ingestion_writes.add((mission_id, source_execution_id))
+    def allow_ingestion_write(
+        self,
+        mission_id: str,
+        source_execution_id: str,
+    ) -> None: ...
+
+
+def _ExactEnvelopeAuthorizer() -> _TestAuthorizer:
+    """Instrument an exact production boundary instance for isolated store tests."""
+
+    authorizer = RepositoryDataAccessAuthorizer(database=Database())
+    grants: dict[str, tuple[DataAccessGrant, ...]] = {}
+    ingestion_writes: set[tuple[str, str]] = set()
+    ingestion_write_resources: list[tuple[str, ResourceBinding]] = []
+
+    def set_grants(
+        mission_id: str,
+        entries: tuple[DataAccessGrant, ...],
+    ) -> None:
+        grants[mission_id] = entries
+
+    def allow_ingestion_write(
+        mission_id: str,
+        source_execution_id: str,
+    ) -> None:
+        ingestion_writes.add((mission_id, source_execution_id))
 
     def require_access(
-        self,
         *,
         mission_id: str,
         resource_type: DataResourceType,
@@ -93,12 +129,11 @@ class _ExactEnvelopeAuthorizer:
             grant.resource_type == resource_type
             and grant.resource == resource
             and operation in grant.operations
-            for grant in self._grants.get(mission_id, ())
+            for grant in grants.get(mission_id, ())
         ):
             raise SecretAccessError("trusted authorization envelope denied resource access")
 
     def require_ingestion_write(
-        self,
         *,
         mission_id: str,
         source_execution_id: str,
@@ -107,9 +142,20 @@ class _ExactEnvelopeAuthorizer:
         now: datetime,
     ) -> None:
         del now
-        if (mission_id, source_execution_id) not in self._ingestion_writes:
+        if (mission_id, source_execution_id) not in ingestion_writes:
             raise SecretAccessError("trusted ingestion authorization denied resource write")
-        self.ingestion_write_resources.append((resource_type, resource))
+        ingestion_write_resources.append((resource_type, resource))
+
+    authorizer.set_grants = set_grants  # type: ignore[attr-defined]
+    authorizer.allow_ingestion_write = allow_ingestion_write  # type: ignore[attr-defined]
+    authorizer.require_access = require_access  # type: ignore[method-assign]
+    authorizer.require_ingestion_write = (  # type: ignore[method-assign]
+        require_ingestion_write
+    )
+    authorizer.ingestion_write_resources = (  # type: ignore[attr-defined]
+        ingestion_write_resources
+    )
+    return cast(_TestAuthorizer, authorizer)
 
 
 class _AuditContexts:
@@ -228,7 +274,7 @@ def _stores(
     EncryptedRawResultQuarantine,
     ArtifactStore,
     SecretStore,
-    _ExactEnvelopeAuthorizer,
+    _TestAuthorizer,
     MissionAuditLog,
 ]:
     keys = _keys()
@@ -259,6 +305,168 @@ def _stores(
         mission_quota_bytes=16 * 1024,
     )
     return quarantine, artifacts, secrets, authorizer, audit_log
+
+
+def test_store_constructors_reject_structural_authorizer_lookalikes(
+    tmp_path: Path,
+) -> None:
+    class _UntrustedStructuralAuthorizer:
+        def require_access(self, **kwargs: object) -> None:
+            del kwargs
+
+        def require_ingestion_write(self, **kwargs: object) -> None:
+            del kwargs
+
+    audit = MissionAuditRecorder(
+        audit_log=MissionAuditLog(),
+        contexts=_AuditContexts(),
+    )
+    with pytest.raises(SecretAccessError, match="trusted data access authorizer"):
+        ArtifactStore(
+            root=tmp_path / "untrusted-authorizer-artifacts",
+            keys=_keys(),
+            authorizer=_UntrustedStructuralAuthorizer(),  # type: ignore[arg-type]
+            audit=audit,
+            max_item_bytes=1024,
+            mission_quota_bytes=4096,
+        )
+    with pytest.raises(SecretAccessError, match="trusted data access authorizer"):
+        SecretStore(
+            root=tmp_path / "untrusted-authorizer-secrets",
+            keys=_keys(),
+            authorizer=_UntrustedStructuralAuthorizer(),  # type: ignore[arg-type]
+            audit=audit,
+            max_item_bytes=1024,
+            mission_quota_bytes=4096,
+        )
+
+
+def test_repository_authorizer_revalidates_decision_execution_and_current_policy(
+    tmp_path: Path,
+) -> None:
+    policy = DataAccessPolicy(
+        allowed=(
+            DataAccessRule(
+                resource_type="artifact",
+                resource_pattern="artifact_*",
+                operations=frozenset({"read", "write"}),
+            ),
+            DataAccessRule(
+                resource_type="secret_reference",
+                resource_pattern="secret_*",
+                operations=frozenset({"write", "resolve"}),
+            ),
+        ),
+        prohibited=(),
+    )
+    harness = build_execution_harness(data_access_policy=policy)
+    authorizer = RepositoryDataAccessAuthorizer(
+        database=harness.database,
+    )
+    prepared = prepare_execution(harness)
+    running = asyncio.run(
+        harness.executor.dispatch(
+            prepared.execution_id,
+            now=FIXED_TIME + timedelta(minutes=3),
+        )
+    )
+    artifacts = ArtifactStore(
+        root=tmp_path / "repository-authorized-artifacts",
+        keys=_keys(),
+        authorizer=authorizer,
+        audit=MissionAuditRecorder(
+            audit_log=MissionAuditLog(),
+            contexts=_AuditContexts(),
+        ),
+        max_item_bytes=4096,
+        mission_quota_bytes=16 * 1024,
+        clock=lambda: FIXED_TIME + timedelta(minutes=3),
+    )
+    reference = artifacts.put(
+        mission_id=running.mission_id,
+        content=b"repository-authorized-content",
+        media_type="text/plain",
+        classification="normal",
+        variant="redacted",
+        source_execution_id=running.execution_id,
+        created_at=FIXED_TIME + timedelta(minutes=3),
+    )
+    with pytest.raises(SecretAccessError, match="source execution"):
+        authorizer.require_ingestion_write(
+            mission_id=running.mission_id,
+            source_execution_id="execution-untrusted",
+            resource_type="artifact",
+            resource=ResourceBinding(
+                resource_id=reference.artifact_id,
+                resource_version="1",
+                resource_digest=reference.sha256,
+            ),
+            now=FIXED_TIME + timedelta(minutes=3),
+        )
+
+    persisted = ResourceBinding(
+        resource_id=reference.artifact_id,
+        resource_version="1",
+        resource_digest=reference.sha256,
+    )
+    harness.kernel.resources.add(
+        ContextResourceIndexRecord(
+            index_id="index-repository-readable",
+            binding=persisted,
+            resource_type="artifact",
+            mission_id=running.mission_id,
+            target_references=(),
+            verification_state="confirmed",
+            observed_at=FIXED_TIME + timedelta(minutes=2),
+            classification="normal",
+            size_bytes=reference.size_bytes,
+            summary_metadata=CanonicalJsonObject(
+                {"source": "repository-authorizer-regression"}
+            ),
+        )
+    )
+    grant = DataAccessGrant(
+        resource_type="artifact",
+        resource=persisted,
+        operations=frozenset({"read"}),
+    )
+    prepared_reader = prepare_additional_execution(
+        harness,
+        requested_data_access=(grant,),
+    )
+    assert prepared_reader.provider_execution_state == "AUTHORIZED"
+    assert artifacts.read(
+        reference,
+        operation="read",
+        now=FIXED_TIME + timedelta(minutes=3),
+    ) == b"repository-authorized-content"
+    with pytest.raises(SecretAccessError, match="no current trusted decision"):
+        authorizer.require_access(
+            mission_id=running.mission_id,
+            resource_type="artifact",
+            resource=persisted.model_copy(
+                update={"resource_version": "stale-version"}
+            ),
+            operation="read",
+            now=FIXED_TIME + timedelta(minutes=3),
+        )
+
+    PolicyStateRepository(harness.database).set_current(
+        build_policy_state(
+            mission_id=running.mission_id,
+            state_version=1,
+            policy_version="policy-v2",
+            updated_at=FIXED_TIME + timedelta(minutes=4),
+        )
+    )
+    with pytest.raises(SecretAccessError, match="current data access authorization"):
+        authorizer.require_access(
+            mission_id=running.mission_id,
+            resource_type="artifact",
+            resource=persisted,
+            operation="read",
+            now=FIXED_TIME + timedelta(minutes=4),
+        )
 
 
 def test_secure_ingestion_exposes_only_redacted_references(tmp_path: Path) -> None:
@@ -5981,6 +6189,323 @@ def test_atomic_envelope_failures_do_not_accumulate_wrapped_key_records(
                 ".resource-creation-*.intent"
             )
         )
+
+
+@pytest.mark.parametrize("interruption", ("partial_write", "before_fsync"))
+def test_creation_intent_publication_recovers_prelink_crashes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    interruption: Literal["partial_write", "before_fsync"],
+) -> None:
+    keys = _keys()
+    baseline_record_count = len(keys._records)
+    authorizer = _ExactEnvelopeAuthorizer()
+    mission_id = f"mission-intent-{interruption}"
+    execution_id = f"execution-intent-{interruption}"
+    authorizer.allow_ingestion_write(mission_id, execution_id)
+    artifact_root = tmp_path / f"intent-{interruption}"
+    artifacts = ArtifactStore(
+        root=artifact_root,
+        keys=keys,
+        authorizer=authorizer,
+        audit=MissionAuditRecorder(
+            audit_log=MissionAuditLog(),
+            contexts=_AuditContexts(),
+        ),
+        max_item_bytes=4096,
+        mission_quota_bytes=16 * 1024,
+        clock=lambda: NOW,
+    )
+
+    class _SimulatedProcessCrash(BaseException):
+        pass
+
+    if interruption == "partial_write":
+        original_write = os.write
+        writes = 0
+
+        def interrupt_partial_write(descriptor: int, content: bytes) -> int:
+            nonlocal writes
+            writes += 1
+            if writes == 1:
+                return original_write(
+                    descriptor,
+                    content[: max(1, len(content) // 2)],
+                )
+            raise _SimulatedProcessCrash
+
+        monkeypatch.setattr(os, "write", interrupt_partial_write)
+    else:
+        original_fsync = os.fsync
+
+        def interrupt_before_fsync(descriptor: int) -> None:
+            if stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise _SimulatedProcessCrash
+            original_fsync(descriptor)
+
+        monkeypatch.setattr(os, "fsync", interrupt_before_fsync)
+
+    with pytest.raises(_SimulatedProcessCrash):
+        artifacts.put(
+            mission_id=mission_id,
+            content=b"intent-publication-content",
+            media_type="text/plain",
+            classification="normal",
+            variant="redacted",
+            source_execution_id=execution_id,
+            created_at=NOW,
+        )
+
+    mission_root = artifact_root / mission_id
+    assert len(list(mission_root.glob(".pending-*"))) == 1
+    assert not list(mission_root.glob(".resource-creation-*.intent"))
+    assert not list(mission_root.glob("*.json"))
+    assert len(keys._records) == baseline_record_count
+
+    monkeypatch.undo()
+    restarted = ArtifactStore(
+        root=artifact_root,
+        keys=keys,
+        authorizer=authorizer,
+        audit=MissionAuditRecorder(
+            audit_log=MissionAuditLog(),
+            contexts=_AuditContexts(),
+        ),
+        max_item_bytes=4096,
+        mission_quota_bytes=16 * 1024,
+        clock=lambda: NOW,
+    )
+    assert not list(mission_root.glob(".pending-*"))
+    recovered = restarted.put(
+        mission_id=mission_id,
+        content=b"intent-publication-content",
+        media_type="text/plain",
+        classification="normal",
+        variant="redacted",
+        source_execution_id=execution_id,
+        created_at=NOW,
+    )
+    assert recovered.size_bytes == len(b"intent-publication-content")
+
+
+@pytest.mark.parametrize("store_type", ("artifact", "secret", "quarantine"))
+def test_creation_audit_pending_intent_recovers_each_public_store(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    store_type: Literal["artifact", "secret", "quarantine"],
+) -> None:
+    keys = _keys()
+    authorizer = _ExactEnvelopeAuthorizer()
+    mission_id = f"mission-audit-pending-{store_type}"
+    execution_id = f"execution-audit-pending-{store_type}"
+    authorizer.allow_ingestion_write(mission_id, execution_id)
+    audit_log = MissionAuditLog()
+    audit = MissionAuditRecorder(audit_log=audit_log, contexts=_AuditContexts())
+    root = tmp_path / f"audit-pending-{store_type}"
+    original_record = audit.record
+
+    class _SimulatedProcessCrash(BaseException):
+        pass
+
+    def interrupt_creation_audit(**kwargs):
+        expected_operation = "commit" if store_type == "quarantine" else "create"
+        if kwargs["operation"] == expected_operation:
+            raise _SimulatedProcessCrash
+        return original_record(**kwargs)
+
+    monkeypatch.setattr(audit, "record", interrupt_creation_audit)
+    if store_type == "artifact":
+        store = ArtifactStore(
+            root=root,
+            keys=keys,
+            authorizer=authorizer,
+            audit=audit,
+            max_item_bytes=4096,
+            mission_quota_bytes=16 * 1024,
+            clock=lambda: NOW,
+        )
+        with pytest.raises(_SimulatedProcessCrash):
+            store.put(
+                mission_id=mission_id,
+                content=b"audit-pending-artifact",
+                media_type="text/plain",
+                classification="normal",
+                variant="redacted",
+                source_execution_id=execution_id,
+                created_at=NOW,
+            )
+    elif store_type == "secret":
+        store = SecretStore(
+            root=root,
+            keys=keys,
+            authorizer=authorizer,
+            audit=audit,
+            max_item_bytes=4096,
+            mission_quota_bytes=16 * 1024,
+            clock=lambda: NOW,
+        )
+        with pytest.raises(_SimulatedProcessCrash):
+            store.create(
+                mission_id=mission_id,
+                secret_value=b"audit-pending-secret",
+                credential_type="password",
+                associated_principal_ref=None,
+                source_execution_id=execution_id,
+                created_at=NOW,
+            )
+    else:
+        store = EncryptedRawResultQuarantine(
+            root=root,
+            keys=keys,
+            audit=audit,
+            max_item_bytes=4096,
+            mission_quota_bytes=16 * 1024,
+            clock=lambda: NOW,
+        )
+        with pytest.raises(_SimulatedProcessCrash):
+            store.commit(
+                mission_id=mission_id,
+                mission_revision=1,
+                execution_id=execution_id,
+                content=b"audit-pending-quarantine",
+                created_at=NOW,
+                retention_until=NOW + timedelta(hours=1),
+            )
+
+    mission_root = root / mission_id
+    assert len(list(mission_root.glob(".resource-creation-*.intent"))) == 1
+    assert len(list(mission_root.glob("*.json"))) == 1
+    monkeypatch.setattr(audit, "record", original_record)
+
+    if store_type == "artifact":
+        ArtifactStore(
+            root=root,
+            keys=keys,
+            authorizer=authorizer,
+            audit=audit,
+            max_item_bytes=4096,
+            mission_quota_bytes=16 * 1024,
+            clock=lambda: NOW,
+        )
+        expected_event = "artifact.create"
+    elif store_type == "secret":
+        SecretStore(
+            root=root,
+            keys=keys,
+            authorizer=authorizer,
+            audit=audit,
+            max_item_bytes=4096,
+            mission_quota_bytes=16 * 1024,
+            clock=lambda: NOW,
+        )
+        expected_event = "secret_reference.create"
+    else:
+        EncryptedRawResultQuarantine(
+            root=root,
+            keys=keys,
+            audit=audit,
+            max_item_bytes=4096,
+            mission_quota_bytes=16 * 1024,
+            clock=lambda: NOW,
+        )
+        expected_event = "raw_result_quarantine.commit"
+
+    assert not list(mission_root.glob(".resource-creation-*.intent"))
+    assert [
+        event.event_type for event in audit_log.events_for(mission_id)
+    ] == [expected_event]
+
+
+def test_expired_secret_erasure_resumes_after_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    keys = _keys()
+    authorizer = _ExactEnvelopeAuthorizer()
+    mission_id = "mission-secret-expiry"
+    execution_id = "execution-secret-expiry"
+    authorizer.allow_ingestion_write(mission_id, execution_id)
+    audit_log = MissionAuditLog()
+    audit = MissionAuditRecorder(audit_log=audit_log, contexts=_AuditContexts())
+    secret_root = tmp_path / "secret-expiry"
+    current_time = [NOW]
+    initial = SecretStore(
+        root=secret_root,
+        keys=keys,
+        authorizer=authorizer,
+        audit=audit,
+        max_item_bytes=4096,
+        mission_quota_bytes=16 * 1024,
+        clock=lambda: current_time[0],
+    )
+    expires_at = NOW + timedelta(minutes=5)
+    reference = initial.create(
+        mission_id=mission_id,
+        secret_value=b"expiring-secret-value",
+        credential_type="password",
+        associated_principal_ref="principal-expiry",
+        source_execution_id=execution_id,
+        created_at=NOW,
+        expires_at=expires_at,
+    )
+    envelope = initial._store.verified_envelope(
+        mission_id=mission_id,
+        resource_id=reference.secret_reference_id,
+        now=None,
+    )
+    original_erase = initial._store.erase_resource
+
+    def interrupt_target_erasure(*, mission_id: str, resource_id: str) -> None:
+        if resource_id == reference.secret_reference_id:
+            raise ArtifactSecurityError("simulated secret erasure interruption")
+        original_erase(mission_id=mission_id, resource_id=resource_id)
+
+    monkeypatch.setattr(initial._store, "erase_resource", interrupt_target_erasure)
+    current_time[0] = expires_at
+    with pytest.raises(ArtifactSecurityError, match="erasure interruption"):
+        initial.resolve(reference, now=expires_at)
+    intent_id = initial._expiry_intent_id(reference.secret_reference_id)
+    assert initial._store.has_resource(
+        mission_id=mission_id,
+        resource_id=intent_id,
+    )
+    assert not keys.resource_key_destroyed(envelope.payload.metadata)
+
+    current_time[0] = expires_at + timedelta(seconds=1)
+    restarted = SecretStore(
+        root=secret_root,
+        keys=keys,
+        authorizer=authorizer,
+        audit=audit,
+        max_item_bytes=4096,
+        mission_quota_bytes=16 * 1024,
+        clock=lambda: current_time[0],
+    )
+    assert not restarted._store.has_resource(
+        mission_id=mission_id,
+        resource_id=reference.secret_reference_id,
+    )
+    assert not restarted._store.has_resource(
+        mission_id=mission_id,
+        resource_id=intent_id,
+    )
+    assert keys.resource_key_destroyed(envelope.payload.metadata)
+    SecretStore(
+        root=secret_root,
+        keys=keys,
+        authorizer=authorizer,
+        audit=audit,
+        max_item_bytes=4096,
+        mission_quota_bytes=16 * 1024,
+        clock=lambda: current_time[0],
+    )
+    assert len(
+        [
+            event
+            for event in audit_log.events_for(mission_id)
+            if event.event_type == "secret_reference.delete"
+        ]
+    ) == 1
 
 
 def test_long_ordinary_tokens_do_not_exhaust_uri_stream_lookahead(
