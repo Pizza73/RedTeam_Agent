@@ -942,3 +942,90 @@ PHASE_GATE=phase-0c PASS
 - No protected governance file was modified.
 - A fresh independent Phase 0C review remains required on the resulting 40-character PR HEAD; this
   local PASS is not an independent Phase Gate PASS.
+
+## Eighteenth independent review correction cycle
+
+Current phase: `phase-0c`.
+
+Input review SHA: `cc50997d7895f8a9609a38448b9e13dabf3a5e5d`.
+
+Phase base: `5cda9a5f8792ee33c3e153d8e791499f5619d82e`.
+
+### Findings addressed
+
+- [`discussion_r3899678577`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3899678577):
+  committed-ingestion deletion recovery now decrypts and revalidates the durable receipt against
+  the terminal, deletion intent, and ingestion-result binding before removing remaining chunks. A
+  reconstructed deleted sink retains committed receipt, byte, and chunk metadata; idempotent
+  `commit()` returns that receipt without making the sink writable. Executor crash recovery can
+  therefore collect stable adapter metadata and consume the durable secure-ingestion result without
+  retransmitting raw chunks or resubmitting the action.
+- [`discussion_r3899678582`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3899678582):
+  non-stream quarantine objects now use an authenticated expiry-deletion intent and constructor
+  sweep. The target reference, retention, digest, encryption metadata, and deterministic audit
+  operation are revalidated before cryptographic erasure; target-first and intent-last cleanup is
+  restartable after interruption, and expired `resume()` purges rather than merely denying access.
+- [`discussion_r3899678585`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3899678585):
+  unquoted credential keys now accept one or more whitespace bytes as a value delimiter in addition
+  to `:` and `=`. Complete and split netrc-style `password value` records are stored only as Secret
+  references and redacted before the Artifact becomes LLM-visible.
+
+### Modified files and regression tests
+
+Resulting working-tree diff: `5 files changed, 600 insertions(+), 12 deletions(-)`.
+
+- `src/redteam_agent/data_security/ingestion.py`
+- `src/redteam_agent/data_security/stores.py`
+- `src/redteam_agent/data_security/streaming.py`
+- `tests/security/test_phase0c_data_security.py`
+- `docs/review/phase-0c-fix-report.md`
+
+Regression coverage simulates an Executor crash after durable secure ingestion and quarantine
+deletion but before `ExecutionResult` persistence, interrupts non-stream expiry after target-key
+destruction and completes it on restart, and verifies complete plus split whitespace-delimited
+credentials. No test was deleted, skipped, weakened, or marked as an expected failure.
+
+### Validation
+
+Focused regression command:
+
+```text
+PYTHONPATH=src:. /home/kali/Red_Agent/.venv/bin/pytest -q \
+  tests/security/test_phase0c_data_security.py \
+  -k 'oauth_fields or executor_resumes_deleted or expired_non_stream'
+```
+
+Result: `3 passed, 40 deselected`.
+
+Combined Phase 0B execution-safety and Phase 0C data-security modules: `79 passed`.
+
+Required phase-gate command:
+
+```text
+PATH="/home/kali/Red_Agent/.venv/bin:$PATH" \
+  bash scripts/ci/run_phase_gate.sh phase-0c
+```
+
+Result:
+
+```text
+AUTOMATION_VALIDATION=PASS
+ruff: All checks passed
+mypy: Success: no issues found in 78 source files
+unit: 200 passed
+integration: 7 passed
+security: 188 passed
+full/coverage run: 395 passed
+skipped=0, errors=0, failures=0
+coverage: 82% total (branch coverage enabled)
+pip check: No broken requirements found
+PHASE_GATE=phase-0c PASS
+```
+
+### Remaining constraints
+
+- No real C2, MCP, provider, subprocess, local-attack, credential-collection, or external-target
+  action was executed.
+- No protected governance file was modified.
+- A fresh independent Phase 0C review remains required on the resulting 40-character PR HEAD; this
+  local PASS is not an independent Phase Gate PASS.

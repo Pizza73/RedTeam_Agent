@@ -113,6 +113,7 @@ class _DeletionBinding(StrictImmutableBoundaryModel):
     execution_id: str = Field(min_length=1)
     sink_id: str = Field(min_length=1)
     chunk_count: int = Field(ge=0)
+    bytes_received: int = Field(ge=0)
     aggregate_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
     receipt_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
     ingestion_id: str = Field(min_length=1)
@@ -193,6 +194,8 @@ class EncryptedRawResultSink:
         self._aborted = False
         self._recovery_required = False
         self._deleted = False
+        self._deleted_bytes_received: int | None = None
+        self._deleted_chunk_count: int | None = None
         self.max_observed_chunk_bytes = 0
         if self._store.has_resource(
             mission_id=self.binding.mission_id,
@@ -234,6 +237,8 @@ class EncryptedRawResultSink:
 
     @property
     def bytes_received(self) -> int:
+        if self._deleted_bytes_received is not None:
+            return self._deleted_bytes_received
         return sum(envelope.plaintext_size for _, envelope in self._chunks)
 
     @property
@@ -323,12 +328,12 @@ class EncryptedRawResultSink:
         ) from None
 
     def _commit_terminal(self) -> RawResultReceipt:
+        if self._receipt is not None:
+            return self._receipt
         if self._deleted:
             raise RawResultQuarantineError("deleted quarantine cannot be committed")
         if self._aborted:
             raise RawResultQuarantineError("aborted quarantine cannot be committed")
-        if self._receipt is not None:
-            return self._receipt
         if self._input_sequence < len(self._chunks):
             raise RawResultQuarantineError("stream replay did not verify every durable chunk")
         incomplete_artifacts = {
@@ -477,7 +482,11 @@ class EncryptedRawResultSink:
             sink_id=self.sink_id,
             state=state,
             bytes_received=self.bytes_received,
-            last_chunk_sequence=len(self._chunks) - 1,
+            last_chunk_sequence=(
+                self._deleted_chunk_count - 1
+                if self._deleted_chunk_count is not None
+                else len(self._chunks) - 1
+            ),
             receipt_id=None if self._receipt is None else self._receipt.receipt_id,
             updated_at=updated_at,
         )
@@ -661,6 +670,7 @@ class EncryptedRawResultSink:
             execution_id=self.execution_id,
             sink_id=self.sink_id,
             chunk_count=len(self._chunks),
+            bytes_received=self.bytes_received,
             aggregate_digest=terminal.aggregate_digest,
             receipt_digest=self._receipt.receipt_digest,
             ingestion_id=self._ingestion_result.ingestion_id,
@@ -1110,7 +1120,7 @@ class EncryptedRawResultSink:
         if value.get("record_type") == "stream_expiry_delete_intent":
             self._resume_expiry_deletion(value, envelope=envelope)
             return
-        if self._ingestion_result is None:
+        if self._ingestion_result is None or self._ingestion_binding is None:
             raise RawResultQuarantineError(
                 "deletion intent lacks a durable ingestion result"
             )
@@ -1118,16 +1128,21 @@ class EncryptedRawResultSink:
             intent = _DeletionBinding.model_validate(value)
         except ValueError as exc:
             raise RawResultQuarantineError("deletion intent is invalid") from exc
-        terminal_envelope = self._store.verified_envelope(
+        terminal_raw, terminal_envelope = self._store.read_bound(
             mission_id=self.binding.mission_id,
             resource_id=self._terminal_resource_id("commit"),
             now=None,
         )
         try:
+            canonical_loads(terminal_raw)
             terminal = _TerminalBinding.model_validate(
                 terminal_envelope.binding.to_dict()
             )
-        except ValueError as exc:
+            receipt = RawResultReceipt.model_validate_json(
+                terminal_raw,
+                strict=True,
+            )
+        except (TypeError, ValueError) as exc:
             raise RawResultQuarantineError("deletion terminal is invalid") from exc
         if not (
             intent.mission_revision == self.binding.mission_revision
@@ -1136,12 +1151,30 @@ class EncryptedRawResultSink:
             and intent.sink_id == self.sink_id
             and terminal.record_type == "stream_commit"
             and terminal.chunk_count == intent.chunk_count
+            and intent.bytes_received <= self.binding.max_result_bytes
+            and receipt.stdout_bytes + receipt.stderr_bytes
+            <= intent.bytes_received
+            and receipt.artifact_count <= intent.chunk_count
             and terminal.aggregate_digest == intent.aggregate_digest
             and terminal.receipt_digest == intent.receipt_digest
+            and receipt.execution_id == self.execution_id
+            and receipt.quarantine_id == self.quarantine_id
+            and receipt.sink_id == self.sink_id
+            and receipt.ciphertext_digest == terminal.aggregate_digest
+            and receipt.receipt_digest == terminal.receipt_digest
+            and digest_model(receipt, exclude={"receipt_digest"})
+            == receipt.receipt_digest
+            and self._ingestion_binding.receipt_id == receipt.receipt_id
+            and self._ingestion_binding.receipt_digest
+            == receipt.receipt_digest
             and intent.ingestion_id == self._ingestion_result.ingestion_id
             and intent.ingestion_digest == self._ingestion_result.ingestion_digest
         ):
             raise RawResultQuarantineError("deletion intent binding is invalid")
+        self._receipt = receipt
+        self._terminal_envelope = terminal_envelope
+        self._deleted_bytes_received = intent.bytes_received
+        self._deleted_chunk_count = intent.chunk_count
         self._audit.record(
             mission_id=self.binding.mission_id,
             resource_type="raw_result_quarantine",

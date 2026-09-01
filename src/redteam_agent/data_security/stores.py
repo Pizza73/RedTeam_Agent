@@ -11,7 +11,7 @@ import secrets
 import stat
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager, contextmanager, suppress
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from threading import RLock
 from typing import Literal, Protocol
@@ -105,6 +105,11 @@ class _SecretTombstone(StrictImmutableBoundaryModel):
     metadata: SecretReferenceMetadata
     source_execution_id: str = Field(min_length=1)
     metadata_version: Literal[2]
+
+
+class _QuarantineExpiryIntent(StrictImmutableBoundaryModel):
+    record_type: Literal["quarantine_expiry_intent"]
+    reference: QuarantineReference
 
 
 class _ArtifactStreamChunkBinding(StrictImmutableBoundaryModel):
@@ -959,6 +964,7 @@ class EncryptedRawResultQuarantine:
         audit: DataStoreAuditRecorder,
         max_item_bytes: int,
         mission_quota_bytes: int,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._store = _EncryptedFileStore(
             root=root,
@@ -968,6 +974,37 @@ class EncryptedRawResultQuarantine:
             mission_quota_bytes=mission_quota_bytes,
         )
         self._audit = audit
+        self._clock = clock or (lambda: datetime.now(UTC))
+        self._sweep_expired()
+
+    def _sweep_expired(self) -> None:
+        now = self._clock()
+        _require_time(now)
+        for mission_id in self._store.mission_ids():
+            for intent_id in self._store.resource_ids_with_prefix(
+                mission_id=mission_id,
+                prefix="quarantineexpiry_",
+            ):
+                intent = self._load_expiry_intent(
+                    mission_id=mission_id,
+                    intent_id=intent_id,
+                )
+                self._resume_expiry_intent(
+                    intent,
+                    intent_id=intent_id,
+                )
+            for resource_id in self._store.resource_ids_with_prefix(
+                mission_id=mission_id,
+                prefix="quarantine_",
+            ):
+                envelope = self._store.verified_envelope(
+                    mission_id=mission_id,
+                    resource_id=resource_id,
+                    now=None,
+                )
+                reference = self._reference_from_envelope(envelope)
+                if now >= reference.retention_until:
+                    self._expire_reference(reference, now=now)
 
     def commit(
         self,
@@ -1026,6 +1063,10 @@ class EncryptedRawResultQuarantine:
         return reference
 
     def resume(self, reference: QuarantineReference, *, now: datetime) -> bytes:
+        _require_time(now)
+        if now >= reference.retention_until:
+            self._expire_reference(reference, now=now)
+            raise ArtifactSecurityError("encrypted resource retention has expired")
         content, envelope = self._store.read_bound(
             mission_id=reference.mission_id,
             resource_id=reference.quarantine_id,
@@ -1057,6 +1098,179 @@ class EncryptedRawResultQuarantine:
             occurred_at=now,
         )
         return content
+
+    def _expire_reference(
+        self,
+        reference: QuarantineReference,
+        *,
+        now: datetime,
+    ) -> None:
+        if now < reference.retention_until:
+            raise ArtifactSecurityError("quarantine retention has not expired")
+        intent_id = self._expiry_intent_id(reference.quarantine_id)
+        if not self._store.has_resource(
+            mission_id=reference.mission_id,
+            resource_id=intent_id,
+        ):
+            target_exists = self._store.has_resource(
+                mission_id=reference.mission_id,
+                resource_id=reference.quarantine_id,
+            )
+            if not target_exists:
+                return
+            authoritative = self._reference_from_envelope(
+                self._store.verified_envelope(
+                    mission_id=reference.mission_id,
+                    resource_id=reference.quarantine_id,
+                    now=None,
+                )
+            )
+            if authoritative != reference:
+                raise DigestIntegrityError(
+                    "quarantine reference integrity failed"
+                )
+            intent = _QuarantineExpiryIntent(
+                record_type="quarantine_expiry_intent",
+                reference=reference,
+            )
+            self._store.write(
+                mission_id=reference.mission_id,
+                resource_id=intent_id,
+                content=b"",
+                binding=intent.model_dump(mode="json"),
+                created_at=now,
+                retention_until=None,
+            )
+        intent = self._load_expiry_intent(
+            mission_id=reference.mission_id,
+            intent_id=intent_id,
+        )
+        if intent.reference != reference:
+            raise DigestIntegrityError("quarantine expiry intent binding failed")
+        self._resume_expiry_intent(intent, intent_id=intent_id)
+
+    def _resume_expiry_intent(
+        self,
+        intent: _QuarantineExpiryIntent,
+        *,
+        intent_id: str,
+    ) -> None:
+        reference = intent.reference
+        if intent_id != self._expiry_intent_id(reference.quarantine_id):
+            raise ArtifactSecurityError("quarantine expiry intent binding is invalid")
+        if self._store.has_resource(
+            mission_id=reference.mission_id,
+            resource_id=reference.quarantine_id,
+        ):
+            authoritative = self._reference_from_envelope(
+                self._store.verified_envelope(
+                    mission_id=reference.mission_id,
+                    resource_id=reference.quarantine_id,
+                    now=None,
+                )
+            )
+            if authoritative != reference:
+                raise DigestIntegrityError("quarantine expiry target binding failed")
+        _, intent_envelope = self._store.read_bound(
+            mission_id=reference.mission_id,
+            resource_id=intent_id,
+            now=None,
+        )
+        if intent_envelope.created_at < reference.retention_until:
+            raise ArtifactSecurityError(
+                "quarantine expiry intent predates retention"
+            )
+        self._audit.record(
+            mission_id=reference.mission_id,
+            resource_type="raw_result_quarantine",
+            resource_id=reference.quarantine_id,
+            operation="delete",
+            operation_id=stable_id(
+                "auditop",
+                {
+                    "schema_version": "quarantine-expiry-audit-v1",
+                    "quarantine_id": reference.quarantine_id,
+                },
+            ),
+            metadata_digest=reference.sha256,
+            occurred_at=intent_envelope.created_at,
+        )
+        self._store.erase_resource(
+            mission_id=reference.mission_id,
+            resource_id=reference.quarantine_id,
+        )
+        self._store.erase_resource(
+            mission_id=reference.mission_id,
+            resource_id=intent_id,
+        )
+
+    def _load_expiry_intent(
+        self,
+        *,
+        mission_id: str,
+        intent_id: str,
+    ) -> _QuarantineExpiryIntent:
+        raw, envelope = self._store.read_bound(
+            mission_id=mission_id,
+            resource_id=intent_id,
+            now=None,
+        )
+        if raw:
+            raise ArtifactSecurityError("quarantine expiry intent content is invalid")
+        try:
+            intent = _QuarantineExpiryIntent.model_validate_json(
+                canonicalize(envelope.binding.to_dict()),
+                strict=True,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ArtifactSecurityError(
+                "quarantine expiry intent is invalid"
+            ) from exc
+        if not (
+            intent.reference.mission_id == mission_id
+            and intent_id == self._expiry_intent_id(
+                intent.reference.quarantine_id
+            )
+        ):
+            raise ArtifactSecurityError("quarantine expiry intent binding is invalid")
+        return intent
+
+    @staticmethod
+    def _reference_from_envelope(envelope: _StoredEnvelope) -> QuarantineReference:
+        binding = envelope.binding.to_dict()
+        mission_revision = binding.get("mission_revision")
+        execution_id = binding.get("execution_id")
+        if not (
+            set(binding) == {"mission_revision", "execution_id"}
+            and isinstance(mission_revision, int)
+            and not isinstance(mission_revision, bool)
+            and mission_revision >= 1
+            and isinstance(execution_id, str)
+            and execution_id
+            and envelope.retention_until is not None
+        ):
+            raise ArtifactSecurityError("quarantine envelope binding is invalid")
+        return QuarantineReference(
+            quarantine_id=envelope.resource_id,
+            mission_id=envelope.mission_id,
+            mission_revision=mission_revision,
+            execution_id=execution_id,
+            size_bytes=envelope.plaintext_size,
+            sha256=envelope.plaintext_sha256,
+            encryption_metadata_id=envelope.encryption_metadata_id,
+            created_at=envelope.created_at,
+            retention_until=envelope.retention_until,
+        )
+
+    @staticmethod
+    def _expiry_intent_id(quarantine_id: str) -> str:
+        return stable_id(
+            "quarantineexpiry",
+            {
+                "schema_version": "quarantine-expiry-intent-v1",
+                "quarantine_id": quarantine_id,
+            },
+        )
 
     def delete(self, reference: QuarantineReference, *, now: datetime) -> None:
         self._audit.record(

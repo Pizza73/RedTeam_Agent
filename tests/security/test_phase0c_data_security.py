@@ -50,11 +50,18 @@ from redteam_agent.errors import (
     SecretAccessError,
     SecureIngestionError,
 )
+from redteam_agent.executor import MockExecutionAdapter
 from redteam_agent.models.capabilities import SandboxCapabilities
 from redteam_agent.models.context import DataAccessGrant, ResourceBinding
 from redteam_agent.models.execution import RawArtifactMetadata
 from redteam_agent.models.scope import DataAccessOperation, DataResourceType
+from redteam_agent.seeds import FIXED_TIME
 from redteam_agent.storage import Database
+from tests.phase0b_helpers import (
+    build_execution_harness,
+    executor_with_adapter,
+    prepare_execution,
+)
 
 NOW = datetime(2026, 8, 31, 8, 0, tzinfo=UTC)
 
@@ -1051,6 +1058,11 @@ def test_oauth_fields_are_redacted_across_stream_chunks(tmp_path: Path) -> None:
         await sink.write_stdout(b'5fsecret":"escaped-client-value"} ')
         await sink.write_stdout(b"passwordHash=unquoted-hash token")
         await sink.write_stdout(b"Value: unquoted-token")
+        await sink.write_stdout(
+            b" machine complete.example login user password complete-netrc "
+        )
+        await sink.write_stdout(b"machine split.example login user pass")
+        await sink.write_stdout(b"word split-netrc")
         receipt = await sink.commit()
         return await SecureIngestor(
             quarantine=quarantine,
@@ -1059,7 +1071,7 @@ def test_oauth_fields_are_redacted_across_stream_chunks(tmp_path: Path) -> None:
         ).ingest_stream(sink, receipt, now=NOW)
 
     result = asyncio.run(ingest_oauth_stream())
-    assert result.redaction_metadata.redaction_count == 13
+    assert result.redaction_metadata.redaction_count == 15
     assert result.redacted_artifacts[0].classification == "sensitive"
     assert {item.credential_type for item in result.detected_secrets} == {
         "tokenvalue",
@@ -1073,6 +1085,7 @@ def test_oauth_fields_are_redacted_across_stream_chunks(tmp_path: Path) -> None:
         "sshprivatekey",
         "api_key",
         "client_secret",
+        "password",
     }
     artifact = result.redacted_artifacts[0]
     authorizer.set_grants(
@@ -1098,6 +1111,8 @@ def test_oauth_fields_are_redacted_across_stream_chunks(tmp_path: Path) -> None:
         b'"sshPrivateKey":"[REDACTED]","api\\u005fkey":"[REDACTED]",'
         b'"client\\u005fsecret":"[REDACTED]"} '
         b"passwordHash=[REDACTED] tokenValue: [REDACTED]"
+        b" machine complete.example login user password [REDACTED] "
+        b"machine split.example login user password [REDACTED]"
     )
     for value in (
         b"prefix-value",
@@ -1113,6 +1128,8 @@ def test_oauth_fields_are_redacted_across_stream_chunks(tmp_path: Path) -> None:
         b"escaped-client-value",
         b"unquoted-hash",
         b"unquoted-token",
+        b"complete-netrc",
+        b"split-netrc",
     ):
         assert value not in visible
         assert value.decode() not in result.model_dump_json()
@@ -2665,12 +2682,20 @@ def test_storage_rejects_traversal_symlink_quota_retention_and_corruption(
     with pytest.raises(EncryptionKeyUnavailableError):
         quarantine.resume(erase_reference, now=NOW)
 
-    stored_path = next((root / "mission-a").glob("*.json"))
+    corrupt_reference = quarantine.commit(
+        mission_id="mission-corrupt",
+        mission_revision=1,
+        execution_id="execution-corrupt",
+        content=b"corrupt",
+        created_at=NOW,
+        retention_until=NOW + timedelta(minutes=5),
+    )
+    stored_path = next((root / "mission-corrupt").glob("*.json"))
     envelope = json.loads(stored_path.read_text(encoding="utf-8"))
     envelope["plaintext_sha256"] = "sha256:" + ("0" * 64)
     stored_path.write_text(json.dumps(envelope), encoding="utf-8")
     with pytest.raises((DigestIntegrityError, EncryptionIntegrityError)):
-        quarantine.resume(reference, now=NOW)
+        quarantine.resume(corrupt_reference, now=NOW)
 
     stream_audit_log = MissionAuditLog()
     stream_audit = MissionAuditRecorder(
@@ -3061,6 +3086,232 @@ def test_storage_rejects_traversal_symlink_quota_retention_and_corruption(
     assert all(
         raw_secret not in path.read_bytes() for path in tmp_path.rglob("*.json")
     )
+
+
+def test_executor_resumes_deleted_ingestion_without_recollecting_raw_chunks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = build_execution_harness()
+    prepared = prepare_execution(harness)
+    keys = _keys()
+    audit = MissionAuditRecorder(
+        audit_log=MissionAuditLog(),
+        contexts=_AuditContexts(),
+    )
+    current_time = [FIXED_TIME + timedelta(minutes=3)]
+    quarantine = EncryptedRawResultQuarantine(
+        root=tmp_path / "executor-crash-quarantine",
+        keys=keys,
+        audit=audit,
+        max_item_bytes=16 * 1024,
+        mission_quota_bytes=64 * 1024,
+        clock=lambda: current_time[0],
+    )
+    binding = QuarantineStreamBinding(
+        mission_id=prepared.mission_id,
+        mission_revision=prepared.mission_revision,
+        execution_id=prepared.execution_id,
+        retention_until=FIXED_TIME + timedelta(hours=1),
+        max_result_bytes=harness.environment.tool.max_output_bytes,
+        resume_mode="from_start",
+    )
+    sink_factory = EncryptedRawResultSinkFactory(
+        quarantine=quarantine,
+        bindings=_StreamBindings(binding),
+        clock=lambda: current_time[0],
+    )
+    authorizer = _ExactEnvelopeAuthorizer()
+    authorizer.allow_ingestion_write(prepared.mission_id, prepared.execution_id)
+    artifacts = ArtifactStore(
+        root=tmp_path / "executor-crash-artifacts",
+        keys=keys,
+        authorizer=authorizer,
+        audit=audit,
+        max_item_bytes=16 * 1024,
+        mission_quota_bytes=64 * 1024,
+    )
+    secrets = SecretStore(
+        root=tmp_path / "executor-crash-secrets",
+        keys=keys,
+        authorizer=authorizer,
+        audit=audit,
+        max_item_bytes=1024,
+        mission_quota_bytes=4096,
+    )
+    adapter = MockExecutionAdapter(
+        capabilities=harness.environment.adapter_snapshot.adapters[0],
+        now=current_time[0],
+        stdout_chunks=(b"password executor-crash-secret",),
+    )
+    harness.executor = executor_with_adapter(
+        harness,
+        adapter,
+        sink_factory=sink_factory,  # type: ignore[arg-type]
+    )
+    running = asyncio.run(
+        harness.executor.dispatch(
+            prepared.execution_id,
+            now=current_time[0],
+        )
+    )
+    ingestor = SecureIngestor(
+        quarantine=quarantine,
+        artifacts=artifacts,
+        secrets=secrets,
+    )
+    current_time[0] = FIXED_TIME + timedelta(minutes=4)
+
+    def crash_before_result_record(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("simulated crash before ExecutionResult persistence")
+
+    with monkeypatch.context() as crash:
+        crash.setattr(harness.results, "add", crash_before_result_record)
+        with pytest.raises(RuntimeError, match="ExecutionResult persistence"):
+            asyncio.run(
+                harness.executor.ingest_result(
+                    running.execution_id,
+                    ingester=EncryptedSecureResultIngester(
+                        ingestor=ingestor,
+                        sinks=sink_factory,
+                        clock=lambda: current_time[0],
+                    ),
+                    now=current_time[0],
+                )
+            )
+
+    reconstructed = sink_factory.for_execution(running.execution_id)
+    assert reconstructed.committed
+    assert reconstructed._deleted
+    assert harness.results.get_by_execution(running.execution_id) is None
+    assert adapter.collect_calls == 1
+
+    current_time[0] = FIXED_TIME + timedelta(minutes=6)
+    recovered = asyncio.run(
+        harness.executor.resume_result_ingestion(
+            running.execution_id,
+            ingester=EncryptedSecureResultIngester(
+                ingestor=ingestor,
+                sinks=sink_factory,
+                clock=lambda: current_time[0],
+            ),
+            now=current_time[0],
+        )
+    )
+    assert recovered.execution_id == running.execution_id
+    assert harness.results.get_by_execution(running.execution_id) == recovered
+    final_execution = harness.executions.get(running.execution_id)
+    final_ingestion = harness.ingestions.get_by_execution(running.execution_id)
+    assert final_execution is not None
+    assert final_execution.result_ingestion_state == "SUCCEEDED"
+    assert final_ingestion is not None and final_ingestion.status == "SUCCEEDED"
+    assert adapter.submit_calls == 1
+    assert adapter.collect_calls == 2
+
+
+def test_expired_non_stream_quarantine_is_erased_and_resumed_after_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    keys = _keys()
+    audit_log = MissionAuditLog()
+    audit = MissionAuditRecorder(
+        audit_log=audit_log,
+        contexts=_AuditContexts(),
+    )
+    root = tmp_path / "expiring-object-quarantine"
+    current_time = [NOW]
+    quarantine = EncryptedRawResultQuarantine(
+        root=root,
+        keys=keys,
+        audit=audit,
+        max_item_bytes=1024,
+        mission_quota_bytes=4096,
+        clock=lambda: current_time[0],
+    )
+    retention_until = NOW + timedelta(minutes=5)
+    reference = quarantine.commit(
+        mission_id="mission-expiring-object",
+        mission_revision=1,
+        execution_id="execution-expiring-object",
+        content=b"expired-object-secret",
+        created_at=NOW,
+        retention_until=retention_until,
+    )
+    target_envelope = quarantine._store.verified_envelope(
+        mission_id=reference.mission_id,
+        resource_id=reference.quarantine_id,
+        now=None,
+    )
+    current_time[0] = retention_until
+    store_type = type(quarantine._store)
+    original_erase = store_type.erase_resource
+
+    def interrupt_after_target_erasure(
+        store,
+        *,
+        mission_id: str,
+        resource_id: str,
+    ) -> None:
+        original_erase(
+            store,
+            mission_id=mission_id,
+            resource_id=resource_id,
+        )
+        if resource_id == reference.quarantine_id:
+            raise ArtifactSecurityError("simulated expiry cleanup interruption")
+
+    with monkeypatch.context() as interrupted:
+        interrupted.setattr(
+            store_type,
+            "erase_resource",
+            interrupt_after_target_erasure,
+        )
+        with pytest.raises(ArtifactSecurityError, match="cleanup interruption"):
+            EncryptedRawResultQuarantine(
+                root=root,
+                keys=keys,
+                audit=audit,
+                max_item_bytes=1024,
+                mission_quota_bytes=4096,
+                clock=lambda: current_time[0],
+            )
+
+    pending = quarantine._store.envelopes_for(reference.mission_id)
+    assert len(pending) == 1
+    assert pending[0].resource_id.startswith("quarantineexpiry_")
+    intent_metadata = pending[0].payload.metadata
+    current_time[0] += timedelta(seconds=1)
+    restarted = EncryptedRawResultQuarantine(
+        root=root,
+        keys=keys,
+        audit=audit,
+        max_item_bytes=1024,
+        mission_quota_bytes=4096,
+        clock=lambda: current_time[0],
+    )
+    assert not restarted._store.resource_ids_with_prefix(
+        mission_id=reference.mission_id,
+        prefix="quarantine_",
+    )
+    assert not restarted._store.resource_ids_with_prefix(
+        mission_id=reference.mission_id,
+        prefix="quarantineexpiry_",
+    )
+    assert keys.resource_key_destroyed(target_envelope.payload.metadata)
+    assert keys.resource_key_destroyed(intent_metadata)
+    assert (
+        len(
+            [
+                event
+                for event in audit_log.events_for(reference.mission_id)
+                if event.event_type == "raw_result_quarantine.delete"
+            ]
+        )
+        == 1
+    )
+    with pytest.raises(ArtifactSecurityError, match="retention"):
+        restarted.resume(reference, now=current_time[0])
 
 
 def test_artifact_quota_is_serialized_across_store_instances(

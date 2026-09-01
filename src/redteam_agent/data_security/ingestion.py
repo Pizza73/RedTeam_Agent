@@ -219,13 +219,16 @@ class _StreamingSecretRedactor:
             if data[cursor] != key_quote:
                 return None
             cursor += 1
+        delimiter_start = cursor
         while cursor < len(data) and data[cursor] in _SECRET_WHITESPACE:
             cursor += 1
         if cursor == len(data):
             return None if final else "incomplete"
-        if data[cursor] not in b":=":
+        whitespace_delimited = key_quote is None and cursor > delimiter_start
+        if data[cursor] in b":=":
+            cursor += 1
+        elif not whitespace_delimited:
             return None
-        cursor += 1
         while cursor < len(data) and data[cursor] in _SECRET_WHITESPACE:
             cursor += 1
         if cursor == len(data):
