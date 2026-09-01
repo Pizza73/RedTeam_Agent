@@ -26,10 +26,17 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["id", "severity", "requirement_id", "evidence", "required_fix", "retest"],
+        "required": [
+          "id", "severity", "invariant_family", "requirement_id",
+          "evidence", "required_fix", "retest"
+        ],
         "properties": {
           "id": {"pattern": "^[A-Z][A-Z0-9-]+$", "type": "string"},
           "severity": {"enum": ["BLOCKER", "HIGH", "MEDIUM", "LOW"]},
+          "invariant_family": {
+            "pattern": "^[a-z][a-z0-9-]{2,63}$",
+            "type": "string"
+          },
           "requirement_id": {"minLength": 1, "type": "string"},
           "evidence": {"minLength": 1, "type": "string"},
           "required_fix": {"minLength": 1, "type": "string"},

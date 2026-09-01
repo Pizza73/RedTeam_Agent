@@ -63,6 +63,8 @@ def validate_automation(repo_root: Path) -> None:
     schemas = root / "automation" / "schemas"
     for schema_name in (
         "implementation-request.schema.json",
+        "invariant-audit.schema.json",
+        "invariant-families.schema.json",
         "review-result.schema.json",
         "phase-plan.schema.json",
         "provider-gates.schema.json",
@@ -90,6 +92,20 @@ def validate_automation(repo_root: Path) -> None:
         prompt_path = (root / item["prompt"]).resolve(strict=True)
         if not prompt_path.is_relative_to(root / "prompts" / "phases") or not prompt_path.is_file():
             raise AutomationValidationError(f"invalid phase prompt path: {item['prompt']}")
+
+    invariant_policy = _validate_instance(
+        root / "automation" / "invariant-families.json",
+        schemas / "invariant-families.schema.json",
+    )
+    family_ids = [item["id"] for item in invariant_policy["families"]]
+    if len(set(family_ids)) != len(family_ids):
+        raise AutomationValidationError("duplicate invariant-family ID")
+    known_families = set(family_ids)
+    if tuple(invariant_policy["phases"]) != EXPECTED_PHASES:
+        raise AutomationValidationError("invariant-family phase mapping is incomplete or unordered")
+    for phase, families in invariant_policy["phases"].items():
+        if not set(families).issubset(known_families):
+            raise AutomationValidationError(f"unknown invariant family for {phase}")
 
     gates = _validate_instance(
         root / "automation" / "provider-gates.json",

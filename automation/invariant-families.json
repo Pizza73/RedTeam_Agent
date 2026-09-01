@@ -1,0 +1,132 @@
+{
+  "schema_version": "1.0",
+  "semantic_recurrence_limit": 2,
+  "families": [
+    {
+      "id": "authorization-lifecycle",
+      "title": "Authorization, approval, scope and lifecycle",
+      "stateful": true,
+      "review_questions": [
+        "Are all executable decisions and lifecycle transitions loaded from trusted current source of truth?",
+        "Do omitted, stale or caller-controlled scope, target, approval, adapter or lifecycle fields fail closed?",
+        "Were all public entry points, alternate callers and sibling state transitions audited?"
+      ]
+    },
+    {
+      "id": "secret-plaintext-boundary",
+      "title": "Secrets, plaintext and LLM-visible data",
+      "stateful": false,
+      "review_questions": [
+        "Can secret values or raw output reach prompts, normal storage, logs, exceptions or reports?",
+        "Do every public resolve, read, export and recovery path enforce the same reference-only boundary?"
+      ]
+    },
+    {
+      "id": "integrity-cryptography-keys",
+      "title": "Integrity, authenticated encryption and key domains",
+      "stateful": true,
+      "review_questions": [
+        "Are digests, IDs, bindings, algorithms, nonces and key domains checked on both write and read?",
+        "Do rotation, revocation and unavailable-key paths fail closed without plaintext or cross-domain fallback?"
+      ]
+    },
+    {
+      "id": "audit-recovery-durability",
+      "title": "Audit, retry, recovery and durable state",
+      "stateful": true,
+      "review_questions": [
+        "Are crash, retry, reconciliation and unknown-outcome transitions complete and non-duplicating?",
+        "Are audit ordering, integrity and recovery decisions derived from durable trusted state?"
+      ]
+    },
+    {
+      "id": "filesystem-concurrency-retention",
+      "title": "Filesystem, concurrency, quota and retention",
+      "stateful": true,
+      "review_questions": [
+        "Are traversal, symlink, race, atomicity, ownership, quota and cleanup paths covered?",
+        "Are retention and lease decisions based on trusted time and durable current state?"
+      ]
+    },
+    {
+      "id": "untrusted-output-parsing",
+      "title": "Untrusted parsing, schemas and output boundaries",
+      "stateful": false,
+      "review_questions": [
+        "Are duplicate keys, unknown fields, coercion, malformed metadata and prompt injection rejected at the actual boundary?",
+        "Do alternate parsers and compatibility readers preserve the same fail-closed behavior?"
+      ]
+    },
+    {
+      "id": "acceptance-compatibility",
+      "title": "Acceptance completeness and earlier-phase compatibility",
+      "stateful": false,
+      "review_questions": [
+        "Does every acceptance criterion have positive, negative and failure-path evidence?",
+        "Do changed interfaces preserve every earlier-phase invariant and supported caller?"
+      ]
+    }
+  ],
+  "phases": {
+    "phase-0a": [
+      "authorization-lifecycle",
+      "integrity-cryptography-keys",
+      "untrusted-output-parsing",
+      "acceptance-compatibility"
+    ],
+    "phase-0b": [
+      "authorization-lifecycle",
+      "audit-recovery-durability",
+      "filesystem-concurrency-retention",
+      "untrusted-output-parsing",
+      "acceptance-compatibility"
+    ],
+    "phase-0c": [
+      "authorization-lifecycle",
+      "secret-plaintext-boundary",
+      "integrity-cryptography-keys",
+      "audit-recovery-durability",
+      "filesystem-concurrency-retention",
+      "untrusted-output-parsing",
+      "acceptance-compatibility"
+    ],
+    "phase-1": [
+      "authorization-lifecycle",
+      "secret-plaintext-boundary",
+      "audit-recovery-durability",
+      "untrusted-output-parsing",
+      "acceptance-compatibility"
+    ],
+    "phase-2": [
+      "authorization-lifecycle",
+      "secret-plaintext-boundary",
+      "integrity-cryptography-keys",
+      "untrusted-output-parsing",
+      "acceptance-compatibility"
+    ],
+    "phase-3": [
+      "authorization-lifecycle",
+      "audit-recovery-durability",
+      "filesystem-concurrency-retention",
+      "acceptance-compatibility"
+    ],
+    "phase-4": [
+      "authorization-lifecycle",
+      "secret-plaintext-boundary",
+      "integrity-cryptography-keys",
+      "audit-recovery-durability",
+      "filesystem-concurrency-retention",
+      "untrusted-output-parsing",
+      "acceptance-compatibility"
+    ],
+    "phase-5": [
+      "authorization-lifecycle",
+      "secret-plaintext-boundary",
+      "integrity-cryptography-keys",
+      "audit-recovery-durability",
+      "filesystem-concurrency-retention",
+      "untrusted-output-parsing",
+      "acceptance-compatibility"
+    ]
+  }
+}

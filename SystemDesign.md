@@ -4912,6 +4912,24 @@ Tool Availability Resolver、Policy Engine、Executor、Knowledge Reducer、Sess
 
 特定C2、特定MCP、特定LLMへの依存をコアロジックへ持ち込まないこと。
 
+## 40.1 不変条件ファミリー単位の実装・Review Loop
+
+Formal Codex Reviewへ進む前に、実装担当はCurrent Phaseで要求される不変条件ファミリーを
+`automation/invariant-families.json`から解決し、各Familyについてpublic entry point、caller、
+compatibility reader、recovery path、sibling implementationを監査する。指摘行だけを直すのではなく、
+同じSemantic Invariantを共有する経路を1つの修正単位とする。
+
+監査結果は`docs/review/<phase>-invariant-audit.json`へ記録し、Implementation Request、入力HEAD、
+出力HEAD、Canonical DigestへBindingする。全Familyはpositive、negative、failure-path test evidenceを
+持ち、変更されたStateful Familyはproperty-basedまたはstate-machine test evidenceも持つ。CIはこの
+監査の構造とBindingを検証してからReview Readyを発行する。
+
+独立Reviewerは監査Reportを正しさの証明として信頼せず、Review順序を決めるRouting Evidenceとして
+だけ使用する。各P0/P1はTrusted Policy中のInvariant Family IDを1つ保持する。同じFamilyが同一Phaseの
+2回目のFormal Reviewへ再出現した場合、局所Patchを続けずLoopをDesign Reviewで停止する。再開には、
+再発した全経路を同時に閉じるCoherent RedesignとHuman Resume Evidenceを必要とする。Exact Findingと
+Phase全体の既存5回上限はDefense-in-Depthとして残す。
+
 ---
 
 # 41. Revision Summary

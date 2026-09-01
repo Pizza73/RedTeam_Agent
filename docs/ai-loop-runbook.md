@@ -8,16 +8,20 @@ repeats this sequence:
 1. Read a SHA-bound implementation request created by `github-actions[bot]`.
 2. Post an `@codex` implementation request as the ChatGPT-linked GitHub user.
 3. Wait for Codex to push a normal PR commit and for all required CI checks to pass.
-4. Post one exhaustive `@codex review` for that exact phase, head SHA and phase base SHA. The same
+4. Require Codex's phase-specific invariant-family audit, including sibling-path coverage and
+   positive/negative/failure tests; stateful changes also require property/state-machine evidence.
+   CI binds its canonical digest to the implementation request and output HEAD.
+5. Post one exhaustive `@codex review` for that exact phase, head SHA and phase base SHA. The same
    review instruction applies to every Phase.
-5. Require Codex to continue after the first issue and retain every consequential P0/P1 in that
+6. Require Codex to continue after the first issue and retain every consequential P0/P1 in that
    single native review. Validate reviewer identity, ready/trigger chain, current head, bot 👍 and
    unchanged review timeline, then request one fix covering every retained finding.
-6. Dispatch **Record AI Phase Review**, which independently revalidates the SHA, review and CI.
-7. Request a bounded fix or continue with the next phase.
-8. If `main` advanced before the next Phase implementation began, roll back one Phase, incorporate
+7. Dispatch **Record AI Phase Review**, which independently revalidates the SHA, review and CI.
+8. Request a bounded semantic-family fix or continue with the next phase. A family recurring in a
+   second formal review stops for coherent redesign instead of requesting another local patch.
+9. If `main` advanced before the next Phase implementation began, roll back one Phase, incorporate
    `main` with an exact expected HEAD, and repeat that prior Phase gate on the new HEAD.
-9. At Phase 5 completion, revalidate the full Phase 0A→5 SHA chain and current-head checks, then
+10. At Phase 5 completion, revalidate the full Phase 0A→5 SHA chain and current-head checks, then
    merge the `ai-loop` PR once with the exact current HEAD SHA.
 
 The process stops on a failure limit, `BLOCKED`, a runtime limit, the Phase 4/5 Human Gates, or
@@ -179,16 +183,19 @@ Codex Code Review posts standard GitHub evidence rather than repository-defined 
 the single review requires the standard no-major-issues comment, a matching 10-or-more-character
 commit prefix and a reviewer-authored 👍 reaction. For `CHANGES_REQUESTED`, it requires one formal
 review bound to the full current SHA and aggregates every retained P0/P1 inline comment from that
-review. The trusted fix request records the exact `finding_count` and every finding permalink;
-`finding_key` is used only for bounded retry counting, and Codex must resolve every retained
-finding. Head synchronization between the trigger and completion is forbidden. The
+review. The trusted fix request records the exact `finding_count`, every finding permalink and
+each invariant-family ID; `finding_key` is used only for bounded retry counting, and Codex must
+resolve every retained finding plus its sibling paths. Head synchronization between the trigger
+and completion is forbidden. The
 approver-restricted workflow re-queries and validates the same evidence before producing the
 machine-readable phase record.
 
 ## Human Gates and blocked runs
 
-- `CHANGES_REQUESTED`: the runner automatically requests a same-phase fix. The third occurrence of
-  one root-cause key or the fifth change cycle blocks the loop.
+- `CHANGES_REQUESTED`: the runner requests one same-phase fix covering all findings and every
+  sibling path in their semantic invariant families. The fifth occurrence of one exact root-cause
+  key or the fifth change cycle blocks the loop. A semantic family appearing in a second formal
+  review blocks immediately for a documented coherent redesign.
 - CI failure: the runner consumes the bounded failure request and asks Codex for a same-phase fix;
   CI failure never counts as PASS.
 - `BLOCKED`: resolve the recorded cause. For Phase 0A through Phase 3, run **Resume AI Loop** with

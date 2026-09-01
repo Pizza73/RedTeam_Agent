@@ -75,7 +75,7 @@ IMPLEMENTATION_REQUESTED
   -> local orchestrator requests Codex Cloud implementation
   -> CI_RUNNING
        -> CI_FAILED -> FIX_REQUESTED
-       -> REVIEW_READY
+       -> INVARIANT_FAMILY_AUDIT -> REVIEW_READY
   -> local orchestrator requests one exhaustive Codex/ChatGPT review for one exact SHA
   -> local orchestrator validates and aggregates the complete native review
        -> CHANGES_REQUESTED -> FIX_REQUESTED
@@ -118,6 +118,18 @@ then dispatch only the existing bounded Resume workflow bound to the blocked gat
 -->
 ```
 
+For implementation requests carrying `invariant_audit.required=true`, the same trusted CI comment
+also contains a `redteam-invariant-audit` marker. It binds the exact implementation request,
+current output HEAD, phase-specific report path and canonical report digest. Legacy/recovery
+evidence created before this policy remains readable, but every newly issued implementation or fix
+request uses the audited path.
+
+```html
+<!-- redteam-invariant-audit
+{"schema_version":"1.0","phase":"phase-0c","head_sha":"<output-sha>","audit_path":"docs/review/phase-0c-invariant-audit.json","audit_digest":"<sha256>","request_reference":"https://github.com/..."}
+-->
+```
+
 ### Trusted phase-gate record
 
 This marker is created only by the `Record AI Phase Review` workflow after it re-queries GitHub
@@ -133,7 +145,7 @@ checks and validates the reviewer permalink. AI-authored markers are not accepte
 
 ```html
 <!-- redteam-implementation-request
-{"schema_version":"1.0","action":"IMPLEMENT_PHASE","trigger":"PHASE_START","phase":"phase-0b","head_sha":"<sha>","phase_prompt":"prompts/phases/phase-0b.md"}
+{"schema_version":"1.0","action":"IMPLEMENT_PHASE","trigger":"PHASE_START","phase":"phase-0b","head_sha":"<sha>","phase_prompt":"prompts/phases/phase-0b.md","invariant_audit":{"policy_version":"1.0","required":true}}
 -->
 ```
 
@@ -187,16 +199,17 @@ After CI posts the review-ready marker:
    The same exhaustive instruction applies to every Phase.
 2. Codex reviews the complete Phase diff and supporting unchanged code across authorization and
    lifecycle, secrets and untrusted output, integrity/cryptography/storage/recovery/concurrency,
-   every acceptance criterion, bypass path, and earlier-Phase regression.
+   every acceptance criterion, bypass path, and earlier-Phase regression. The bound pre-review
+   audit is a routing checklist only; the reviewer independently verifies every required family.
 3. Codex continues after the first issue and retains every consequential finding in that one
-   native review, each in standard P0/P1 inline format. No-major-issues is valid only when none
-   remains.
+   native review, each in standard P0/P1 inline format with exactly one trusted invariant-family
+   ID. No-major-issues is valid only when none remains.
 4. The orchestrator validates reviewer identity, current phase/head/base, ready/trigger chain,
    native output and absence of `synchronize` events. It aggregates every retained P0/P1 into one
    `CHANGES_REQUESTED`; the first finding supplies only the stable retry key, not the fix scope.
-5. The resulting trusted fix request records `finding_count` plus every P0/P1 permalink and
-   references the complete native review. Codex must fix every listed finding before the next
-   review. The orchestrator then dispatches
+5. The resulting trusted fix request records `finding_count`, every P0/P1 permalink and each
+   finding's invariant family, and references the complete native review. Codex must fix every
+   listed finding and its sibling paths before the next review. The orchestrator then dispatches
    `Record AI Phase Review` as `AI_GATE_APPROVER_LOGIN`.
 
 The workflow rejects a stale SHA, wrong reviewer, wrong phase base, fork PR, missing/failed checks,
@@ -205,6 +218,9 @@ commit evidence, a PASS without the bot 👍, or orchestrator input that differs
 deterministically derived aggregate result. A formal Codex review without retained P0/P1 comments
 is fail-closed. The loop stops after five change cycles in a phase or five occurrences of the same
 root-cause key.
+The exact-finding and Phase limits remain five. Separately, if any semantic invariant family
+appears in a second formal review for the Phase, the workflow emits no new fix request and enters
+`BLOCKED_LIMIT` for coherent redesign and bounded Human Resume.
 
 ## Phase progression
 

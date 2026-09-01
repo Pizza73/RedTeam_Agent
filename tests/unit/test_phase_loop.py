@@ -24,8 +24,10 @@ from automation.run_phase_loop import (
     codex_implementation_blocker,
     current_phase_from_labels,
     evaluate_native_review,
+    invariant_audit_from_ready,
     marker_payloads,
     native_finding_key,
+    review_trigger_source,
     select_evidence_action,
     select_finding_key,
     strict_json_loads,
@@ -69,6 +71,7 @@ def review_result(*, verdict: str = "PASS") -> dict[str, object]:
             {
                 "id": "FINDING-1",
                 "severity": "HIGH",
+                "invariant_family": "authorization-lifecycle",
                 "requirement_id": "SAFE-001",
                 "evidence": "Fail-closed regression evidence",
                 "required_fix": "Restore the deny path",
@@ -476,6 +479,46 @@ def test_fix_request_requires_total_finding_count() -> None:
         )
 
 
+def test_audited_fix_request_requires_family_for_every_finding() -> None:
+    payload = {
+        **implementation_request(),
+        "action": "FIX_REVIEW_FINDINGS",
+        "trigger": "REVIEW_FINDINGS",
+        "invariant_audit": {"policy_version": "1.0", "required": True},
+        "review": {
+            "reviewed_sha": HEAD_SHA,
+            "review_reference": REVIEW_URL,
+            "finding_key": "CODEX-P1-ALL-FINDINGS",
+            "finding_count": 1,
+            "findings": [
+                {
+                    "finding_key": "CODEX-P1-ALL-FINDINGS",
+                    "finding_reference": f"{REVIEW_URL}#discussion-1",
+                }
+            ],
+            "summary": "Codex reported one P1 finding.",
+        },
+    }
+
+    with pytest.raises(UntrustedEvidenceError, match="classify every finding"):
+        validate_implementation_request(
+            payload,
+            schema=load_schema("implementation-request.schema.json"),
+            phase="phase-0a",
+            head_sha=HEAD_SHA,
+            phase_prompt="prompts/phases/phase-0a-security-fix.md",
+        )
+
+    payload["review"]["findings"][0]["invariant_family"] = "authorization-lifecycle"  # type: ignore[index]
+    validate_implementation_request(
+        payload,
+        schema=load_schema("implementation-request.schema.json"),
+        phase="phase-0a",
+        head_sha=HEAD_SHA,
+        phase_prompt="prompts/phases/phase-0a-security-fix.md",
+    )
+
+
 def test_changes_requested_uses_requirement_id_as_stable_key() -> None:
     assert select_finding_key(review_result(verdict="CHANGES_REQUESTED")) == "SAFE-001"
 
@@ -557,6 +600,34 @@ def test_native_codex_no_finding_result_is_sha_bound_pass() -> None:
     assert result.result["reviewed_sha"] == HEAD_SHA
     assert result.result["base_sha"] == BASE_SHA
     assert result.result["findings"] == []
+
+
+def test_review_trigger_source_binds_invariant_audit_digest() -> None:
+    ready_payload = {"schema_version": "1.0", "phase": "phase-0a", "head_sha": HEAD_SHA}
+    audit_payload = {
+        "schema_version": "1.0",
+        "phase": "phase-0a",
+        "head_sha": HEAD_SHA,
+        "audit_path": "docs/review/phase-0a-invariant-audit.json",
+        "audit_digest": "c" * 64,
+        "request_reference": "https://github.com/example/repo/pull/1#issuecomment-request",
+    }
+    ready = MarkerEvidence(
+        payload=ready_payload,
+        url=READY_URL,
+        author="github-actions[bot]",
+        body=(
+            f"{marker('redteam-invariant-audit', audit_payload)}\n\n"
+            f"{marker('redteam-ready-for-review', ready_payload)}"
+        ),
+    )
+
+    assert invariant_audit_from_ready(ready, phase="phase-0a", head_sha=HEAD_SHA) == audit_payload
+    source = review_trigger_source(
+        ready=ready, phase="phase-0a", head_sha=HEAD_SHA, base_sha=BASE_SHA
+    )
+    assert source["audit_digest"] == "c" * 64
+    assert source["request_reference"] == audit_payload["request_reference"]
 
 
 def test_native_codex_pass_requires_reviewer_thumbs_up() -> None:
@@ -726,7 +797,10 @@ def test_native_codex_p1_becomes_changes_requested() -> None:
         "created_at": "2026-08-30T00:02:00Z",
         "path": "docs/review/phase-0a-fix-report.md",
         "line": 10,
-        "body": "![P1 Badge](badge) H-07 evidence is stale",
+        "body": (
+            "![P1 Badge](badge) H-07 evidence is stale\n\n"
+            "Invariant family: `acceptance-compatibility`"
+        ),
     }
     evidence["review_comments"] = [finding]
 
@@ -740,6 +814,7 @@ def test_native_codex_p1_becomes_changes_requested() -> None:
         {
             "id": native_finding_key(finding),
             "severity": "HIGH",
+            "invariant_family": "acceptance-compatibility",
             "requirement_id": "H-07",
             "evidence": "docs/review/phase-0a-fix-report.md:10; Codex review comment 88",
             "required_fix": (
@@ -793,7 +868,10 @@ def test_one_native_review_aggregates_every_p0_p1_finding() -> None:
             "created_at": "2026-08-30T00:02:00Z",
             "path": "src/redteam_agent/policy/engine.py",
             "line": 10,
-            "body": "![P0 Badge](badge) H-01 authorization bypass",
+            "body": (
+                "![P0 Badge](badge) H-01 authorization bypass\n\n"
+                "Invariant family: `authorization-lifecycle`"
+            ),
         },
         {
             "id": 89,
@@ -804,7 +882,10 @@ def test_one_native_review_aggregates_every_p0_p1_finding() -> None:
             "created_at": "2026-08-30T00:02:00Z",
             "path": "src/redteam_agent/output/pipeline.py",
             "line": 20,
-            "body": "![P1 Badge](badge) H-02 raw output reaches the planner",
+            "body": (
+                "![P1 Badge](badge) H-02 raw output reaches the planner\n\n"
+                "Invariant family: `secret-plaintext-boundary`"
+            ),
         },
     ]
 
@@ -845,7 +926,10 @@ def test_exhaustive_findings_split_across_formal_reviews_fail_closed() -> None:
             "created_at": "2026-08-30T00:02:00Z",
             "path": f"src/redteam_agent/review_{review_id}.py",
             "line": 10,
-            "body": f"![P1 Badge](badge) H-01 finding from review {review_id}",
+            "body": (
+                f"![P1 Badge](badge) H-01 finding from review {review_id}\n\n"
+                "Invariant family: `authorization-lifecycle`"
+            ),
         }
         for review_id in (77, 78)
     ]
@@ -863,6 +947,40 @@ def test_native_finding_key_is_stable_when_only_line_number_changes() -> None:
     changed_line = {**finding, "line": 99}
 
     assert native_finding_key(finding) == native_finding_key(changed_line)
+
+
+def test_current_native_finding_requires_one_invariant_family() -> None:
+    evidence = native_evidence()
+    comments = evidence["comments"]
+    assert isinstance(comments, list)
+    comments.pop()
+    evidence["reactions"] = []
+    evidence["reviews"] = [
+        {
+            "id": 77,
+            "html_url": REVIEW_URL,
+            "user": {"login": REVIEWER_LOGIN},
+            "commit_id": HEAD_SHA,
+            "state": "COMMENTED",
+            "submitted_at": "2026-08-30T00:02:00Z",
+        }
+    ]
+    evidence["review_comments"] = [
+        {
+            "id": 88,
+            "html_url": f"{REVIEW_URL}#discussion-88",
+            "user": {"login": REVIEWER_LOGIN},
+            "commit_id": HEAD_SHA,
+            "pull_request_review_id": 77,
+            "created_at": "2026-08-30T00:02:00Z",
+            "path": "src/redteam_agent/policy/engine.py",
+            "line": 10,
+            "body": "![P1 Badge](badge) H-01 authorization bypass",
+        }
+    ]
+
+    with pytest.raises(UntrustedEvidenceError, match="Invariant family"):
+        evaluate_fixture(evidence)
 
 
 def phase_state(*, phase: str = "phase-0a") -> PullRequestState:
@@ -912,6 +1030,8 @@ def test_every_phase_uses_one_exhaustive_all_findings_review(phase: str) -> None
     assert "applies identically to every Phase" in prompt
     assert "retain every consequential finding in this single native review" in prompt
     assert "standard P0 or P1 inline format" in prompt
+    assert "Invariant family: FAMILY_ID" in prompt
+    assert "pre-review audit" in prompt
     assert prompt.count("redteam-local-codex-trigger") == 1
 
 
