@@ -11,6 +11,15 @@
     "phase": {"pattern": "^phase-(0a|0b|0c|[1-5])$", "type": "string"},
     "head_sha": {"pattern": "^[0-9a-f]{40}$", "type": "string"},
     "phase_prompt": {"pattern": "^prompts/phases/[a-z0-9-]+\\.md$", "type": "string"},
+    "invariant_audit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["policy_version", "required"],
+      "properties": {
+        "policy_version": {"const": "1.0"},
+        "required": {"const": true}
+      }
+    },
     "trigger": {
       "enum": ["PHASE_START", "CI_FAILURE", "HUMAN_GATE", "HUMAN_RESUME", "REVIEW_FINDINGS"]
     },
@@ -49,6 +58,10 @@
               },
               "finding_reference": {
                 "pattern": "^https://github\\.com/[^/]+/[^/]+/pull/[0-9]+(?:[#/].*)?$",
+                "type": "string"
+              },
+              "invariant_family": {
+                "pattern": "^[a-z][a-z0-9-]{2,63}$",
                 "type": "string"
               }
             }

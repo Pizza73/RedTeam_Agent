@@ -2,14 +2,20 @@ from __future__ import annotations
 
 import json
 import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
 
+from automation.run_phase_loop import INVARIANT_FAMILIES
 from scripts.ci.validate_automation import (
     AutomationValidationError,
     strict_json_load,
     validate_automation,
+)
+from scripts.ci.validate_invariant_audit import (
+    InvariantAuditError,
+    validate_invariant_audit,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -17,6 +23,95 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 def test_repository_automation_configuration_is_valid() -> None:
     validate_automation(REPO_ROOT)
+
+
+def test_runtime_family_ids_match_machine_policy() -> None:
+    policy = json.loads(
+        (REPO_ROOT / "automation" / "invariant-families.json").read_text(encoding="utf-8")
+    )
+
+    assert tuple(item["id"] for item in policy["families"]) == INVARIANT_FAMILIES
+
+
+def _audit_repo(tmp_path: Path) -> tuple[Path, Path]:
+    repo = tmp_path / "audit-repo"
+    shutil.copytree(REPO_ROOT / "automation", repo / "automation")
+    (repo / "docs" / "review").mkdir(parents=True)
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_family.py").write_text("def test_family():\n    pass\n")
+    git = shutil.which("git")
+    assert git is not None
+
+    def run_git(*arguments: str, capture_output: bool = False) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(  # noqa: S603 - fixed test-only git executable and arguments.
+            [git, *arguments],
+            cwd=repo,
+            check=True,
+            capture_output=capture_output,
+            text=True,
+        )
+
+    run_git("init", "-q")
+    run_git("config", "user.email", "audit@example.invalid")
+    run_git("config", "user.name", "Audit Test")
+    run_git("add", ".")
+    run_git("commit", "-qm", "audit base")
+    head = run_git("rev-parse", "HEAD", capture_output=True).stdout.strip()
+    policy = json.loads((repo / "automation" / "invariant-families.json").read_text())
+    report = {
+        "schema_version": "1.0",
+        "phase": "phase-0c",
+        "request": {
+            "head_sha": head,
+            "reference": "https://github.com/example/repo/pull/1#issuecomment-1",
+            "action": "IMPLEMENT_PHASE",
+        },
+        "families": [
+            {
+                "id": family,
+                "status": "verified-unchanged",
+                "entry_points": ["tests/test_family.py"],
+                "sibling_paths": ["tests/test_family.py"],
+                "invariant_evidence": ["Inspected the complete test boundary."],
+                "tests": ["tests/test_family.py"],
+                "test_modes": ["positive", "negative", "failure"],
+            }
+            for family in policy["phases"]["phase-0c"]
+        ],
+        "cross_family_tests": ["tests/test_family.py"],
+        "notes": "No production changes in the validation fixture.",
+    }
+    report_path = repo / "docs" / "review" / "phase-0c-invariant-audit.json"
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    return repo, report_path
+
+
+def test_complete_invariant_family_audit_is_valid(tmp_path: Path) -> None:
+    repo, _ = _audit_repo(tmp_path)
+
+    digest = validate_invariant_audit(repo, "phase-0c")
+
+    assert digest is not None and len(digest) == 64
+
+
+def test_invariant_family_audit_rejects_missing_family(tmp_path: Path) -> None:
+    repo, report_path = _audit_repo(tmp_path)
+    report = json.loads(report_path.read_text())
+    report["families"].pop()
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    with pytest.raises(InvariantAuditError, match="exact required family set"):
+        validate_invariant_audit(repo, "phase-0c")
+
+
+def test_affected_stateful_family_requires_model_based_test(tmp_path: Path) -> None:
+    repo, report_path = _audit_repo(tmp_path)
+    report = json.loads(report_path.read_text())
+    report["families"][0]["status"] = "affected"
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    with pytest.raises(InvariantAuditError, match="property/state-machine"):
+        validate_invariant_audit(repo, "phase-0c")
 
 
 def test_nested_duplicate_json_key_is_rejected(tmp_path: Path) -> None:
@@ -86,6 +181,10 @@ def test_phase_gate_uses_fail_closed_native_codex_evidence_chain() -> None:
         "findings: currentFindings.map",
         "finding_reference: item.html_url",
         "all ${currentFindings.length} retained P0/P1 finding(s)",
+        "invariant_family: invariantFamily(item.body)",
+        "redteam-invariant-family-review",
+        "recurringFamilies.length > 0",
+        "semantic invariant family recurred",
         "sameFindingCount + 1 >= 5",
         "AI_LOOP_MAX_ITERATIONS must be exactly 5",
         "parseTime(item.created_at, 'Codex finding') <= triggerTime) return false",
@@ -117,6 +216,26 @@ def test_phase_gate_uses_fail_closed_native_codex_evidence_chain() -> None:
     assert "Review evidence must contain exactly one redteam-ai-review marker" not in workflow
     assert "Current-head Codex finding predates the trusted trigger" not in workflow
     assert "sameFindingCount + 1 >= 3" not in workflow
+
+
+def test_ci_binds_pre_review_audit_to_request_and_output_head() -> None:
+    workflow = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(
+        encoding="utf-8"
+    )
+    phase_gate = (REPO_ROOT / "scripts" / "ci" / "run_phase_gate.sh").read_text(
+        encoding="utf-8"
+    )
+
+    for required_control in (
+        "auditData.request?.head_sha",
+        "auditData.request?.action",
+        "auditData.request?.reference",
+        "redteam-invariant-audit",
+        "audit_digest",
+        "context.payload.before",
+    ):
+        assert required_control in workflow
+    assert "validate_invariant_audit.py --phase" in phase_gate
 
 
 def test_ci_and_review_retry_limits_are_exactly_five() -> None:

@@ -4,9 +4,10 @@
   "title": "RedTeam Agent Phase Plan",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "phases"],
+  "required": ["schema_version", "invariant_audit", "phases"],
   "properties": {
     "schema_version": {"const": "1.0"},
+    "invariant_audit": {"$ref": "#/$defs/invariantAuditPolicy"},
     "phases": {
       "type": "array",
       "minItems": 8,
@@ -29,6 +30,17 @@
             "then": {"required": ["human_gate_reason"]}
           }
         ]
+      }
+    }
+  },
+  "$defs": {
+    "invariantAuditPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["policy_version", "required"],
+      "properties": {
+        "policy_version": {"const": "1.0"},
+        "required": {"const": true}
       }
     }
   }

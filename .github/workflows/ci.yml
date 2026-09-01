@@ -189,14 +189,30 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
+      contents: read
       issues: write
       pull-requests: write
       statuses: write
     steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
       - name: Post SHA-bound review request
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
         with:
           script: |
+            const fs = require('fs');
+            function canonicalJson(value) {
+              if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+              if (value && typeof value === 'object') {
+                return `{${Object.keys(value).sort().map(
+                  (key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`
+                ).join(',')}}`;
+              }
+              return JSON.stringify(value);
+            }
             const pr = context.payload.pull_request;
             const labels = pr.labels.map((item) => item.name);
             const phases = labels.filter((name) => /^phase-(0a|0b|0c|[1-5])$/.test(name));
@@ -204,18 +220,115 @@ jobs:
               core.setFailed(`Exactly one phase label is required, got: ${phases.join(', ')}`);
               return;
             }
-            const payload = {
-              schema_version: '1.0',
-              phase: phases[0],
-              head_sha: pr.head.sha,
-            };
-            const marker = `<!-- redteam-ready-for-review\n${JSON.stringify(payload)}\n-->`;
+            const plan = JSON.parse(fs.readFileSync('automation/phase-plan.json', 'utf8'));
+            const phaseConfig = plan.phases.find((item) => item.id === phases[0]);
+            if (!phaseConfig || !plan.invariant_audit) {
+              core.setFailed('Trusted phase or invariant-audit policy is unavailable.');
+              return;
+            }
             const comments = await github.paginate(github.rest.issues.listComments, {
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: pr.number,
               per_page: 100,
             });
+            const beforeSha = context.payload.before || '';
+            const requestCandidates = [];
+            for (const comment of comments) {
+              if (comment.user?.login !== 'github-actions[bot]') continue;
+              const matches = [...(comment.body || '').matchAll(
+                /<!--\s*redteam-implementation-request\s*([\s\S]*?)-->/g
+              )];
+              if (matches.length > 1) {
+                core.setFailed('Trusted comment contains multiple implementation requests.');
+                return;
+              }
+              if (matches.length !== 1) continue;
+              let request;
+              try {
+                request = JSON.parse(matches[0][1].trim());
+              } catch (_) {
+                core.setFailed('Trusted implementation request is invalid JSON.');
+                return;
+              }
+              if (
+                request.phase === phases[0] && request.head_sha === beforeSha &&
+                request.phase_prompt === phaseConfig.prompt &&
+                ['IMPLEMENT_PHASE', 'FIX_REVIEW_FINDINGS'].includes(request.action) &&
+                JSON.stringify(request.invariant_audit || null) ===
+                  JSON.stringify(plan.invariant_audit)
+              ) {
+                requestCandidates.push({comment, request});
+              }
+            }
+            requestCandidates.sort(
+              (left, right) => Date.parse(left.comment.created_at) - Date.parse(right.comment.created_at)
+            );
+            const auditedRequest = requestCandidates.at(-1);
+            let trustedBaseRefresh = false;
+            if (/^[0-9a-f]{40}$/.test(beforeSha)) {
+              const statuses = await github.paginate(github.rest.repos.listCommitStatusesForRef, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: beforeSha,
+                per_page: 100,
+              });
+              trustedBaseRefresh = statuses.some((status) => {
+                const match = (status.context || '').match(
+                  /^redteam\/base-refresh\/(phase-(?:0a|0b|0c|[1-5]))\/(phase-(?:0a|0b|0c|[1-5]))\/[0-9a-f]{40}$/
+                );
+                return status.state === 'success' &&
+                  status.creator?.login === 'github-actions[bot]' &&
+                  match && [match[1], match[2]].includes(phases[0]);
+              });
+            }
+            const isOutputTransition = /^[0-9a-f]{40}$/.test(beforeSha);
+            if (isOutputTransition && !auditedRequest && !trustedBaseRefresh) {
+              core.setFailed(
+                'Current output is not bound to an audited implementation request or trusted base refresh.'
+              );
+              return;
+            }
+            let auditMarker = '';
+            let auditDescription = '';
+            if (auditedRequest) {
+              const auditPath = `docs/review/${phases[0]}-invariant-audit.json`;
+              let auditData;
+              try {
+                auditData = JSON.parse(fs.readFileSync(auditPath, 'utf8'));
+              } catch (_) {
+                core.setFailed('Invariant-family audit is missing or invalid JSON.');
+                return;
+              }
+              if (
+                auditedRequest.request.head_sha === pr.head.sha ||
+                auditData.phase !== phases[0] ||
+                auditData.request?.head_sha !== auditedRequest.request.head_sha ||
+                auditData.request?.action !== auditedRequest.request.action ||
+                auditData.request?.reference !== auditedRequest.comment.html_url
+              ) {
+                core.setFailed('Invariant-family audit is not bound to the trusted output transition.');
+                return;
+              }
+              const auditDigest = require('crypto').createHash('sha256')
+                .update(canonicalJson(auditData)).digest('hex');
+              const auditPayload = {
+                schema_version: '1.0',
+                phase: phases[0],
+                head_sha: pr.head.sha,
+                audit_path: auditPath,
+                audit_digest: auditDigest,
+                request_reference: auditedRequest.comment.html_url,
+              };
+              auditMarker = `<!-- redteam-invariant-audit\n${JSON.stringify(auditPayload)}\n-->`;
+              auditDescription = ' The invariant-family pre-review audit is bound to this HEAD.';
+            }
+            const payload = {
+              schema_version: '1.0',
+              phase: phases[0],
+              head_sha: pr.head.sha,
+            };
+            const marker = `<!-- redteam-ready-for-review\n${JSON.stringify(payload)}\n-->`;
             const markerExists = comments.some(
               (item) => item.user?.login === 'github-actions[bot]' && item.body?.includes(marker)
             );
@@ -252,7 +365,7 @@ jobs:
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: pr.number,
-                body: `CI passed for \`${phases[0]}\` at \`${pr.head.sha}\`. The local phase orchestrator will request a fresh SHA-bound Codex review and record validated evidence; restart it if polling is paused.\n\n${marker}`,
+                body: `CI passed for \`${phases[0]}\` at \`${pr.head.sha}\`.${auditDescription} The local phase orchestrator will request a fresh SHA-bound Codex review and record validated evidence; restart it if polling is paused.\n\n${auditMarker ? `${auditMarker}\n\n` : ''}${marker}`,
               });
             }
 
@@ -375,6 +488,7 @@ jobs:
               phase: phases[0],
               head_sha: pr.head.sha,
               phase_prompt: phaseConfig.prompt,
+              invariant_audit: plan.invariant_audit,
             };
             const marker = `<!-- redteam-implementation-request\n${JSON.stringify(request)}\n-->`;
             if (comments.some(

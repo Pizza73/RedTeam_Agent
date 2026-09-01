@@ -32,8 +32,18 @@
 - CHANGES_REQUESTEDはCurrent HEADへ完全BindingされたCodex formal reviewと全P0/P1 inline
   findingを要求し、root-cause keyを決定論的に導出する。Fix Requestは全Findingの件数とPermalinkを
   列挙し、Codexは`finding_key`だけでなく全件を修正する
-- Phase Cycle、同一Root Cause、CI Failureの自動Loop上限はすべて5回とし、設定値が5以外なら
-  Fail Closedにする
+- 新規Policy適用後のImplementation Requestは、PhaseごとのRequired Invariant Familyを全件
+  列挙した閉じた監査JSONを要求する。CIはRequest permalink/input HEAD/action、output HEAD、
+  canonical audit digest、Family set、evidence/test pathを検証してからready markerを発行する
+- 監査対象Familyは全public entry point、caller、compatibility reader、recovery path、sibling
+  implementationを列挙し、positive/negative/failure testを持つ。変更されたStateful Familyは
+  property-basedまたはstate-machine testを持つ
+- Formal Reviewは監査を自己合格証跡として扱わず、各Required Familyを独立に再検証する。
+  各P0/P1はTrusted PolicyのInvariant Familyを正確に1件保持する
+- 同じInvariant FamilyがPhase内の2回目のFormal Reviewへ再出現した場合は新しいFix Requestを
+  発行せず`BLOCKED_LIMIT`で停止し、coherent redesignを記録したHuman Resumeを要求する
+- Phase Cycle、同一exact Root Cause、CI Failureの自動Loop上限はすべて5回とし、設定値が5以外なら
+  Fail Closedにする。Semantic Invariant Familyの再発上限は2回とし、設定値が2以外ならFail Closedにする
 - Required Check成功前にReview Gateを記録しない
 - 自動Phase遷移は`ai-review-passed` markerを解除するまでRunnerが待機し、next追加後にcurrentを削除する。
   各境界でfreshなopen PR、exact HEAD、marker、隣接Phaseを再検証し、無関係Labelを完全置換で消さない。
