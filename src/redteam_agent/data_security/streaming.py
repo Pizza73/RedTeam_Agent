@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Callable
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Literal, Protocol
 
 from pydantic import Field, model_validator
@@ -32,6 +32,13 @@ from redteam_agent.models.execution import (
     RawResultReceipt,
     RawResultRecoveryMetadata,
 )
+from redteam_agent.repositories import (
+    ExecutionRepository,
+    MissionRevisionRepository,
+    MissionStateRepository,
+    RawResultRecoveryRepository,
+)
+from redteam_agent.storage import Database
 
 from .models import SecureIngestionResult
 from .stores import (
@@ -64,6 +71,104 @@ class QuarantineStreamBinding(StrictImmutableBoundaryModel):
 
 class QuarantineStreamBindingResolver(Protocol):
     def resolve(self, execution_id: str) -> QuarantineStreamBinding: ...
+
+
+class RepositoryQuarantineStreamBindingResolver:
+    """Reconstruct stream bindings only from current trusted repositories."""
+
+    _allowed_mission_states = frozenset(
+        {"RUNNING", "PAUSED", "FINALIZING", "WAITING_HUMAN_REVIEW"}
+    )
+
+    def __init__(
+        self,
+        *,
+        database: Database,
+        retention: timedelta,
+        max_result_bytes: int,
+    ) -> None:
+        if type(database) is not Database:
+            raise RawResultQuarantineError(
+                "stream binding resolver requires the trusted database"
+            )
+        if retention <= timedelta(0) or max_result_bytes <= 0:
+            raise RawResultQuarantineError(
+                "stream binding policy is invalid"
+            )
+        self._executions = ExecutionRepository(database)
+        self._mission_revisions = MissionRevisionRepository(database)
+        self._mission_states = MissionStateRepository(database)
+        self._recovery = RawResultRecoveryRepository(database)
+        self._retention = retention
+        self._max_result_bytes = max_result_bytes
+
+    def resolve(self, execution_id: str) -> QuarantineStreamBinding:
+        execution = self._executions.get(execution_id)
+        if execution is None or execution.provider_execution_state in {
+            "PLANNED",
+            "BLOCKED",
+        }:
+            raise RawResultQuarantineError(
+                "execution cannot issue a raw-result stream binding"
+            )
+        state = self._mission_states.get(execution.mission_id)
+        revision = self._mission_revisions.latest(execution.mission_id)
+        if state is None or revision is None or not (
+            state.mission_id == execution.mission_id == revision.mission_id
+            and revision.mission_revision == execution.mission_revision
+            and state.authorization_epoch == execution.authorization_epoch
+            and state.state in self._allowed_mission_states
+        ):
+            raise RawResultQuarantineError(
+                "execution mission binding is stale"
+            )
+        retention_until = min(
+            execution.created_at + self._retention,
+            revision.valid_until,
+        )
+        if retention_until <= execution.created_at:
+            raise RawResultQuarantineError(
+                "execution quarantine retention is unavailable"
+            )
+        quarantine_id = stable_id(
+            "quarantine",
+            {
+                "schema_version": "encrypted-stream-v1",
+                "execution_id": execution.execution_id,
+            },
+        )
+        recovery_id = stable_id(
+            "recovery",
+            {
+                "schema_version": "raw-result-recovery-v1",
+                "execution_id": execution.execution_id,
+                "quarantine_id": quarantine_id,
+            },
+        )
+        recovery = self._recovery.get(recovery_id)
+        if recovery is None:
+            resume_mode: Literal["from_start", "from_cursor"] = "from_start"
+            resume_cursor = None
+        else:
+            if not (
+                recovery.execution_id == execution.execution_id
+                and recovery.quarantine_id == quarantine_id
+                and recovery.state != "ABORTED"
+            ):
+                raise RawResultQuarantineError(
+                    "raw-result recovery binding is invalid"
+                )
+            resume_mode = "from_cursor"
+            resume_cursor = recovery.last_chunk_sequence + 1
+        return QuarantineStreamBinding(
+            mission_id=execution.mission_id,
+            mission_revision=execution.mission_revision,
+            execution_id=execution.execution_id,
+            retention_until=retention_until,
+            max_result_bytes=self._max_result_bytes,
+            resume_mode=resume_mode,
+            resume_cursor=resume_cursor,
+        )
 
 
 class _ChunkBinding(StrictImmutableBoundaryModel):
@@ -1699,9 +1804,13 @@ class EncryptedRawResultSinkFactory:
         self,
         *,
         quarantine: EncryptedRawResultQuarantine,
-        bindings: QuarantineStreamBindingResolver,
+        bindings: RepositoryQuarantineStreamBindingResolver,
         clock: Callable[[], datetime],
     ) -> None:
+        if type(bindings) is not RepositoryQuarantineStreamBindingResolver:
+            raise RawResultQuarantineError(
+                "raw-result sink factory requires trusted repository bindings"
+            )
         self._quarantine = quarantine
         self._bindings = bindings
         self._clock = clock

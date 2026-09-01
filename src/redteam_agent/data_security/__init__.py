@@ -48,6 +48,7 @@ from .streaming import (
     EncryptedRawResultSinkFactory,
     QuarantineStreamBinding,
     QuarantineStreamBindingResolver,
+    RepositoryQuarantineStreamBindingResolver,
 )
 
 __all__ = [
@@ -79,6 +80,7 @@ __all__ = [
     "QuarantineReference",
     "QuarantineStreamBinding",
     "QuarantineStreamBindingResolver",
+    "RepositoryQuarantineStreamBindingResolver",
     "RedactionMetadata",
     "RepositoryDataAccessAuthorizer",
     "SandboxPolicy",

@@ -122,6 +122,11 @@ class RepositoryDataAccessAuthorizer(DataAccessAuthorizer):
         "RECONCILING",
         "OUTCOME_UNKNOWN",
     )
+    _SECRET_RESOLUTION_STATES = (
+        "AUTHORIZED",
+        "DISPATCHED",
+        "RUNNING",
+    )
 
     def __init__(
         self,
@@ -171,11 +176,16 @@ class RepositoryDataAccessAuthorizer(DataAccessAuthorizer):
         if not self._evaluator.allows(requested, runtime.mission.data_access_policy):
             raise SecretAccessError("current data access policy denies the resource")
         try:
+            allowed_states = (
+                self._SECRET_RESOLUTION_STATES
+                if resource_type == "secret_reference" and operation == "resolve"
+                else ("AUTHORIZED", *self._POST_DISPATCH_STATES)
+            )
             _, decision = self._current_execution_decision(
                 execution_id=execution_id,
                 runtime=runtime,
                 now=now,
-                allowed_states=("AUTHORIZED", *self._POST_DISPATCH_STATES),
+                allowed_states=allowed_states,
             )
             current = self._resources.current_binding(
                 mission_id,

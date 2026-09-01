@@ -111,6 +111,11 @@ class _QuarantineExpiryIntent(StrictImmutableBoundaryModel):
     reference: QuarantineReference
 
 
+class _QuarantineDeletionIntent(StrictImmutableBoundaryModel):
+    record_type: Literal["quarantine_delete_intent"]
+    reference: QuarantineReference
+
+
 class _SecretExpiryIntent(StrictImmutableBoundaryModel):
     record_type: Literal["secret_expiry_intent"]
     reference: SecretReferenceMetadata
@@ -376,6 +381,8 @@ class _EncryptedFileStore:
         model_type: type[StrictImmutableBoundaryModel]
         if record_type == "quarantine_expiry_intent":
             model_type = _QuarantineExpiryIntent
+        elif record_type == "quarantine_delete_intent":
+            model_type = _QuarantineDeletionIntent
         elif record_type == "stream_delete_intent":
             model_type = _StreamDeletionBinding
         elif record_type == "stream_abort_delete_intent":
@@ -393,14 +400,23 @@ class _EncryptedFileStore:
             )
         except (TypeError, ValueError) as exc:
             raise ArtifactSecurityError("cleanup record binding is invalid") from exc
-        if isinstance(intent, _QuarantineExpiryIntent):
-            expected_id = stable_id(
-                "quarantineexpiry",
-                {
-                    "schema_version": "quarantine-expiry-intent-v1",
-                    "quarantine_id": intent.reference.quarantine_id,
-                },
-            )
+        if isinstance(intent, (_QuarantineExpiryIntent, _QuarantineDeletionIntent)):
+            if isinstance(intent, _QuarantineExpiryIntent):
+                expected_id = stable_id(
+                    "quarantineexpiry",
+                    {
+                        "schema_version": "quarantine-expiry-intent-v1",
+                        "quarantine_id": intent.reference.quarantine_id,
+                    },
+                )
+            else:
+                expected_id = stable_id(
+                    "quarantinedeletion",
+                    {
+                        "schema_version": "quarantine-deletion-intent-v1",
+                        "quarantine_id": intent.reference.quarantine_id,
+                    },
+                )
             bound_mission_id = intent.reference.mission_id
         else:
             stream_intent = intent
@@ -2330,6 +2346,16 @@ class EncryptedRawResultQuarantine:
         self._reconcile_pending_creation_audits()
         self._sweep_expired()
 
+    def _trusted_time(self) -> datetime:
+        try:
+            now = self._clock()
+            _require_time(now)
+            return now
+        except Exception as exc:
+            raise ArtifactSecurityError(
+                "trusted quarantine clock is unavailable"
+            ) from exc
+
     def _reconcile_pending_creation_audits(self) -> None:
         for mission_id, resource_id in self._store.pending_creation_audits():
             if not resource_id.startswith("quarantine_"):
@@ -2359,14 +2385,26 @@ class EncryptedRawResultQuarantine:
         for mission_id in mission_ids:
             for intent_id in self._store.resource_ids_with_prefix(
                 mission_id=mission_id,
+                prefix="quarantinedeletion_",
+            ):
+                deletion_intent = self._load_deletion_intent(
+                    mission_id=mission_id,
+                    intent_id=intent_id,
+                )
+                self._resume_deletion_intent(
+                    deletion_intent,
+                    intent_id=intent_id,
+                )
+            for intent_id in self._store.resource_ids_with_prefix(
+                mission_id=mission_id,
                 prefix="quarantineexpiry_",
             ):
-                intent = self._load_expiry_intent(
+                expiry_intent = self._load_expiry_intent(
                     mission_id=mission_id,
                     intent_id=intent_id,
                 )
                 self._resume_expiry_intent(
-                    intent,
+                    expiry_intent,
                     intent_id=intent_id,
                 )
             for resource_id in self._store.resource_ids_with_prefix(
@@ -2397,7 +2435,10 @@ class EncryptedRawResultQuarantine:
         _require_time(retention_until)
         if mission_revision < 1 or retention_until <= created_at:
             raise ArtifactSecurityError("quarantine binding or retention is invalid")
-        self._sweep_expired(now=created_at, mission_id=mission_id)
+        operation_time = self._trusted_time()
+        self._sweep_expired(now=operation_time, mission_id=mission_id)
+        if retention_until <= operation_time:
+            raise ArtifactSecurityError("quarantine retention has expired")
         binding: dict[str, object] = {
             "mission_revision": mission_revision,
             "execution_id": execution_id,
@@ -2459,15 +2500,49 @@ class EncryptedRawResultQuarantine:
         )
 
     def resume(self, reference: QuarantineReference, *, now: datetime) -> bytes:
-        _require_time(now)
-        self._sweep_expired(now=now, mission_id=reference.mission_id)
-        if now >= reference.retention_until:
-            self._expire_reference(reference, now=now)
+        del reference, now
+        raise ArtifactSecurityError(
+            "quarantine plaintext requires trusted ingestion"
+        )
+
+    def _resume_for_ingestion(self, publication: object) -> bytes:
+        from .ingestion import _FullObjectIngestionPublication
+
+        if type(publication) is not _FullObjectIngestionPublication:
+            raise ArtifactSecurityError(
+                "quarantine ingestion publication is not trusted"
+            )
+        trusted_publication = cast(Any, publication)
+        reference, _, _ = trusted_publication._binding()
+        operation_time = self._trusted_time()
+        try:
+            return self._release_for_ingestion(
+                reference,
+                operation_time=operation_time,
+            )
+        except Exception as failure:
+            failure.__traceback__ = None
+        raise ArtifactSecurityError("quarantine ingestion release failed closed")
+
+    def _release_for_ingestion(
+        self,
+        reference: QuarantineReference,
+        *,
+        operation_time: datetime,
+    ) -> bytes:
+        """Decrypt and audit raw output outside the sanitized caller frame."""
+
+        self._sweep_expired(
+            now=operation_time,
+            mission_id=reference.mission_id,
+        )
+        if operation_time >= reference.retention_until:
+            self._expire_reference(reference, now=operation_time)
             raise ArtifactSecurityError("encrypted resource retention has expired")
         content, envelope = self._store.read_bound(
             mission_id=reference.mission_id,
             resource_id=reference.quarantine_id,
-            now=now,
+            now=operation_time,
         )
         expected_binding = CanonicalJsonObject(
             {
@@ -2492,7 +2567,7 @@ class EncryptedRawResultQuarantine:
             resource_id=reference.quarantine_id,
             operation="resume",
             metadata_digest=reference.sha256,
-            occurred_at=now,
+            occurred_at=operation_time,
         )
         return content
 
@@ -2668,23 +2743,148 @@ class EncryptedRawResultQuarantine:
         )
 
     def delete(self, reference: QuarantineReference, *, now: datetime) -> None:
-        _require_time(now)
+        del now
+        operation_time = self._trusted_time()
+        intent_id = self._deletion_intent_id(reference.quarantine_id)
+        if not self._store.has_resource(
+            mission_id=reference.mission_id,
+            resource_id=intent_id,
+        ):
+            authoritative = self._reference_from_envelope(
+                self._store.verified_envelope(
+                    mission_id=reference.mission_id,
+                    resource_id=reference.quarantine_id,
+                    now=None,
+                )
+            )
+            if authoritative != reference:
+                raise DigestIntegrityError(
+                    "quarantine deletion target binding failed"
+                )
+            intent = _QuarantineDeletionIntent(
+                record_type="quarantine_delete_intent",
+                reference=reference,
+            )
+            self._store.write_quarantine_cleanup_intent(
+                mission_id=reference.mission_id,
+                resource_id=intent_id,
+                binding=intent.model_dump(mode="json"),
+                created_at=operation_time,
+            )
+        intent = self._load_deletion_intent(
+            mission_id=reference.mission_id,
+            intent_id=intent_id,
+        )
+        if intent.reference != reference:
+            raise DigestIntegrityError(
+                "quarantine deletion intent binding failed"
+            )
+        self._resume_deletion_intent(intent, intent_id=intent_id)
+
+    def _resume_deletion_intent(
+        self,
+        intent: _QuarantineDeletionIntent,
+        *,
+        intent_id: str,
+    ) -> None:
+        reference = intent.reference
+        if intent_id != self._deletion_intent_id(reference.quarantine_id):
+            raise ArtifactSecurityError(
+                "quarantine deletion intent binding is invalid"
+            )
+        if self._store.has_resource(
+            mission_id=reference.mission_id,
+            resource_id=reference.quarantine_id,
+        ):
+            authoritative = self._reference_from_envelope(
+                self._store.verified_envelope(
+                    mission_id=reference.mission_id,
+                    resource_id=reference.quarantine_id,
+                    now=None,
+                )
+            )
+            if authoritative != reference:
+                raise DigestIntegrityError(
+                    "quarantine deletion target binding failed"
+                )
+        _, intent_envelope = self._store.read_bound(
+            mission_id=reference.mission_id,
+            resource_id=intent_id,
+            now=None,
+        )
         self._audit.record(
             mission_id=reference.mission_id,
             resource_type="raw_result_quarantine",
             resource_id=reference.quarantine_id,
             operation="delete",
+            operation_id=stable_id(
+                "auditop",
+                {
+                    "schema_version": "quarantine-delete-audit-v1",
+                    "quarantine_id": reference.quarantine_id,
+                    "encryption_metadata_id": reference.encryption_metadata_id,
+                    "created_at": reference.created_at,
+                },
+            ),
             metadata_digest=reference.sha256,
-            occurred_at=now,
+            occurred_at=intent_envelope.created_at,
         )
-        self._store.delete(
+        if self._store.has_resource(
             mission_id=reference.mission_id,
             resource_id=reference.quarantine_id,
-            binding={
-                "mission_revision": reference.mission_revision,
-                "execution_id": reference.execution_id,
+        ):
+            self._store.erase_resource(
+                mission_id=reference.mission_id,
+                resource_id=reference.quarantine_id,
+            )
+        self._store.erase_resource(
+            mission_id=reference.mission_id,
+            resource_id=intent_id,
+        )
+
+    def _load_deletion_intent(
+        self,
+        *,
+        mission_id: str,
+        intent_id: str,
+    ) -> _QuarantineDeletionIntent:
+        raw, envelope = self._store.read_bound(
+            mission_id=mission_id,
+            resource_id=intent_id,
+            now=None,
+        )
+        if raw:
+            raise ArtifactSecurityError(
+                "quarantine deletion intent content is invalid"
+            )
+        try:
+            intent = _QuarantineDeletionIntent.model_validate_json(
+                canonicalize(envelope.binding.to_dict()),
+                strict=True,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ArtifactSecurityError(
+                "quarantine deletion intent is invalid"
+            ) from exc
+        if not (
+            intent.reference.mission_id == mission_id
+            and intent_id == self._deletion_intent_id(
+                intent.reference.quarantine_id
+            )
+        ):
+            raise ArtifactSecurityError(
+                "quarantine deletion intent binding is invalid"
+            )
+        return intent
+
+    @staticmethod
+    def _deletion_intent_id(quarantine_id: str) -> str:
+        return stable_id(
+            "quarantinedeletion",
+            {
+                "schema_version": "quarantine-deletion-intent-v1",
+                "quarantine_id": quarantine_id,
             },
-            expected_encryption_metadata_id=reference.encryption_metadata_id,
         )
 
 
@@ -2718,6 +2918,16 @@ class ArtifactStore:
         self._reconcile_pending_creation_audits()
         self._resume_pending_stream_cleanups()
         self._sweep_expired_artifacts()
+
+    def _trusted_time(self) -> datetime:
+        try:
+            now = self._clock()
+            _require_time(now)
+            return now
+        except Exception as exc:
+            raise ArtifactSecurityError(
+                "trusted artifact clock is unavailable"
+            ) from exc
 
     def _reconcile_pending_creation_audits(self) -> None:
         for mission_id, resource_id in self._store.pending_creation_audits():
@@ -2754,8 +2964,26 @@ class ArtifactStore:
             variant=variant,
             source_execution_id=source_execution_id,
             created_at=created_at,
+            publication=None,
             retention_until=retention_until,
             derived_from_artifact_id=derived_from_artifact_id,
+        )
+
+    def _publish_ingested_object(
+        self,
+        publication: object,
+    ) -> ArtifactReference:
+        return self._put(
+            mission_id="publication-pending",
+            content=b"",
+            media_type="application/octet-stream",
+            classification="normal",
+            variant="redacted",
+            source_execution_id="publication-pending",
+            created_at=datetime.min.replace(tzinfo=UTC),
+            publication=publication,
+            retention_until=None,
+            derived_from_artifact_id=None,
         )
 
     def _put(
@@ -2768,12 +2996,39 @@ class ArtifactStore:
         variant: Literal["redacted", "encrypted_raw"],
         source_execution_id: str,
         created_at: datetime,
+        publication: object | None,
         retention_until: datetime | None,
         derived_from_artifact_id: str | None,
     ) -> ArtifactReference:
+        ingestion_evidence = None
+        if publication is not None:
+            from .ingestion import _IngestedObjectArtifactPublication
+
+            if type(publication) is not _IngestedObjectArtifactPublication:
+                raise ArtifactSecurityError(
+                    "object-artifact publication is not trusted"
+                )
+            trusted_publication = cast(Any, publication)
+            (
+                receipt,
+                mission_id,
+                content,
+                classification,
+                variant,
+                derived_from_artifact_id,
+                created_at,
+            ) = trusted_publication._consume()
+            media_type = "application/octet-stream"
+            source_execution_id = receipt.execution_id
+            retention_until = None
+            ingestion_evidence = self._authorizer._begin_ingestion_write(
+                receipt=receipt,
+                now=created_at,
+            )
         _require_bytes(content)
+        operation_time = self._trusted_time()
         self._sweep_expired_artifacts(
-            now=created_at,
+            now=operation_time,
             mission_id=mission_id,
         )
         self._validate_metadata(
@@ -2783,6 +3038,8 @@ class ArtifactStore:
             created_at=created_at,
             retention_until=retention_until,
         )
+        if retention_until is not None and retention_until <= operation_time:
+            raise ArtifactSecurityError("artifact retention has expired")
         content_digest = self._store._content_digest(content)
         artifact_id = self._artifact_id(
             mission_id=mission_id,
@@ -2810,7 +3067,7 @@ class ArtifactStore:
                 resource_version="1",
                 resource_digest=content_digest,
             ),
-            evidence=None,
+            evidence=ingestion_evidence,
             now=created_at,
         )
         if self._store.has_resource(mission_id=mission_id, resource_id=artifact_id):
@@ -2932,10 +3189,13 @@ class ArtifactStore:
     ) -> ArtifactReference:
         """Persist a stream with a restartable intent for orphan-chunk cleanup."""
 
+        operation_time = self._trusted_time()
         self._sweep_expired_artifacts(
-            now=created_at,
+            now=operation_time,
             mission_id=mission_id,
         )
+        if retention_until is not None and retention_until <= operation_time:
+            raise ArtifactSecurityError("artifact retention has expired")
         stream_id = self._artifact_stream_id(
             mission_id=mission_id,
             media_type=media_type,
@@ -3610,14 +3870,16 @@ class ArtifactStore:
         operation: Literal["read", "export"],
         now: datetime,
     ) -> bytes:
+        del now
+        operation_time = self._trusted_time()
         self._sweep_expired_artifacts(
-            now=now,
+            now=operation_time,
             mission_id=reference.mission_id,
         )
         authoritative = self._stored_reference(
             mission_id=reference.mission_id,
             artifact_id=reference.artifact_id,
-            now=now,
+            now=operation_time,
         )
         if authoritative != reference:
             raise DigestIntegrityError("artifact reference integrity failed")
@@ -3636,19 +3898,19 @@ class ArtifactStore:
                 resource_digest=reference.sha256,
             ),
             operation=operation,
-            now=now,
+            now=operation_time,
         )
         envelope = self._store.verified_envelope(
             mission_id=reference.mission_id,
             resource_id=reference.artifact_id,
-            now=now,
+            now=operation_time,
         )
         try:
             return self._release_authorized_content(
                 reference,
                 envelope=envelope,
                 operation=operation,
-                now=now,
+                now=operation_time,
             )
         except Exception as failure:
             failure.__traceback__ = None
@@ -3705,7 +3967,8 @@ class ArtifactStore:
     ) -> None:
         """Cryptographically erase an expired Artifact through a durable intent."""
 
-        _require_time(now)
+        del now
+        now = self._trusted_time()
         intent_id = self._deletion_intent_id(reference.artifact_id)
         intent_exists = self._store.has_resource(
             mission_id=reference.mission_id,
@@ -4302,6 +4565,16 @@ class SecretStore:
         self._reconcile_pending_creation_audits()
         self._sweep_expired_secrets()
 
+    def _trusted_time(self) -> datetime:
+        try:
+            now = self._clock()
+            _require_time(now)
+            return now
+        except Exception as exc:
+            raise SecretAccessError(
+                "trusted secret clock is unavailable"
+            ) from exc
+
     def _reconcile_pending_creation_audits(self) -> None:
         for mission_id, resource_id in self._store.pending_creation_audits():
             if not resource_id.startswith("secret_"):
@@ -4566,8 +4839,9 @@ class SecretStore:
             )
         _require_bytes(secret_value)
         _require_time(created_at)
+        operation_time = self._trusted_time()
         self._sweep_expired_secrets(
-            now=created_at,
+            now=operation_time,
             mission_id=mission_id,
         )
         if not secret_value or not credential_type or not source_execution_id:
@@ -4576,6 +4850,8 @@ class SecretStore:
             _require_time(expires_at)
             if expires_at <= created_at:
                 raise SecretAccessError("secret expiry is invalid")
+            if expires_at <= operation_time:
+                raise SecretAccessError("secret retention has expired")
         secret_reference_id = stable_id(
             "secret",
             {
@@ -4695,21 +4971,25 @@ class SecretStore:
         execution_id: str,
         now: datetime,
     ) -> bytes:
+        del now
+        operation_time = self._trusted_time()
         self._sweep_expired_secrets(
-            now=now,
+            now=operation_time,
             mission_id=reference.mission_id,
         )
+        if reference.expires_at is not None and operation_time >= reference.expires_at:
+            raise SecretAccessError("secret reference has expired")
         authoritative, source_execution_id, version = self._authoritative_metadata(reference)
         if authoritative.verification_state == "revoked":
             raise SecretAccessError("secret reference is revoked")
         if (
             authoritative.expires_at is not None
-            and now >= authoritative.expires_at
+            and operation_time >= authoritative.expires_at
         ):
             self._expire_detected_secret(
                 authoritative,
                 source_execution_id=source_execution_id,
-                now=now,
+                now=operation_time,
             )
             raise SecretAccessError("secret reference has expired")
         self._authorizer.require_access(
@@ -4722,14 +5002,14 @@ class SecretStore:
                 resource_digest=sha256_digest(authoritative),
             ),
             operation="resolve",
-            now=now,
+            now=operation_time,
         )
         try:
             return self._release_authorized_secret(
                 authoritative,
                 source_execution_id=source_execution_id,
                 version=version,
-                now=now,
+                now=operation_time,
             )
         except Exception as failure:
             failure.__traceback__ = None
@@ -4776,8 +5056,10 @@ class SecretStore:
         execution_id: str,
         now: datetime,
     ) -> SecretReferenceMetadata:
+        del now
+        operation_time = self._trusted_time()
         self._sweep_expired_secrets(
-            now=now,
+            now=operation_time,
             mission_id=reference.mission_id,
         )
         authoritative, source_execution_id, version = self._authoritative_metadata(reference)
@@ -4791,7 +5073,7 @@ class SecretStore:
                 resource_digest=sha256_digest(authoritative),
             ),
             operation="write",
-            now=now,
+            now=operation_time,
         )
         if authoritative.verification_state == "revoked":
             self._audit.record(
@@ -4800,7 +5082,7 @@ class SecretStore:
                 resource_id=authoritative.secret_reference_id,
                 operation="revoke",
                 metadata_digest=sha256_digest(authoritative),
-                occurred_at=now,
+                occurred_at=operation_time,
             )
             self._reconcile_revoked_secret_erasure(
                 authoritative,
@@ -4825,7 +5107,7 @@ class SecretStore:
                 "metadata_version": 2,
                 "metadata_digest": tombstone_digest,
             },
-            created_at=now,
+            created_at=operation_time,
             retention_until=None,
         )
         self._audit.record(
@@ -4834,7 +5116,7 @@ class SecretStore:
             resource_id=authoritative.secret_reference_id,
             operation="revoke",
             metadata_digest=tombstone_digest,
-            occurred_at=now,
+            occurred_at=operation_time,
         )
         self._audit.record(
             mission_id=authoritative.mission_id,
@@ -4842,7 +5124,7 @@ class SecretStore:
             resource_id=authoritative.secret_reference_id,
             operation="delete",
             metadata_digest=tombstone_digest,
-            occurred_at=now,
+            occurred_at=operation_time,
         )
         self._reconcile_revoked_secret_erasure(
             revoked,

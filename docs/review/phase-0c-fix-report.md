@@ -474,6 +474,117 @@ PHASE_GATE=phase-0c PASS
 - A fresh independent Phase 0C review remains required on the resulting 40-character PR HEAD; this
   local PASS is not an independent Phase Gate PASS.
 
+## Post-governance invariant-family correction cycle
+
+Current phase: `phase-0c`.
+
+Input review SHA: `66c00e7a0a58e6b453cabac833fbb4d816a85bf9`.
+
+Phase base: `5cda9a5f8792ee33c3e153d8e791499f5619d82e`.
+
+Trusted implementation request:
+`https://github.com/Pizza73/RedTeam_Agent/pull/3#issuecomment-5497701145`.
+
+Invariant audit digest:
+`23e05903173ed16d49706b30e2d55c1c4493eb3ad6dcdaf865e48f90255b8ebc`.
+
+### Findings addressed
+
+- [`discussion_r3901438381`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3901438381):
+  Artifact, Secret, and Quarantine retention enforcement now uses store-owned trusted clocks; a
+  caller-provided timestamp cannot extend a resource lifetime or trigger premature erasure.
+- [`discussion_r3901438388`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3901438388):
+  Secret resolution now requires the operation-specific active just-in-time execution lifecycle
+  and rejects terminal or reconciliation states.
+- [`discussion_r3901438395`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3901438395):
+  direct Quarantine plaintext resume is denied. Full-object plaintext release is restricted to the
+  exact instance-bound trusted ingestion publication.
+- [`discussion_r3901438405`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3901438405):
+  full-object ingestion now carries durable receipt/lease evidence and content-bound publication
+  authority through Artifact and detected-Secret writes under the production authorizer.
+- [`discussion_r3906579129`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3906579129)
+  (`authorization-lifecycle`): `EncryptedRawResultSinkFactory` accepts only the exact
+  repository-backed resolver, which reloads Execution, latest Mission revision, current Mission
+  lifecycle/authorization epoch, and durable recovery cursor before constructing a binding.
+- [`discussion_r3906579132`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3906579132)
+  (`secret-plaintext-boundary`): Quarantine decryption and resume auditing run in an isolated helper
+  frame; failures clear the original traceback and cross the caller boundary only as a typed,
+  plaintext-free error.
+- [`discussion_r3906579136`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3906579136)
+  (`audit-recovery-durability`): explicit Quarantine deletion persists a strictly typed,
+  authenticated intent before its deterministic audit event. Startup reconciliation completes
+  cryptographic erasure and removes the intent after a crash between audit and key destruction.
+
+### Modified files and regression tests
+
+Resulting working-tree diff: `8 files changed, 1592 insertions(+), 159 deletions(-)`.
+
+- `src/redteam_agent/data_security/__init__.py`
+- `src/redteam_agent/data_security/authorization.py`
+- `src/redteam_agent/data_security/ingestion.py`
+- `src/redteam_agent/data_security/stores.py`
+- `src/redteam_agent/data_security/streaming.py`
+- `tests/security/test_phase0c_data_security.py`
+- `docs/review/phase-0c-invariant-audit.json`
+- `docs/review/phase-0c-fix-report.md`
+
+New and extended regressions cover production repository binding reconstruction, caller-selected
+cross-Mission resolver rejection, stale Mission revision rejection, backdated/future retention
+timestamps, terminal Secret resolution denial, direct Quarantine resume denial, production
+full-object ingestion, plaintext-free Quarantine audit-failure tracebacks, and restart recovery
+after an interruption between the Quarantine delete audit and cryptographic erasure. No test was
+deleted, skipped, weakened, or marked as an expected failure.
+
+### Validation
+
+Focused Phase 0C data-security suite:
+
+```text
+/home/kali/Red_Agent/.venv/bin/python -m pytest -q \
+  tests/security/test_phase0c_data_security.py --strict-markers
+```
+
+Result: `85 passed`.
+
+Required phase-gate command:
+
+```text
+PATH=/home/kali/Red_Agent/.venv/bin:$PATH \
+  bash scripts/ci/run_phase_gate.sh phase-0c
+```
+
+Result:
+
+```text
+AUTOMATION_VALIDATION=PASS
+INVARIANT_AUDIT=PASS:23e05903173ed16d49706b30e2d55c1c4493eb3ad6dcdaf865e48f90255b8ebc
+ruff: All checks passed
+mypy: Success: no issues found in 79 source files
+unit: 208 passed
+integration: 7 passed
+security: 231 passed
+full/coverage run: 446 passed
+skipped=0, errors=0, failures=0
+coverage: 81% total (branch coverage enabled)
+pip check: No broken requirements found
+PHASE_GATE=phase-0c PASS
+```
+
+### Remaining constraints
+
+- Runtime publication objects and exact-type resolver checks protect the in-process application
+  boundary; mutually hostile Python code still requires the later process/OS sandbox boundary.
+- Quarantine, Artifact, and Secret cleanup remains operation-driven plus startup recovery; this
+  phase does not add a background scheduler.
+- Durable cryptographic destruction depends on the configured Key Provider. The wrapped-file
+  provider supplies externally anchored generation semantics; production deployment must supply an
+  equivalently protected provider.
+- No real C2, MCP, provider, subprocess, local-attack, credential-collection, or external-target
+  action was executed.
+- No protected governance file was modified.
+- A fresh independent Phase 0C review remains required on the resulting 40-character PR HEAD; this
+  local PASS is not an independent Phase Gate PASS.
+
 ## Thirteenth independent review correction cycle
 
 Current phase: `phase-0c`.

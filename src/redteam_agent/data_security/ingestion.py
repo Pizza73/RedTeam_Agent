@@ -6,7 +6,7 @@ from collections.abc import AsyncIterator, Callable
 from datetime import datetime
 from typing import Any, Literal
 
-from redteam_agent.canonical import sha256_digest, stable_id
+from redteam_agent.canonical import digest_model, sha256_digest, stable_id
 from redteam_agent.errors import SecretDetectionError, SecureIngestionError
 from redteam_agent.models.execution import (
     ExecutionResult,
@@ -690,7 +690,7 @@ class _StreamingSecretRedactor:
         )
 
 
-def _trusted_publication_types() -> tuple[Any, Any, Any]:
+def _trusted_publication_types() -> tuple[Any, Any, Any, Any, Any, Any]:
     construction_token = object()
 
     class DetectedSecretPublication:
@@ -837,6 +837,191 @@ def _trusted_publication_types() -> tuple[Any, Any, Any]:
             if final:
                 yield final
 
+    class IngestedObjectArtifactPublication:
+        __slots__ = (
+            "_classification",
+            "_consumed",
+            "_content",
+            "_derived_from_artifact_id",
+            "_mission_id",
+            "_now",
+            "_receipt",
+            "_variant",
+        )
+
+        def __init__(
+            self,
+            token: object,
+            *,
+            receipt: RawResultReceipt,
+            mission_id: str,
+            content: bytes,
+            classification: Literal["normal", "sensitive", "secret"],
+            variant: Literal["redacted", "encrypted_raw"],
+            derived_from_artifact_id: str | None,
+            now: datetime,
+        ) -> None:
+            if token is not construction_token:
+                raise SecureIngestionError(
+                    "object-artifact publication is not trusted"
+                )
+            self._receipt = receipt
+            self._mission_id = mission_id
+            self._content = content
+            self._classification = classification
+            self._variant = variant
+            self._derived_from_artifact_id = derived_from_artifact_id
+            self._now = now
+            self._consumed = False
+
+        def _consume(
+            self,
+        ) -> tuple[
+            RawResultReceipt,
+            str,
+            bytes,
+            Literal["normal", "sensitive", "secret"],
+            Literal["redacted", "encrypted_raw"],
+            str | None,
+            datetime,
+        ]:
+            if self._consumed:
+                raise SecureIngestionError(
+                    "object-artifact publication was already consumed"
+                )
+            self._consumed = True
+            return (
+                self._receipt,
+                self._mission_id,
+                self._content,
+                self._classification,
+                self._variant,
+                self._derived_from_artifact_id,
+                self._now,
+            )
+
+    class FullObjectIngestionPublication:
+        __slots__ = (
+            "_detections",
+            "_loaded",
+            "_now",
+            "_quarantine",
+            "_raw",
+            "_receipt",
+            "_redacted",
+            "_reference",
+            "_secrets",
+        )
+
+        def __init__(
+            self,
+            token: object,
+            *,
+            quarantine: EncryptedRawResultQuarantine,
+            reference: QuarantineReference,
+            receipt: RawResultReceipt,
+            secrets: SecretStore,
+            now: datetime,
+        ) -> None:
+            if (
+                token is not construction_token
+                or type(quarantine) is not EncryptedRawResultQuarantine
+                or receipt.execution_id != reference.execution_id
+                or receipt.quarantine_id != reference.quarantine_id
+                or receipt.ciphertext_digest != reference.sha256
+            ):
+                raise SecureIngestionError(
+                    "full-object ingestion publication is not trusted"
+                )
+            self._quarantine = quarantine
+            self._reference = reference
+            self._receipt = receipt
+            self._secrets = secrets
+            self._now = now
+            self._raw: bytes | None = None
+            self._redacted: bytes | None = None
+            self._detections: list[SecretDiscoveryReference] = []
+            self._loaded = False
+
+        def _binding(
+            self,
+        ) -> tuple[QuarantineReference, RawResultReceipt, datetime]:
+            return self._reference, self._receipt, self._now
+
+        def _load(self) -> None:
+            if self._loaded:
+                raise SecureIngestionError(
+                    "full-object ingestion publication was already loaded"
+                )
+            raw = self._quarantine._resume_for_ingestion(self)
+
+            def replace(keyword: bytes, secret_value: bytes) -> bytes:
+                credential_type = keyword.decode("ascii").lower().replace("-", "_")
+                secret = self._secrets._create_detected(
+                    DetectedSecretPublication(
+                        construction_token,
+                        receipt=self._receipt,
+                        mission_id=self._reference.mission_id,
+                        secret_value=secret_value,
+                        credential_type=credential_type,
+                        associated_principal_ref=None,
+                        now=self._now,
+                    )
+                )
+                self._detections.append(
+                    SecretDiscoveryReference(
+                        secret_reference_id=secret.secret_reference_id,
+                        credential_type=secret.credential_type,
+                        associated_principal_ref=secret.associated_principal_ref,
+                        source_execution_id=self._receipt.execution_id,
+                        verification_state=secret.verification_state,
+                    )
+                )
+                return b"[REDACTED]"
+
+            self._raw = raw
+            self._redacted = _StreamingSecretRedactor(replace).feed(
+                raw,
+                final=True,
+            )
+            self._loaded = True
+
+        def _artifact(
+            self,
+            *,
+            variant: Literal["redacted", "encrypted_raw"],
+            derived_from_artifact_id: str | None,
+        ) -> IngestedObjectArtifactPublication:
+            if not self._loaded or self._raw is None or self._redacted is None:
+                raise SecureIngestionError(
+                    "full-object ingestion publication is incomplete"
+                )
+            if variant == "redacted":
+                content = self._redacted
+                classification: Literal["normal", "sensitive", "secret"] = (
+                    "sensitive" if self._detections else "normal"
+                )
+            else:
+                content = self._raw
+                classification = "secret"
+            return IngestedObjectArtifactPublication(
+                construction_token,
+                receipt=self._receipt,
+                mission_id=self._reference.mission_id,
+                content=content,
+                classification=classification,
+                variant=variant,
+                derived_from_artifact_id=derived_from_artifact_id,
+                now=self._now,
+            )
+
+        def _detected_secrets(self) -> tuple[SecretDiscoveryReference, ...]:
+            if not self._loaded:
+                raise SecureIngestionError(
+                    "full-object ingestion publication is incomplete"
+                )
+            return tuple(self._detections)
+
     def create_redacted_artifact_publication(
         *,
         sink: EncryptedRawResultSink,
@@ -852,17 +1037,40 @@ def _trusted_publication_types() -> tuple[Any, Any, Any]:
             now=now,
         )
 
+    def create_full_object_ingestion_publication(
+        *,
+        quarantine: EncryptedRawResultQuarantine,
+        reference: QuarantineReference,
+        receipt: RawResultReceipt,
+        secrets: SecretStore,
+        now: datetime,
+    ) -> FullObjectIngestionPublication:
+        return FullObjectIngestionPublication(
+            construction_token,
+            quarantine=quarantine,
+            reference=reference,
+            receipt=receipt,
+            secrets=secrets,
+            now=now,
+        )
+
     return (
         DetectedSecretPublication,
         RedactedArtifactPublication,
+        IngestedObjectArtifactPublication,
+        FullObjectIngestionPublication,
         create_redacted_artifact_publication,
+        create_full_object_ingestion_publication,
     )
 
 
 (
     _DetectedSecretPublication,
     _RedactedArtifactPublication,
+    _IngestedObjectArtifactPublication,
+    _FullObjectIngestionPublication,
     _create_redacted_artifact_publication,
+    _create_full_object_ingestion_publication,
 ) = _trusted_publication_types()
 
 
@@ -886,12 +1094,15 @@ class SecureIngestor:
         self,
         reference: QuarantineReference,
         *,
+        receipt: RawResultReceipt | None = None,
         now: datetime,
         retain_encrypted_raw: bool = False,
     ) -> SecureIngestionResult:
+        receipt = receipt or self._legacy_receipt(reference)
         try:
             return self._ingest_quarantined(
                 reference,
+                receipt=receipt,
                 now=now,
                 retain_encrypted_raw=retain_encrypted_raw,
             )
@@ -903,44 +1114,37 @@ class SecureIngestor:
         self,
         reference: QuarantineReference,
         *,
+        receipt: RawResultReceipt,
         now: datetime,
         retain_encrypted_raw: bool,
     ) -> SecureIngestionResult:
         """Run secret-bearing work outside the replacement exception frame."""
 
-        raw = self._quarantine.resume(reference, now=now)
-        detections: list[SecretDiscoveryReference] = []
-        redacted = self._redact(
-            raw,
-            mission_id=reference.mission_id,
-            source_execution_id=reference.execution_id,
-            detections=detections,
+        publication = _create_full_object_ingestion_publication(
+            quarantine=self._quarantine,
+            reference=reference,
+            receipt=receipt,
+            secrets=self._secrets,
             now=now,
         )
-        redacted_reference = self._artifacts.put(
-            mission_id=reference.mission_id,
-            content=redacted,
-            media_type="application/octet-stream",
-            classification="sensitive" if detections else "normal",
-            variant="redacted",
-            source_execution_id=reference.execution_id,
-            created_at=now,
-            derived_from_artifact_id=None,
+        publication._load()
+        redacted_reference = self._artifacts._publish_ingested_object(
+            publication._artifact(
+                variant="redacted",
+                derived_from_artifact_id=None,
+            )
         )
         encrypted_raw: tuple[ArtifactReference, ...] = ()
         if retain_encrypted_raw:
             encrypted_raw = (
-                self._artifacts.put(
-                    mission_id=reference.mission_id,
-                    content=raw,
-                    media_type="application/octet-stream",
-                    classification="secret",
-                    variant="encrypted_raw",
-                    source_execution_id=reference.execution_id,
-                    created_at=now,
-                    derived_from_artifact_id=redacted_reference.artifact_id,
+                self._artifacts._publish_ingested_object(
+                    publication._artifact(
+                        variant="encrypted_raw",
+                        derived_from_artifact_id=redacted_reference.artifact_id,
+                    )
                 ),
             )
+        detections = list(publication._detected_secrets())
         result = self._result(
             quarantine_id=reference.quarantine_id,
             quarantine_digest=reference.sha256,
@@ -950,6 +1154,41 @@ class SecureIngestor:
         )
         self._quarantine.delete(reference, now=now)
         return result
+
+    @staticmethod
+    def _legacy_receipt(reference: QuarantineReference) -> RawResultReceipt:
+        identity = {
+            "schema_version": "raw-result-receipt-v1",
+            "execution_id": reference.execution_id,
+            "quarantine_id": reference.quarantine_id,
+            "sink_id": stable_id(
+                "sink",
+                {
+                    "schema_version": "full-object-ingestion-v1",
+                    "execution_id": reference.execution_id,
+                },
+            ),
+        }
+        provisional = RawResultReceipt(
+            receipt_id=stable_id("receipt", identity),
+            receipt_digest="pending",
+            execution_id=reference.execution_id,
+            quarantine_id=reference.quarantine_id,
+            sink_id=str(identity["sink_id"]),
+            stdout_bytes=reference.size_bytes,
+            stderr_bytes=0,
+            artifact_count=0,
+            ciphertext_digest=reference.sha256,
+            committed_at=reference.created_at,
+        )
+        return provisional.model_copy(
+            update={
+                "receipt_digest": digest_model(
+                    provisional,
+                    exclude={"receipt_digest"},
+                )
+            }
+        )
 
     async def ingest_stream(
         self,
