@@ -14,6 +14,7 @@ from redteam_agent.models.execution import (
     SecureIngestionSummary,
 )
 
+from .authorization import IngestionWriteEvidence
 from .models import (
     ArtifactReference,
     QuarantineReference,
@@ -711,12 +712,14 @@ class SecureIngestor:
         reference: QuarantineReference,
         *,
         now: datetime,
+        ingestion_evidence: IngestionWriteEvidence | None = None,
         retain_encrypted_raw: bool = False,
     ) -> SecureIngestionResult:
         try:
             return self._ingest_quarantined(
                 reference,
                 now=now,
+                ingestion_evidence=ingestion_evidence,
                 retain_encrypted_raw=retain_encrypted_raw,
             )
         except Exception as failure:
@@ -728,6 +731,7 @@ class SecureIngestor:
         reference: QuarantineReference,
         *,
         now: datetime,
+        ingestion_evidence: IngestionWriteEvidence | None,
         retain_encrypted_raw: bool,
     ) -> SecureIngestionResult:
         """Run secret-bearing work outside the replacement exception frame."""
@@ -739,6 +743,7 @@ class SecureIngestor:
             mission_id=reference.mission_id,
             source_execution_id=reference.execution_id,
             detections=detections,
+            ingestion_evidence=ingestion_evidence,
             now=now,
         )
         redacted_reference = self._artifacts.put(
@@ -749,6 +754,7 @@ class SecureIngestor:
             variant="redacted",
             source_execution_id=reference.execution_id,
             created_at=now,
+            ingestion_evidence=ingestion_evidence,
             derived_from_artifact_id=None,
         )
         encrypted_raw: tuple[ArtifactReference, ...] = ()
@@ -762,6 +768,7 @@ class SecureIngestor:
                     variant="encrypted_raw",
                     source_execution_id=reference.execution_id,
                     created_at=now,
+                    ingestion_evidence=ingestion_evidence,
                     derived_from_artifact_id=redacted_reference.artifact_id,
                 ),
             )
@@ -812,6 +819,10 @@ class SecureIngestor:
         if durable_result is not None:
             sink._delete_committed(now=now)
             return durable_result
+        ingestion_evidence = self._artifacts.current_ingestion_evidence(
+            receipt=receipt,
+            now=now,
+        )
         detections: list[SecretDiscoveryReference] = []
 
         def replace(keyword: bytes, secret_value: bytes) -> bytes:
@@ -821,6 +832,7 @@ class SecureIngestor:
                 mission_id=sink.binding.mission_id,
                 source_execution_id=receipt.execution_id,
                 detections=detections,
+                ingestion_evidence=ingestion_evidence,
                 now=now,
             )
             return b"[REDACTED]"
@@ -844,6 +856,7 @@ class SecureIngestor:
             variant="redacted",
             source_execution_id=receipt.execution_id,
             created_at=now,
+            ingestion_evidence=ingestion_evidence,
             derived_from_artifact_id=None,
         )
         result = self._result(
@@ -864,6 +877,7 @@ class SecureIngestor:
         mission_id: str,
         source_execution_id: str,
         detections: list[SecretDiscoveryReference],
+        ingestion_evidence: IngestionWriteEvidence | None,
         now: datetime,
     ) -> bytes:
         def replace(keyword: bytes, secret_value: bytes) -> bytes:
@@ -873,6 +887,7 @@ class SecureIngestor:
                 mission_id=mission_id,
                 source_execution_id=source_execution_id,
                 detections=detections,
+                ingestion_evidence=ingestion_evidence,
                 now=now,
             )
             return b"[REDACTED]"
@@ -893,6 +908,7 @@ class SecureIngestor:
         mission_id: str,
         source_execution_id: str,
         detections: list[SecretDiscoveryReference],
+        ingestion_evidence: IngestionWriteEvidence | None,
         now: datetime,
     ) -> None:
         credential_type = keyword.decode("ascii").lower().replace("-", "_")
@@ -903,6 +919,7 @@ class SecureIngestor:
             associated_principal_ref=None,
             source_execution_id=source_execution_id,
             created_at=now,
+            ingestion_evidence=ingestion_evidence,
         )
         detections.append(
             SecretDiscoveryReference(

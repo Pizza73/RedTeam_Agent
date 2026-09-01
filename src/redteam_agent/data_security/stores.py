@@ -33,9 +33,13 @@ from redteam_agent.errors import (
 from redteam_agent.models.base import StrictImmutableBoundaryModel
 from redteam_agent.models.common import UtcDatetime, require_utc
 from redteam_agent.models.context import ResourceBinding
+from redteam_agent.models.execution import RawResultReceipt
 
 from .audit import DataStoreAuditRecorder
-from .authorization import RepositoryDataAccessAuthorizer
+from .authorization import (
+    IngestionWriteEvidence,
+    RepositoryDataAccessAuthorizer,
+)
 from .keys import EncryptionKeyProvider
 from .models import (
     ArtifactReference,
@@ -581,6 +585,31 @@ class _EncryptedFileStore:
                     mission_metadata=mission_metadata,
                     audit_required=require_creation_audit,
                 )
+                mission_usage = self._mission_usage_anchored(
+                    mission_id=mission_id,
+                    mission_descriptor=mission_descriptor,
+                )
+                mission_record_count = self._mission_record_count_anchored(
+                    mission_id=mission_id,
+                    mission_descriptor=mission_descriptor,
+                )
+                if enforce_quota and (
+                    mission_usage + _MIN_ENCRYPTED_ENVELOPE_QUOTA_BYTES
+                    > self._mission_quota_bytes
+                    or mission_record_count + 1
+                    > max(
+                        1,
+                        self._mission_quota_bytes
+                        // _RESOURCE_KEY_RECORD_QUOTA_UNIT_BYTES,
+                    )
+                ):
+                    self._recover_resource_creations_anchored(
+                        mission_id=mission_id,
+                        root_descriptor=root_descriptor,
+                        mission_descriptor=mission_descriptor,
+                        mission_metadata=mission_metadata,
+                    )
+                    raise ArtifactSecurityError("mission storage quota exceeded")
                 try:
                     encrypted = self._keys.seal_for_resource(
                         self._domain,
@@ -1369,11 +1398,31 @@ class _EncryptedFileStore:
         for entry in entries:
             intent_resource_id = self._creation_intent_resource_id(entry)
             if intent_resource_id is not None:
-                self._load_resource_creation_intent_anchored(
+                intent = self._load_resource_creation_intent_anchored(
                     mission_id=mission_id,
                     resource_id=intent_resource_id,
                     mission_descriptor=mission_descriptor,
                 )
+                try:
+                    intent_metadata = os.stat(
+                        entry,
+                        dir_fd=mission_descriptor,
+                        follow_symlinks=False,
+                    )
+                except OSError as exc:
+                    raise ArtifactSecurityError(
+                        "resource creation intent is unavailable"
+                    ) from exc
+                serialized_intent = canonicalize(intent.model_dump(mode="python"))
+                if not (
+                    stat.S_ISREG(intent_metadata.st_mode)
+                    and intent_metadata.st_nlink == 1
+                    and intent_metadata.st_size == len(serialized_intent)
+                ):
+                    raise ArtifactSecurityError(
+                        "resource creation intent is invalid"
+                    )
+                total += intent_metadata.st_size
                 continue
             if not entry.endswith(".json"):
                 raise ArtifactSecurityError("unexpected mission storage entry")
@@ -1441,6 +1490,7 @@ class _EncryptedFileStore:
                     resource_id=intent_resource_id,
                     mission_descriptor=mission_descriptor,
                 )
+                record_count += 1
                 continue
             if not entry.endswith(".json"):
                 raise ArtifactSecurityError("unexpected mission storage entry")
@@ -2662,6 +2712,17 @@ class ArtifactStore:
         self._resume_pending_stream_cleanups()
         self._sweep_expired_artifacts()
 
+    def current_ingestion_evidence(
+        self,
+        *,
+        receipt: RawResultReceipt,
+        now: datetime,
+    ) -> IngestionWriteEvidence:
+        return self._authorizer.current_ingestion_evidence(
+            receipt=receipt,
+            now=now,
+        )
+
     def _reconcile_pending_creation_audits(self) -> None:
         for mission_id, resource_id in self._store.pending_creation_audits():
             if not resource_id.startswith("artifact_"):
@@ -2686,6 +2747,7 @@ class ArtifactStore:
         variant: Literal["redacted", "encrypted_raw"],
         source_execution_id: str,
         created_at: datetime,
+        ingestion_evidence: IngestionWriteEvidence | None = None,
         retention_until: datetime | None = None,
         derived_from_artifact_id: str | None = None,
     ) -> ArtifactReference:
@@ -2724,6 +2786,7 @@ class ArtifactStore:
                 resource_version="1",
                 resource_digest=content_digest,
             ),
+            evidence=ingestion_evidence,
             now=created_at,
         )
         if self._store.has_resource(mission_id=mission_id, resource_id=artifact_id):
@@ -2784,6 +2847,7 @@ class ArtifactStore:
         variant: Literal["redacted", "encrypted_raw"],
         source_execution_id: str,
         created_at: datetime,
+        ingestion_evidence: IngestionWriteEvidence | None = None,
         retention_until: datetime | None = None,
         derived_from_artifact_id: str | None = None,
     ) -> ArtifactReference:
@@ -2812,6 +2876,7 @@ class ArtifactStore:
                     variant=variant,
                     source_execution_id=source_execution_id,
                     created_at=created_at,
+                    ingestion_evidence=ingestion_evidence,
                     retention_until=retention_until,
                     derived_from_artifact_id=derived_from_artifact_id,
                     attempt_id=cleanup_id,
@@ -2845,6 +2910,7 @@ class ArtifactStore:
         variant: Literal["redacted", "encrypted_raw"],
         source_execution_id: str,
         created_at: datetime,
+        ingestion_evidence: IngestionWriteEvidence | None,
         retention_until: datetime | None = None,
         derived_from_artifact_id: str | None = None,
         attempt_id: str,
@@ -2884,6 +2950,7 @@ class ArtifactStore:
                 resource_version="1",
                 resource_digest=stream_metadata_digest,
             ),
+            evidence=ingestion_evidence,
             now=created_at,
         )
         digest = hashlib.sha256()
@@ -3026,6 +3093,7 @@ class ArtifactStore:
                 resource_version="1",
                 resource_digest=content_digest,
             ),
+            evidence=ingestion_evidence,
             now=created_at,
         )
         manifest_content = canonicalize(manifest.model_dump(mode="python"))
@@ -3415,6 +3483,7 @@ class ArtifactStore:
         self,
         reference: ArtifactReference,
         *,
+        execution_id: str,
         operation: Literal["read", "export"],
         now: datetime,
     ) -> bytes:
@@ -3432,6 +3501,7 @@ class ArtifactStore:
         self._reconcile_create_audit(authoritative)
         self._authorizer.require_access(
             mission_id=reference.mission_id,
+            execution_id=execution_id,
             resource_type="artifact",
             resource=ResourceBinding(
                 resource_id=reference.artifact_id,
@@ -3499,7 +3569,13 @@ class ArtifactStore:
         )
         return content
 
-    def expire(self, reference: ArtifactReference, *, now: datetime) -> None:
+    def expire(
+        self,
+        reference: ArtifactReference,
+        *,
+        execution_id: str,
+        now: datetime,
+    ) -> None:
         """Cryptographically erase an expired Artifact through a durable intent."""
 
         _require_time(now)
@@ -3538,6 +3614,7 @@ class ArtifactStore:
             raise ArtifactSecurityError("artifact retention has not expired")
         self._authorizer.require_access(
             mission_id=reference.mission_id,
+            execution_id=execution_id,
             resource_type="artifact",
             resource=ResourceBinding(
                 resource_id=reference.artifact_id,
@@ -4289,6 +4366,7 @@ class SecretStore:
         associated_principal_ref: str | None,
         source_execution_id: str,
         created_at: datetime,
+        ingestion_evidence: IngestionWriteEvidence | None = None,
         expires_at: datetime | None = None,
     ) -> SecretReferenceMetadata:
         _require_bytes(secret_value)
@@ -4340,6 +4418,7 @@ class SecretStore:
             source_execution_id=source_execution_id,
             resource_type="secret_reference",
             resource=write_binding,
+            evidence=ingestion_evidence,
             now=created_at,
         )
         if self._store.has_resource(
@@ -4414,6 +4493,7 @@ class SecretStore:
         self,
         reference: SecretReferenceMetadata,
         *,
+        execution_id: str,
         now: datetime,
     ) -> bytes:
         authoritative, source_execution_id, version = self._authoritative_metadata(reference)
@@ -4431,6 +4511,7 @@ class SecretStore:
             raise SecretAccessError("secret reference has expired")
         self._authorizer.require_access(
             mission_id=authoritative.mission_id,
+            execution_id=execution_id,
             resource_type="secret_reference",
             resource=ResourceBinding(
                 resource_id=authoritative.secret_reference_id,
@@ -4486,11 +4567,16 @@ class SecretStore:
         return value
 
     def revoke(
-        self, reference: SecretReferenceMetadata, *, now: datetime
+        self,
+        reference: SecretReferenceMetadata,
+        *,
+        execution_id: str,
+        now: datetime,
     ) -> SecretReferenceMetadata:
         authoritative, source_execution_id, version = self._authoritative_metadata(reference)
         self._authorizer.require_access(
             mission_id=authoritative.mission_id,
+            execution_id=execution_id,
             resource_type="secret_reference",
             resource=ResourceBinding(
                 resource_id=authoritative.secret_reference_id,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import timedelta
 
@@ -18,6 +19,7 @@ from redteam_agent.executor import (
 from redteam_agent.mission import MissionManager
 from redteam_agent.models.context import DataAccessGrant
 from redteam_agent.models.execution import WorkflowRunBinding
+from redteam_agent.models.plans import ExecutionPlan
 from redteam_agent.models.scope import DataAccessPolicy
 from redteam_agent.policy.issuance import PolicyDecisionIssuanceService
 from redteam_agent.policy.plans import create_execution_plan
@@ -201,11 +203,16 @@ def prepare_additional_execution(
     harness: ExecutionHarness,
     *,
     requested_data_access: tuple[DataAccessGrant, ...] = (),
+    requested_data_access_factory: (
+        Callable[[ExecutionPlan], tuple[DataAccessGrant, ...]] | None
+    ) = None,
+    objective: str = "Inspect another in-scope mock target",
+    run_seed: str = "phase-0b-additional-action",
 ):
     """Prepare another independently authorized action before a safety pause."""
 
     proposal = harness.environment.proposal.model_copy(
-        update={"objective": "Inspect another in-scope mock target"}
+        update={"objective": objective}
     )
     PlanProposalRepository(harness.database).add(proposal)
     plan = create_execution_plan(
@@ -215,6 +222,8 @@ def prepare_additional_execution(
         created_at=FIXED_TIME + timedelta(seconds=1),
     )
     harness.kernel.plans.add(plan)
+    if requested_data_access_factory is not None:
+        requested_data_access = requested_data_access_factory(plan)
     decision = PolicyDecisionIssuanceService(
         runtime_resolver=harness.kernel.runtime_resolver,
         plans=harness.kernel.plans,
@@ -229,7 +238,7 @@ def prepare_additional_execution(
     run = create_workflow_run(
         mission_id=plan.mission_id,
         mission_revision=plan.mission_revision,
-        run_seed="phase-0b-additional-action",
+        run_seed=run_seed,
         created_at=FIXED_TIME + timedelta(minutes=1),
     )
     WorkflowRunRepository(harness.database).add(run)

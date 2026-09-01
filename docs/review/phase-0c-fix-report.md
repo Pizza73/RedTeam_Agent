@@ -1953,3 +1953,111 @@ PHASE_GATE=phase-0c PASS
 - No protected governance file was modified.
 - A fresh independent Phase 0C review remains required on the resulting 40-character PR HEAD; this
   local PASS is not an independent Phase Gate PASS.
+
+## Twenty-eighth independent review correction cycle
+
+Current phase: `phase-0c`.
+
+Input review SHA: `c0688d5316db71ce4208651b057e727ca05ebe25`.
+
+Phase base: `5cda9a5f8792ee33c3e153d8e791499f5619d82e`.
+
+### Findings addressed
+
+- [`discussion_r3900976716`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3900976716):
+  Artifact reads/exports/expiry and Secret resolution/revocation now require an exact trusted
+  `execution_id`. The repository-backed authorizer reloads that ExecutionRecord and its immutable
+  PolicyDecision, verifies the current Mission/runtime/approval bindings, requires one exact
+  decision grant for the resource version, digest, type, and operation, and requires the same
+  binding to remain current in the Context Resource Index. Concrete repository regressions prove
+  that an output-producing execution cannot borrow a reader execution's Artifact or Secret grant
+  and that superseded Artifact and Secret index bindings fail closed.
+- [`discussion_r3900976723`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3900976723):
+  Artifact and Secret creation through the production authorizer now requires immutable
+  `IngestionWriteEvidence` bound to the exact ExecutionRecord, current INGESTING record and state
+  version, attempt, non-expired lease, persisted receipt/digest, and Quarantine identifier. The
+  PolicyDecision must explicitly grant the plan-bound prospective output authority for the
+  corresponding resource type, while the actual generated output must still satisfy the current
+  Mission Data Access Policy. `SecureIngestor` obtains this evidence only from the trusted
+  repository-backed boundary and propagates it to every Artifact and Secret write. Regressions deny
+  direct writes before result ingestion starts and replay of the same evidence after ingestion
+  succeeds.
+- [`discussion_r3900976729`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3900976729):
+  authenticated resource-creation intent files now contribute their verified physical size and one
+  record to Mission quota accounting. After publishing a new intent, the store recalculates exact
+  usage and record count before allocating a resource key, reserves capacity for the encrypted
+  envelope, and removes the uncommitted intent if that reservation fails. A repeated create-audit
+  interruption regression proves pending intent/envelope pairs remain within the configured
+  physical quota and that further creation is denied rather than growing storage without bound.
+
+### Modified files and regression tests
+
+Resulting working-tree diff: `8 files changed, 1035 insertions(+), 162 deletions(-)`.
+
+- `src/redteam_agent/data_security/__init__.py`
+- `src/redteam_agent/data_security/authorization.py`
+- `src/redteam_agent/data_security/ingestion.py`
+- `src/redteam_agent/data_security/stores.py`
+- `src/redteam_agent/repositories/policy.py`
+- `tests/phase0b_helpers.py`
+- `tests/security/test_phase0c_data_security.py`
+- `docs/review/phase-0c-fix-report.md`
+
+Regression coverage exercises cross-execution Artifact and Secret denial, current binding
+supersession, missing ingestion evidence, completed-ingestion evidence replay, plan-bound output
+authority, and repeated audit-failure quota exhaustion. Existing directory anchoring, key
+destruction, audit recovery, streaming, lifecycle, scope, and detector regressions continue to
+pass. No test was deleted, skipped, weakened, or marked as an expected failure.
+
+### Validation
+
+Focused review regressions:
+
+```text
+PYTHONPATH=. /home/kali/Red_Agent/.venv/bin/pytest -q \
+  tests/security/test_phase0c_data_security.py::test_repository_authorizer_revalidates_decision_execution_and_current_policy \
+  tests/security/test_phase0c_data_security.py::test_audit_pending_creation_intents_are_charged_to_mission_quota
+```
+
+Result: `2 passed`.
+
+Phase 0C data-security module: `79 passed`.
+
+Required phase-gate command:
+
+```text
+PATH=/home/kali/Red_Agent/.venv/bin:$PATH PYTHONPATH=. \
+  scripts/ci/run_phase_gate.sh phase-0c
+```
+
+Result:
+
+```text
+AUTOMATION_VALIDATION=PASS
+ruff: All checks passed
+mypy: Success: no issues found in 79 source files
+unit: 200 passed
+integration: 7 passed
+security: 225 passed
+full/coverage run: 432 passed
+skipped=0, errors=0, failures=0
+coverage: 81% total (branch coverage enabled)
+pip check: No broken requirements found
+PHASE_GATE=phase-0c PASS
+```
+
+### Remaining constraints
+
+- Plan-bound ingestion output authorities are reference-only metadata grants. They do not replace
+  exact grants for later reads/resolution, and actual generated resource identifiers must still
+  satisfy the current Mission Data Access Policy.
+- Resource-creation recovery assumes the configured key provider performs durable cryptographic
+  destruction. The wrapped-file provider supplies that property through its externally anchored
+  generation protocol.
+- The key-state and audit-head external generation adapters remain integration boundaries supplied
+  by an OS keystore, vault, or equivalently protected monotonic service.
+- No real C2, MCP, provider, subprocess, local-attack, credential-collection, or external-target
+  action was executed.
+- No protected governance file was modified.
+- A fresh independent Phase 0C review remains required on the resulting 40-character PR HEAD; this
+  local PASS is not an independent Phase Gate PASS.

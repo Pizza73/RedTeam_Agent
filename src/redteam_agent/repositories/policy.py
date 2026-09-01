@@ -8,7 +8,6 @@ from redteam_agent.errors import (
     MissionTTLExceededError,
     PolicyDecisionProvenanceError,
 )
-from redteam_agent.models.context import ResourceBinding
 from redteam_agent.models.mission import MissionRevision
 from redteam_agent.models.policy import PolicyDecision
 from redteam_agent.repositories.plans import PlanRepository
@@ -20,25 +19,6 @@ class PolicyDecisionRepository(ImmutableJsonRepository[PolicyDecision]):
     table = "policy_decisions"
     id_column = "decision_id"
     model_type = PolicyDecision
-
-    def decision_ids_for_exact_data_access(
-        self,
-        resource: ResourceBinding,
-    ) -> tuple[str, ...]:
-        """Locate candidate owners; ``get`` still verifies every complete envelope."""
-
-        rows = self.database.connection.execute(
-            "SELECT DISTINCT owner_id FROM data_access_grants "
-            "WHERE owner_type = 'policy' AND resource_id = ? "
-            "AND resource_version = ? AND resource_digest = ? "
-            "ORDER BY owner_id",
-            (
-                resource.resource_id,
-                resource.resource_version,
-                resource.resource_digest,
-            ),
-        ).fetchall()
-        return tuple(str(row["owner_id"]) for row in rows)
 
     def verify_integrity(self, model: PolicyDecision) -> None:
         verify_model_digest(model, model.decision_digest, exclude={"decision_digest"})

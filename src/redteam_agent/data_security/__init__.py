@@ -13,7 +13,12 @@ from .audit import (
     MissionAuditLog,
     MissionAuditRecorder,
 )
-from .authorization import DataAccessAuthorizer, RepositoryDataAccessAuthorizer
+from .authorization import (
+    DataAccessAuthorizer,
+    IngestionWriteEvidence,
+    RepositoryDataAccessAuthorizer,
+    ingestion_output_authority,
+)
 from .ingestion import EncryptedSecureResultIngester, SecureIngestor
 from .keys import (
     EncryptionKeyProvider,
@@ -66,6 +71,7 @@ __all__ = [
     "EncryptionKeyProvider",
     "EncryptionMetadata",
     "InMemoryEncryptionKeyProvider",
+    "IngestionWriteEvidence",
     "KeyDomain",
     "KeyedAuditChainAuthenticator",
     "KeyedFileAuditHeadStore",
@@ -86,4 +92,5 @@ __all__ = [
     "SecureIngestor",
     "WrappedFileEncryptionKeyProvider",
     "require_sandbox_capabilities",
+    "ingestion_output_authority",
 ]
