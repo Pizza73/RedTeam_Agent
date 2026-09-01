@@ -138,6 +138,7 @@ jobs:
               phase,
               head_sha: headSha,
               phase_prompt: phaseConfig.prompt,
+              invariant_audit: plan.invariant_audit,
             };
             const marker = `<!-- redteam-implementation-request\n${JSON.stringify(request)}\n-->`;
             const comments = await github.paginate(github.rest.issues.listComments, {

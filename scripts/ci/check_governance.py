@@ -25,6 +25,7 @@ PROTECTED_FILES = frozenset(
         "scripts/ci/check_governance.py",
         "scripts/ci/run_phase_gate.sh",
         "scripts/ci/validate_automation.py",
+        "scripts/ci/validate_invariant_audit.py",
     }
 )
 PROTECTED_PREFIXES = (".github/", "automation/", "prompts/phases/")

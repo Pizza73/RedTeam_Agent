@@ -164,6 +164,7 @@ jobs:
               phase: target.id,
               head_sha: pr.head.sha,
               phase_prompt: target.prompt,
+              invariant_audit: plan.invariant_audit,
             };
             const marker = `<!-- redteam-implementation-request\n${JSON.stringify(request)}\n-->`;
             await github.rest.issues.createComment({

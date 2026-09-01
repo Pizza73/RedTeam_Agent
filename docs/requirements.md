@@ -12,10 +12,10 @@ Codex CloudまたはChatGPTによる独立ReviewとCodexによる実装を、Pha
 | LOOP-002 | 全ReviewをCI ready marker、Operator trigger、Current PR HEAD、Review中のhead不変性を検証してPRの最新40桁commit SHAへBindingする。Codex表示上の短縮SHAだけをBinding根拠にしない |
 | LOOP-003 | Codexの完了報告ではなく、Git差分、CI、受入条件で判定する |
 | LOOP-004 | Codex native reviewを検証後、Trusted Phase Gateが`PASS`、`CHANGES_REQUESTED`、`BLOCKED`を機械可読JSONとして記録する |
-| LOOP-005 | Review Verdictのうち`CHANGES_REQUESTED`だけがCodex修正Requestを生成する。修正Requestは単一Native Review内の全P0/P1の件数とPermalinkを列挙し、Codexは全件を修正する。`finding_key`はRetry判定専用で修正範囲を縮小しない。CI failureは同じPhaseの実装Requestを再発行できるが、Review PASSやPhase遷移として扱わない |
+| LOOP-005 | Review Verdictのうち`CHANGES_REQUESTED`だけがCodex修正Requestを生成する。修正Requestは単一Native Review内の全P0/P1の件数、Permalink、不変条件ファミリーを列挙し、Codexは全件と同じSemantic Invariantを共有する全public entry point・caller・sibling pathを修正する。`finding_key`はRetry判定専用で修正範囲を縮小しない。CI failureは同じPhaseの実装Requestを再発行できるが、Review PASSやPhase遷移として扱わない |
 | LOOP-006 | CI成功時だけ独立AI Reviewを要求する |
 | LOOP-007 | 同じSHAを重複Review・重複修正しない |
-| LOOP-008 | Phaseごとに最大5回、同じRoot Causeも最大5回で停止する |
+| LOOP-008 | Phaseごとに最大5回、同じexact Root Causeも最大5回で停止する。これとは別に、同じSemantic Invariant Familyが2回目のFormal Reviewへ再出現した時点で局所修正を停止し、設計見直しのHuman Gateへ送る |
 | LOOP-009 | Phase GateをPASSするまで次Phaseを開始しない。自動遷移は`ai-review-passed` marker中だけnext Phaseを先に追加してからcurrent Phaseを個別削除し、marker中の1件または隣接2件のPhaseをRunnerが遷移中として待機する。完全Label置換を使用せず、無関係な並行Label writeを上書きしない。競合によりmarker、HEAD、open state、Phase隣接性が崩れた場合はFail Closedにする |
 | LOOP-010 | Phase 0A、0B、0C、1、2、3、4、5の順序を固定する |
 | LOOP-011 | Phase 4/5の未設定外部依存はHuman Gateで停止する |
@@ -32,6 +32,8 @@ Codex CloudまたはChatGPTによる独立ReviewとCodexによる実装を、Pha
 | LOOP-022 | Governance PR、Fork PR、Phase未完了、Stop Label、Stale/Unknown/Ambiguous Evidence、Default Branch未包含時は自動mergeしない。CodexとGitHub ActionsにはFinal Merge APIを与えない |
 | LOOP-023 | Final Merge API呼出し前に、PR番号と完全HEAD固定のRepository Git ref claimを原子的に作成し、PR番号、完全HEAD、Default Branch SHA、Phase 5 Gate、Policy Digest、Actor、Claim RefへBindingした永続Attempt RecordをPRへ保存する。同じPR/HEADのClaim/Recordが存在・作成結果不明、または取得後GateにDrift/Unknownがあれば、明示的Reconciliationなしに再送しない |
 | LOOP-024 | Phase 0B～3のblocked cumulative HEADがCurrent default branch上の必須Governanceを含まない場合、Approver限定WorkflowはCurrent-Phase `BLOCKED_LIMIT` Gate、そのGateの唯一の隣接Base PASS、旧HEAD、Current default-branch SHAを検証したStatusだけを発行する。Local OrchestratorはPhase Labelを戻さずExpected HEAD固定でBaseを取り込み、両祖先関係とCurrent-HEAD Checkを検証後、同Gate permalinkへBindingしたbounded Resumeだけを発行する |
+| LOOP-025 | 新しい実装・修正RequestはCurrent Phaseの不変条件ファミリー監査を必須化する。CodexはFormal Review前に各Required Familyのentry point、sibling path、invariant evidence、positive/negative/failure testを閉じたJSONへ記録し、Stateful Family変更時はproperty-basedまたはstate-machine testを追加する。CIはRequest、出力HEAD、監査DigestをBindingしてからready markerを発行する |
+| LOOP-026 | Formal ReviewはSHA-bound不変条件監査をrouting evidenceとしてのみ使用し、各Familyを独立に再検証する。各P0/P1はTrusted Policy中のFamily IDを1件だけ保持し、Trusted GateはPhase内のFamily再発を機械的に集計する |
 
 ## Non-Functional Requirements
 

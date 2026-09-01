@@ -30,6 +30,7 @@ PY
 
 python -m compileall -q src/redteam_agent
 python scripts/ci/validate_automation.py
+python scripts/ci/validate_invariant_audit.py --phase "$phase" --if-present
 python -m ruff check .
 python -m mypy src/redteam_agent
 python -m pytest -q tests/unit --strict-markers

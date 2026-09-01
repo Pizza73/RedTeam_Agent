@@ -204,6 +204,40 @@ jobs:
               return;
             }
             const phaseIndex = plan.phases.findIndex((item) => item.id === phase);
+            const {data: familyPolicyFile} = await github.rest.repos.getContent({
+              owner,
+              repo,
+              path: 'automation/invariant-families.json',
+              ref: context.payload.repository.default_branch,
+            });
+            if (
+              Array.isArray(familyPolicyFile) || familyPolicyFile.type !== 'file' ||
+              !familyPolicyFile.content
+            ) {
+              core.setFailed('Trusted invariant-family policy is unavailable.');
+              return;
+            }
+            let familyPolicy;
+            try {
+              familyPolicy = JSON.parse(
+                Buffer.from(familyPolicyFile.content, 'base64').toString('utf8')
+              );
+            } catch (_) {
+              core.setFailed('Trusted invariant-family policy is invalid JSON.');
+              return;
+            }
+            const familyIds = (familyPolicy.families || []).map((item) => item.id);
+            if (
+              familyPolicy.schema_version !== '1.0' ||
+              familyPolicy.semantic_recurrence_limit !== 2 ||
+              familyIds.length !== 7 || new Set(familyIds).size !== familyIds.length ||
+              !Array.isArray(familyPolicy.phases?.[phase]) ||
+              familyPolicy.phases[phase].length < 1 ||
+              !(familyPolicy.phases?.[phase] || []).every((item) => familyIds.includes(item))
+            ) {
+              core.setFailed('Trusted invariant-family policy has an unsupported shape.');
+              return;
+            }
 
             const comments = await github.paginate(github.rest.issues.listComments, {
               owner, repo, issue_number: pull_number, per_page: 100,
@@ -454,6 +488,26 @@ jobs:
               if (!Number.isFinite(parsed)) throw new Error(`${name} timestamp is invalid.`);
               return parsed;
             }
+            function optionalMarker(body, name) {
+              const pattern = new RegExp(`<!--\\s*${name}\\s*([\\s\\S]*?)-->`, 'g');
+              const matches = [...(body || '').matchAll(pattern)];
+              if (matches.length === 0) return null;
+              if (matches.length !== 1) throw new Error(`${name} marker is ambiguous.`);
+              try {
+                return JSON.parse(matches[0][1].trim());
+              } catch (_) {
+                throw new Error(`${name} marker is not valid JSON.`);
+              }
+            }
+            function canonicalJson(value) {
+              if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+              if (value && typeof value === 'object') {
+                return `{${Object.keys(value).sort().map(
+                  (key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`
+                ).join(',')}}`;
+              }
+              return JSON.stringify(value);
+            }
 
             const readyEvidence = comments.find((item) => item.html_url === readyReference);
             if (!readyEvidence || readyEvidence.user?.login !== 'github-actions[bot]') {
@@ -468,6 +522,76 @@ jobs:
             ) {
               core.setFailed('Ready marker is not exactly bound to the current phase and head.');
               return;
+            }
+            const invariantAudit = optionalMarker(
+              readyEvidence.body, 'redteam-invariant-audit'
+            );
+            if (invariantAudit && (
+              !exactKeys(invariantAudit, [
+                'schema_version', 'phase', 'head_sha', 'audit_path', 'audit_digest',
+                'request_reference',
+              ]) ||
+              invariantAudit.schema_version !== '1.0' || invariantAudit.phase !== phase ||
+              invariantAudit.head_sha !== reviewedSha ||
+              invariantAudit.audit_path !== `docs/review/${phase}-invariant-audit.json` ||
+              !/^[0-9a-f]{64}$/.test(invariantAudit.audit_digest || '') ||
+              !String(invariantAudit.request_reference || '').toLowerCase().startsWith(expectedPrefix)
+            )) {
+              core.setFailed('Invariant-audit marker is malformed or stale.');
+              return;
+            }
+            if (invariantAudit) {
+              const {data: auditFile} = await github.rest.repos.getContent({
+                owner, repo, path: invariantAudit.audit_path, ref: reviewedSha,
+              });
+              if (Array.isArray(auditFile) || auditFile.type !== 'file' || !auditFile.content) {
+                core.setFailed('Invariant-audit file is unavailable at the reviewed SHA.');
+                return;
+              }
+              let auditData;
+              try {
+                auditData = JSON.parse(Buffer.from(auditFile.content, 'base64').toString('utf8'));
+              } catch (_) {
+                core.setFailed('Invariant-audit file is invalid JSON.');
+                return;
+              }
+              const auditDigest = crypto.createHash('sha256')
+                .update(canonicalJson(auditData)).digest('hex');
+              if (auditDigest !== invariantAudit.audit_digest) {
+                core.setFailed('Invariant-audit digest does not match the reviewed file.');
+                return;
+              }
+              const requestEvidence = comments.find(
+                (item) => item.html_url === invariantAudit.request_reference
+              );
+              const requestMatches = [...(requestEvidence?.body || '').matchAll(
+                /<!--\s*redteam-implementation-request\s*([\s\S]*?)-->/g
+              )];
+              if (
+                requestEvidence?.user?.login !== 'github-actions[bot]' ||
+                requestMatches.length !== 1
+              ) {
+                core.setFailed('Invariant audit is not bound to one trusted implementation request.');
+                return;
+              }
+              let requestPayload;
+              try {
+                requestPayload = JSON.parse(requestMatches[0][1].trim());
+              } catch (_) {
+                core.setFailed('Invariant-audit implementation request is invalid JSON.');
+                return;
+              }
+              if (
+                auditData.phase !== phase || auditData.request?.head_sha !== requestPayload.head_sha ||
+                auditData.request?.action !== requestPayload.action ||
+                auditData.request?.reference !== invariantAudit.request_reference ||
+                requestPayload.phase !== phase ||
+                JSON.stringify(requestPayload.invariant_audit || null) !==
+                  JSON.stringify(plan.invariant_audit)
+              ) {
+                core.setFailed('Invariant audit does not match its trusted implementation request.');
+                return;
+              }
             }
             const readyTime = parseTime(readyEvidence.created_at, 'ready evidence');
 
@@ -487,7 +611,15 @@ jobs:
               core.setFailed('Review trigger must use @codex review and contain both full SHAs.');
               return;
             }
-            const source = {
+            const source = invariantAudit ? {
+              audit_digest: invariantAudit.audit_digest,
+              audit_path: invariantAudit.audit_path,
+              base_sha: suppliedBaseSha,
+              head_sha: reviewedSha,
+              phase,
+              ready_url: readyReference,
+              request_reference: invariantAudit.request_reference,
+            } : {
               base_sha: suppliedBaseSha,
               head_sha: reviewedSha,
               phase,
@@ -540,6 +672,17 @@ jobs:
               if (matches.length > 1) throw new Error('Codex finding has ambiguous priority badges.');
               return matches.length === 1 ? matches[0][1] : null;
             }
+            function invariantFamily(body) {
+              const matches = [...(body || '').matchAll(
+                /^Invariant family: `([a-z][a-z0-9-]{2,63})`$/gm
+              )];
+              if (matches.length !== 1 || !familyIds.includes(matches[0][1])) {
+                throw new Error(
+                  'Codex finding must contain exactly one recognized Invariant family line.'
+                );
+              }
+              return matches[0][1];
+            }
             function nativeFindingKey(comment) {
               const priority = codexPriority(comment.body);
               if (!priority || typeof comment.path !== 'string' || !comment.path) {
@@ -584,7 +727,11 @@ jobs:
                 core.setFailed('Codex finding is missing its permalink.');
                 return;
               }
+              invariantFamily(finding.body);
             }
+            const currentFamilies = [...new Set(
+              currentFindings.map((item) => invariantFamily(item.body))
+            )].sort();
             const findingReviewIds = new Set(
               currentFindings.map((item) => item.pull_request_review_id)
             );
@@ -668,8 +815,44 @@ jobs:
             const sameFindingCount = priorChanges.filter(
               (record) => record.finding_key === findingKey
             ).length;
+            const priorFamilyReviews = [];
+            for (const comment of comments) {
+              if (
+                comment.user?.login !== 'github-actions[bot]' ||
+                !(comment.body || '').includes('redteam-invariant-family-review')
+              ) continue;
+              const familyReview = optionalMarker(
+                comment.body, 'redteam-invariant-family-review'
+              );
+              if (
+                !exactKeys(familyReview, [
+                  'schema_version', 'phase', 'reviewed_sha', 'review_reference',
+                  'verdict', 'families',
+                ]) || familyReview.schema_version !== '1.0' ||
+                !expectedPhaseIds.includes(familyReview.phase) ||
+                !/^[0-9a-f]{40}$/.test(familyReview.reviewed_sha || '') ||
+                !String(familyReview.review_reference || '').toLowerCase().startsWith(expectedPrefix) ||
+                !['PASS', 'CHANGES_REQUESTED'].includes(familyReview.verdict) ||
+                !Array.isArray(familyReview.families) ||
+                new Set(familyReview.families).size !== familyReview.families.length ||
+                !familyReview.families.every((item) => familyIds.includes(item))
+              ) {
+                core.setFailed('Trusted invariant-family review marker is malformed.');
+                return;
+              }
+              priorFamilyReviews.push(familyReview);
+            }
+            const recurringFamilies = currentFamilies.filter((family) =>
+              priorFamilyReviews.some(
+                (record) => record.phase === phase &&
+                  record.reviewed_sha !== reviewedSha &&
+                  record.verdict === 'CHANGES_REQUESTED' && record.families.includes(family)
+              )
+            );
+            const designStop = verdict === 'CHANGES_REQUESTED' &&
+              recurringFamilies.length > 0;
             const limitReached = verdict === 'CHANGES_REQUESTED' && (
-              priorChanges.length + 1 >= maximum || sameFindingCount + 1 >= 5
+              priorChanges.length + 1 >= maximum || sameFindingCount + 1 >= 5 || designStop
             );
 
             const { data: livePr } = await github.rest.pulls.get({owner, repo, pull_number});
@@ -700,11 +883,21 @@ jobs:
               loop_state: limitReached ? 'BLOCKED_LIMIT' : verdict,
             };
             const marker = `<!-- redteam-phase-gate\n${JSON.stringify(record)}\n-->`;
+            const familyReview = {
+              schema_version: '1.0',
+              phase,
+              reviewed_sha: reviewedSha,
+              review_reference: reviewReference,
+              verdict,
+              families: currentFamilies,
+            };
+            const familyMarker =
+              `<!-- redteam-invariant-family-review\n${JSON.stringify(familyReview)}\n-->`;
             const { data: recordComment } = await github.rest.issues.createComment({
               owner,
               repo,
               issue_number: pull_number,
-              body: `Recorded independent review for \`${phase}\` at \`${reviewedSha}\`: **${verdict}**.\n\n${marker}`,
+              body: `Recorded independent review for \`${phase}\` at \`${reviewedSha}\`: **${verdict}**.\n\n${marker}\n\n${familyMarker}`,
             });
 
             async function removeLabel(name) {
@@ -735,8 +928,18 @@ jobs:
             if (verdict === 'BLOCKED' || limitReached) {
               await removeLabel('ai-needs-fix');
               await addLabels(['ai-loop-blocked']);
-              const reason = limitReached ? 'bounded retry limit reached' : 'independent review blocked';
+              const reason = designStop
+                ? `semantic invariant family recurred: ${recurringFamilies.join(', ')}`
+                : limitReached ? 'bounded retry limit reached' : 'independent review blocked';
               await setReviewStatus('error', `${phase}: ${reason}`);
+              if (designStop) {
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: pull_number,
+                  body: `AI loop stopped for design review: invariant family ${recurringFamilies.map(
+                    (item) => `\`${item}\``
+                  ).join(', ')} recurred in a second formal review. A new local patch is not authorized; document and approve a coherent redesign before using the bounded Resume workflow.`,
+                });
+              }
               return;
             }
 
@@ -752,6 +955,7 @@ jobs:
                 phase,
                 head_sha: reviewedSha,
                 phase_prompt: phaseConfig.prompt,
+                invariant_audit: plan.invariant_audit,
                 review: {
                   reviewed_sha: reviewedSha,
                   review_reference: reviewReference,
@@ -760,6 +964,7 @@ jobs:
                   findings: currentFindings.map((item) => ({
                     finding_key: nativeFindingKey(item),
                     finding_reference: item.html_url,
+                    invariant_family: invariantFamily(item.body),
                   })),
                   summary,
                 },
@@ -811,6 +1016,7 @@ jobs:
               phase: next.id,
               head_sha: reviewedSha,
               phase_prompt: next.prompt,
+              invariant_audit: plan.invariant_audit,
             };
             const requestMarker = `<!-- redteam-implementation-request\n${JSON.stringify(request)}\n-->`;
             const transition = {
