@@ -1735,3 +1735,102 @@ PHASE_GATE=phase-0c PASS
 - No protected governance file was modified.
 - A fresh independent Phase 0C review remains required on the resulting 40-character PR HEAD; this
   local PASS is not an independent Phase Gate PASS.
+
+## Twenty-sixth independent review correction cycle
+
+Current phase: `phase-0c`.
+
+Input review SHA: `22f0b2f0e3c62a206ac58e0fcc832a814c5c2dde`.
+
+Phase base: `5cda9a5f8792ee33c3e153d8e791499f5619d82e`.
+
+### Findings addressed
+
+- [`discussion_r3900679640`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3900679640):
+  encrypted resource creation now fsyncs a strictly typed, keyed-digest-authenticated preparation
+  before the resource key is sealed. The durable envelope is the commit record. Recovery removes
+  abandoned atomic-write files, fully verifies a linked envelope before retaining its key, and
+  destroys every deterministic resource-key generation when no envelope committed. Wrapped key
+  state therefore cannot accumulate unreachable keys after a crash inside key sealing or before
+  envelope linkage. Ordinary `_atomic_write_anchored()` failures reconcile immediately; process
+  interruption remains restart-recoverable. Regressions interrupt both before and after the link,
+  restart the wrapped provider and store, and prove rollback creates a new key while commit recovery
+  preserves the linked key.
+- [`discussion_r3900679652`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3900679652):
+  URI-scheme and unquoted structured-key lookahead are bounded at 256 bytes. A long ordinary token
+  can no longer consume the 64 KiB pending-secret budget merely because it starts with alphabetic
+  scheme characters, while the generic short-scheme URI grammar and fail-closed credential checks
+  remain intact. Complete and arbitrarily split 70 KiB provider chunks traverse the encrypted
+  streaming ingestion path unchanged and produce no false secret detection.
+
+### Modified files and regression tests
+
+Resulting working-tree diff: `5 files changed, 872 insertions(+), 14 deletions(-)`.
+
+- `src/redteam_agent/data_security/ingestion.py`
+- `src/redteam_agent/data_security/keys.py`
+- `src/redteam_agent/data_security/stores.py`
+- `tests/security/test_phase0c_data_security.py`
+- `docs/review/phase-0c-fix-report.md`
+
+Regression coverage exercises wrapped-key recovery on process interruption before and after the
+envelope link, immediate retry after directory-sync failure, repeated failed writes without wrapped
+record growth, keyed intent validation and durable prepare/commit sync boundaries, and
+complete/split long ordinary provider output. Existing complete and split credential-bearing URI
+tests continue to prove password-only redaction. No test was deleted, skipped, weakened, or marked
+as an expected failure.
+
+### Validation
+
+Focused regression command:
+
+```text
+PYTHONPATH=/tmp/redteam-phase0c-a91790d3 \
+  /home/kali/Red_Agent/.venv/bin/python -m pytest -q \
+  tests/security/test_phase0c_data_security.py \
+  -k 'resource_creation_reconciles_wrapped_keys or atomic_envelope_failures \
+      or long_ordinary_tokens or connection_uri_credentials'
+```
+
+Result: `5 passed, 65 deselected`.
+
+Phase 0C data-security module: `70 passed`.
+
+Required phase-gate command:
+
+```text
+PATH="/home/kali/Red_Agent/.venv/bin:$PATH" \
+  bash scripts/ci/run_phase_gate.sh phase-0c
+```
+
+Result:
+
+```text
+AUTOMATION_VALIDATION=PASS
+ruff: All checks passed
+mypy: Success: no issues found in 78 source files
+unit: 200 passed
+integration: 7 passed
+security: 216 passed
+full/coverage run: 423 passed
+skipped=0, errors=0, failures=0
+coverage: 81% total (branch coverage enabled)
+pip check: No broken requirements found
+PHASE_GATE=phase-0c PASS
+```
+
+### Remaining constraints
+
+- Resource-creation intent recovery assumes the configured key provider retains deterministic
+  resource-key generations and performs cryptographic destruction durably; the wrapped-file
+  provider does so through its externally anchored generation protocol.
+- URI and structured-key lookahead deliberately cap candidate names at 256 bytes. Longer prefixes
+  are treated as ordinary data rather than credential syntax; credential values remain subject to
+  the fail-closed pending-match bound.
+- The key-state and audit-head external generation adapters remain integration boundaries supplied by
+  an OS keystore, vault, or equivalently protected monotonic service.
+- No real C2, MCP, provider, subprocess, local-attack, credential-collection, or external-target
+  action was executed.
+- No protected governance file was modified.
+- A fresh independent Phase 0C review remains required on the resulting 40-character PR HEAD; this
+  local PASS is not an independent Phase Gate PASS.

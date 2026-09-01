@@ -50,6 +50,10 @@ _SAFE_TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _ARTIFACT_STREAM_CHUNK_BYTES = 4 * 1024
 _RESOURCE_KEY_RECORD_QUOTA_UNIT_BYTES = 1024
 _MIN_ENCRYPTED_ENVELOPE_QUOTA_BYTES = 1024
+_CREATION_INTENT_PREFIX = ".resource-creation-"
+_CREATION_INTENT_SUFFIX = ".intent"
+_PENDING_RESOURCE_FILE = re.compile(r"^\.pending-[0-9a-f]{32}$")
+_MAX_CREATION_INTENT_BYTES = 16 * 1024
 
 
 def _require_bytes(value: bytes) -> None:
@@ -100,6 +104,22 @@ class _StoredEnvelope(StrictImmutableBoundaryModel):
     retention_until: UtcDatetime | None
     encryption_metadata_id: str = Field(min_length=1)
     payload: EncryptedPayload
+
+
+class _ResourceCreationIntentBody(StrictImmutableBoundaryModel):
+    schema_version: Literal["resource-creation-intent-v1"]
+    domain: KeyDomain
+    mission_id: str = Field(min_length=1)
+    resource_id: str = Field(min_length=1)
+    key_resource_id: str = Field(
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"
+    )
+
+
+class _ResourceCreationIntent(StrictImmutableBoundaryModel):
+    body: _ResourceCreationIntentBody
+    verifier_metadata: EncryptionMetadata
+    intent_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
 
 
 class _SecretTombstone(StrictImmutableBoundaryModel):
@@ -245,6 +265,8 @@ class _EncryptedFileStore:
             and not self._transaction_lock_path.is_file()
         ):
             raise ArtifactSecurityError("store transaction lock is invalid")
+        with self._lock, self._write_transaction():
+            self._recover_all_resource_creations()
 
     @classmethod
     def _prepare_root(cls, root: Path) -> Path:
@@ -449,6 +471,12 @@ class _EncryptedFileStore:
                 mission_descriptor,
                 mission_metadata,
             ):
+                self._recover_resource_creations_anchored(
+                    mission_id=mission_id,
+                    root_descriptor=root_descriptor,
+                    mission_descriptor=mission_descriptor,
+                    mission_metadata=mission_metadata,
+                )
                 if self._resource_exists_anchored(
                     mission_descriptor=mission_descriptor,
                     resource_id=resource_id,
@@ -509,13 +537,30 @@ class _EncryptedFileStore:
                     created_at=created_at,
                     retention_until=retention_until,
                 )
-                encrypted = self._keys.seal_for_resource(
-                    self._domain,
-                    resource_id,
-                    content,
-                    aad,
-                    created_at=created_at,
+                creation_intent = self._prepare_resource_creation_intent_anchored(
+                    mission_id=mission_id,
+                    resource_id=resource_id,
+                    root_descriptor=root_descriptor,
+                    mission_descriptor=mission_descriptor,
+                    mission_metadata=mission_metadata,
                 )
+                try:
+                    encrypted = self._keys.seal_for_resource(
+                        self._domain,
+                        creation_intent.body.key_resource_id,
+                        content,
+                        aad,
+                        created_at=created_at,
+                    )
+                except Exception:
+                    with suppress(Exception):
+                        self._recover_resource_creations_anchored(
+                            mission_id=mission_id,
+                            root_descriptor=root_descriptor,
+                            mission_descriptor=mission_descriptor,
+                            mission_metadata=mission_metadata,
+                        )
+                    raise
                 if (
                     self._content_digest(
                         content,
@@ -523,6 +568,16 @@ class _EncryptedFileStore:
                     )
                     != content_digest
                 ):
+                    self._keys.destroy_resource_keys_for_resource(
+                        self._domain,
+                        creation_intent.body.key_resource_id,
+                    )
+                    self._finish_resource_creation_intent_anchored(
+                        intent=creation_intent,
+                        root_descriptor=root_descriptor,
+                        mission_descriptor=mission_descriptor,
+                        mission_metadata=mission_metadata,
+                    )
                     raise ArtifactSecurityError(
                         "resource verifier key changed during creation"
                     )
@@ -547,11 +602,36 @@ class _EncryptedFileStore:
                     mission_usage + self._quota_charge(serialized_envelope)
                     > self._mission_quota_bytes
                 ):
-                    self._keys.destroy_resource_key(encrypted.metadata)
+                    self._keys.destroy_resource_keys_for_resource(
+                        self._domain,
+                        creation_intent.body.key_resource_id,
+                    )
+                    self._finish_resource_creation_intent_anchored(
+                        intent=creation_intent,
+                        root_descriptor=root_descriptor,
+                        mission_descriptor=mission_descriptor,
+                        mission_metadata=mission_metadata,
+                    )
                     raise ArtifactSecurityError("mission storage quota exceeded")
-                self._atomic_write_anchored(
-                    path=path,
-                    data=serialized_envelope,
+                try:
+                    self._atomic_write_anchored(
+                        path=path,
+                        data=serialized_envelope,
+                        root_descriptor=root_descriptor,
+                        mission_descriptor=mission_descriptor,
+                        mission_metadata=mission_metadata,
+                    )
+                except Exception:
+                    with suppress(Exception):
+                        self._recover_resource_creations_anchored(
+                            mission_id=mission_id,
+                            root_descriptor=root_descriptor,
+                            mission_descriptor=mission_descriptor,
+                            mission_metadata=mission_metadata,
+                        )
+                    raise
+                self._finish_resource_creation_intent_anchored(
+                    intent=creation_intent,
                     root_descriptor=root_descriptor,
                     mission_descriptor=mission_descriptor,
                     mission_metadata=mission_metadata,
@@ -1473,6 +1553,339 @@ class _EncryptedFileStore:
             "created_at": created_at,
             "retention_until": retention_until,
         }
+
+    @staticmethod
+    def _creation_intent_name(resource_id: str) -> str:
+        return f"{_CREATION_INTENT_PREFIX}{resource_id}{_CREATION_INTENT_SUFFIX}"
+
+    def _recover_all_resource_creations(self) -> None:
+        for mission_id in self.mission_ids():
+            with self._anchored_mission_directory(mission_id) as (
+                root_descriptor,
+                mission_descriptor,
+                mission_metadata,
+            ):
+                self._recover_resource_creations_anchored(
+                    mission_id=mission_id,
+                    root_descriptor=root_descriptor,
+                    mission_descriptor=mission_descriptor,
+                    mission_metadata=mission_metadata,
+                )
+
+    def _recover_resource_creations_anchored(
+        self,
+        *,
+        mission_id: str,
+        root_descriptor: int,
+        mission_descriptor: int,
+        mission_metadata: os.stat_result,
+    ) -> None:
+        """Finish or roll back every durable key-and-envelope preparation."""
+
+        try:
+            entries = sorted(os.listdir(mission_descriptor))
+        except OSError as exc:
+            raise ArtifactSecurityError("mission storage is unavailable") from exc
+        removed_pending = False
+        for entry in entries:
+            if _PENDING_RESOURCE_FILE.fullmatch(entry) is None:
+                continue
+            try:
+                metadata = os.stat(
+                    entry,
+                    dir_fd=mission_descriptor,
+                    follow_symlinks=False,
+                )
+            except OSError as exc:
+                raise ArtifactSecurityError(
+                    "pending resource creation is unavailable"
+                ) from exc
+            if not (
+                stat.S_ISREG(metadata.st_mode)
+                and metadata.st_nlink in {1, 2}
+            ):
+                raise ArtifactSecurityError("pending resource creation is invalid")
+            try:
+                os.unlink(entry, dir_fd=mission_descriptor)
+            except OSError as exc:
+                raise ArtifactSecurityError(
+                    "pending resource cleanup failed"
+                ) from exc
+            removed_pending = True
+        if removed_pending:
+            try:
+                os.fsync(mission_descriptor)
+            except OSError as exc:
+                raise ArtifactSecurityError(
+                    "resource directory sync failed"
+                ) from exc
+
+        for entry in entries:
+            if not (
+                entry.startswith(_CREATION_INTENT_PREFIX)
+                and entry.endswith(_CREATION_INTENT_SUFFIX)
+            ):
+                continue
+            resource_id = entry[
+                len(_CREATION_INTENT_PREFIX) : -len(_CREATION_INTENT_SUFFIX)
+            ]
+            self._validate_token(resource_id)
+            if entry != self._creation_intent_name(resource_id):
+                raise ArtifactSecurityError("resource creation intent is invalid")
+            intent = self._load_resource_creation_intent_anchored(
+                mission_id=mission_id,
+                resource_id=resource_id,
+                mission_descriptor=mission_descriptor,
+            )
+            if self._resource_exists_anchored(
+                mission_descriptor=mission_descriptor,
+                resource_id=resource_id,
+            ):
+                envelope = self._load_envelope_from_descriptor(
+                    mission_descriptor=mission_descriptor,
+                    resource_id=resource_id,
+                )
+                if not (
+                    envelope.domain == self._domain
+                    and envelope.mission_id == mission_id
+                    and envelope.resource_id == resource_id
+                    and envelope.encryption_metadata_id
+                    == self._keys.metadata_id(envelope.payload.metadata)
+                ):
+                    raise ArtifactSecurityError(
+                        "committed resource creation binding is invalid"
+                    )
+                self._verify_envelope(
+                    envelope,
+                    mission_id=mission_id,
+                    resource_id=resource_id,
+                    binding=envelope.binding.to_dict(),
+                    expected_encryption_metadata_id=(
+                        envelope.encryption_metadata_id
+                    ),
+                    now=None,
+                )
+            else:
+                self._keys.destroy_resource_keys_for_resource(
+                    self._domain,
+                    intent.body.key_resource_id,
+                )
+            self._finish_resource_creation_intent_anchored(
+                intent=intent,
+                root_descriptor=root_descriptor,
+                mission_descriptor=mission_descriptor,
+                mission_metadata=mission_metadata,
+            )
+
+    def _prepare_resource_creation_intent_anchored(
+        self,
+        *,
+        mission_id: str,
+        resource_id: str,
+        root_descriptor: int,
+        mission_descriptor: int,
+        mission_metadata: os.stat_result,
+    ) -> _ResourceCreationIntent:
+        body = _ResourceCreationIntentBody(
+            schema_version="resource-creation-intent-v1",
+            domain=self._domain,
+            mission_id=mission_id,
+            resource_id=resource_id,
+            key_resource_id=stable_id(
+                "resourcecreationkey",
+                {
+                    "schema_version": "resource-creation-key-v1",
+                    "domain": self._domain,
+                    "mission_id": mission_id,
+                    "resource_id": resource_id,
+                    "nonce": secrets.token_hex(32),
+                },
+            ),
+        )
+        verifier_metadata = self._keys.get_active_key_metadata(self._domain)
+        intent = _ResourceCreationIntent(
+            body=body,
+            verifier_metadata=verifier_metadata,
+            intent_digest=self._keys.keyed_digest(
+                self._domain,
+                "resource-creation-intent",
+                canonicalize(
+                    {
+                        "body": body.model_dump(mode="python"),
+                        "verifier_metadata": verifier_metadata.model_dump(
+                            mode="python"
+                        ),
+                    }
+                ),
+                metadata=verifier_metadata,
+            ),
+        )
+        serialized = canonicalize(intent.model_dump(mode="python"))
+        if len(serialized) > _MAX_CREATION_INTENT_BYTES:
+            raise ArtifactSecurityError("resource creation intent is invalid")
+        name = self._creation_intent_name(resource_id)
+        file_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            file_flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(
+                name,
+                file_flags,
+                0o600,
+                dir_fd=mission_descriptor,
+            )
+        except FileExistsError:
+            raise ArtifactSecurityError(
+                "resource creation intent already exists"
+            ) from None
+        except OSError as exc:
+            raise ArtifactSecurityError(
+                "resource creation intent is unavailable"
+            ) from exc
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(serialized)
+                stream.flush()
+                os.fsync(stream.fileno())
+            try:
+                os.fsync(mission_descriptor)
+            except OSError as exc:
+                raise ArtifactSecurityError(
+                    "resource directory sync failed"
+                ) from exc
+            self._require_current_mission_identity(
+                mission_id=mission_id,
+                root_descriptor=root_descriptor,
+                mission_metadata=mission_metadata,
+                operation="resource creation preparation",
+            )
+        except Exception:
+            with suppress(OSError):
+                os.close(descriptor)
+            raise
+        return intent
+
+    def _load_resource_creation_intent_anchored(
+        self,
+        *,
+        mission_id: str,
+        resource_id: str,
+        mission_descriptor: int,
+    ) -> _ResourceCreationIntent:
+        name = self._creation_intent_name(resource_id)
+        file_flags = os.O_RDONLY | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            file_flags |= os.O_NOFOLLOW
+        descriptor: int | None = None
+        try:
+            try:
+                descriptor = os.open(
+                    name,
+                    file_flags,
+                    dir_fd=mission_descriptor,
+                )
+            except OSError as exc:
+                raise ArtifactSecurityError(
+                    "resource creation intent is unavailable"
+                ) from exc
+            metadata = os.fstat(descriptor)
+            if not (
+                stat.S_ISREG(metadata.st_mode)
+                and metadata.st_nlink == 1
+                and metadata.st_size <= _MAX_CREATION_INTENT_BYTES
+            ):
+                raise ArtifactSecurityError("resource creation intent is invalid")
+            raw = bytearray()
+            while len(raw) <= _MAX_CREATION_INTENT_BYTES:
+                chunk = os.read(
+                    descriptor,
+                    min(
+                        4096,
+                        _MAX_CREATION_INTENT_BYTES + 1 - len(raw),
+                    ),
+                )
+                if not chunk:
+                    break
+                raw.extend(chunk)
+            if len(raw) > _MAX_CREATION_INTENT_BYTES:
+                raise ArtifactSecurityError("resource creation intent is invalid")
+            try:
+                canonical_loads(bytes(raw))
+                intent = _ResourceCreationIntent.model_validate_json(
+                    bytes(raw),
+                    strict=True,
+                )
+            except (TypeError, ValueError) as exc:
+                raise ArtifactSecurityError(
+                    "resource creation intent is invalid"
+                ) from exc
+        finally:
+            if descriptor is not None:
+                with suppress(OSError):
+                    os.close(descriptor)
+        if not (
+            intent.body.domain == self._domain
+            and intent.body.mission_id == mission_id
+            and intent.body.resource_id == resource_id
+            and secrets.compare_digest(
+                intent.intent_digest,
+                self._keys.keyed_digest(
+                    self._domain,
+                    "resource-creation-intent",
+                    canonicalize(
+                        {
+                            "body": intent.body.model_dump(mode="python"),
+                            "verifier_metadata": (
+                                intent.verifier_metadata.model_dump(
+                                    mode="python"
+                                )
+                            ),
+                        }
+                    ),
+                    metadata=intent.verifier_metadata,
+                ),
+            )
+        ):
+            raise ArtifactSecurityError("resource creation intent binding is invalid")
+        return intent
+
+    def _finish_resource_creation_intent_anchored(
+        self,
+        *,
+        intent: _ResourceCreationIntent,
+        root_descriptor: int,
+        mission_descriptor: int,
+        mission_metadata: os.stat_result,
+    ) -> None:
+        self._require_current_mission_identity(
+            mission_id=intent.body.mission_id,
+            root_descriptor=root_descriptor,
+            mission_metadata=mission_metadata,
+            operation="resource creation commit",
+        )
+        current = self._load_resource_creation_intent_anchored(
+            mission_id=intent.body.mission_id,
+            resource_id=intent.body.resource_id,
+            mission_descriptor=mission_descriptor,
+        )
+        if current != intent:
+            raise ArtifactSecurityError("resource creation intent binding is invalid")
+        try:
+            os.unlink(
+                self._creation_intent_name(intent.body.resource_id),
+                dir_fd=mission_descriptor,
+            )
+            os.fsync(mission_descriptor)
+        except OSError as exc:
+            raise ArtifactSecurityError(
+                "resource creation commit failed"
+            ) from exc
+        self._require_current_mission_identity(
+            mission_id=intent.body.mission_id,
+            root_descriptor=root_descriptor,
+            mission_metadata=mission_metadata,
+            operation="resource creation commit",
+        )
 
     def _atomic_write(self, path: Path, data: bytes) -> None:
         mission_id = path.parent.name

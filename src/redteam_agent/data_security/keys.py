@@ -124,6 +124,12 @@ class EncryptionKeyProvider(Protocol):
 
     def destroy_resource_key(self, metadata: EncryptionMetadata) -> None: ...
 
+    def destroy_resource_keys_for_resource(
+        self,
+        domain: KeyDomain,
+        resource_id: str,
+    ) -> None: ...
+
     def resource_key_destroyed(self, metadata: EncryptionMetadata) -> bool: ...
 
 
@@ -391,6 +397,68 @@ class InMemoryEncryptionKeyProvider:
         self.set_rotation_state(
             metadata.key_domain, metadata.key_id, metadata.key_version, "destroyed"
         )
+
+    def destroy_resource_keys_for_resource(
+        self,
+        domain: KeyDomain,
+        resource_id: str,
+    ) -> None:
+        """Destroy and discard every key belonging to an uncommitted resource."""
+
+        self._destroy_resource_keys_for_resource(domain, resource_id)
+
+    def _destroy_resource_keys_for_resource(
+        self,
+        domain: KeyDomain,
+        resource_id: str,
+    ) -> None:
+        if not resource_id:
+            raise EncryptionKeyUnavailableError("resource key identity is invalid")
+        with self._lock:
+            maximum_generation = len(self._records) + 1
+            matches: list[tuple[tuple[KeyDomain, str, int], _KeyRecord]] = []
+            for generation in range(1, maximum_generation + 1):
+                key_id, separation_tag = self._resource_key_identity(
+                    domain=domain,
+                    resource_id=resource_id,
+                    generation=generation,
+                )
+                identity = (domain, key_id, 1)
+                record = self._records.get(identity)
+                if record is None:
+                    continue
+                if not (
+                    record.resource_key
+                    and record.metadata.key_id == key_id
+                    and record.metadata.key_version == 1
+                    and record.metadata.key_domain == domain
+                    and record.metadata.key_separation_tag == separation_tag
+                ):
+                    raise EncryptionKeyUnavailableError(
+                        "resource key binding is invalid"
+                    )
+                matches.append((identity, record))
+            discarded_identities = {identity for identity, _ in matches}
+            for identity, record in matches:
+                if record.material is not None:
+                    fingerprint = hmac.digest(
+                        b"redteam-key-equality-v1",
+                        record.material,
+                        "sha256",
+                    )
+                    record.material[:] = b"\x00" * len(record.material)
+                    self._material_fingerprints.discard(fingerprint)
+                self._records.pop(identity)
+                self._key_ids.discard(record.metadata.key_id)
+                self._separation_tags.discard(
+                    record.metadata.key_separation_tag
+                )
+            if discarded_identities:
+                self._used_nonces = {
+                    item
+                    for item in self._used_nonces
+                    if item[:3] not in discarded_identities
+                }
 
     def resource_key_destroyed(self, metadata: EncryptionMetadata) -> bool:
         identity = (metadata.key_domain, metadata.key_id, metadata.key_version)
@@ -718,6 +786,14 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
                 metadata.key_version,
                 "destroyed",
             )
+
+    def destroy_resource_keys_for_resource(
+        self,
+        domain: KeyDomain,
+        resource_id: str,
+    ) -> None:
+        with self._update_state():
+            self._destroy_resource_keys_for_resource(domain, resource_id)
 
     def get_active_key_metadata(self, domain: KeyDomain) -> EncryptionMetadata:
         self._refresh_if_idle()

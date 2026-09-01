@@ -70,7 +70,9 @@ _URI_SCHEME_START_BYTES = frozenset(
     b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 )
 _URI_SCHEME_BYTES = _URI_SCHEME_START_BYTES | frozenset(b"0123456789+.-")
+_MAX_URI_SCHEME_BYTES = 256
 _STRUCTURED_KEY_BYTES = _ASCII_WORD_BYTES | frozenset(b"-")
+_MAX_STRUCTURED_KEY_BYTES = 256
 _XML_TAG_NAME_BYTES = _STRUCTURED_KEY_BYTES | frozenset(b":.")
 _MAX_PENDING_SECRET_MATCH_BYTES = 64 * 1024
 _JSON_KEY_SIMPLE_ESCAPES = {
@@ -221,6 +223,8 @@ class _StreamingSecretRedactor:
             cursor = keyword_start
             while cursor < len(data) and data[cursor] in _STRUCTURED_KEY_BYTES:
                 cursor += 1
+                if cursor - keyword_start > _MAX_STRUCTURED_KEY_BYTES:
+                    return None
             if cursor == len(data):
                 return None if final else "incomplete"
             structured_key = data[keyword_start:cursor]
@@ -472,6 +476,8 @@ class _StreamingSecretRedactor:
         scheme_end = index + 1
         while scheme_end < len(data) and data[scheme_end] in _URI_SCHEME_BYTES:
             scheme_end += 1
+            if scheme_end - index > _MAX_URI_SCHEME_BYTES:
+                return None
         if scheme_end == len(data):
             return None if final else "incomplete"
         delimiter = b"://"

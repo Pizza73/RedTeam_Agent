@@ -1326,7 +1326,7 @@ def test_terminal_storage_and_key_failures_are_typed_for_recovery(
     original_seal = keys.seal_for_resource
 
     def fail_terminal_key(*args, **kwargs):
-        if str(args[1]).startswith("streamterminal_"):
+        if str(args[3]["resource_id"]).startswith("streamterminal_"):
             raise EncryptionKeyUnavailableError("simulated terminal key failure")
         return original_seal(*args, **kwargs)
 
@@ -1386,7 +1386,7 @@ def test_encrypted_store_fsyncs_parent_before_acknowledging_write(
         created_at=NOW,
         retention_until=NOW + timedelta(hours=1),
     )
-    assert directory_sync_attempts == 4
+    assert directory_sync_attempts == 7
     assert quarantine.resume(reference, now=NOW) == b"encrypted-result"
     assert tuple(
         event.event_type for event in audit_log.events_for("mission-durable")
@@ -1581,7 +1581,7 @@ def test_encrypted_store_fsyncs_store_root_for_first_mission_write(
         created_at=NOW,
         retention_until=NOW + timedelta(hours=1),
     )
-    assert directory_sync_attempts == 3
+    assert directory_sync_attempts == 5
     assert quarantine.resume(reference, now=NOW) == b"first-encrypted-result"
     assert tuple(
         event.event_type for event in audit_log.events_for("mission-first-write")
@@ -1639,7 +1639,7 @@ def test_encrypted_store_fsyncs_new_nested_root_before_acknowledging_write(
         created_at=NOW,
         retention_until=NOW + timedelta(hours=1),
     )
-    assert directory_sync_attempts == 6
+    assert directory_sync_attempts == 8
     assert quarantine.resume(reference, now=NOW) == b"new-store-encrypted-result"
     assert tuple(
         event.event_type for event in audit_log.events_for("mission-new-store")
@@ -5804,6 +5804,270 @@ def test_wrapped_key_state_limit_is_enforced_before_generation_commit(
     assert (
         restarted.get_active_key_metadata("artifact_store").key_id
         == "artifact_store-key-v1"
+    )
+
+
+@pytest.mark.parametrize("interruption", ("before_link", "after_link"))
+def test_resource_creation_reconciles_wrapped_keys_across_envelope_link_crashes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    interruption: Literal["before_link", "after_link"],
+) -> None:
+    key_directory = tmp_path / f"creation-{interruption}-keys"
+    key_directory.mkdir(mode=0o700)
+    key_state_path = key_directory / "provider.json"
+    generation_store = _GenerationStore()
+    keys = _wrapped_keys(
+        key_state_path,
+        generation_store=generation_store,
+    )
+    baseline_record_count = len(keys._records)
+    authorizer = _ExactEnvelopeAuthorizer()
+    mission_id = f"mission-creation-{interruption}"
+    execution_id = f"execution-creation-{interruption}"
+    authorizer.allow_ingestion_write(mission_id, execution_id)
+    audit = MissionAuditRecorder(
+        audit_log=MissionAuditLog(),
+        contexts=_AuditContexts(),
+    )
+    artifact_root = tmp_path / f"creation-{interruption}-artifacts"
+    initial = ArtifactStore(
+        root=artifact_root,
+        keys=keys,
+        authorizer=authorizer,
+        audit=audit,
+        max_item_bytes=4096,
+        mission_quota_bytes=16 * 1024,
+    )
+    content = b"resource-creation-crash-recovery"
+    captured_metadata = []
+    original_seal = keys.seal_for_resource
+
+    def capture_seal(*args, **kwargs):
+        payload = original_seal(*args, **kwargs)
+        captured_metadata.append(payload.metadata)
+        return payload
+
+    monkeypatch.setattr(keys, "seal_for_resource", capture_seal)
+    original_write = initial._store._atomic_write_anchored
+
+    class _SimulatedProcessCrash(BaseException):
+        pass
+
+    def interrupt_envelope_link(**kwargs) -> None:
+        if interruption == "after_link":
+            original_write(**kwargs)
+        raise _SimulatedProcessCrash
+
+    monkeypatch.setattr(
+        initial._store,
+        "_atomic_write_anchored",
+        interrupt_envelope_link,
+    )
+    with pytest.raises(_SimulatedProcessCrash):
+        initial.put(
+            mission_id=mission_id,
+            content=content,
+            media_type="text/plain",
+            classification="normal",
+            variant="redacted",
+            source_execution_id=execution_id,
+            created_at=NOW,
+        )
+
+    assert len(captured_metadata) == 1
+    mission_root = artifact_root / mission_id
+    assert len(list(mission_root.glob(".resource-creation-*.intent"))) == 1
+
+    restarted_keys = _wrapped_keys(
+        key_state_path,
+        generation_store=generation_store,
+    )
+    restarted = ArtifactStore(
+        root=artifact_root,
+        keys=restarted_keys,
+        authorizer=authorizer,
+        audit=audit,
+        max_item_bytes=4096,
+        mission_quota_bytes=16 * 1024,
+    )
+
+    assert not list(mission_root.glob(".resource-creation-*.intent"))
+    if interruption == "before_link":
+        assert len(restarted_keys._records) == baseline_record_count
+        with pytest.raises(
+            EncryptionKeyUnavailableError,
+            match="unavailable",
+        ):
+            restarted_keys.get_key_metadata(
+                captured_metadata[0].key_domain,
+                captured_metadata[0].key_id,
+                captured_metadata[0].key_version,
+            )
+    else:
+        assert len(restarted_keys._records) == baseline_record_count + 1
+        assert not restarted_keys.resource_key_destroyed(
+            captured_metadata[0]
+        )
+    recovered = restarted.put(
+        mission_id=mission_id,
+        content=content,
+        media_type="text/plain",
+        classification="normal",
+        variant="redacted",
+        source_execution_id=execution_id,
+        created_at=NOW,
+    )
+    if interruption == "before_link":
+        assert recovered.encryption_metadata_id != restarted_keys.metadata_id(
+            captured_metadata[0]
+        )
+    else:
+        assert recovered.encryption_metadata_id == restarted_keys.metadata_id(
+            captured_metadata[0]
+        )
+
+
+def test_atomic_envelope_failures_do_not_accumulate_wrapped_key_records(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key_directory = tmp_path / "creation-failure-keys"
+    key_directory.mkdir(mode=0o700)
+    keys = _wrapped_keys(
+        key_directory / "provider.json",
+        generation_store=_GenerationStore(),
+    )
+    baseline_record_count = len(keys._records)
+    authorizer = _ExactEnvelopeAuthorizer()
+    artifacts = ArtifactStore(
+        root=tmp_path / "creation-failure-artifacts",
+        keys=keys,
+        authorizer=authorizer,
+        audit=MissionAuditRecorder(
+            audit_log=MissionAuditLog(),
+            contexts=_AuditContexts(),
+        ),
+        max_item_bytes=4096,
+        mission_quota_bytes=16 * 1024,
+    )
+
+    def fail_envelope_write(**kwargs) -> None:
+        del kwargs
+        raise ArtifactSecurityError("simulated envelope write failure")
+
+    monkeypatch.setattr(
+        artifacts._store,
+        "_atomic_write_anchored",
+        fail_envelope_write,
+    )
+    for index in range(3):
+        mission_id = f"mission-creation-failure-{index}"
+        execution_id = f"execution-creation-failure-{index}"
+        authorizer.allow_ingestion_write(mission_id, execution_id)
+        with pytest.raises(ArtifactSecurityError, match="write failure"):
+            artifacts.put(
+                mission_id=mission_id,
+                content=f"failed-content-{index}".encode(),
+                media_type="text/plain",
+                classification="normal",
+                variant="redacted",
+                source_execution_id=execution_id,
+                created_at=NOW,
+            )
+        assert len(keys._records) == baseline_record_count
+        assert not list(
+            (artifacts._store._root / mission_id).glob(
+                ".resource-creation-*.intent"
+            )
+        )
+
+
+def test_long_ordinary_tokens_do_not_exhaust_uri_stream_lookahead(
+    tmp_path: Path,
+) -> None:
+    keys = _keys()
+    authorizer = _ExactEnvelopeAuthorizer()
+    audit = MissionAuditRecorder(
+        audit_log=MissionAuditLog(),
+        contexts=_AuditContexts(),
+    )
+    quarantine = EncryptedRawResultQuarantine(
+        root=tmp_path / "long-token-quarantine",
+        keys=keys,
+        audit=audit,
+        max_item_bytes=128 * 1024,
+        mission_quota_bytes=1024 * 1024,
+    )
+    artifacts = ArtifactStore(
+        root=tmp_path / "long-token-artifacts",
+        keys=keys,
+        authorizer=authorizer,
+        audit=audit,
+        max_item_bytes=128 * 1024,
+        mission_quota_bytes=1024 * 1024,
+    )
+    secret_store = SecretStore(
+        root=tmp_path / "long-token-secrets",
+        keys=keys,
+        authorizer=authorizer,
+        audit=audit,
+        max_item_bytes=4096,
+        mission_quota_bytes=64 * 1024,
+    )
+    ordinary_token = b"a" * (70 * 1024)
+
+    async def ingest(case: str, chunks: tuple[bytes, ...]) -> None:
+        mission_id = f"mission-long-token-{case}"
+        execution_id = f"execution-long-token-{case}"
+        authorizer.allow_ingestion_write(mission_id, execution_id)
+        sink = EncryptedRawResultSinkFactory(
+            quarantine=quarantine,
+            bindings=_StreamBindings(
+                QuarantineStreamBinding(
+                    mission_id=mission_id,
+                    mission_revision=1,
+                    execution_id=execution_id,
+                    retention_until=NOW + timedelta(hours=1),
+                    max_result_bytes=len(ordinary_token),
+                    resume_mode="from_start",
+                )
+            ),
+            clock=lambda: NOW,
+        ).for_execution(execution_id)
+        for chunk in chunks:
+            await sink.write_stdout(chunk)
+        receipt = await sink.commit()
+        result = await SecureIngestor(
+            quarantine=quarantine,
+            artifacts=artifacts,
+            secrets=secret_store,
+        ).ingest_stream(sink, receipt, now=NOW)
+        assert result.redaction_metadata.redaction_count == 0
+        assert not result.detected_secrets
+        artifact = result.redacted_artifacts[0]
+        authorizer.set_grants(
+            mission_id,
+            (
+                DataAccessGrant(
+                    resource_type="artifact",
+                    resource=ResourceBinding(
+                        resource_id=artifact.artifact_id,
+                        resource_version="1",
+                        resource_digest=artifact.sha256,
+                    ),
+                    operations=frozenset({"read"}),
+                ),
+            ),
+        )
+        assert artifacts.read(artifact, operation="read", now=NOW) == ordinary_token
+
+    asyncio.run(ingest("complete", (ordinary_token,)))
+    asyncio.run(
+        ingest(
+            "split",
+            (ordinary_token[:128], ordinary_token[128:]),
+        )
     )
 
 
