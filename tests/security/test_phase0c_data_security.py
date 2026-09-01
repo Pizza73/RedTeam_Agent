@@ -3411,6 +3411,49 @@ def test_executor_resumes_deleted_ingestion_without_recollecting_raw_chunks(
     assert adapter.collect_calls == 1
 
     current_time[0] = FIXED_TIME + timedelta(minutes=6)
+    original_erase = reconstructed._store.erase_resource
+    acknowledgment_id = reconstructed._ingestion_ack_resource_id()
+    interrupted_ack = False
+
+    def interrupt_ack_cleanup(*, mission_id: str, resource_id: str) -> None:
+        nonlocal interrupted_ack
+        acknowledgment_exists = reconstructed._store.has_resource(
+            mission_id=mission_id,
+            resource_id=acknowledgment_id,
+        )
+        original_erase(mission_id=mission_id, resource_id=resource_id)
+        if acknowledgment_exists and not interrupted_ack:
+            interrupted_ack = True
+            raise ArtifactSecurityError(
+                "simulated crash during persisted-result acknowledgment"
+            )
+
+    with monkeypatch.context() as crash:
+        crash.setattr(
+            reconstructed._store,
+            "erase_resource",
+            interrupt_ack_cleanup,
+        )
+        with pytest.raises(ArtifactSecurityError, match="acknowledgment"):
+            asyncio.run(
+                harness.executor.resume_result_ingestion(
+                    running.execution_id,
+                    ingester=EncryptedSecureResultIngester(
+                        ingestor=ingestor,
+                        sinks=sink_factory,
+                        clock=lambda: current_time[0],
+                    ),
+                    now=current_time[0],
+                )
+            )
+    assert interrupted_ack
+    assert harness.results.get_by_execution(running.execution_id) is not None
+    assert reconstructed._store.has_resource(
+        mission_id=prepared.mission_id,
+        resource_id=acknowledgment_id,
+    )
+
+    current_time[0] = FIXED_TIME + timedelta(minutes=7)
     recovered = asyncio.run(
         harness.executor.resume_result_ingestion(
             running.execution_id,
@@ -3431,6 +3474,25 @@ def test_executor_resumes_deleted_ingestion_without_recollecting_raw_chunks(
     assert final_ingestion is not None and final_ingestion.status == "SUCCEEDED"
     assert adapter.submit_calls == 1
     assert adapter.collect_calls == 2
+    quarantine_directory = (
+        quarantine._store._root / prepared.mission_id
+    )
+    assert not list(quarantine_directory.glob("*.json"))
+
+    repeated = asyncio.run(
+        harness.executor.resume_result_ingestion(
+            running.execution_id,
+            ingester=EncryptedSecureResultIngester(
+                ingestor=ingestor,
+                sinks=sink_factory,
+                clock=lambda: current_time[0] + timedelta(seconds=1),
+            ),
+            now=current_time[0] + timedelta(seconds=1),
+        )
+    )
+    assert repeated == recovered
+    assert adapter.collect_calls == 2
+    assert not list(quarantine_directory.glob("*.json"))
 
 
 def test_expired_non_stream_quarantine_is_erased_and_resumed_after_restart(
@@ -5684,3 +5746,250 @@ def test_completed_expiry_removes_intent_and_allows_safe_recreation(
             if event.event_type == "artifact.delete"
         ]
     ) == 2
+
+
+def test_wrapped_key_state_limit_is_enforced_before_generation_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key_directory = tmp_path / "bounded-wrapped-key-state"
+    key_directory.mkdir(mode=0o700)
+    state_path = key_directory / "provider.json"
+    generation_store = _GenerationStore()
+    provider = _wrapped_keys(
+        state_path,
+        generation_store=generation_store,
+    )
+    committed_generation = generation_store.current_generation()
+    committed_path = provider._state_path_for_generation(committed_generation)
+    committed_state = committed_path.read_bytes()
+    monkeypatch.setattr(
+        "redteam_agent.data_security.keys._MAX_WRAPPED_STATE_BYTES",
+        len(committed_state),
+    )
+
+    with pytest.raises(EncryptionKeyUnavailableError, match="provider limit"):
+        provider.seal_for_resource(
+            "artifact_store",
+            "artifact-state-limit-crossing",
+            b"threshold-crossing-content",
+            {"purpose": "wrapped-state-threshold"},
+            created_at=NOW + timedelta(minutes=1),
+        )
+
+    assert generation_store.current_generation() == committed_generation
+    assert committed_path.read_bytes() == committed_state
+    restarted = WrappedFileEncryptionKeyProvider(
+        state_path=state_path,
+        wrapping_key=b"wrapped-provider-root-key-material",
+        generation_store=generation_store,
+    )
+    assert (
+        restarted.get_active_key_metadata("artifact_store").key_id
+        == "artifact_store-key-v1"
+    )
+
+
+def test_connection_uri_credentials_are_redacted_complete_and_split(
+    tmp_path: Path,
+) -> None:
+    quarantine, artifacts, secrets, authorizer, _ = _stores(
+        tmp_path / "credential-uri"
+    )
+    complete_mission = "mission-uri-complete"
+    complete_execution = "execution-uri-complete"
+    complete_secret = b"complete-uri-password"
+    authorizer.allow_ingestion_write(complete_mission, complete_execution)
+    complete_reference = quarantine.commit(
+        mission_id=complete_mission,
+        mission_revision=1,
+        execution_id=complete_execution,
+        content=(
+            b"dsn=postgresql://alice:"
+            + complete_secret
+            + b"@database.local/app status=ok"
+        ),
+        created_at=NOW,
+        retention_until=NOW + timedelta(hours=1),
+    )
+    complete = SecureIngestor(
+        quarantine=quarantine,
+        artifacts=artifacts,
+        secrets=secrets,
+    ).ingest(complete_reference, now=NOW)
+    assert complete.redaction_metadata.redaction_count == 1
+    assert complete.detected_secrets[0].credential_type == "uri_password"
+    complete_artifact = complete.redacted_artifacts[0]
+    authorizer.set_grants(
+        complete_mission,
+        (
+            DataAccessGrant(
+                resource_type="artifact",
+                resource=ResourceBinding(
+                    resource_id=complete_artifact.artifact_id,
+                    resource_version="1",
+                    resource_digest=complete_artifact.sha256,
+                ),
+                operations=frozenset({"read"}),
+            ),
+        ),
+    )
+    complete_visible = artifacts.read(
+        complete_artifact,
+        operation="read",
+        now=NOW,
+    )
+    assert complete_secret not in complete_visible
+    assert b"postgresql://alice:[REDACTED]@database.local/app" in complete_visible
+
+    split_mission = "mission-uri-split"
+    split_execution = "execution-uri-split"
+    split_secret = b"split-uri-password"
+    authorizer.allow_ingestion_write(split_mission, split_execution)
+    split_binding = QuarantineStreamBinding(
+        mission_id=split_mission,
+        mission_revision=1,
+        execution_id=split_execution,
+        retention_until=NOW + timedelta(hours=1),
+        max_result_bytes=4096,
+        resume_mode="from_start",
+    )
+    split_sink = EncryptedRawResultSinkFactory(
+        quarantine=quarantine,
+        bindings=_StreamBindings(split_binding),
+        clock=lambda: NOW,
+    ).for_execution(split_execution)
+
+    async def ingest_split_uri():
+        await split_sink.write_stdout(b"cache=red")
+        await split_sink.write_stdout(b"is://worker:split-uri-")
+        await split_sink.write_stdout(b"password@cache.local/0 status=ok")
+        receipt = await split_sink.commit()
+        return await SecureIngestor(
+            quarantine=quarantine,
+            artifacts=artifacts,
+            secrets=secrets,
+        ).ingest_stream(split_sink, receipt, now=NOW)
+
+    split = asyncio.run(ingest_split_uri())
+    assert split.redaction_metadata.redaction_count == 1
+    assert split.detected_secrets[0].credential_type == "uri_password"
+    split_artifact = split.redacted_artifacts[0]
+    authorizer.set_grants(
+        split_mission,
+        (
+            DataAccessGrant(
+                resource_type="artifact",
+                resource=ResourceBinding(
+                    resource_id=split_artifact.artifact_id,
+                    resource_version="1",
+                    resource_digest=split_artifact.sha256,
+                ),
+                operations=frozenset({"read"}),
+            ),
+        ),
+    )
+    split_visible = artifacts.read(split_artifact, operation="read", now=NOW)
+    assert split_secret not in split_visible
+    assert b"redis://worker:[REDACTED]@cache.local/0" in split_visible
+
+
+def test_full_quota_quarantine_cleanup_survives_restart(
+    tmp_path: Path,
+) -> None:
+    keys = _keys()
+    audit = MissionAuditRecorder(
+        audit_log=MissionAuditLog(),
+        contexts=_AuditContexts(),
+    )
+    non_stream_root = tmp_path / "full-non-stream-quarantine"
+    non_stream = EncryptedRawResultQuarantine(
+        root=non_stream_root,
+        keys=keys,
+        audit=audit,
+        max_item_bytes=4096,
+        mission_quota_bytes=16 * 1024,
+    )
+    non_stream_mission = "mission-full-non-stream"
+    non_stream_reference = non_stream.commit(
+        mission_id=non_stream_mission,
+        mission_revision=1,
+        execution_id="execution-full-non-stream",
+        content=b"full-quota-non-stream-secret",
+        created_at=NOW,
+        retention_until=NOW + timedelta(minutes=5),
+    )
+    non_stream_usage = sum(
+        path.stat().st_size
+        for path in (non_stream_root / non_stream_mission).glob("*.json")
+    )
+    non_stream._store._mission_quota_bytes = non_stream_usage
+    with pytest.raises(ArtifactSecurityError, match="retention has expired"):
+        non_stream.resume(
+            non_stream_reference,
+            now=NOW + timedelta(minutes=5),
+        )
+    assert not list((non_stream_root / non_stream_mission).glob("*.json"))
+    EncryptedRawResultQuarantine(
+        root=non_stream_root,
+        keys=keys,
+        audit=audit,
+        max_item_bytes=4096,
+        mission_quota_bytes=non_stream_usage,
+        clock=lambda: NOW + timedelta(minutes=6),
+    )
+
+    stream_root = tmp_path / "full-stream-quarantine"
+    stream = EncryptedRawResultQuarantine(
+        root=stream_root,
+        keys=keys,
+        audit=audit,
+        max_item_bytes=4096,
+        mission_quota_bytes=16 * 1024,
+    )
+    stream_mission = "mission-full-stream"
+    stream_execution = "execution-full-stream"
+    stream_binding = QuarantineStreamBinding(
+        mission_id=stream_mission,
+        mission_revision=1,
+        execution_id=stream_execution,
+        retention_until=NOW + timedelta(minutes=5),
+        max_result_bytes=4096,
+        resume_mode="from_start",
+    )
+    current_time = [NOW]
+    stream_factory = EncryptedRawResultSinkFactory(
+        quarantine=stream,
+        bindings=_StreamBindings(stream_binding),
+        clock=lambda: current_time[0],
+    )
+
+    async def populate_stream() -> None:
+        sink = stream_factory.for_execution(stream_execution)
+        await sink.write_stdout(b"full-quota-stream-secret")
+        await sink.commit()
+
+    asyncio.run(populate_stream())
+    stream_usage = sum(
+        path.stat().st_size
+        for path in (stream_root / stream_mission).glob("*.json")
+    )
+    stream._store._mission_quota_bytes = stream_usage
+    current_time[0] = NOW + timedelta(minutes=5)
+    expired = stream_factory.for_execution(stream_execution)
+    assert expired._deleted
+    assert not list((stream_root / stream_mission).glob("streamchunk_*.json"))
+    assert not list((stream_root / stream_mission).glob("streamterminal_*.json"))
+    restarted_stream = EncryptedRawResultQuarantine(
+        root=stream_root,
+        keys=keys,
+        audit=audit,
+        max_item_bytes=4096,
+        mission_quota_bytes=stream_usage,
+    )
+    restarted = EncryptedRawResultSinkFactory(
+        quarantine=restarted_stream,
+        bindings=_StreamBindings(stream_binding),
+        clock=lambda: NOW + timedelta(minutes=6),
+    ).for_execution(stream_execution)
+    assert restarted._deleted

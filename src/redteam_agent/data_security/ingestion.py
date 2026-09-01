@@ -8,7 +8,11 @@ from typing import Literal
 
 from redteam_agent.canonical import sha256_digest, stable_id
 from redteam_agent.errors import SecretDetectionError, SecureIngestionError
-from redteam_agent.models.execution import RawResultReceipt, SecureIngestionSummary
+from redteam_agent.models.execution import (
+    ExecutionResult,
+    RawResultReceipt,
+    SecureIngestionSummary,
+)
 
 from .models import (
     ArtifactReference,
@@ -43,6 +47,18 @@ _SECRET_KEYWORDS = (
 )
 _AUTHORIZATION_HEADER = b"authorization"
 _SUPPORTED_AUTHORIZATION_SCHEMES = (b"bearer", b"basic")
+_SUPPORTED_CREDENTIAL_URI_SCHEMES = (
+    b"amqp",
+    b"ftp",
+    b"https",
+    b"http",
+    b"mariadb",
+    b"mongodb",
+    b"mysql",
+    b"postgresql",
+    b"postgres",
+    b"redis",
+)
 _PEM_BEGIN_PREFIX = b"-----BEGIN "
 _PEM_LABEL_SUFFIX = b"-----"
 _CREDENTIAL_KEY_COMPONENTS = (
@@ -158,6 +174,13 @@ class _StreamingSecretRedactor:
         )
         if header is not None:
             return header
+        credential_uri = _StreamingSecretRedactor._credential_uri_candidate(
+            data,
+            index,
+            final=final,
+        )
+        if credential_uri is not None:
+            return credential_uri
         authorization = _StreamingSecretRedactor._supported_scheme_candidate(
             data,
             index,
@@ -442,6 +465,70 @@ class _StreamingSecretRedactor:
                 raise SecretDetectionError("secret detection failed closed")
             decoded.extend(chr(codepoint).encode("utf-8"))
         return bytes(decoded)
+
+    @staticmethod
+    def _credential_uri_candidate(
+        data: bytes,
+        index: int,
+        *,
+        final: bool,
+    ) -> _SecretMatch | Literal["incomplete"] | None:
+        """Redact the password in a supported URI authority user-info component."""
+
+        available = data[index:].lower()
+        matching_schemes = tuple(
+            scheme
+            for scheme in _SUPPORTED_CREDENTIAL_URI_SCHEMES
+            if scheme.startswith(available)
+        )
+        if matching_schemes and all(
+            len(available) < len(scheme) for scheme in matching_schemes
+        ):
+            return None if final else "incomplete"
+        scheme = next(
+            (
+                candidate
+                for candidate in _SUPPORTED_CREDENTIAL_URI_SCHEMES
+                if available[: len(candidate)] == candidate
+            ),
+            None,
+        )
+        if scheme is None:
+            return None
+        scheme_end = index + len(scheme)
+        delimiter = b"://"
+        available_delimiter = data[scheme_end : scheme_end + len(delimiter)]
+        if delimiter.startswith(available_delimiter) and len(available_delimiter) < len(
+            delimiter
+        ):
+            return None if final else "incomplete"
+        if available_delimiter != delimiter:
+            return None
+        authority_start = scheme_end + len(delimiter)
+        cursor = authority_start
+        while cursor < len(data) and data[cursor] not in b"/?# \t\r\n\v\f\"'":
+            cursor += 1
+        if cursor == len(data) and not final:
+            return "incomplete"
+        authority = data[authority_start:cursor]
+        userinfo_end = authority.rfind(b"@")
+        if userinfo_end < 0:
+            return None
+        password_separator = authority.find(b":", 0, userinfo_end)
+        if password_separator < 0:
+            return None
+        secret_start = authority_start + password_separator + 1
+        secret_end = authority_start + userinfo_end
+        if secret_start == secret_end:
+            raise SecretDetectionError("secret detection failed closed")
+        return (
+            index,
+            scheme_end,
+            secret_start,
+            secret_end,
+            cursor,
+            b"uri_password",
+        )
 
     @staticmethod
     def _authorization_header_candidate(
@@ -907,4 +994,16 @@ class EncryptedSecureResultIngester:
             redacted_artifact_references=tuple(
                 artifact.artifact_id for artifact in result.redacted_artifacts
             ),
+        )
+
+    async def acknowledge_persisted(
+        self,
+        receipt: RawResultReceipt,
+        result: ExecutionResult,
+    ) -> None:
+        sink = self._sinks.for_execution(receipt.execution_id)
+        sink._acknowledge_persisted(
+            receipt,
+            result,
+            now=self._clock(),
         )

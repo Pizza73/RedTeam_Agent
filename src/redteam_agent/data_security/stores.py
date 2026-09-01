@@ -114,6 +114,62 @@ class _QuarantineExpiryIntent(StrictImmutableBoundaryModel):
     reference: QuarantineReference
 
 
+class _StreamDeletionBinding(StrictImmutableBoundaryModel):
+    record_type: Literal["stream_delete_intent"]
+    mission_revision: int = Field(ge=1)
+    stream_binding_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    execution_id: str = Field(min_length=1)
+    sink_id: str = Field(min_length=1)
+    chunk_count: int = Field(ge=0)
+    artifact_sequences: tuple[int, ...]
+    bytes_received: int = Field(ge=0)
+    aggregate_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    receipt_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    ingestion_id: str = Field(min_length=1)
+    ingestion_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+
+
+class _StreamAbortDeletionBinding(StrictImmutableBoundaryModel):
+    record_type: Literal["stream_abort_delete_intent"]
+    mission_revision: int = Field(ge=1)
+    stream_binding_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    execution_id: str = Field(min_length=1)
+    sink_id: str = Field(min_length=1)
+    chunk_count: int = Field(ge=0)
+    artifact_sequences: tuple[int, ...]
+    aggregate_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+
+
+class _StreamExpiryDeletionBinding(StrictImmutableBoundaryModel):
+    record_type: Literal["stream_expiry_delete_intent"]
+    mission_revision: int = Field(ge=1)
+    stream_binding_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    execution_id: str = Field(min_length=1)
+    sink_id: str = Field(min_length=1)
+    terminal_state: Literal["committed", "abandoned"]
+    chunk_count: int = Field(ge=0)
+    artifact_sequences: tuple[int, ...]
+    aggregate_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    receipt_digest: str | None = None
+
+
+class _StreamIngestionAckBinding(StrictImmutableBoundaryModel):
+    record_type: Literal["stream_ingestion_ack"]
+    mission_revision: int = Field(ge=1)
+    stream_binding_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    execution_id: str = Field(min_length=1)
+    sink_id: str = Field(min_length=1)
+    chunk_count: int = Field(ge=0)
+    artifact_sequences: tuple[int, ...]
+    aggregate_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    receipt_id: str = Field(min_length=1)
+    receipt_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    ingestion_id: str = Field(min_length=1)
+    ingestion_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    execution_result_id: str = Field(min_length=1)
+    execution_result_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+
+
 class _ArtifactStreamChunkBinding(StrictImmutableBoundaryModel):
     record_type: Literal["artifact_stream_chunk"]
     stream_id: str = Field(min_length=1)
@@ -285,6 +341,80 @@ class _EncryptedFileStore:
         if not (
             resource_id == expected_id
             and intent.reference.mission_id == mission_id
+            and binding == intent.model_dump(mode="json")
+        ):
+            raise ArtifactSecurityError("cleanup record binding is invalid")
+        return self._write(
+            mission_id=mission_id,
+            resource_id=resource_id,
+            content=b"",
+            binding=binding,
+            created_at=created_at,
+            retention_until=None,
+            enforce_quota=False,
+        )
+
+    def write_quarantine_cleanup_intent(
+        self,
+        *,
+        mission_id: str,
+        resource_id: str,
+        binding: dict[str, object],
+        created_at: datetime,
+    ) -> tuple[str, str]:
+        """Persist only a strictly typed quarantine cleanup record outside quota."""
+
+        record_type = binding.get("record_type")
+        model_type: type[StrictImmutableBoundaryModel]
+        if record_type == "quarantine_expiry_intent":
+            model_type = _QuarantineExpiryIntent
+        elif record_type == "stream_delete_intent":
+            model_type = _StreamDeletionBinding
+        elif record_type == "stream_abort_delete_intent":
+            model_type = _StreamAbortDeletionBinding
+        elif record_type == "stream_expiry_delete_intent":
+            model_type = _StreamExpiryDeletionBinding
+        elif record_type == "stream_ingestion_ack":
+            model_type = _StreamIngestionAckBinding
+        else:
+            raise ArtifactSecurityError("cleanup record binding is invalid")
+        try:
+            intent = model_type.model_validate_json(
+                canonicalize(binding),
+                strict=True,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ArtifactSecurityError("cleanup record binding is invalid") from exc
+        if isinstance(intent, _QuarantineExpiryIntent):
+            expected_id = stable_id(
+                "quarantineexpiry",
+                {
+                    "schema_version": "quarantine-expiry-intent-v1",
+                    "quarantine_id": intent.reference.quarantine_id,
+                },
+            )
+            bound_mission_id = intent.reference.mission_id
+        else:
+            stream_intent = intent
+            identity_schema = (
+                "stream-ingestion-ack-v1"
+                if isinstance(stream_intent, _StreamIngestionAckBinding)
+                else "stream-deletion-intent-v1"
+            )
+            expected_id = stable_id(
+                "streamack"
+                if isinstance(stream_intent, _StreamIngestionAckBinding)
+                else "streamdeletion",
+                {
+                    "schema_version": identity_schema,
+                    "execution_id": stream_intent.execution_id,
+                    "sink_id": stream_intent.sink_id,
+                },
+            )
+            bound_mission_id = mission_id
+        if not (
+            resource_id == expected_id
+            and mission_id == bound_mission_id
             and binding == intent.model_dump(mode="json")
         ):
             raise ArtifactSecurityError("cleanup record binding is invalid")
@@ -1667,13 +1797,11 @@ class EncryptedRawResultQuarantine:
                 record_type="quarantine_expiry_intent",
                 reference=reference,
             )
-            self._store.write(
+            self._store.write_quarantine_cleanup_intent(
                 mission_id=reference.mission_id,
                 resource_id=intent_id,
-                content=b"",
                 binding=intent.model_dump(mode="json"),
                 created_at=now,
-                retention_until=None,
             )
         intent = self._load_expiry_intent(
             mission_id=reference.mission_id,

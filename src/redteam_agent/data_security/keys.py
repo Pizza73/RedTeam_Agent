@@ -935,6 +935,10 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
                 authentication_tag=self._encode(tag),
             ).model_dump(mode="python")
         )
+        if len(wrapped) > _MAX_WRAPPED_STATE_BYTES:
+            raise EncryptionKeyUnavailableError(
+                "key-state file exceeds provider limit"
+            )
         target_path = self._state_path_for_generation(generation)
         self._write_wrapped_state_locked(
             target_path,

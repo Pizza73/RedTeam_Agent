@@ -27,13 +27,21 @@ from redteam_agent.errors import (
 from redteam_agent.models.base import StrictImmutableBoundaryModel
 from redteam_agent.models.common import UtcDatetime
 from redteam_agent.models.execution import (
+    ExecutionResult,
     RawArtifactMetadata,
     RawResultReceipt,
     RawResultRecoveryMetadata,
 )
 
 from .models import SecureIngestionResult
-from .stores import EncryptedRawResultQuarantine, _StoredEnvelope
+from .stores import (
+    EncryptedRawResultQuarantine,
+    _StoredEnvelope,
+    _StreamAbortDeletionBinding,
+    _StreamDeletionBinding,
+    _StreamExpiryDeletionBinding,
+    _StreamIngestionAckBinding,
+)
 
 
 class QuarantineStreamBinding(StrictImmutableBoundaryModel):
@@ -110,44 +118,6 @@ class _ArtifactTerminalBinding(StrictImmutableBoundaryModel):
     chunk_bindings_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
 
 
-class _DeletionBinding(StrictImmutableBoundaryModel):
-    record_type: Literal["stream_delete_intent"]
-    mission_revision: int = Field(ge=1)
-    stream_binding_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
-    execution_id: str = Field(min_length=1)
-    sink_id: str = Field(min_length=1)
-    chunk_count: int = Field(ge=0)
-    bytes_received: int = Field(ge=0)
-    aggregate_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
-    receipt_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
-    ingestion_id: str = Field(min_length=1)
-    ingestion_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
-
-
-class _AbortDeletionBinding(StrictImmutableBoundaryModel):
-    record_type: Literal["stream_abort_delete_intent"]
-    mission_revision: int = Field(ge=1)
-    stream_binding_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
-    execution_id: str = Field(min_length=1)
-    sink_id: str = Field(min_length=1)
-    chunk_count: int = Field(ge=0)
-    artifact_sequences: tuple[int, ...]
-    aggregate_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
-
-
-class _ExpiryDeletionBinding(StrictImmutableBoundaryModel):
-    record_type: Literal["stream_expiry_delete_intent"]
-    mission_revision: int = Field(ge=1)
-    stream_binding_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
-    execution_id: str = Field(min_length=1)
-    sink_id: str = Field(min_length=1)
-    terminal_state: Literal["committed", "abandoned"]
-    chunk_count: int = Field(ge=0)
-    artifact_sequences: tuple[int, ...]
-    aggregate_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
-    receipt_digest: str | None = None
-
-
 class _IngestionResultBinding(StrictImmutableBoundaryModel):
     record_type: Literal["stream_ingestion_result"]
     mission_revision: int = Field(ge=1)
@@ -201,6 +171,12 @@ class EncryptedRawResultSink:
         self._deleted_bytes_received: int | None = None
         self._deleted_chunk_count: int | None = None
         self.max_observed_chunk_bytes = 0
+        if self._store.has_resource(
+            mission_id=self.binding.mission_id,
+            resource_id=self._ingestion_ack_resource_id(),
+        ):
+            self._resume_ingestion_ack()
+            return
         if self._store.has_resource(
             mission_id=self.binding.mission_id,
             resource_id=self._deletion_resource_id(),
@@ -667,28 +643,129 @@ class EncryptedRawResultSink:
         terminal = _TerminalBinding.model_validate(
             self._terminal_envelope.binding.to_dict()
         )
-        intent = _DeletionBinding(
+        intent = _StreamDeletionBinding(
             record_type="stream_delete_intent",
             mission_revision=self.binding.mission_revision,
             stream_binding_digest=self._binding_digest,
             execution_id=self.execution_id,
             sink_id=self.sink_id,
             chunk_count=len(self._chunks),
+            artifact_sequences=tuple(sorted(self._artifact_terminals)),
             bytes_received=self.bytes_received,
             aggregate_digest=terminal.aggregate_digest,
             receipt_digest=self._receipt.receipt_digest,
             ingestion_id=self._ingestion_result.ingestion_id,
             ingestion_digest=self._ingestion_result.ingestion_digest,
         )
-        self._store.write(
+        self._store.write_quarantine_cleanup_intent(
             mission_id=self.binding.mission_id,
             resource_id=self._deletion_resource_id(),
-            content=b"",
-            binding=intent.model_dump(mode="python"),
+            binding=intent.model_dump(mode="json"),
             created_at=now,
-            retention_until=None,
         )
         self._resume_deletion()
+
+    def _acknowledge_persisted(
+        self,
+        receipt: RawResultReceipt,
+        result: ExecutionResult,
+        *,
+        now: datetime,
+    ) -> None:
+        """Reclaim replay metadata only after the Executor persisted its result."""
+
+        if not (
+            receipt.execution_id == self.execution_id
+            and receipt.quarantine_id == self.quarantine_id
+            and receipt.sink_id == self.sink_id
+            and result.execution_id == self.execution_id
+        ):
+            raise RawResultQuarantineError(
+                "execution-result acknowledgment binding is invalid"
+            )
+        if self._store.has_resource(
+            mission_id=self.binding.mission_id,
+            resource_id=self._ingestion_ack_resource_id(),
+        ):
+            self._resume_ingestion_ack()
+            return
+        if not self._store.has_resource(
+            mission_id=self.binding.mission_id,
+            resource_id=self._deletion_resource_id(),
+        ):
+            if not self._audit.operation_recorded(
+                mission_id=self.binding.mission_id,
+                resource_type="raw_result_quarantine",
+                resource_id=self.quarantine_id,
+                operation="delete",
+                operation_id=self._audit_operation_id("delete", "intent"),
+                metadata_digest=receipt.receipt_digest,
+            ):
+                raise RawResultQuarantineError(
+                    "execution-result acknowledgment is unavailable"
+                )
+            self._deleted = True
+            return
+        if not self._deleted:
+            self._resume_deletion()
+        if (
+            self._receipt is None
+            or self._ingestion_result is None
+            or self._terminal_envelope is None
+        ):
+            raise RawResultQuarantineError(
+                "execution-result acknowledgment source is unavailable"
+            )
+        if not (
+            self._receipt == receipt
+            and self._ingestion_result.ingestion_id == result.secure_ingestion_id
+        ):
+            raise RawResultQuarantineError(
+                "execution-result acknowledgment binding is invalid"
+            )
+        terminal = _TerminalBinding.model_validate(
+            self._terminal_envelope.binding.to_dict()
+        )
+        intent_raw, _ = self._store.read_bound(
+            mission_id=self.binding.mission_id,
+            resource_id=self._deletion_resource_id(),
+            now=None,
+        )
+        if intent_raw:
+            raise RawResultQuarantineError("deletion intent content is invalid")
+        deletion_intent = _StreamDeletionBinding.model_validate_json(
+            canonicalize(
+                self._store.verified_envelope(
+                    mission_id=self.binding.mission_id,
+                    resource_id=self._deletion_resource_id(),
+                    now=None,
+                ).binding.to_dict()
+            ),
+            strict=True,
+        )
+        acknowledgment = _StreamIngestionAckBinding(
+            record_type="stream_ingestion_ack",
+            mission_revision=self.binding.mission_revision,
+            stream_binding_digest=self._binding_digest,
+            execution_id=self.execution_id,
+            sink_id=self.sink_id,
+            chunk_count=deletion_intent.chunk_count,
+            artifact_sequences=deletion_intent.artifact_sequences,
+            aggregate_digest=terminal.aggregate_digest,
+            receipt_id=receipt.receipt_id,
+            receipt_digest=receipt.receipt_digest,
+            ingestion_id=self._ingestion_result.ingestion_id,
+            ingestion_digest=self._ingestion_result.ingestion_digest,
+            execution_result_id=result.result_id,
+            execution_result_digest=result.result_digest,
+        )
+        self._store.write_quarantine_cleanup_intent(
+            mission_id=self.binding.mission_id,
+            resource_id=self._ingestion_ack_resource_id(),
+            binding=acknowledgment.model_dump(mode="json"),
+            created_at=now,
+        )
+        self._resume_ingestion_ack()
 
     def _capture_write_failure(
         self,
@@ -1087,6 +1164,16 @@ class EncryptedRawResultSink:
             },
         )
 
+    def _ingestion_ack_resource_id(self) -> str:
+        return stable_id(
+            "streamack",
+            {
+                "schema_version": "stream-ingestion-ack-v1",
+                "execution_id": self.execution_id,
+                "sink_id": self.sink_id,
+            },
+        )
+
     def _ingestion_result_resource_id(self) -> str:
         return stable_id(
             "streamingestion",
@@ -1129,8 +1216,11 @@ class EncryptedRawResultSink:
                 "deletion intent lacks a durable ingestion result"
             )
         try:
-            intent = _DeletionBinding.model_validate(value)
-        except ValueError as exc:
+            intent = _StreamDeletionBinding.model_validate_json(
+                canonicalize(value),
+                strict=True,
+            )
+        except (TypeError, ValueError) as exc:
             raise RawResultQuarantineError("deletion intent is invalid") from exc
         terminal_raw, terminal_envelope = self._store.read_bound(
             mission_id=self.binding.mission_id,
@@ -1153,6 +1243,9 @@ class EncryptedRawResultSink:
             and intent.stream_binding_digest == self._binding_digest
             and intent.execution_id == self.execution_id
             and intent.sink_id == self.sink_id
+            and intent.artifact_sequences
+            == tuple(sorted(set(intent.artifact_sequences)))
+            and all(sequence >= 0 for sequence in intent.artifact_sequences)
             and terminal.record_type == "stream_commit"
             and terminal.chunk_count == intent.chunk_count
             and intent.bytes_received <= self.binding.max_result_bytes
@@ -1195,6 +1288,120 @@ class EncryptedRawResultSink:
             )
         self._deleted = True
 
+    def _resume_ingestion_ack(self) -> None:
+        raw, envelope = self._store.read_bound(
+            mission_id=self.binding.mission_id,
+            resource_id=self._ingestion_ack_resource_id(),
+            now=None,
+        )
+        if raw:
+            raise RawResultQuarantineError(
+                "execution-result acknowledgment content is invalid"
+            )
+        try:
+            acknowledgment = _StreamIngestionAckBinding.model_validate_json(
+                canonicalize(envelope.binding.to_dict()),
+                strict=True,
+            )
+        except (TypeError, ValueError) as exc:
+            raise RawResultQuarantineError(
+                "execution-result acknowledgment is invalid"
+            ) from exc
+        if not (
+            acknowledgment.mission_revision == self.binding.mission_revision
+            and acknowledgment.stream_binding_digest == self._binding_digest
+            and acknowledgment.execution_id == self.execution_id
+            and acknowledgment.sink_id == self.sink_id
+            and acknowledgment.artifact_sequences
+            == tuple(sorted(set(acknowledgment.artifact_sequences)))
+            and all(
+                sequence >= 0
+                for sequence in acknowledgment.artifact_sequences
+            )
+        ):
+            raise RawResultQuarantineError(
+                "execution-result acknowledgment binding is invalid"
+            )
+        deletion_resource_id = self._deletion_resource_id()
+        if self._store.has_resource(
+            mission_id=self.binding.mission_id,
+            resource_id=deletion_resource_id,
+        ):
+            deletion_raw, deletion_envelope = self._store.read_bound(
+                mission_id=self.binding.mission_id,
+                resource_id=deletion_resource_id,
+                now=None,
+            )
+            if deletion_raw:
+                raise RawResultQuarantineError("deletion intent content is invalid")
+            try:
+                deletion = _StreamDeletionBinding.model_validate_json(
+                    canonicalize(deletion_envelope.binding.to_dict()),
+                    strict=True,
+                )
+            except (TypeError, ValueError) as exc:
+                raise RawResultQuarantineError("deletion intent is invalid") from exc
+            if not (
+                deletion.mission_revision == acknowledgment.mission_revision
+                and deletion.stream_binding_digest
+                == acknowledgment.stream_binding_digest
+                and deletion.execution_id == acknowledgment.execution_id
+                and deletion.sink_id == acknowledgment.sink_id
+                and deletion.chunk_count == acknowledgment.chunk_count
+                and deletion.artifact_sequences
+                == acknowledgment.artifact_sequences
+                and deletion.aggregate_digest == acknowledgment.aggregate_digest
+                and deletion.receipt_digest == acknowledgment.receipt_digest
+                and deletion.ingestion_id == acknowledgment.ingestion_id
+                and deletion.ingestion_digest == acknowledgment.ingestion_digest
+            ):
+                raise RawResultQuarantineError(
+                    "execution-result acknowledgment binding is invalid"
+                )
+        if not self._audit.operation_recorded(
+            mission_id=self.binding.mission_id,
+            resource_type="raw_result_quarantine",
+            resource_id=self.quarantine_id,
+            operation="delete",
+            operation_id=self._audit_operation_id("delete", "intent"),
+            metadata_digest=acknowledgment.receipt_digest,
+        ):
+            raise RawResultQuarantineError(
+                "execution-result acknowledgment lacks deletion evidence"
+            )
+        for sequence in range(acknowledgment.chunk_count):
+            self._store.erase_resource(
+                mission_id=self.binding.mission_id,
+                resource_id=self._chunk_resource_id(sequence),
+            )
+        for artifact_sequence in acknowledgment.artifact_sequences:
+            self._store.erase_resource(
+                mission_id=self.binding.mission_id,
+                resource_id=self._artifact_terminal_resource_id(
+                    artifact_sequence
+                ),
+            )
+        for resource_id in (
+            self._terminal_resource_id("commit"),
+            self._ingestion_result_resource_id(),
+            deletion_resource_id,
+        ):
+            self._store.erase_resource(
+                mission_id=self.binding.mission_id,
+                resource_id=resource_id,
+            )
+        self._store.erase_resource(
+            mission_id=self.binding.mission_id,
+            resource_id=self._ingestion_ack_resource_id(),
+        )
+        self._chunks.clear()
+        self._artifact_terminals.clear()
+        self._receipt = None
+        self._ingestion_result = None
+        self._ingestion_binding = None
+        self._terminal_envelope = None
+        self._deleted = True
+
     def _delete_expired(self, *, now: datetime) -> None:
         if self._deleted:
             return
@@ -1206,7 +1413,7 @@ class EncryptedRawResultSink:
         ):
             self._resume_deletion()
             return
-        intent = _ExpiryDeletionBinding(
+        intent = _StreamExpiryDeletionBinding(
             record_type="stream_expiry_delete_intent",
             mission_revision=self.binding.mission_revision,
             stream_binding_digest=self._binding_digest,
@@ -1222,13 +1429,11 @@ class EncryptedRawResultSink:
                 None if self._receipt is None else self._receipt.receipt_digest
             ),
         )
-        self._store.write(
+        self._store.write_quarantine_cleanup_intent(
             mission_id=self.binding.mission_id,
             resource_id=self._deletion_resource_id(),
-            content=b"",
-            binding=intent.model_dump(mode="python"),
+            binding=intent.model_dump(mode="json"),
             created_at=now,
-            retention_until=None,
         )
         self._resume_deletion()
 
@@ -1239,7 +1444,7 @@ class EncryptedRawResultSink:
         envelope: _StoredEnvelope,
     ) -> None:
         try:
-            intent = _ExpiryDeletionBinding.model_validate_json(
+            intent = _StreamExpiryDeletionBinding.model_validate_json(
                 canonicalize(value),
                 strict=True,
             )
@@ -1333,7 +1538,7 @@ class EncryptedRawResultSink:
         terminal = _TerminalBinding.model_validate(
             self._terminal_envelope.binding.to_dict()
         )
-        intent = _AbortDeletionBinding(
+        intent = _StreamAbortDeletionBinding(
             record_type="stream_abort_delete_intent",
             mission_revision=self.binding.mission_revision,
             stream_binding_digest=self._binding_digest,
@@ -1343,13 +1548,11 @@ class EncryptedRawResultSink:
             artifact_sequences=tuple(sorted(self._artifact_terminals)),
             aggregate_digest=terminal.aggregate_digest,
         )
-        self._store.write(
+        self._store.write_quarantine_cleanup_intent(
             mission_id=self.binding.mission_id,
             resource_id=self._deletion_resource_id(),
-            content=b"",
-            binding=intent.model_dump(mode="python"),
+            binding=intent.model_dump(mode="json"),
             created_at=now,
-            retention_until=None,
         )
         self._resume_deletion()
 
@@ -1360,7 +1563,7 @@ class EncryptedRawResultSink:
         envelope: _StoredEnvelope,
     ) -> None:
         try:
-            intent = _AbortDeletionBinding.model_validate_json(
+            intent = _StreamAbortDeletionBinding.model_validate_json(
                 canonicalize(value),
                 strict=True,
             )

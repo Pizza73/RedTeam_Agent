@@ -635,19 +635,26 @@ class Executor:
         ingester: SecureResultIngester,
         now: datetime,
     ) -> ExecutionResult:
-        adapter_result = await self.collect_result(execution_id, now=now)
         record = self._require_execution(execution_id)
         ingestion = self.ingestions.get_by_execution(execution_id)
-        if ingestion is None:
-            raise ExecutionStateTransitionError("result ingestion does not exist")
         existing = self.results.get_by_execution(execution_id)
         if existing is not None:
+            if ingestion is None:
+                raise ExecutionStateTransitionError(
+                    "existing result lacks its result-ingestion record"
+                )
+            receipt = self.receipts.get_by_execution(execution_id)
+            if receipt is None:
+                raise ExecutionStateTransitionError(
+                    "existing result lacks its durable raw-result receipt"
+                )
             if ingestion.status not in {"INGESTING", "SUCCEEDED"} or (
                 record.result_ingestion_state not in {"INGESTING", "SUCCEEDED"}
             ):
                 raise ExecutionStateTransitionError(
                     "existing result has inconsistent ingestion state"
                 )
+            await ingester.acknowledge_persisted(receipt, existing)
             if ingestion.status == "INGESTING":
                 ingestion = self.ingestions.transition(
                     ingestion.ingestion_id,
@@ -663,6 +670,11 @@ class Executor:
                     now=now,
                 )
             return existing
+        adapter_result = await self.collect_result(execution_id, now=now)
+        record = self._require_execution(execution_id)
+        ingestion = self.ingestions.get_by_execution(execution_id)
+        if ingestion is None:
+            raise ExecutionStateTransitionError("result ingestion does not exist")
         if ingestion.status not in {"PENDING", "FAILED", "INGESTING"}:
             raise ExecutionStateTransitionError("result ingestion is not resumable")
         lease_id = stable_id(
@@ -729,6 +741,7 @@ class Executor:
             raise
         result = self._normalize_result(record, adapter_result, summary)
         self.results.add(result)
+        await ingester.acknowledge_persisted(adapter_result.receipt, result)
         completed = self.ingestions.transition(
             active.ingestion_id,
             expected_state_version=active.state_version,

@@ -5,11 +5,21 @@ from __future__ import annotations
 from typing import Protocol
 
 from redteam_agent.errors import ResultIngestionError
-from redteam_agent.models.execution import RawResultReceipt, SecureIngestionSummary
+from redteam_agent.models.execution import (
+    ExecutionResult,
+    RawResultReceipt,
+    SecureIngestionSummary,
+)
 
 
 class SecureResultIngester(Protocol):
     async def ingest(self, receipt: RawResultReceipt) -> SecureIngestionSummary: ...
+
+    async def acknowledge_persisted(
+        self,
+        receipt: RawResultReceipt,
+        result: ExecutionResult,
+    ) -> None: ...
 
 
 class MockSecureResultIngester:
@@ -32,3 +42,10 @@ class MockSecureResultIngester:
             self._fail = False
             raise ResultIngestionError("mock secure ingestion failed")
         return self._summary
+
+    async def acknowledge_persisted(
+        self,
+        receipt: RawResultReceipt,
+        result: ExecutionResult,
+    ) -> None:
+        del receipt, result

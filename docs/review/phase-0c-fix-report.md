@@ -1521,3 +1521,116 @@ PHASE_GATE=phase-0c PASS
 - No protected governance file was modified.
 - A fresh independent Phase 0C review remains required on the resulting 40-character PR HEAD; this
   local PASS is not an independent Phase Gate PASS.
+
+## Twenty-fourth independent review correction cycle
+
+Current phase: `phase-0c`.
+
+Input review SHA: `a4b391a7475d47709010c8d300c86d9962c0d227`.
+
+Phase base: `5cda9a5f8792ee33c3e153d8e791499f5619d82e`.
+
+### Findings addressed
+
+- [`discussion_r3900470887`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3900470887):
+  the wrapped key-state provider now rejects an oversized serialized state before writing either
+  alternating state file and before advancing the external generation CAS. The threshold-crossing
+  regression fixes the limit at the current committed file size, proves the next resource-key write
+  is rejected without changing the generation or committed bytes, and reconstructs the provider
+  from that still-readable generation.
+- [`discussion_r3900470897`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3900470897):
+  non-stream expiry and all streaming delete/abort/expiry intents now use a cleanup-only writer that
+  accepts only strict typed bindings with their exact deterministic resource ID. Caller data cannot
+  use this path, while an exact-full quota can no longer prevent cryptographic erasure. Both
+  non-stream and streaming full-quota lifecycles are exercised through restart.
+- [`discussion_r3900470908`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3900470908):
+  the secure-ingestion contract now has an Executor-only acknowledgment after the immutable
+  `ExecutionResult` is persisted. A result-bound, quota-independent temporary ACK makes reclamation
+  of chunks, artifact terminals, the commit terminal, ingestion result, deletion intent, and ACK
+  itself idempotent across crashes. Existing persisted results are resumed before provider
+  recollection, and exact trusted delete-audit evidence makes repeated acknowledgment safe after all
+  temporary records are gone.
+- [`discussion_r3900470912`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3900470912):
+  the streaming secret grammar recognizes supported credential-bearing URI authorities and replaces
+  only the password portion of `scheme://user:password@host`. Complete PostgreSQL and arbitrarily
+  split Redis regressions verify `uri_password` secret references and prove the password never
+  reaches the readable redacted Artifact.
+
+### Modified files and regression tests
+
+Resulting working-tree diff: `8 files changed, 952 insertions(+), 66 deletions(-)`.
+
+- `src/redteam_agent/data_security/ingestion.py`
+- `src/redteam_agent/data_security/keys.py`
+- `src/redteam_agent/data_security/stores.py`
+- `src/redteam_agent/data_security/streaming.py`
+- `src/redteam_agent/executor/ingestion.py`
+- `src/redteam_agent/executor/service.py`
+- `tests/security/test_phase0c_data_security.py`
+- `docs/review/phase-0c-fix-report.md`
+
+Regression coverage exercises the wrapped-state threshold before CAS, complete and split connection
+URI credentials, exact-full non-stream and streaming quarantine expiry, and an Executor result that
+is persisted immediately before cleanup is interrupted. Restart consumes the temporary ACK, removes
+all quarantine metadata, and a repeated successful resume neither recollects provider output nor
+recreates metadata. No test was deleted, skipped, weakened, or marked as an expected failure.
+
+### Validation
+
+Focused regression command:
+
+```text
+/home/kali/Red_Agent/.venv/bin/python -m pytest -q \
+  tests/security/test_phase0c_data_security.py \
+  -k 'wrapped_key_state_limit_is_enforced or connection_uri_credentials \
+      or full_quota_quarantine_cleanup or executor_resumes_deleted_ingestion'
+```
+
+Result: `4 passed, 60 deselected`.
+
+Phase 0C data-security module: `64 passed`.
+
+Executor integration and safety regression command:
+
+```text
+/home/kali/Red_Agent/.venv/bin/python -m pytest -q \
+  tests/integration/test_phase0b_flow.py \
+  tests/security/test_phase0b_execution_safety.py
+```
+
+Result: `40 passed`.
+
+Required phase-gate command:
+
+```text
+PATH="/home/kali/Red_Agent/.venv/bin:$PATH" \
+  bash scripts/ci/run_phase_gate.sh phase-0c
+```
+
+Result:
+
+```text
+AUTOMATION_VALIDATION=PASS
+ruff: All checks passed
+mypy: Success: no issues found in 78 source files
+unit: 200 passed
+integration: 7 passed
+security: 210 passed
+full/coverage run: 417 passed
+skipped=0, errors=0, failures=0
+coverage: 81% total (branch coverage enabled)
+pip check: No broken requirements found
+PHASE_GATE=phase-0c PASS
+```
+
+### Remaining constraints
+
+- URI user-info detection is deliberately limited to the explicit supported connection and network
+  schemes; an unrecognized scheme is not treated as authorization evidence.
+- The key-state and audit-head external generation adapters remain integration boundaries supplied by
+  an OS keystore, vault, or equivalently protected monotonic service.
+- No real C2, MCP, provider, subprocess, local-attack, credential-collection, or external-target
+  action was executed.
+- No protected governance file was modified.
+- A fresh independent Phase 0C review remains required on the resulting 40-character PR HEAD; this
+  local PASS is not an independent Phase Gate PASS.
