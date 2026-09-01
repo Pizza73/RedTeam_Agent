@@ -3366,23 +3366,53 @@ def test_artifact_quota_is_serialized_across_store_instances(
     release_first_write = Event()
     second_call_started = Event()
     second_atomic_started = Event()
-    original_first_atomic_write = first_store._store._atomic_write
-    original_second_atomic_write = second_store._store._atomic_write
+    original_first_atomic_write = first_store._store._atomic_write_anchored
+    original_second_atomic_write = second_store._store._atomic_write_anchored
 
-    def pause_first_atomic_write(path: Path, data: bytes) -> None:
+    def pause_first_atomic_write(
+        *,
+        path: Path,
+        data: bytes,
+        root_descriptor: int,
+        mission_descriptor: int,
+        mission_metadata: os.stat_result,
+    ) -> None:
         first_atomic_started.set()
         if not release_first_write.wait(timeout=5):
             raise AssertionError("timed out waiting to release the first write")
-        original_first_atomic_write(path, data)
+        original_first_atomic_write(
+            path=path,
+            data=data,
+            root_descriptor=root_descriptor,
+            mission_descriptor=mission_descriptor,
+            mission_metadata=mission_metadata,
+        )
 
-    def observe_second_atomic_write(path: Path, data: bytes) -> None:
+    def observe_second_atomic_write(
+        *,
+        path: Path,
+        data: bytes,
+        root_descriptor: int,
+        mission_descriptor: int,
+        mission_metadata: os.stat_result,
+    ) -> None:
         second_atomic_started.set()
-        original_second_atomic_write(path, data)
+        original_second_atomic_write(
+            path=path,
+            data=data,
+            root_descriptor=root_descriptor,
+            mission_descriptor=mission_descriptor,
+            mission_metadata=mission_metadata,
+        )
 
-    monkeypatch.setattr(first_store._store, "_atomic_write", pause_first_atomic_write)
+    monkeypatch.setattr(
+        first_store._store,
+        "_atomic_write_anchored",
+        pause_first_atomic_write,
+    )
     monkeypatch.setattr(
         second_store._store,
-        "_atomic_write",
+        "_atomic_write_anchored",
         observe_second_atomic_write,
     )
 
@@ -3439,6 +3469,78 @@ def test_artifact_quota_is_serialized_across_store_instances(
         ),
     )
     assert first_store.read(first_reference, operation="read", now=NOW) == b"first!"
+
+
+def test_artifact_quota_scan_stays_on_anchored_mission_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    keys = _keys()
+    authorizer = _ExactEnvelopeAuthorizer()
+    authorizer.allow_ingestion_write("mission-quota-swap", "execution-first")
+    authorizer.allow_ingestion_write("mission-quota-swap", "execution-second")
+    artifacts = ArtifactStore(
+        root=tmp_path / "quota-swap-artifacts",
+        keys=keys,
+        authorizer=authorizer,
+        audit=MissionAuditRecorder(
+            audit_log=MissionAuditLog(),
+            contexts=_AuditContexts(),
+        ),
+        max_item_bytes=10,
+        mission_quota_bytes=10,
+    )
+    artifacts.put(
+        mission_id="mission-quota-swap",
+        content=b"first!",
+        media_type="text/plain",
+        classification="normal",
+        variant="redacted",
+        source_execution_id="execution-first",
+        created_at=NOW,
+    )
+    mission_root = artifacts._store._root / "mission-quota-swap"
+    detached_root = artifacts._store._root / "detached-mission-quota-swap"
+    original_usage = artifacts._store._mission_usage_anchored
+    swapped = False
+
+    def swap_during_quota_scan(
+        *,
+        mission_id: str,
+        mission_descriptor: int,
+    ) -> int:
+        nonlocal swapped
+        mission_root.rename(detached_root)
+        mission_root.mkdir(mode=0o700)
+        try:
+            usage = original_usage(
+                mission_id=mission_id,
+                mission_descriptor=mission_descriptor,
+            )
+        finally:
+            mission_root.rmdir()
+            detached_root.rename(mission_root)
+        swapped = True
+        return usage
+
+    monkeypatch.setattr(
+        artifacts._store,
+        "_mission_usage_anchored",
+        swap_during_quota_scan,
+    )
+    with pytest.raises(ArtifactSecurityError, match="quota"):
+        artifacts.put(
+            mission_id="mission-quota-swap",
+            content=b"second",
+            media_type="text/plain",
+            classification="normal",
+            variant="redacted",
+            source_execution_id="execution-second",
+            created_at=NOW,
+        )
+
+    assert swapped
+    assert len(list(mission_root.glob("*.json"))) == 1
 
 
 def test_identical_streamed_artifacts_keep_cross_execution_provenance(
@@ -4014,6 +4116,249 @@ def test_sqlite_audit_chain_persists_events_and_trusted_head(tmp_path: Path) -> 
                     generation_store=head_generation_store,
                 ),
             ).verify("mission-durable")
+
+
+def test_sqlite_audit_recovers_prepared_appends_across_commit_boundaries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "recoverable-audit.sqlite3"
+    head_state_path = tmp_path / "recoverable-audit-head" / "heads.json"
+    key_directory = tmp_path / "recoverable-audit-keys"
+    key_directory.mkdir(mode=0o700)
+    generation_store = _GenerationStore()
+    head_generation_store = _GenerationStore()
+    keys = _wrapped_keys(
+        key_directory / "provider.json",
+        generation_store=generation_store,
+    )
+    authenticator = KeyedAuditChainAuthenticator(keys)
+    mission_id = "mission-recoverable-audit"
+
+    with Database(database_path) as database:
+        database.connection.execute(
+            "INSERT INTO missions(mission_id, payload_json, created_at, created_by) "
+            "VALUES (?, ?, ?, ?)",
+            (mission_id, "{}", NOW.isoformat(), "test"),
+        )
+        head_store = _audit_head_store(
+            head_state_path,
+            keys=keys,
+            generation_store=head_generation_store,
+        )
+        audit = MissionAuditLog(
+            database,
+            authenticator=authenticator,
+            head_store=head_store,
+        )
+        first = audit.append(
+            mission_id=mission_id,
+            mission_revision=1,
+            authorization_epoch=0,
+            payload=AuditReferencePayload(
+                resource_type="artifact",
+                resource_id="artifact_" + "a" * 32,
+                operation="create",
+                operation_id="auditop_" + "1" * 32,
+                metadata_digest="sha256:" + "1" * 64,
+            ),
+            occurred_at=NOW,
+        )
+        if audit._repository is None:
+            raise AssertionError("durable audit repository was not created")
+        original_insert_event = audit._repository.insert_event
+
+        def interrupt_before_database_insert(**kwargs: object) -> None:
+            del kwargs
+            raise AuditIntegrityError("simulated interruption before database insert")
+
+        monkeypatch.setattr(
+            audit._repository,
+            "insert_event",
+            interrupt_before_database_insert,
+        )
+        with pytest.raises(AuditIntegrityError, match="simulated interruption"):
+            audit.append(
+                mission_id=mission_id,
+                mission_revision=1,
+                authorization_epoch=0,
+                payload=AuditReferencePayload(
+                    resource_type="artifact",
+                    resource_id="artifact_" + "a" * 32,
+                    operation="read",
+                    operation_id="auditop_" + "2" * 32,
+                    metadata_digest="sha256:" + "2" * 64,
+                ),
+                occurred_at=NOW + timedelta(seconds=1),
+            )
+        prepared_second = head_store.prepared_append(mission_id)
+        assert prepared_second is not None
+        assert audit.events_for(mission_id) == (first,)
+        monkeypatch.setattr(
+            audit._repository,
+            "insert_event",
+            original_insert_event,
+        )
+
+        restarted_head_store = _audit_head_store(
+            head_state_path,
+            keys=keys,
+            generation_store=head_generation_store,
+        )
+        restarted = MissionAuditLog(
+            database,
+            authenticator=authenticator,
+            head_store=restarted_head_store,
+        )
+        assert restarted.verify(mission_id) == (first, prepared_second)
+        assert restarted_head_store.prepared_append(mission_id) is None
+        original_commit_append = restarted_head_store.commit_append
+
+        def interrupt_after_database_commit(
+            requested_mission_id: str,
+            *,
+            event: object,
+        ) -> bool:
+            del requested_mission_id, event
+            raise AuditIntegrityError("simulated interruption after database commit")
+
+        monkeypatch.setattr(
+            restarted_head_store,
+            "commit_append",
+            interrupt_after_database_commit,
+        )
+        with pytest.raises(AuditIntegrityError, match="simulated interruption"):
+            restarted.append(
+                mission_id=mission_id,
+                mission_revision=1,
+                authorization_epoch=0,
+                payload=AuditReferencePayload(
+                    resource_type="artifact",
+                    resource_id="artifact_" + "a" * 32,
+                    operation="export",
+                    operation_id="auditop_" + "3" * 32,
+                    metadata_digest="sha256:" + "3" * 64,
+                ),
+                occurred_at=NOW + timedelta(seconds=2),
+            )
+        prepared_third = restarted_head_store.prepared_append(mission_id)
+        assert prepared_third is not None
+        assert restarted.events_for(mission_id) == (
+            first,
+            prepared_second,
+            prepared_third,
+        )
+        monkeypatch.setattr(
+            restarted_head_store,
+            "commit_append",
+            original_commit_append,
+        )
+
+        database.connection.execute(
+            "DELETE FROM audit_logs WHERE event_id = ?",
+            (prepared_third.event_id,),
+        )
+        database.connection.execute(
+            "UPDATE audit_log_heads SET sequence_number = ?, event_hash = ? "
+            "WHERE mission_id = ?",
+            (
+                prepared_second.sequence_number,
+                prepared_second.event_hash,
+                mission_id,
+            ),
+        )
+        recovered_head_store = _audit_head_store(
+            head_state_path,
+            keys=keys,
+            generation_store=head_generation_store,
+        )
+        recovered = MissionAuditLog(
+            database,
+            authenticator=authenticator,
+            head_store=recovered_head_store,
+        )
+        assert recovered.verify(mission_id) == (
+            first,
+            prepared_second,
+            prepared_third,
+        )
+        assert recovered_head_store.prepared_append(mission_id) is None
+        assert recovered_head_store.head(mission_id) == (
+            prepared_third.sequence_number,
+            prepared_third.event_hash,
+        )
+
+
+def test_audit_head_write_stays_on_validated_directory_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key_directory = tmp_path / "audit-head-swap-keys"
+    key_directory.mkdir(mode=0o700)
+    keys = _wrapped_keys(
+        key_directory / "provider.json",
+        generation_store=_GenerationStore(),
+    )
+    authenticator = KeyedAuditChainAuthenticator(keys)
+    event = MissionAuditLog(authenticator=authenticator).append(
+        mission_id="mission-audit-head-swap",
+        mission_revision=1,
+        authorization_epoch=0,
+        payload=AuditReferencePayload(
+            resource_type="artifact",
+            resource_id="artifact_" + "b" * 32,
+            operation="create",
+            operation_id="auditop_" + "4" * 32,
+            metadata_digest="sha256:" + "4" * 64,
+        ),
+        occurred_at=NOW,
+    )
+    head_directory = tmp_path / "audit-head-swap"
+    detached_directory = tmp_path / "detached-audit-head-swap"
+    outside_directory = tmp_path / "outside-audit-head-swap"
+    outside_directory.mkdir(mode=0o700)
+    outside_state = outside_directory / "heads.json"
+    outside_state.write_bytes(b"outside-state-must-not-change")
+    generation_store = _GenerationStore()
+    head_store = _audit_head_store(
+        head_directory / "heads.json",
+        keys=keys,
+        generation_store=generation_store,
+    )
+    original_replace = os.replace
+    swapped = False
+
+    def swap_parent_before_replace(
+        source: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        destination: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        nonlocal swapped
+        if not swapped:
+            head_directory.rename(detached_directory)
+            head_directory.symlink_to(outside_directory, target_is_directory=True)
+            swapped = True
+        original_replace(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
+
+    monkeypatch.setattr(os, "replace", swap_parent_before_replace)
+    with pytest.raises(AuditIntegrityError, match="directory identity changed"):
+        head_store.prepare_append(
+            event.mission_id,
+            expected=None,
+            event=event,
+        )
+
+    assert swapped
+    assert generation_store.current_generation() == 0
+    assert outside_state.read_bytes() == b"outside-state-must-not-change"
+    assert (detached_directory / "heads.json").is_file()
 
 
 def test_keyed_sqlite_audit_rejects_recomputed_forged_chain(tmp_path: Path) -> None:

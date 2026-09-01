@@ -131,12 +131,21 @@ class AuditHeadGenerationStore(Protocol):
 class AuditHeadStore(Protocol):
     def head(self, mission_id: str) -> tuple[int, str] | None: ...
 
-    def compare_and_set(
+    def prepared_append(self, mission_id: str) -> AuditEvent | None: ...
+
+    def prepare_append(
         self,
         mission_id: str,
         *,
         expected: tuple[int, str] | None,
-        new: tuple[int, str],
+        event: AuditEvent,
+    ) -> bool: ...
+
+    def commit_append(
+        self,
+        mission_id: str,
+        *,
+        event: AuditEvent,
     ) -> bool: ...
 
 
@@ -146,19 +155,58 @@ class _AuditHeadRecord(StrictImmutableBoundaryModel):
     event_hash: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
 
 
+class _AuditPreparedAppend(StrictImmutableBoundaryModel):
+    mission_id: str = Field(min_length=1)
+    previous_sequence_number: int | None = Field(default=None, ge=1)
+    previous_event_hash: str | None = Field(
+        default=None,
+        pattern=r"^sha256:[0-9a-f]{64}$",
+    )
+    event: AuditEvent
+
+    @model_validator(mode="after")
+    def event_follows_previous_head(self) -> _AuditPreparedAppend:
+        previous_absent = (
+            self.previous_sequence_number is None
+            and self.previous_event_hash is None
+        )
+        previous_present = (
+            self.previous_sequence_number is not None
+            and self.previous_event_hash is not None
+        )
+        expected_sequence = (
+            1
+            if self.previous_sequence_number is None
+            else self.previous_sequence_number + 1
+        )
+        if not (
+            (previous_absent or previous_present)
+            and self.event.mission_id == self.mission_id
+            and self.event.sequence_number == expected_sequence
+            and self.event.previous_event_hash == self.previous_event_hash
+        ):
+            raise ValueError("prepared audit append is not adjacent to its head")
+        return self
+
+
 class _AuditHeadState(StrictImmutableBoundaryModel):
-    schema_version: Literal["audit-head-state-v1"]
+    schema_version: Literal["audit-head-state-v2"]
     generation: int = Field(ge=1)
     heads: tuple[_AuditHeadRecord, ...]
+    prepared: tuple[_AuditPreparedAppend, ...]
     signing_key_id: str = Field(min_length=1)
     signing_key_version: int = Field(ge=1)
     state_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
 
     @model_validator(mode="after")
     def heads_are_canonical(self) -> _AuditHeadState:
-        mission_ids = tuple(item.mission_id for item in self.heads)
-        if mission_ids != tuple(sorted(mission_ids)) or len(set(mission_ids)) != len(
-            mission_ids
+        head_missions = tuple(item.mission_id for item in self.heads)
+        prepared_missions = tuple(item.mission_id for item in self.prepared)
+        if (
+            head_missions != tuple(sorted(head_missions))
+            or len(set(head_missions)) != len(head_missions)
+            or prepared_missions != tuple(sorted(prepared_missions))
+            or len(set(prepared_missions)) != len(prepared_missions)
         ):
             raise ValueError("audit heads are not canonical")
         return self
@@ -207,101 +255,148 @@ class KeyedFileAuditHeadStore:
     def head(self, mission_id: str) -> tuple[int, str] | None:
         if not mission_id:
             raise AuditIntegrityError("audit-head mission binding is invalid")
-        with self._lock, self._locked_state_file():
-            state = self._load_state()
-            for item in state.values():
-                if item.mission_id == mission_id:
-                    return item.sequence_number, item.event_hash
-            return None
+        with self._lock, self._locked_state_file() as directory_descriptor:
+            heads, _ = self._load_state(directory_descriptor=directory_descriptor)
+            item = heads.get(mission_id)
+            return None if item is None else (item.sequence_number, item.event_hash)
 
-    def compare_and_set(
+    def prepared_append(self, mission_id: str) -> AuditEvent | None:
+        if not mission_id:
+            raise AuditIntegrityError("audit-head mission binding is invalid")
+        with self._lock, self._locked_state_file() as directory_descriptor:
+            _, prepared = self._load_state(
+                directory_descriptor=directory_descriptor
+            )
+            item = prepared.get(mission_id)
+            return None if item is None else item.event
+
+    def prepare_append(
         self,
         mission_id: str,
         *,
         expected: tuple[int, str] | None,
-        new: tuple[int, str],
+        event: AuditEvent,
     ) -> bool:
         if (
             not mission_id
-            or not self._valid_head(new)
             or (expected is not None and not self._valid_head(expected))
+            or not self._event_follows_head(
+                mission_id,
+                event=event,
+                expected=expected,
+            )
         ):
-            raise AuditIntegrityError("audit-head update is invalid")
-        with self._lock, self._locked_state_file():
+            raise AuditIntegrityError("prepared audit append is invalid")
+        self._verify_event_digest(event)
+        with self._lock, self._locked_state_file() as directory_descriptor:
             generation = self._external_generation()
-            state = self._load_state(expected_generation=generation)
-            current_record = state.get(mission_id)
+            heads, prepared = self._load_state(
+                directory_descriptor=directory_descriptor,
+                expected_generation=generation,
+            )
+            current_record = heads.get(mission_id)
             current = (
                 None
                 if current_record is None
                 else (current_record.sequence_number, current_record.event_hash)
             )
-            if current == new:
-                return True
             if current != expected:
                 return False
-            if expected is not None and new[0] <= expected[0]:
-                raise AuditIntegrityError("audit head did not advance")
-            state[mission_id] = _AuditHeadRecord(
+            existing = prepared.get(mission_id)
+            candidate = _AuditPreparedAppend(
                 mission_id=mission_id,
-                sequence_number=new[0],
-                event_hash=new[1],
+                previous_sequence_number=(None if expected is None else expected[0]),
+                previous_event_hash=(None if expected is None else expected[1]),
+                event=event,
             )
-            next_generation = generation + 1
-            signer = self._authenticator.active_signer()
-            if signer.key_domain != "audit_signing" or signer.rotation_state != "active":
-                raise AuditIntegrityError("audit signing key is unavailable")
-            heads = tuple(state[key] for key in sorted(state))
-            digest_payload = self._state_digest_payload(
-                generation=next_generation,
+            if existing is not None:
+                return existing == candidate
+            prepared[mission_id] = candidate
+            self._persist_state(
                 heads=heads,
-                signing_key_id=signer.key_id,
-                signing_key_version=signer.key_version,
+                prepared=prepared,
+                generation=generation,
+                directory_descriptor=directory_descriptor,
             )
-            persisted = _AuditHeadState(
-                schema_version="audit-head-state-v1",
-                generation=next_generation,
+            return True
+
+    def commit_append(
+        self,
+        mission_id: str,
+        *,
+        event: AuditEvent,
+    ) -> bool:
+        if not mission_id or event.mission_id != mission_id:
+            raise AuditIntegrityError("committed audit append is invalid")
+        self._verify_event_digest(event)
+        with self._lock, self._locked_state_file() as directory_descriptor:
+            generation = self._external_generation()
+            heads, prepared = self._load_state(
+                directory_descriptor=directory_descriptor,
+                expected_generation=generation,
+            )
+            current_record = heads.get(mission_id)
+            current = (
+                None
+                if current_record is None
+                else (current_record.sequence_number, current_record.event_hash)
+            )
+            new = (event.sequence_number, event.event_hash)
+            pending = prepared.get(mission_id)
+            if pending is None:
+                return current == new
+            expected = (
+                None
+                if pending.previous_sequence_number is None
+                else (
+                    pending.previous_sequence_number,
+                    pending.previous_event_hash,
+                )
+            )
+            if not (
+                pending.event == event
+                and current == expected
+                and self._event_follows_head(
+                    mission_id,
+                    event=event,
+                    expected=expected,
+                )
+            ):
+                return False
+            heads[mission_id] = _AuditHeadRecord(
+                mission_id=mission_id,
+                sequence_number=event.sequence_number,
+                event_hash=event.event_hash,
+            )
+            del prepared[mission_id]
+            self._persist_state(
                 heads=heads,
-                signing_key_id=signer.key_id,
-                signing_key_version=signer.key_version,
-                state_digest=self._authenticator.head_digest(
-                    digest_payload,
-                    signing_key_id=signer.key_id,
-                    signing_key_version=signer.key_version,
-                ),
+                prepared=prepared,
+                generation=generation,
+                directory_descriptor=directory_descriptor,
             )
-            self._write_state(
-                self._state_path_for_generation(next_generation),
-                canonicalize(persisted.model_dump(mode="python")),
-            )
-            try:
-                advanced = self._generation_store.compare_and_set_generation(
-                    expected=generation,
-                    new=next_generation,
-                )
-            except Exception as exc:
-                raise AuditIntegrityError(
-                    "external audit-head generation is unavailable"
-                ) from exc
-            if not advanced:
-                raise AuditIntegrityError(
-                    "external audit-head generation update conflicted"
-                )
             return True
 
     def _load_state(
         self,
         *,
+        directory_descriptor: int,
         expected_generation: int | None = None,
-    ) -> dict[str, _AuditHeadRecord]:
+    ) -> tuple[
+        dict[str, _AuditHeadRecord],
+        dict[str, _AuditPreparedAppend],
+    ]:
         generation = (
             self._external_generation()
             if expected_generation is None
             else expected_generation
         )
         if generation == 0:
-            return {}
-        raw = self._read_state(self._state_path_for_generation(generation))
+            return {}, {}
+        raw = self._read_state(
+            self._state_path_for_generation(generation),
+            directory_descriptor=directory_descriptor,
+        )
         try:
             duplicate_free = canonical_loads(raw)
             state = _AuditHeadState.model_validate_json(
@@ -313,6 +408,7 @@ class KeyedFileAuditHeadStore:
         digest_payload = self._state_digest_payload(
             generation=state.generation,
             heads=state.heads,
+            prepared=state.prepared,
             signing_key_id=state.signing_key_id,
             signing_key_version=state.signing_key_version,
         )
@@ -328,20 +424,80 @@ class KeyedFileAuditHeadStore:
             raise AuditIntegrityError(
                 "audit-head rollback, generation, or authentication failed"
             )
-        return {item.mission_id: item for item in state.heads}
+        return (
+            {item.mission_id: item for item in state.heads},
+            {item.mission_id: item for item in state.prepared},
+        )
+
+    def _persist_state(
+        self,
+        *,
+        heads: dict[str, _AuditHeadRecord],
+        prepared: dict[str, _AuditPreparedAppend],
+        generation: int,
+        directory_descriptor: int,
+    ) -> None:
+        next_generation = generation + 1
+        signer = self._authenticator.active_signer()
+        if signer.key_domain != "audit_signing" or signer.rotation_state != "active":
+            raise AuditIntegrityError("audit signing key is unavailable")
+        canonical_heads = tuple(heads[key] for key in sorted(heads))
+        canonical_prepared = tuple(prepared[key] for key in sorted(prepared))
+        digest_payload = self._state_digest_payload(
+            generation=next_generation,
+            heads=canonical_heads,
+            prepared=canonical_prepared,
+            signing_key_id=signer.key_id,
+            signing_key_version=signer.key_version,
+        )
+        persisted = _AuditHeadState(
+            schema_version="audit-head-state-v2",
+            generation=next_generation,
+            heads=canonical_heads,
+            prepared=canonical_prepared,
+            signing_key_id=signer.key_id,
+            signing_key_version=signer.key_version,
+            state_digest=self._authenticator.head_digest(
+                digest_payload,
+                signing_key_id=signer.key_id,
+                signing_key_version=signer.key_version,
+            ),
+        )
+        self._write_state(
+            self._state_path_for_generation(next_generation),
+            canonicalize(persisted.model_dump(mode="python")),
+            directory_descriptor=directory_descriptor,
+        )
+        try:
+            advanced = self._generation_store.compare_and_set_generation(
+                expected=generation,
+                new=next_generation,
+            )
+        except Exception as exc:
+            raise AuditIntegrityError(
+                "external audit-head generation is unavailable"
+            ) from exc
+        if not advanced:
+            raise AuditIntegrityError(
+                "external audit-head generation update conflicted"
+            )
 
     @staticmethod
     def _state_digest_payload(
         *,
         generation: int,
         heads: tuple[_AuditHeadRecord, ...],
+        prepared: tuple[_AuditPreparedAppend, ...],
         signing_key_id: str,
         signing_key_version: int,
     ) -> dict[str, object]:
         return {
-            "schema_version": "audit-head-state-v1",
+            "schema_version": "audit-head-state-v2",
             "generation": generation,
             "heads": tuple(item.model_dump(mode="python") for item in heads),
+            "prepared": tuple(
+                item.model_dump(mode="python") for item in prepared
+            ),
             "signing_key_id": signing_key_id,
             "signing_key_version": signing_key_version,
         }
@@ -368,38 +524,71 @@ class KeyedFileAuditHeadStore:
         return self._state_paths[0 if generation % 2 else 1]
 
     @contextmanager
-    def _locked_state_file(self) -> Iterator[None]:
-        flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC
+    def _locked_state_file(self) -> Iterator[int]:
+        directory_flags = os.O_RDONLY | os.O_CLOEXEC
+        if hasattr(os, "O_DIRECTORY"):
+            directory_flags |= os.O_DIRECTORY
         if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        try:
-            descriptor = os.open(self._lock_path, flags, 0o600)
-        except OSError as exc:
-            raise AuditIntegrityError("audit-head lock is unavailable") from exc
+            directory_flags |= os.O_NOFOLLOW
+        directory_descriptor: int | None = None
+        lock_descriptor: int | None = None
         locked = False
         try:
-            metadata = os.fstat(descriptor)
-            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-                raise AuditIntegrityError("audit-head lock is invalid")
-            os.fchmod(descriptor, 0o600)
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
-            locked = True
-            self._verify_parent_identity()
-            yield
-        except OSError as exc:
-            raise AuditIntegrityError("audit-head lock is unavailable") from exc
+            try:
+                directory_descriptor = os.open(
+                    self._state_path.parent,
+                    directory_flags,
+                )
+                directory_metadata = os.fstat(directory_descriptor)
+                if (
+                    not stat.S_ISDIR(directory_metadata.st_mode)
+                    or (directory_metadata.st_dev, directory_metadata.st_ino)
+                    != self._parent_identity
+                ):
+                    raise AuditIntegrityError(
+                        "audit-head state directory identity changed"
+                    )
+                lock_flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC
+                if hasattr(os, "O_NOFOLLOW"):
+                    lock_flags |= os.O_NOFOLLOW
+                lock_descriptor = os.open(
+                    self._lock_path.name,
+                    lock_flags,
+                    0o600,
+                    dir_fd=directory_descriptor,
+                )
+            except OSError as exc:
+                raise AuditIntegrityError("audit-head lock is unavailable") from exc
+            try:
+                metadata = os.fstat(lock_descriptor)
+                if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                    raise AuditIntegrityError("audit-head lock is invalid")
+                os.fchmod(lock_descriptor, 0o600)
+                fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+                locked = True
+                self._verify_parent_identity()
+                yield directory_descriptor
+            except OSError as exc:
+                raise AuditIntegrityError("audit-head lock is unavailable") from exc
         finally:
-            if locked:
+            if locked and lock_descriptor is not None:
                 with suppress(OSError):
-                    fcntl.flock(descriptor, fcntl.LOCK_UN)
-            os.close(descriptor)
+                    fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+            if lock_descriptor is not None:
+                os.close(lock_descriptor)
+            if directory_descriptor is not None:
+                os.close(directory_descriptor)
 
-    def _read_state(self, path: Path) -> bytes:
+    def _read_state(self, path: Path, *, directory_descriptor: int) -> bytes:
         flags = os.O_RDONLY | os.O_CLOEXEC
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         try:
-            descriptor = os.open(path, flags)
+            descriptor = os.open(
+                path.name,
+                flags,
+                dir_fd=directory_descriptor,
+            )
         except OSError as exc:
             raise AuditIntegrityError("audit-head state is unavailable") from exc
         try:
@@ -430,27 +619,39 @@ class KeyedFileAuditHeadStore:
         finally:
             os.close(descriptor)
 
-    def _write_state(self, path: Path, data: bytes) -> None:
+    def _write_state(
+        self,
+        path: Path,
+        data: bytes,
+        *,
+        directory_descriptor: int,
+    ) -> None:
         if len(data) > self._MAX_STATE_BYTES:
             raise AuditIntegrityError("audit-head state exceeds its size limit")
-        temporary = path.parent / f".pending-{secrets.token_hex(16)}"
+        temporary_name = f".pending-{secrets.token_hex(16)}"
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         descriptor: int | None = None
         try:
-            descriptor = os.open(temporary, flags, 0o600)
+            descriptor = os.open(
+                temporary_name,
+                flags,
+                0o600,
+                dir_fd=directory_descriptor,
+            )
             with os.fdopen(descriptor, "wb") as stream:
                 descriptor = None
                 stream.write(data)
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.replace(temporary, path)
-            directory_descriptor = os.open(path.parent, os.O_RDONLY | os.O_CLOEXEC)
-            try:
-                os.fsync(directory_descriptor)
-            finally:
-                os.close(directory_descriptor)
+            os.replace(
+                temporary_name,
+                path.name,
+                src_dir_fd=directory_descriptor,
+                dst_dir_fd=directory_descriptor,
+            )
+            os.fsync(directory_descriptor)
             self._verify_parent_identity()
         except OSError as exc:
             raise AuditIntegrityError("audit-head state persistence failed") from exc
@@ -459,7 +660,47 @@ class KeyedFileAuditHeadStore:
                 with suppress(OSError):
                     os.close(descriptor)
             with suppress(OSError):
-                os.unlink(temporary)
+                os.unlink(temporary_name, dir_fd=directory_descriptor)
+
+    def _verify_event_digest(self, event: AuditEvent) -> None:
+        if event.signing_key_id is None or event.signing_key_version is None:
+            raise AuditIntegrityError("prepared audit event has no signer")
+        payload = {
+            "event_id": event.event_id,
+            "mission_id": event.mission_id,
+            "mission_revision": event.mission_revision,
+            "authorization_epoch": event.authorization_epoch,
+            "chain_scope": event.chain_scope,
+            "sequence_number": event.sequence_number,
+            "previous_event_hash": event.previous_event_hash,
+            "signing_key_id": event.signing_key_id,
+            "signing_key_version": event.signing_key_version,
+            "event_type": event.event_type,
+            "canonical_payload": event.canonical_payload,
+            "occurred_at": event.occurred_at,
+        }
+        expected = self._authenticator.digest(
+            payload,
+            signing_key_id=event.signing_key_id,
+            signing_key_version=event.signing_key_version,
+        )
+        if not hmac.compare_digest(expected, event.event_hash):
+            raise AuditIntegrityError("prepared audit event hash failed")
+
+    @classmethod
+    def _event_follows_head(
+        cls,
+        mission_id: str,
+        *,
+        event: AuditEvent,
+        expected: tuple[int, str] | None,
+    ) -> bool:
+        return (
+            event.mission_id == mission_id
+            and event.sequence_number == (1 if expected is None else expected[0] + 1)
+            and event.previous_event_hash == (None if expected is None else expected[1])
+            and cls._valid_hash(event.event_hash)
+        )
 
     def _verify_parent_identity(self) -> None:
         try:
@@ -725,42 +966,13 @@ class MissionAuditLog:
     def verify(
         self, mission_id: str, *, events: tuple[AuditEvent, ...] | None = None
     ) -> tuple[AuditEvent, ...]:
+        if self._database is not None:
+            self._recover_prepared_append(mission_id)
         persisted = self.events_for(mission_id)
         if self._database is not None and events is not None and events != persisted:
             raise AuditIntegrityError("supplied audit chain differs from persistence")
         candidates = persisted if events is None else events
-        previous_hash: str | None = None
-        seen_ids: set[str] = set()
-        for expected_sequence, event in enumerate(candidates, start=1):
-            if not (
-                event.mission_id == mission_id
-                and event.chain_scope == "mission"
-                and event.sequence_number == expected_sequence
-                and event.previous_event_hash == previous_hash
-                and event.event_id not in seen_ids
-            ):
-                raise AuditIntegrityError("mission audit chain binding failed")
-            expected_hash = self._event_digest(
-                self._event_payload(
-                    event_id=event.event_id,
-                    mission_id=event.mission_id,
-                    mission_revision=event.mission_revision,
-                    authorization_epoch=event.authorization_epoch,
-                    sequence_number=event.sequence_number,
-                    previous_event_hash=event.previous_event_hash,
-                    signing_key_id=event.signing_key_id,
-                    signing_key_version=event.signing_key_version,
-                    event_type=event.event_type,
-                    canonical_payload=event.canonical_payload,
-                    occurred_at=event.occurred_at,
-                ),
-                signing_key_id=event.signing_key_id,
-                signing_key_version=event.signing_key_version,
-            )
-            if not hmac.compare_digest(expected_hash, event.event_hash):
-                raise AuditIntegrityError("mission audit event hash failed")
-            seen_ids.add(event.event_id)
-            previous_hash = event.event_hash
+        previous_hash = self._verify_event_chain(mission_id, candidates)
         if self._database is None:
             trusted_head = self._trusted_head(mission_id)
             if trusted_head is None:
@@ -785,6 +997,8 @@ class MissionAuditLog:
     ) -> AuditEvent:
         if self._database is None or self._repository is None:
             raise AuditIntegrityError("durable audit database is unavailable")
+        if self._head_store is None:
+            raise AuditIntegrityError("durable audit head store is unavailable")
         event_type = f"{payload.resource_type}.{payload.operation}"
         event_id = stable_id(
             "auditevent",
@@ -798,8 +1012,8 @@ class MissionAuditLog:
             },
         )
         try:
+            self.verify(mission_id)
             with self._repository.transaction():
-                self.verify(mission_id)
                 existing_row = self._repository.event_by_id(event_id)
                 if existing_row is not None:
                     existing = self._parse_event(str(existing_row["payload_json"]))
@@ -868,6 +1082,19 @@ class MissionAuditLog:
                 event_json = canonicalize(event.model_dump(mode="python")).decode(
                     "utf-8"
                 )
+                expected_head = (
+                    None
+                    if head is None
+                    else (int(head["sequence_number"]), str(head["event_hash"]))
+                )
+                if not self._head_store.prepare_append(
+                    mission_id,
+                    expected=expected_head,
+                    event=event,
+                ):
+                    raise AuditSequenceConflictError(
+                        "external audit append preparation conflicted"
+                    )
                 self._repository.insert_event(
                     event_id=event.event_id,
                     mission_id=event.mission_id,
@@ -890,6 +1117,16 @@ class MissionAuditLog:
                         event_hash=event.event_hash,
                     ):
                         raise AuditSequenceConflictError("audit head update conflicted")
+            if not self._head_store.commit_append(
+                mission_id,
+                event=event,
+            ) and self._head_store.head(mission_id) != (
+                event.sequence_number,
+                event.event_hash,
+            ):
+                raise AuditSequenceConflictError(
+                    "external audit append commit conflicted"
+                )
             self.verify(mission_id)
             return event
         except (AuditIntegrityError, AuditSequenceConflictError):
@@ -911,6 +1148,8 @@ class MissionAuditLog:
     ) -> None:
         if self._repository is None or self._head_store is None:
             raise AuditIntegrityError("durable audit dependencies are unavailable")
+        if self._head_store.prepared_append(mission_id) is not None:
+            raise AuditIntegrityError("prepared audit append was not recovered")
         row = self._repository.head(mission_id)
         database_head = (
             None
@@ -929,30 +1168,132 @@ class MissionAuditLog:
             external_head
         ):
             raise AuditIntegrityError("external audit head is invalid")
-        if candidate_head is None:
-            if external_head is not None:
-                raise AuditIntegrityError("audit chain was truncated before its head")
-            return
-        if external_head == candidate_head:
-            return
-        if external_head is not None:
-            sequence_number, event_hash = external_head
-            if (
-                sequence_number > len(candidates)
-                or candidates[sequence_number - 1].event_hash != event_hash
-            ):
-                raise AuditIntegrityError("mission audit chain head failed")
+        if external_head != candidate_head:
+            raise AuditIntegrityError("mission audit chain head failed")
+
+    def _recover_prepared_append(self, mission_id: str) -> None:
         if (
-            not self._head_store.compare_and_set(
-                mission_id,
-                expected=external_head,
-                new=candidate_head,
-            )
-            and self._head_store.head(mission_id) != candidate_head
+            self._database is None
+            or self._repository is None
+            or self._head_store is None
         ):
-            raise AuditSequenceConflictError(
-                "external audit head update conflicted"
+            raise AuditIntegrityError("durable audit dependencies are unavailable")
+        prepared = self._head_store.prepared_append(mission_id)
+        if prepared is None:
+            return
+        if self._database.connection.in_transaction:
+            raise AuditIntegrityError(
+                "prepared audit append recovery requires its own transaction"
             )
+        external_head = self._head_store.head(mission_id)
+        expected_head = (
+            None
+            if prepared.sequence_number == 1
+            else (prepared.sequence_number - 1, prepared.previous_event_hash)
+        )
+        if external_head != expected_head:
+            raise AuditIntegrityError("prepared audit append head binding failed")
+        new_head = (prepared.sequence_number, prepared.event_hash)
+        with self._repository.transaction():
+            candidates = self.events_for(mission_id)
+            self._verify_event_chain(mission_id, candidates)
+            row = self._repository.head(mission_id)
+            database_head = (
+                None
+                if row is None
+                else (int(row["sequence_number"]), str(row["event_hash"]))
+            )
+            candidate_head = (
+                None
+                if not candidates
+                else (candidates[-1].sequence_number, candidates[-1].event_hash)
+            )
+            if database_head != candidate_head:
+                raise AuditIntegrityError(
+                    "database audit head differs from event chain"
+                )
+            if candidate_head == new_head:
+                if candidates[-1] != prepared:
+                    raise AuditIntegrityError(
+                        "prepared audit append differs from database suffix"
+                    )
+            elif candidate_head == expected_head:
+                event_json = canonicalize(
+                    prepared.model_dump(mode="python")
+                ).decode("utf-8")
+                self._repository.insert_event(
+                    event_id=prepared.event_id,
+                    mission_id=prepared.mission_id,
+                    sequence_number=prepared.sequence_number,
+                    event_hash=prepared.event_hash,
+                    payload_json=event_json,
+                )
+                if expected_head is None:
+                    self._repository.insert_head(
+                        mission_id=mission_id,
+                        sequence_number=prepared.sequence_number,
+                        event_hash=prepared.event_hash,
+                    )
+                elif not self._repository.update_head(
+                    mission_id=mission_id,
+                    previous_sequence_number=expected_head[0],
+                    previous_event_hash=expected_head[1],
+                    sequence_number=prepared.sequence_number,
+                    event_hash=prepared.event_hash,
+                ):
+                    raise AuditSequenceConflictError(
+                        "prepared audit head recovery conflicted"
+                    )
+            else:
+                raise AuditIntegrityError(
+                    "database chain conflicts with prepared audit append"
+                )
+        if not self._head_store.commit_append(
+            mission_id,
+            event=prepared,
+        ) and self._head_store.head(mission_id) != new_head:
+            raise AuditSequenceConflictError(
+                "prepared audit append commit conflicted"
+            )
+
+    def _verify_event_chain(
+        self,
+        mission_id: str,
+        candidates: tuple[AuditEvent, ...],
+    ) -> str | None:
+        previous_hash: str | None = None
+        seen_ids: set[str] = set()
+        for expected_sequence, event in enumerate(candidates, start=1):
+            if not (
+                event.mission_id == mission_id
+                and event.chain_scope == "mission"
+                and event.sequence_number == expected_sequence
+                and event.previous_event_hash == previous_hash
+                and event.event_id not in seen_ids
+            ):
+                raise AuditIntegrityError("mission audit chain binding failed")
+            expected_hash = self._event_digest(
+                self._event_payload(
+                    event_id=event.event_id,
+                    mission_id=event.mission_id,
+                    mission_revision=event.mission_revision,
+                    authorization_epoch=event.authorization_epoch,
+                    sequence_number=event.sequence_number,
+                    previous_event_hash=event.previous_event_hash,
+                    signing_key_id=event.signing_key_id,
+                    signing_key_version=event.signing_key_version,
+                    event_type=event.event_type,
+                    canonical_payload=event.canonical_payload,
+                    occurred_at=event.occurred_at,
+                ),
+                signing_key_id=event.signing_key_id,
+                signing_key_version=event.signing_key_version,
+            )
+            if not hmac.compare_digest(expected_hash, event.event_hash):
+                raise AuditIntegrityError("mission audit event hash failed")
+            seen_ids.add(event.event_id)
+            previous_hash = event.event_hash
+        return previous_hash
 
     def _active_signer_binding(self) -> tuple[str | None, int | None]:
         if self._authenticator is None:

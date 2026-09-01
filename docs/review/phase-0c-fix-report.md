@@ -1137,3 +1137,95 @@ PHASE_GATE=phase-0c PASS
 - No protected governance file was modified.
 - A fresh independent Phase 0C review remains required on the resulting 40-character PR HEAD; this
   local PASS is not an independent Phase Gate PASS.
+
+## Twentieth independent review correction cycle
+
+Current phase: `phase-0c`.
+
+Input review SHA: `e8277a167d18cc6057473aa432a68820dfb0047c`.
+
+Phase base: `5cda9a5f8792ee33c3e153d8e791499f5619d82e`.
+
+### Findings addressed
+
+- [`discussion_r3899934799`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3899934799):
+  each durable append now persists the complete signed next event as an authenticated prepared
+  append in the independently generation-anchored audit-head store before changing SQLite. After
+  the database transaction commits, the prepared append advances the external committed head.
+  Restart recovery can finish either interruption boundary and reinsert the authenticated prepared
+  suffix if an attacker deleted the committed database row and rolled SQLite's head back.
+- [`discussion_r3899934808`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3899934808):
+  the audit-head store now opens and identity-checks its state directory with no-follow semantics,
+  retains that descriptor while locking, reading, creating the temporary state, replacing the
+  alternating state slot, and syncing, and only uses descriptor-relative names for those writes.
+  A concurrent parent rename and symlink replacement is detected without writing to the replacement
+  directory or advancing the external generation.
+- [`discussion_r3899934817`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3899934817):
+  encrypted-store writes now retain one verified root and mission-directory descriptor across the
+  existing-resource check, envelope verification, quota enumeration, and atomic resource creation.
+  A transient mission-directory replacement during quota calculation therefore cannot substitute an
+  empty directory and then restore the original path to bypass the mission quota.
+
+### Modified files and regression tests
+
+Resulting working-tree diff: `4 files changed, 1235 insertions(+), 349 deletions(-)`.
+
+- `src/redteam_agent/data_security/audit.py`
+- `src/redteam_agent/data_security/stores.py`
+- `tests/security/test_phase0c_data_security.py`
+- `docs/review/phase-0c-fix-report.md`
+
+Regression coverage interrupts a durable audit append before the database insert and after the
+database commit, truncates the latter suffix and rolls back SQLite's head before restart, swaps the
+audit-head parent immediately before replacement, and swaps an encrypted-store mission directory to
+an empty replacement during quota enumeration before restoring it. No test was deleted, skipped,
+weakened, or marked as an expected failure.
+
+### Validation
+
+Focused regression command:
+
+```text
+PATH="/home/kali/Red_Agent/.venv/bin:$PATH" python -m pytest -q \
+  tests/security/test_phase0c_data_security.py \
+  -k 'quota_is_serialized or quota_scan_stays or recovers_prepared_appends \
+      or audit_head_write_stays'
+```
+
+Result: `4 passed, 45 deselected`.
+
+Phase 0C data-security module: `49 passed`.
+
+Required phase-gate command:
+
+```text
+PATH="/home/kali/Red_Agent/.venv/bin:$PATH" \
+  bash scripts/ci/run_phase_gate.sh phase-0c
+```
+
+Result:
+
+```text
+AUTOMATION_VALIDATION=PASS
+ruff: All checks passed
+mypy: Success: no issues found in 78 source files
+unit: 200 passed
+integration: 7 passed
+security: 195 passed
+full/coverage run: 402 passed
+skipped=0, errors=0, failures=0
+coverage: 81% total (branch coverage enabled)
+pip check: No broken requirements found
+PHASE_GATE=phase-0c PASS
+```
+
+### Remaining constraints
+
+- The external audit-head generation adapter remains an integration boundary supplied by an OS
+  keystore, vault, or equivalently protected monotonic service; the application does not emulate
+  that authority in mutable SQLite.
+- No real C2, MCP, provider, subprocess, local-attack, credential-collection, or external-target
+  action was executed.
+- No protected governance file was modified.
+- A fresh independent Phase 0C review remains required on the resulting 40-character PR HEAD; this
+  local PASS is not an independent Phase Gate PASS.

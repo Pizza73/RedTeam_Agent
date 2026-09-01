@@ -251,88 +251,103 @@ class _EncryptedFileStore:
             raise ArtifactSecurityError("resource exceeds its size limit")
         with self._lock, self._write_transaction():
             path = self._path(mission_id, resource_id, create_parent=True)
-            if path.exists():
-                existing = self._load_envelope_anchored(
-                    mission_id=mission_id,
+            with self._anchored_mission_directory(mission_id) as (
+                root_descriptor,
+                mission_descriptor,
+                mission_metadata,
+            ):
+                if self._resource_exists_anchored(
+                    mission_descriptor=mission_descriptor,
                     resource_id=resource_id,
+                ):
+                    existing = self._load_envelope_from_descriptor(
+                        mission_descriptor=mission_descriptor,
+                        resource_id=resource_id,
+                    )
+                    if not (
+                        existing.created_at == created_at
+                        and existing.retention_until == retention_until
+                    ):
+                        raise ArtifactSecurityError(
+                            "resource identifier conflicts with stored metadata"
+                        )
+                    plaintext = self._open_envelope(
+                        existing,
+                        mission_id=mission_id,
+                        resource_id=resource_id,
+                        binding=binding,
+                        expected_encryption_metadata_id=(
+                            existing.encryption_metadata_id
+                        ),
+                        now=None,
+                    )
+                    if plaintext != content:
+                        raise ArtifactSecurityError(
+                            "resource identifier conflicts with stored content"
+                        )
+                    os.fsync(mission_descriptor)
+                    return (
+                        existing.plaintext_sha256,
+                        existing.encryption_metadata_id,
+                    )
+                if (
+                    self._mission_usage_anchored(
+                        mission_id=mission_id,
+                        mission_descriptor=mission_descriptor,
+                    )
+                    + len(content)
+                    > self._mission_quota_bytes
+                ):
+                    raise ArtifactSecurityError("mission storage quota exceeded")
+                content_digest = self._content_digest(content)
+                aad = self._aad(
+                    mission_id,
+                    resource_id,
+                    binding,
+                    plaintext_size=len(content),
+                    plaintext_sha256=content_digest,
+                    created_at=created_at,
+                    retention_until=retention_until,
                 )
-                if not (
-                    existing.created_at == created_at
-                    and existing.retention_until == retention_until
+                encrypted = self._keys.seal_for_resource(
+                    self._domain,
+                    resource_id,
+                    content,
+                    aad,
+                    created_at=created_at,
+                )
+                if (
+                    self._content_digest(
+                        content,
+                        metadata=encrypted.metadata,
+                    )
+                    != content_digest
                 ):
                     raise ArtifactSecurityError(
-                        "resource identifier conflicts with stored metadata"
+                        "resource verifier key changed during creation"
                     )
-                plaintext = self._open_envelope(
-                    existing,
+                metadata_id = self._keys.metadata_id(encrypted.metadata)
+                envelope = _StoredEnvelope(
+                    schema_version="encrypted-store-v1",
+                    domain=self._domain,
                     mission_id=mission_id,
                     resource_id=resource_id,
-                    binding=binding,
-                    expected_encryption_metadata_id=(
-                        existing.encryption_metadata_id
-                    ),
-                    now=None,
+                    binding=CanonicalJsonObject(binding),
+                    plaintext_size=len(content),
+                    plaintext_sha256=content_digest,
+                    created_at=created_at,
+                    retention_until=retention_until,
+                    encryption_metadata_id=metadata_id,
+                    payload=encrypted,
                 )
-                if plaintext != content:
-                    raise ArtifactSecurityError(
-                        "resource identifier conflicts with stored content"
-                    )
-                self._sync_parent_directory(path.parent)
-                return (
-                    existing.plaintext_sha256,
-                    existing.encryption_metadata_id,
+                self._atomic_write_anchored(
+                    path=path,
+                    data=canonicalize(envelope.model_dump(mode="python")),
+                    root_descriptor=root_descriptor,
+                    mission_descriptor=mission_descriptor,
+                    mission_metadata=mission_metadata,
                 )
-            if (
-                self._mission_usage(path.parent) + len(content)
-                > self._mission_quota_bytes
-            ):
-                raise ArtifactSecurityError("mission storage quota exceeded")
-            content_digest = self._content_digest(content)
-            aad = self._aad(
-                mission_id,
-                resource_id,
-                binding,
-                plaintext_size=len(content),
-                plaintext_sha256=content_digest,
-                created_at=created_at,
-                retention_until=retention_until,
-            )
-            encrypted = self._keys.seal_for_resource(
-                self._domain,
-                resource_id,
-                content,
-                aad,
-                created_at=created_at,
-            )
-            if (
-                self._content_digest(
-                    content,
-                    metadata=encrypted.metadata,
-                )
-                != content_digest
-            ):
-                raise ArtifactSecurityError(
-                    "resource verifier key changed during creation"
-                )
-            metadata_id = self._keys.metadata_id(encrypted.metadata)
-            envelope = _StoredEnvelope(
-                schema_version="encrypted-store-v1",
-                domain=self._domain,
-                mission_id=mission_id,
-                resource_id=resource_id,
-                binding=CanonicalJsonObject(binding),
-                plaintext_size=len(content),
-                plaintext_sha256=content_digest,
-                created_at=created_at,
-                retention_until=retention_until,
-                encryption_metadata_id=metadata_id,
-                payload=encrypted,
-            )
-            self._atomic_write(
-                path,
-                canonicalize(envelope.model_dump(mode="python")),
-            )
-            return envelope.plaintext_sha256, metadata_id
+                return envelope.plaintext_sha256, metadata_id
 
     @contextmanager
     def _write_transaction(self) -> Iterator[None]:
@@ -771,46 +786,14 @@ class _EncryptedFileStore:
             )
         return "sha256:" + hashlib.sha256(content).hexdigest()
 
-    def _mission_usage(self, mission_root: Path) -> int:
-        if not mission_root.exists():
-            return 0
-        total = 0
-        for child in mission_root.iterdir():
-            if child.is_symlink() or not child.is_file() or child.suffix != ".json":
-                raise ArtifactSecurityError("unexpected mission storage entry")
-            resource_id = child.stem
-            self._validate_token(resource_id)
-            envelope = self._load_envelope_anchored(
-                mission_id=mission_root.name,
-                resource_id=resource_id,
-            )
-            if not (
-                envelope.domain == self._domain
-                and envelope.mission_id == mission_root.name
-                and child.name == f"{envelope.resource_id}.json"
-            ):
-                raise ArtifactSecurityError("mission storage binding is invalid")
-            self._verify_envelope(
-                envelope,
-                mission_id=envelope.mission_id,
-                resource_id=envelope.resource_id,
-                binding=envelope.binding.to_dict(),
-                expected_encryption_metadata_id=envelope.encryption_metadata_id,
-                now=None,
-            )
-            total += envelope.plaintext_size
-        return total
-
-    def _load_envelope_anchored(
+    @contextmanager
+    def _anchored_mission_directory(
         self,
-        *,
         mission_id: str,
-        resource_id: str,
-    ) -> _StoredEnvelope:
-        """Read relative to verified descriptors so directory swaps cannot redirect it."""
+    ) -> Iterator[tuple[int, int, os.stat_result]]:
+        """Retain verified root and mission descriptors for one store operation."""
 
         self._validate_token(mission_id)
-        self._validate_token(resource_id)
         directory_flags = os.O_RDONLY | os.O_CLOEXEC
         if hasattr(os, "O_DIRECTORY"):
             directory_flags |= os.O_DIRECTORY
@@ -818,7 +801,6 @@ class _EncryptedFileStore:
             directory_flags |= os.O_NOFOLLOW
         root_descriptor: int | None = None
         mission_descriptor: int | None = None
-        resource_descriptor: int | None = None
         try:
             try:
                 root_descriptor = os.open(self._root, directory_flags)
@@ -844,6 +826,117 @@ class _EncryptedFileStore:
             mission_metadata = os.fstat(mission_descriptor)
             if not stat.S_ISDIR(mission_metadata.st_mode):
                 raise ArtifactSecurityError("resource directory is invalid")
+            self._require_current_mission_identity(
+                mission_id=mission_id,
+                root_descriptor=root_descriptor,
+                mission_metadata=mission_metadata,
+                operation="access",
+            )
+            yield root_descriptor, mission_descriptor, mission_metadata
+        finally:
+            if mission_descriptor is not None:
+                with suppress(OSError):
+                    os.close(mission_descriptor)
+            if root_descriptor is not None:
+                with suppress(OSError):
+                    os.close(root_descriptor)
+
+    def _mission_usage_anchored(
+        self,
+        *,
+        mission_id: str,
+        mission_descriptor: int,
+    ) -> int:
+        total = 0
+        try:
+            entries = sorted(os.listdir(mission_descriptor))
+        except OSError as exc:
+            raise ArtifactSecurityError("mission storage is unavailable") from exc
+        for entry in entries:
+            if not entry.endswith(".json"):
+                raise ArtifactSecurityError("unexpected mission storage entry")
+            resource_id = entry.removesuffix(".json")
+            self._validate_token(resource_id)
+            envelope = self._load_envelope_from_descriptor(
+                mission_descriptor=mission_descriptor,
+                resource_id=resource_id,
+            )
+            if not (
+                envelope.domain == self._domain
+                and envelope.mission_id == mission_id
+                and entry == f"{envelope.resource_id}.json"
+            ):
+                raise ArtifactSecurityError("mission storage binding is invalid")
+            self._verify_envelope(
+                envelope,
+                mission_id=envelope.mission_id,
+                resource_id=envelope.resource_id,
+                binding=envelope.binding.to_dict(),
+                expected_encryption_metadata_id=envelope.encryption_metadata_id,
+                now=None,
+            )
+            total += envelope.plaintext_size
+        return total
+
+    def _load_envelope_anchored(
+        self,
+        *,
+        mission_id: str,
+        resource_id: str,
+    ) -> _StoredEnvelope:
+        """Read relative to verified descriptors so directory swaps cannot redirect it."""
+
+        with self._anchored_mission_directory(mission_id) as (
+            root_descriptor,
+            mission_descriptor,
+            mission_metadata,
+        ):
+            envelope = self._load_envelope_from_descriptor(
+                mission_descriptor=mission_descriptor,
+                resource_id=resource_id,
+            )
+            self._require_current_mission_identity(
+                mission_id=mission_id,
+                root_descriptor=root_descriptor,
+                mission_metadata=mission_metadata,
+                operation="read",
+            )
+            return envelope
+
+    def _resource_exists_anchored(
+        self,
+        *,
+        mission_descriptor: int,
+        resource_id: str,
+    ) -> bool:
+        self._validate_token(resource_id)
+        try:
+            metadata = os.stat(
+                f"{resource_id}.json",
+                dir_fd=mission_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            raise ArtifactSecurityError(
+                "encrypted resource metadata is unavailable"
+            ) from exc
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise ArtifactSecurityError(
+                "encrypted resource metadata is unavailable"
+            )
+        return True
+
+    def _load_envelope_from_descriptor(
+        self,
+        *,
+        mission_descriptor: int,
+        resource_id: str,
+    ) -> _StoredEnvelope:
+        self._validate_token(resource_id)
+        resource_descriptor: int | None = None
+        try:
             file_flags = os.O_RDONLY | os.O_CLOEXEC
             if hasattr(os, "O_NOFOLLOW"):
                 file_flags |= os.O_NOFOLLOW
@@ -880,34 +973,38 @@ class _EncryptedFileStore:
                 raise ArtifactSecurityError(
                     "encrypted resource metadata is unavailable"
                 )
-            try:
-                current_metadata = os.stat(
-                    mission_id,
-                    dir_fd=root_descriptor,
-                    follow_symlinks=False,
-                )
-            except OSError as exc:
-                raise ArtifactSecurityError(
-                    "resource directory identity is unavailable"
-                ) from exc
-            if (
-                not stat.S_ISDIR(current_metadata.st_mode)
-                or current_metadata.st_dev != mission_metadata.st_dev
-                or current_metadata.st_ino != mission_metadata.st_ino
-            ):
-                raise ArtifactSecurityError(
-                    "resource directory changed during read"
-                )
             return self._parse_envelope(bytes(raw))
         finally:
-            for descriptor in (
-                resource_descriptor,
-                mission_descriptor,
-                root_descriptor,
-            ):
-                if descriptor is not None:
-                    with suppress(OSError):
-                        os.close(descriptor)
+            if resource_descriptor is not None:
+                with suppress(OSError):
+                    os.close(resource_descriptor)
+
+    @staticmethod
+    def _require_current_mission_identity(
+        *,
+        mission_id: str,
+        root_descriptor: int,
+        mission_metadata: os.stat_result,
+        operation: str,
+    ) -> None:
+        try:
+            current_metadata = os.stat(
+                mission_id,
+                dir_fd=root_descriptor,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise ArtifactSecurityError(
+                "resource directory identity is unavailable"
+            ) from exc
+        if (
+            not stat.S_ISDIR(current_metadata.st_mode)
+            or current_metadata.st_dev != mission_metadata.st_dev
+            or current_metadata.st_ino != mission_metadata.st_ino
+        ):
+            raise ArtifactSecurityError(
+                f"resource directory changed during {operation}"
+            )
 
     @staticmethod
     def _parse_envelope(raw: bytes) -> _StoredEnvelope:
@@ -941,39 +1038,59 @@ class _EncryptedFileStore:
         }
 
     def _atomic_write(self, path: Path, data: bytes) -> None:
-        directory_flags = os.O_RDONLY | os.O_CLOEXEC
-        if hasattr(os, "O_DIRECTORY"):
-            directory_flags |= os.O_DIRECTORY
-        if hasattr(os, "O_NOFOLLOW"):
-            directory_flags |= os.O_NOFOLLOW
-        try:
-            root_descriptor = os.open(path.parent.parent, directory_flags)
-        except OSError as exc:
-            raise ArtifactSecurityError("store root is unavailable") from exc
-        try:
-            root_metadata = os.fstat(root_descriptor)
-            if (
-                not stat.S_ISDIR(root_metadata.st_mode)
-                or (root_metadata.st_dev, root_metadata.st_ino)
-                != self._root_identity
-            ):
-                raise ArtifactSecurityError("store root identity changed")
-            directory_descriptor = os.open(
-                path.parent.name,
-                directory_flags,
-                dir_fd=root_descriptor,
+        mission_id = path.parent.name
+        if path.parent != self._root / mission_id:
+            raise ArtifactSecurityError("resource path escaped storage root")
+        with self._anchored_mission_directory(mission_id) as (
+            root_descriptor,
+            mission_descriptor,
+            mission_metadata,
+        ):
+            self._atomic_write_anchored(
+                path=path,
+                data=data,
+                root_descriptor=root_descriptor,
+                mission_descriptor=mission_descriptor,
+                mission_metadata=mission_metadata,
             )
-        except ArtifactSecurityError:
-            os.close(root_descriptor)
-            raise
-        except OSError as exc:
-            os.close(root_descriptor)
-            raise ArtifactSecurityError("resource directory is unavailable") from exc
+
+    def _atomic_write_anchored(
+        self,
+        *,
+        path: Path,
+        data: bytes,
+        root_descriptor: int,
+        mission_descriptor: int,
+        mission_metadata: os.stat_result,
+    ) -> None:
+        mission_id = path.parent.name
+        resource_id = path.stem
+        self._validate_token(mission_id)
+        self._validate_token(resource_id)
+        if (
+            path.parent != self._root / mission_id
+            or path.name != f"{resource_id}.json"
+        ):
+            raise ArtifactSecurityError("resource path escaped storage root")
+        root_metadata = os.fstat(root_descriptor)
+        directory_metadata = os.fstat(mission_descriptor)
+        if (
+            not stat.S_ISDIR(root_metadata.st_mode)
+            or (root_metadata.st_dev, root_metadata.st_ino)
+            != self._root_identity
+            or not stat.S_ISDIR(directory_metadata.st_mode)
+            or directory_metadata.st_dev != mission_metadata.st_dev
+            or directory_metadata.st_ino != mission_metadata.st_ino
+        ):
+            raise ArtifactSecurityError("resource directory is invalid")
+        self._require_current_mission_identity(
+            mission_id=mission_id,
+            root_descriptor=root_descriptor,
+            mission_metadata=mission_metadata,
+            operation="creation",
+        )
         temporary_name: str | None = None
         try:
-            directory_metadata = os.fstat(directory_descriptor)
-            if not stat.S_ISDIR(directory_metadata.st_mode):
-                raise ArtifactSecurityError("resource directory is invalid")
             file_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
             if hasattr(os, "O_NOFOLLOW"):
                 file_flags |= os.O_NOFOLLOW
@@ -985,7 +1102,7 @@ class _EncryptedFileStore:
                         candidate,
                         file_flags,
                         0o600,
-                        dir_fd=directory_descriptor,
+                        dir_fd=mission_descriptor,
                     )
                 except FileExistsError:
                     continue
@@ -1003,8 +1120,8 @@ class _EncryptedFileStore:
                 os.link(
                     temporary_name,
                     path.name,
-                    src_dir_fd=directory_descriptor,
-                    dst_dir_fd=directory_descriptor,
+                    src_dir_fd=mission_descriptor,
+                    dst_dir_fd=mission_descriptor,
                     follow_symlinks=False,
                 )
             except FileExistsError:
@@ -1014,39 +1131,30 @@ class _EncryptedFileStore:
             except OSError as exc:
                 raise ArtifactSecurityError("resource creation failed") from exc
             try:
-                os.unlink(temporary_name, dir_fd=directory_descriptor)
+                os.unlink(temporary_name, dir_fd=mission_descriptor)
             except OSError as exc:
                 raise ArtifactSecurityError("resource creation failed") from exc
             temporary_name = None
             try:
-                os.fsync(directory_descriptor)
+                os.fsync(mission_descriptor)
             except OSError as exc:
                 raise ArtifactSecurityError("resource directory sync failed") from exc
             try:
-                current_metadata = os.stat(
-                    path.parent.name,
-                    dir_fd=root_descriptor,
-                    follow_symlinks=False,
+                self._require_current_mission_identity(
+                    mission_id=mission_id,
+                    root_descriptor=root_descriptor,
+                    mission_metadata=mission_metadata,
+                    operation="creation",
                 )
-            except OSError:
-                current_metadata = None
-            if current_metadata is None or (
-                not stat.S_ISDIR(current_metadata.st_mode)
-                or current_metadata.st_dev != directory_metadata.st_dev
-                or current_metadata.st_ino != directory_metadata.st_ino
-            ):
+            except ArtifactSecurityError:
                 with suppress(OSError):
-                    os.unlink(path.name, dir_fd=directory_descriptor)
-                    os.fsync(directory_descriptor)
-                raise ArtifactSecurityError("resource directory changed during creation")
+                    os.unlink(path.name, dir_fd=mission_descriptor)
+                    os.fsync(mission_descriptor)
+                raise
         finally:
             if temporary_name is not None:
                 with suppress(OSError):
-                    os.unlink(temporary_name, dir_fd=directory_descriptor)
-            with suppress(OSError):
-                os.close(directory_descriptor)
-            with suppress(OSError):
-                os.close(root_descriptor)
+                    os.unlink(temporary_name, dir_fd=mission_descriptor)
 
     @staticmethod
     def _sync_parent_directory(directory: Path) -> None:
