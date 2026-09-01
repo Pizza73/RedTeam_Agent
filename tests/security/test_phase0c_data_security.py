@@ -240,7 +240,7 @@ def _stores(
         keys=keys,
         audit=audit,
         max_item_bytes=4096,
-        mission_quota_bytes=8192,
+        mission_quota_bytes=32 * 1024,
     )
     artifacts = ArtifactStore(
         root=root / "artifacts",
@@ -248,7 +248,7 @@ def _stores(
         authorizer=authorizer,
         audit=audit,
         max_item_bytes=4096,
-        mission_quota_bytes=8192,
+        mission_quota_bytes=16 * 1024,
     )
     secrets = SecretStore(
         root=root / "secrets",
@@ -256,7 +256,7 @@ def _stores(
         authorizer=authorizer,
         audit=audit,
         max_item_bytes=1024,
-        mission_quota_bytes=4096,
+        mission_quota_bytes=16 * 1024,
     )
     return quarantine, artifacts, secrets, authorizer, audit_log
 
@@ -1023,7 +1023,7 @@ def test_oauth_fields_are_redacted_across_stream_chunks(tmp_path: Path) -> None:
         keys=keys,
         audit=audit,
         max_item_bytes=8192,
-        mission_quota_bytes=32 * 1024,
+        mission_quota_bytes=64 * 1024,
     )
     binding = QuarantineStreamBinding(
         mission_id="mission-oauth",
@@ -1052,7 +1052,7 @@ def test_oauth_fields_are_redacted_across_stream_chunks(tmp_path: Path) -> None:
         authorizer=authorizer,
         audit=audit,
         max_item_bytes=1024,
-        mission_quota_bytes=4096,
+        mission_quota_bytes=32 * 1024,
     )
 
     async def ingest_oauth_stream():
@@ -2850,7 +2850,7 @@ def test_storage_rejects_traversal_symlink_quota_retention_and_corruption(
         keys=keys,
         audit=audit,
         max_item_bytes=8,
-        mission_quota_bytes=10,
+        mission_quota_bytes=1536,
     )
     reference = quarantine.commit(
         mission_id="mission-a",
@@ -2930,7 +2930,7 @@ def test_storage_rejects_traversal_symlink_quota_retention_and_corruption(
         keys=keys,
         audit=stream_audit,
         max_item_bytes=1024,
-        mission_quota_bytes=128 * 1024,
+        mission_quota_bytes=256 * 1024,
     )
     stream_binding = QuarantineStreamBinding(
         mission_id="mission-stream",
@@ -3237,7 +3237,7 @@ def test_storage_rejects_traversal_symlink_quota_retention_and_corruption(
         keys=keys,
         audit=stream_audit,
         max_item_bytes=1024,
-        mission_quota_bytes=8192,
+        mission_quota_bytes=16 * 1024,
     )
     delete_binding = QuarantineStreamBinding(
         mission_id="mission-delete-crash",
@@ -3725,7 +3725,7 @@ def test_artifact_quota_is_serialized_across_store_instances(
         authorizer=authorizer,
         audit=audit,
         max_item_bytes=10,
-        mission_quota_bytes=10,
+        mission_quota_bytes=2048,
     )
     second_store = ArtifactStore(
         root=artifact_root,
@@ -3733,7 +3733,7 @@ def test_artifact_quota_is_serialized_across_store_instances(
         authorizer=authorizer,
         audit=audit,
         max_item_bytes=10,
-        mission_quota_bytes=10,
+        mission_quota_bytes=2048,
     )
     first_atomic_started = Event()
     release_first_write = Event()
@@ -3861,7 +3861,7 @@ def test_artifact_quota_scan_stays_on_anchored_mission_directory(
             contexts=_AuditContexts(),
         ),
         max_item_bytes=10,
-        mission_quota_bytes=10,
+        mission_quota_bytes=2048,
     )
     artifacts.put(
         mission_id="mission-quota-swap",
@@ -3939,7 +3939,7 @@ def test_artifact_quota_lock_stays_on_anchored_store_root(
         authorizer=authorizer,
         audit=audit,
         max_item_bytes=10,
-        mission_quota_bytes=10,
+        mission_quota_bytes=2048,
     )
     second_store = ArtifactStore(
         root=artifact_root,
@@ -3947,7 +3947,7 @@ def test_artifact_quota_lock_stays_on_anchored_store_root(
         authorizer=authorizer,
         audit=audit,
         max_item_bytes=10,
-        mission_quota_bytes=10,
+        mission_quota_bytes=2048,
     )
     original_open = os.open
     original_first_write = first_store._store._atomic_write_anchored
@@ -4066,7 +4066,7 @@ def test_empty_artifacts_consume_record_quota(
             contexts=_AuditContexts(),
         ),
         max_item_bytes=10,
-        mission_quota_bytes=3,
+        mission_quota_bytes=4096,
     )
     for execution_id in execution_ids[:3]:
         reference = artifacts.put(
@@ -5386,3 +5386,301 @@ def test_audit_chain_and_sandbox_capabilities_fail_closed(tmp_path: Path) -> Non
             expected_runtime_id="runtime-a",
             expected_adapter_id="adapter-a",
         )
+
+
+def test_yaml_block_scalar_credentials_fail_closed_complete_and_split(
+    tmp_path: Path,
+) -> None:
+    quarantine, artifacts, secrets, authorizer, _ = _stores(
+        tmp_path / "yaml-block-scalars"
+    )
+    complete_mission = "mission-yaml-block-complete"
+    complete_execution = "execution-yaml-block-complete"
+    complete_secret = b"complete-yaml-private-value"
+    authorizer.allow_ingestion_write(complete_mission, complete_execution)
+    complete_reference = quarantine.commit(
+        mission_id=complete_mission,
+        mission_revision=1,
+        execution_id=complete_execution,
+        content=b"password: |\n  " + complete_secret + b"\nstatus: ok\n",
+        created_at=NOW,
+        retention_until=NOW + timedelta(hours=1),
+    )
+    with pytest.raises(SecureIngestionError) as complete_failure:
+        SecureIngestor(
+            quarantine=quarantine,
+            artifacts=artifacts,
+            secrets=secrets,
+        ).ingest(complete_reference, now=NOW)
+    assert complete_secret.decode() not in str(complete_failure.value)
+    assert not list(
+        (artifacts._store._root / complete_mission).glob("artifact*.json")
+    )
+    assert not list((secrets._store._root / complete_mission).glob("secret*.json"))
+
+    split_mission = "mission-yaml-block-split"
+    split_execution = "execution-yaml-block-split"
+    split_secret = b"split-yaml-private-value"
+    authorizer.allow_ingestion_write(split_mission, split_execution)
+    sink = EncryptedRawResultSinkFactory(
+        quarantine=quarantine,
+        bindings=_StreamBindings(
+            QuarantineStreamBinding(
+                mission_id=split_mission,
+                mission_revision=1,
+                execution_id=split_execution,
+                retention_until=NOW + timedelta(hours=1),
+                max_result_bytes=4096,
+                resume_mode="from_start",
+            )
+        ),
+        clock=lambda: NOW,
+    ).for_execution(split_execution)
+
+    async def ingest_split_block_scalar() -> None:
+        await sink.write_stdout(b"password:")
+        await sink.write_stdout(b" >-\n  split-yaml-")
+        await sink.write_stdout(b"private-value\nstatus: ok\n")
+        receipt = await sink.commit()
+        with pytest.raises(SecureIngestionError) as split_failure:
+            await SecureIngestor(
+                quarantine=quarantine,
+                artifacts=artifacts,
+                secrets=secrets,
+            ).ingest_stream(sink, receipt, now=NOW)
+        assert split_secret.decode() not in str(split_failure.value)
+
+    asyncio.run(ingest_split_block_scalar())
+    assert not list((artifacts._store._root / split_mission).glob("*.json"))
+    assert not list((secrets._store._root / split_mission).glob("*.json"))
+
+
+def test_artifact_quota_charges_durable_envelope_bytes(
+    tmp_path: Path,
+) -> None:
+    keys = _keys()
+    authorizer = _ExactEnvelopeAuthorizer()
+    mission_id = "mission-durable-byte-quota"
+    for execution_id in ("execution-durable-first", "execution-durable-second"):
+        authorizer.allow_ingestion_write(mission_id, execution_id)
+    quota_bytes = 2048
+    artifacts = ArtifactStore(
+        root=tmp_path / "durable-byte-quota",
+        keys=keys,
+        authorizer=authorizer,
+        audit=MissionAuditRecorder(
+            audit_log=MissionAuditLog(),
+            contexts=_AuditContexts(),
+        ),
+        max_item_bytes=16,
+        mission_quota_bytes=quota_bytes,
+    )
+    first = artifacts.put(
+        mission_id=mission_id,
+        content=b"",
+        media_type="text/plain",
+        classification="normal",
+        variant="redacted",
+        source_execution_id="execution-durable-first",
+        created_at=NOW,
+    )
+    mission_root = artifacts._store._root / mission_id
+    durable_usage = sum(path.stat().st_size for path in mission_root.glob("*.json"))
+    assert first.size_bytes == 0
+    assert 0 < durable_usage <= quota_bytes
+    with pytest.raises(ArtifactSecurityError, match="quota"):
+        artifacts.put(
+            mission_id=mission_id,
+            content=b"",
+            media_type="text/plain",
+            classification="normal",
+            variant="redacted",
+            source_execution_id="execution-durable-second",
+            created_at=NOW,
+        )
+    assert sum(path.stat().st_size for path in mission_root.glob("*.json")) == (
+        durable_usage
+    )
+
+
+def test_full_quota_artifact_expiry_recovers_without_caller_capacity(
+    tmp_path: Path,
+) -> None:
+    keys = _keys()
+    authorizer = _ExactEnvelopeAuthorizer()
+    mission_id = "mission-full-quota-expiry"
+    execution_id = "execution-full-quota-expiry"
+    authorizer.allow_ingestion_write(mission_id, execution_id)
+    audit_log = MissionAuditLog()
+    audit = MissionAuditRecorder(audit_log=audit_log, contexts=_AuditContexts())
+    artifact_root = tmp_path / "full-quota-expiry"
+    current_time = [NOW]
+    initial = ArtifactStore(
+        root=artifact_root,
+        keys=keys,
+        authorizer=authorizer,
+        audit=audit,
+        max_item_bytes=1024,
+        mission_quota_bytes=8192,
+        clock=lambda: current_time[0],
+    )
+    retention_until = NOW + timedelta(minutes=5)
+    reference = initial.put(
+        mission_id=mission_id,
+        content=b"artifact-filling-its-configured-quota",
+        media_type="text/plain",
+        classification="normal",
+        variant="redacted",
+        source_execution_id=execution_id,
+        created_at=NOW,
+        retention_until=retention_until,
+    )
+    envelope = initial._store.verified_envelope(
+        mission_id=mission_id,
+        resource_id=reference.artifact_id,
+        now=None,
+    )
+    mission_root = artifact_root / mission_id
+    exact_usage = sum(path.stat().st_size for path in mission_root.glob("*.json"))
+    current_time[0] = retention_until
+
+    restarted = ArtifactStore(
+        root=artifact_root,
+        keys=keys,
+        authorizer=authorizer,
+        audit=audit,
+        max_item_bytes=1024,
+        mission_quota_bytes=exact_usage,
+        clock=lambda: current_time[0],
+    )
+
+    assert not restarted._store.has_resource(
+        mission_id=mission_id,
+        resource_id=reference.artifact_id,
+    )
+    assert not restarted._store.has_resource(
+        mission_id=mission_id,
+        resource_id=restarted._deletion_intent_id(reference.artifact_id),
+    )
+    assert keys.resource_key_destroyed(envelope.payload.metadata)
+    assert len(
+        [
+            event
+            for event in audit_log.events_for(mission_id)
+            if event.event_type == "artifact.delete"
+        ]
+    ) == 1
+
+
+def test_completed_expiry_removes_intent_and_allows_safe_recreation(
+    tmp_path: Path,
+) -> None:
+    keys = _keys()
+    authorizer = _ExactEnvelopeAuthorizer()
+    mission_id = "mission-artifact-recreation"
+    execution_id = "execution-artifact-recreation"
+    authorizer.allow_ingestion_write(mission_id, execution_id)
+    audit_log = MissionAuditLog()
+    audit = MissionAuditRecorder(audit_log=audit_log, contexts=_AuditContexts())
+    artifact_root = tmp_path / "artifact-recreation"
+    artifacts = ArtifactStore(
+        root=artifact_root,
+        keys=keys,
+        authorizer=authorizer,
+        audit=audit,
+        max_item_bytes=1024,
+        mission_quota_bytes=16 * 1024,
+        clock=lambda: NOW,
+    )
+    content = b"recreatable-artifact"
+    first_retention = NOW + timedelta(minutes=5)
+    first = artifacts.put(
+        mission_id=mission_id,
+        content=content,
+        media_type="text/plain",
+        classification="normal",
+        variant="redacted",
+        source_execution_id=execution_id,
+        created_at=NOW,
+        retention_until=first_retention,
+    )
+    authorizer.set_grants(
+        mission_id,
+        (
+            DataAccessGrant(
+                resource_type="artifact",
+                resource=ResourceBinding(
+                    resource_id=first.artifact_id,
+                    resource_version="1",
+                    resource_digest=first.sha256,
+                ),
+                operations=frozenset({"write"}),
+            ),
+        ),
+    )
+    artifacts.expire(first, now=first_retention)
+    artifacts.expire(first, now=first_retention + timedelta(seconds=1))
+    intent_id = artifacts._deletion_intent_id(first.artifact_id)
+    assert not artifacts._store.has_resource(
+        mission_id=mission_id,
+        resource_id=intent_id,
+    )
+
+    second_created_at = NOW + timedelta(minutes=10)
+    second_retention = second_created_at + timedelta(minutes=5)
+    second = artifacts.put(
+        mission_id=mission_id,
+        content=content,
+        media_type="text/plain",
+        classification="normal",
+        variant="redacted",
+        source_execution_id=execution_id,
+        created_at=second_created_at,
+        retention_until=second_retention,
+    )
+    assert second.artifact_id == first.artifact_id
+    assert second.encryption_metadata_id != first.encryption_metadata_id
+
+    restarted = ArtifactStore(
+        root=artifact_root,
+        keys=keys,
+        authorizer=authorizer,
+        audit=audit,
+        max_item_bytes=1024,
+        mission_quota_bytes=16 * 1024,
+        clock=lambda: second_created_at + timedelta(minutes=1),
+    )
+    assert restarted._store.has_resource(
+        mission_id=mission_id,
+        resource_id=second.artifact_id,
+    )
+    assert not restarted._store.has_resource(
+        mission_id=mission_id,
+        resource_id=intent_id,
+    )
+    with pytest.raises(DigestIntegrityError):
+        restarted.expire(first, now=second_retention)
+    restarted.expire(second, now=second_retention)
+    restarted.expire(second, now=second_retention + timedelta(seconds=1))
+    assert not restarted._store.has_resource(
+        mission_id=mission_id,
+        resource_id=second.artifact_id,
+    )
+    assert not restarted._store.has_resource(
+        mission_id=mission_id,
+        resource_id=intent_id,
+    )
+    assert len(
+        [
+            event
+            for event in audit_log.events_for(mission_id)
+            if event.event_type == "artifact.create"
+        ]
+    ) == 2
+    assert len(
+        [
+            event
+            for event in audit_log.events_for(mission_id)
+            if event.event_type == "artifact.delete"
+        ]
+    ) == 2

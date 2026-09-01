@@ -1420,3 +1420,104 @@ PHASE_GATE=phase-0c PASS
 - No protected governance file was modified.
 - A fresh independent Phase 0C review remains required on the resulting 40-character PR HEAD; this
   local PASS is not an independent Phase Gate PASS.
+
+## Twenty-third independent review correction cycle
+
+Current phase: `phase-0c`.
+
+Input review SHA: `087ecfc5df7efe4a7f796768cbaea65100432e77`.
+
+Phase base: `5cda9a5f8792ee33c3e153d8e791499f5619d82e`.
+
+### Findings addressed
+
+- [`discussion_r3900292223`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3900292223):
+  credential-valued YAML literal and folded block-scalar indicators now fail closed before their
+  arbitrarily chunked, indentation-sensitive body can reach redacted Artifact publication. Complete
+  and split-stream regressions verify that neither an Artifact nor a Secret record is published and
+  that the sanitized failure does not expose the scalar body.
+- [`discussion_r3900292227`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3900292227):
+  mission quota now sums the verified canonical encrypted envelope's actual durable file size rather
+  than plaintext length. A separate one-record-per-KiB ceiling bounds resource-key state growth even
+  for empty records. Existing quota tests use capacities sized for encrypted envelopes, and a new
+  on-disk regression proves that a zero-byte plaintext still consumes its complete envelope quota.
+- [`discussion_r3900292236`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3900292236):
+  a strictly parsed and deterministically bound Artifact deletion intent has a cleanup-only durable
+  write path that cannot be blocked by caller-data quota. Restart at an exact full mission quota now
+  records the intent, performs audited cryptographic erasure, and removes the cleanup record.
+- [`discussion_r3900292244`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3900292244):
+  completed Artifact expiry erases the deletion-intent envelope and its live resource key after all
+  targets are durably absent. Repeated calls verify exact completion in the trusted audit chain,
+  while a later same-ID Artifact receives a deterministic successor resource-key identity and
+  incarnation-bound create/delete audit operation IDs. A stale reference cannot erase that new
+  incarnation, and repeated lifecycles leave no deletion-intent tombstone.
+
+### Modified files and regression tests
+
+Resulting working-tree diff: `6 files changed, 710 insertions(+), 63 deletions(-)`.
+
+- `src/redteam_agent/data_security/audit.py`
+- `src/redteam_agent/data_security/ingestion.py`
+- `src/redteam_agent/data_security/keys.py`
+- `src/redteam_agent/data_security/stores.py`
+- `tests/security/test_phase0c_data_security.py`
+- `docs/review/phase-0c-fix-report.md`
+
+Regression coverage rejects complete and split YAML block scalars before publication, accounts for
+encrypted envelope bytes on disk, reconstructs an expired Artifact when its existing envelope
+exactly fills the configured quota, and runs two same-ID Artifact lifecycles through repeated expiry,
+intent removal, successor-key creation, restart, stale-reference rejection, and final erasure. Quota
+fixtures unrelated to quota enforcement were increased only to preserve their prior logical workload
+under physical-envelope accounting. No test was deleted, skipped, weakened, or marked as an expected
+failure.
+
+### Validation
+
+Focused regression command:
+
+```text
+PYTHONPATH=src /home/kali/Red_Agent/.venv/bin/python -m pytest -q \
+  tests/security/test_phase0c_data_security.py \
+  -k 'yaml_block_scalar or durable_envelope_bytes \
+      or full_quota_artifact_expiry or completed_expiry_removes_intent'
+```
+
+Result: `4 passed, 57 deselected`.
+
+Phase 0C data-security module: `61 passed`.
+
+Required phase-gate command:
+
+```text
+PATH="/home/kali/Red_Agent/.venv/bin:$PATH" \
+  bash scripts/ci/run_phase_gate.sh phase-0c
+```
+
+Result:
+
+```text
+AUTOMATION_VALIDATION=PASS
+ruff: All checks passed
+mypy: Success: no issues found in 78 source files
+unit: 200 passed
+integration: 7 passed
+security: 207 passed
+full/coverage run: 414 passed
+skipped=0, errors=0, failures=0
+coverage: 81% total (branch coverage enabled)
+pip check: No broken requirements found
+PHASE_GATE=phase-0c PASS
+```
+
+### Remaining constraints
+
+- YAML block scalars on credential-classified keys are deliberately rejected rather than partially
+  parsed; this is the fail-closed branch allowed by the finding until a complete indentation-aware
+  streaming YAML grammar is introduced.
+- The key-state and audit-head external generation adapters remain integration boundaries supplied by
+  an OS keystore, vault, or equivalently protected monotonic service.
+- No real C2, MCP, provider, subprocess, local-attack, credential-collection, or external-target
+  action was executed.
+- No protected governance file was modified.
+- A fresh independent Phase 0C review remains required on the resulting 40-character PR HEAD; this
+  local PASS is not an independent Phase Gate PASS.

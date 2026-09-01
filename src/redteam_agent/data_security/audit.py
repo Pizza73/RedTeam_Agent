@@ -784,6 +784,17 @@ class DataStoreAuditRecorder(Protocol):
         operation_id: str | None = None,
     ) -> AuditEvent: ...
 
+    def operation_recorded(
+        self,
+        *,
+        mission_id: str,
+        resource_type: AuditResourceType,
+        resource_id: str,
+        operation: AuditOperation,
+        operation_id: str,
+        metadata_digest: str,
+    ) -> bool: ...
+
 
 class MissionAuditRecorder:
     """Resolves current mission authority before appending a typed store event."""
@@ -822,6 +833,40 @@ class MissionAuditRecorder:
             payload=payload,
             occurred_at=occurred_at,
         )
+
+    def operation_recorded(
+        self,
+        *,
+        mission_id: str,
+        resource_type: AuditResourceType,
+        resource_id: str,
+        operation: AuditOperation,
+        operation_id: str,
+        metadata_digest: str,
+    ) -> bool:
+        """Verify an exact idempotent operation against the trusted audit chain."""
+
+        expected = AuditReferencePayload(
+            resource_type=resource_type,
+            resource_id=resource_id,
+            operation=operation,
+            operation_id=operation_id,
+            metadata_digest=metadata_digest,
+        )
+        expected_payload = CanonicalJsonObject(expected.model_dump(mode="json"))
+        matches = tuple(
+            event
+            for event in self._audit_log.verify(mission_id)
+            if event.canonical_payload.to_dict().get("operation_id") == operation_id
+        )
+        if not matches:
+            return False
+        if len(matches) != 1 or not (
+            matches[0].event_type == f"{resource_type}.{operation}"
+            and matches[0].canonical_payload == expected_payload
+        ):
+            raise AuditIntegrityError("audit operation binding failed")
+        return True
 
 
 class MissionAuditLog:

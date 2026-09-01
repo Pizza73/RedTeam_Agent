@@ -48,6 +48,8 @@ from .models import (
 
 _SAFE_TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _ARTIFACT_STREAM_CHUNK_BYTES = 4 * 1024
+_RESOURCE_KEY_RECORD_QUOTA_UNIT_BYTES = 1024
+_MIN_ENCRYPTED_ENVELOPE_QUOTA_BYTES = 1024
 
 
 def _require_bytes(value: bytes) -> None:
@@ -246,6 +248,67 @@ class _EncryptedFileStore:
         created_at: datetime,
         retention_until: datetime | None,
     ) -> tuple[str, str]:
+        return self._write(
+            mission_id=mission_id,
+            resource_id=resource_id,
+            content=content,
+            binding=binding,
+            created_at=created_at,
+            retention_until=retention_until,
+            enforce_quota=True,
+        )
+
+    def write_artifact_deletion_intent(
+        self,
+        *,
+        mission_id: str,
+        resource_id: str,
+        binding: dict[str, object],
+        created_at: datetime,
+    ) -> tuple[str, str]:
+        """Persist trusted erasure metadata even when user data fills its quota."""
+
+        try:
+            intent = _ArtifactDeletionIntent.model_validate_json(
+                canonicalize(binding),
+                strict=True,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ArtifactSecurityError("cleanup record binding is invalid") from exc
+        expected_id = stable_id(
+            "artifactdeletion",
+            {
+                "schema_version": "artifact-deletion-intent-v1",
+                "artifact_id": intent.reference.artifact_id,
+            },
+        )
+        if not (
+            resource_id == expected_id
+            and intent.reference.mission_id == mission_id
+            and binding == intent.model_dump(mode="json")
+        ):
+            raise ArtifactSecurityError("cleanup record binding is invalid")
+        return self._write(
+            mission_id=mission_id,
+            resource_id=resource_id,
+            content=b"",
+            binding=binding,
+            created_at=created_at,
+            retention_until=None,
+            enforce_quota=False,
+        )
+
+    def _write(
+        self,
+        *,
+        mission_id: str,
+        resource_id: str,
+        content: bytes,
+        binding: dict[str, object],
+        created_at: datetime,
+        retention_until: datetime | None,
+        enforce_quota: bool,
+    ) -> tuple[str, str]:
         _require_bytes(content)
         if len(content) > self._max_item_bytes:
             raise ArtifactSecurityError("resource exceeds its size limit")
@@ -290,13 +353,20 @@ class _EncryptedFileStore:
                         existing.plaintext_sha256,
                         existing.encryption_metadata_id,
                     )
-                if (
-                    self._mission_usage_anchored(
-                        mission_id=mission_id,
-                        mission_descriptor=mission_descriptor,
-                    )
-                    + self._quota_charge(len(content))
+                mission_usage = self._mission_usage_anchored(
+                    mission_id=mission_id,
+                    mission_descriptor=mission_descriptor,
+                )
+                if enforce_quota and (
+                    mission_usage + _MIN_ENCRYPTED_ENVELOPE_QUOTA_BYTES
                     > self._mission_quota_bytes
+                    or self._mission_record_count_anchored(mission_descriptor)
+                    + 1
+                    > max(
+                        1,
+                        self._mission_quota_bytes
+                        // _RESOURCE_KEY_RECORD_QUOTA_UNIT_BYTES,
+                    )
                 ):
                     raise ArtifactSecurityError("mission storage quota exceeded")
                 content_digest = self._content_digest(content)
@@ -340,9 +410,18 @@ class _EncryptedFileStore:
                     encryption_metadata_id=metadata_id,
                     payload=encrypted,
                 )
+                serialized_envelope = canonicalize(
+                    envelope.model_dump(mode="python")
+                )
+                if enforce_quota and (
+                    mission_usage + self._quota_charge(serialized_envelope)
+                    > self._mission_quota_bytes
+                ):
+                    self._keys.destroy_resource_key(encrypted.metadata)
+                    raise ArtifactSecurityError("mission storage quota exceeded")
                 self._atomic_write_anchored(
                     path=path,
-                    data=canonicalize(envelope.model_dump(mode="python")),
+                    data=serialized_envelope,
                     root_descriptor=root_descriptor,
                     mission_descriptor=mission_descriptor,
                     mission_metadata=mission_metadata,
@@ -1036,6 +1115,23 @@ class _EncryptedFileStore:
                 raise ArtifactSecurityError("unexpected mission storage entry")
             resource_id = entry.removesuffix(".json")
             self._validate_token(resource_id)
+            try:
+                resource_metadata = os.stat(
+                    entry,
+                    dir_fd=mission_descriptor,
+                    follow_symlinks=False,
+                )
+            except OSError as exc:
+                raise ArtifactSecurityError(
+                    "encrypted resource metadata is unavailable"
+                ) from exc
+            if not (
+                stat.S_ISREG(resource_metadata.st_mode)
+                and resource_metadata.st_nlink == 1
+            ):
+                raise ArtifactSecurityError(
+                    "encrypted resource metadata is unavailable"
+                )
             envelope = self._load_envelope_from_descriptor(
                 mission_descriptor=mission_descriptor,
                 resource_id=resource_id,
@@ -1054,14 +1150,29 @@ class _EncryptedFileStore:
                 expected_encryption_metadata_id=envelope.encryption_metadata_id,
                 now=None,
             )
-            total += self._quota_charge(envelope.plaintext_size)
+            serialized_envelope = canonicalize(envelope.model_dump(mode="python"))
+            if resource_metadata.st_size != len(serialized_envelope):
+                raise ArtifactSecurityError(
+                    "encrypted resource metadata is unavailable"
+                )
+            total += resource_metadata.st_size
         return total
 
     @staticmethod
-    def _quota_charge(plaintext_size: int) -> int:
-        """Cap physical record count even when the plaintext is empty."""
+    def _mission_record_count_anchored(mission_descriptor: int) -> int:
+        try:
+            entries = os.listdir(mission_descriptor)
+        except OSError as exc:
+            raise ArtifactSecurityError("mission storage is unavailable") from exc
+        if any(not entry.endswith(".json") for entry in entries):
+            raise ArtifactSecurityError("unexpected mission storage entry")
+        return len(entries)
 
-        return max(plaintext_size, 1)
+    @staticmethod
+    def _quota_charge(serialized_envelope: bytes) -> int:
+        """Charge the canonical encrypted envelope's durable byte footprint."""
+
+        return len(serialized_envelope)
 
     def _load_envelope_anchored(
         self,
@@ -2577,7 +2688,11 @@ class ArtifactStore:
                 artifact_id=reference.artifact_id,
             )
             authoritative = intent.reference
-        else:
+            deletion_completed = False
+        elif self._store.has_resource(
+            mission_id=reference.mission_id,
+            resource_id=reference.artifact_id,
+        ):
             authoritative = self._stored_reference(
                 mission_id=reference.mission_id,
                 artifact_id=reference.artifact_id,
@@ -2585,6 +2700,12 @@ class ArtifactStore:
             )
             intent = None
             intent_envelope = None
+            deletion_completed = False
+        else:
+            authoritative = reference
+            intent = None
+            intent_envelope = None
+            deletion_completed = True
         if authoritative != reference:
             raise DigestIntegrityError("artifact reference integrity failed")
         if reference.retention_until is None or now < reference.retention_until:
@@ -2600,6 +2721,19 @@ class ArtifactStore:
             operation="write",
             now=now,
         )
+        if deletion_completed:
+            if not self._audit.operation_recorded(
+                mission_id=reference.mission_id,
+                resource_type="artifact",
+                resource_id=reference.artifact_id,
+                operation="delete",
+                operation_id=self._expiry_audit_operation_id(reference),
+                metadata_digest=reference.sha256,
+            ):
+                raise ArtifactSecurityError(
+                    "artifact deletion state is unavailable"
+                )
+            return
         self._expire_authoritative(
             authoritative,
             now=now,
@@ -2625,13 +2759,11 @@ class ArtifactStore:
                 reference=reference,
                 resource_ids=self._deletion_targets(reference),
             )
-            self._store.write(
+            self._store.write_artifact_deletion_intent(
                 mission_id=reference.mission_id,
                 resource_id=intent_id,
-                content=b"",
                 binding=intent.model_dump(mode="json"),
                 created_at=now,
-                retention_until=None,
             )
             intent, intent_envelope = self._load_deletion_intent(
                 mission_id=reference.mission_id,
@@ -2660,13 +2792,7 @@ class ArtifactStore:
             resource_type="artifact",
             resource_id=intent.reference.artifact_id,
             operation="delete",
-            operation_id=stable_id(
-                "auditop",
-                {
-                    "schema_version": "artifact-expiry-audit-v1",
-                    "artifact_id": intent.reference.artifact_id,
-                },
-            ),
+            operation_id=self._expiry_audit_operation_id(intent.reference),
             metadata_digest=intent.reference.sha256,
             occurred_at=intent_envelope.created_at,
         )
@@ -2675,6 +2801,10 @@ class ArtifactStore:
                 mission_id=intent.reference.mission_id,
                 resource_id=resource_id,
             )
+        self._store.erase_resource(
+            mission_id=intent.reference.mission_id,
+            resource_id=self._deletion_intent_id(reference.artifact_id),
+        )
 
     def _load_deletion_intent(
         self,
@@ -2791,6 +2921,20 @@ class ArtifactStore:
             {
                 "schema_version": "artifact-deletion-intent-v1",
                 "artifact_id": artifact_id,
+            },
+        )
+
+    @staticmethod
+    def _expiry_audit_operation_id(
+        reference: ArtifactReference,
+    ) -> str:
+        return stable_id(
+            "auditop",
+            {
+                "schema_version": "artifact-expiry-audit-v2",
+                "artifact_id": reference.artifact_id,
+                "encryption_metadata_id": reference.encryption_metadata_id,
+                "created_at": reference.created_at,
             },
         )
 
@@ -3073,8 +3217,10 @@ class ArtifactStore:
             operation_id=stable_id(
                 "auditop",
                 {
-                    "schema_version": "artifact-create-audit-v1",
+                    "schema_version": "artifact-create-audit-v2",
                     "artifact_id": reference.artifact_id,
+                    "encryption_metadata_id": reference.encryption_metadata_id,
+                    "created_at": reference.created_at,
                 },
             ),
             metadata_digest=reference.sha256,

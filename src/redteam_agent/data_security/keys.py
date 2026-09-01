@@ -297,19 +297,66 @@ class InMemoryEncryptionKeyProvider:
         created_at: datetime,
     ) -> EncryptedPayload:
         parent = self.get_active_key_metadata(domain)
-        key_id = stable_id(
-            "resourcekey",
-            {"schema_version": "resource-key-v1", "domain": domain, "resource_id": resource_id},
-        )
-        identity = (domain, key_id, 1)
         with self._lock:
-            existing = self._records.get(identity)
-        if existing is None:
-            metadata = self._register_key(
-                domain=domain,
-                key_id=key_id,
-                key_version=1,
-                key_separation_tag=stable_id(
+            generation = 1
+            while True:
+                key_id, separation_tag = self._resource_key_identity(
+                    domain=domain,
+                    resource_id=resource_id,
+                    generation=generation,
+                )
+                identity = (domain, key_id, 1)
+                existing = self._records.get(identity)
+                if existing is None:
+                    metadata = self._register_key(
+                        domain=domain,
+                        key_id=key_id,
+                        key_version=1,
+                        key_separation_tag=separation_tag,
+                        material=secrets.token_bytes(32),
+                        created_at=created_at,
+                        rotation_state="active",
+                        resource_key=True,
+                        parent_key=(parent.key_id, parent.key_version),
+                    )
+                    break
+                if not existing.resource_key:
+                    raise EncryptionKeyUnavailableError("resource key is unavailable")
+                if existing.metadata.rotation_state == "destroyed":
+                    generation += 1
+                    continue
+                if not (
+                    existing.metadata.rotation_state == "active"
+                    and existing.parent_key
+                    == (parent.key_id, parent.key_version)
+                ):
+                    raise EncryptionKeyUnavailableError("resource key is unavailable")
+                metadata = existing.metadata
+                break
+        return self._seal_with_metadata(metadata, plaintext, aad)
+
+    @staticmethod
+    def _resource_key_identity(
+        *,
+        domain: KeyDomain,
+        resource_id: str,
+        generation: int,
+    ) -> tuple[str, str]:
+        if generation < 1:
+            raise EncryptionKeyUnavailableError(
+                "resource key generation is invalid"
+            )
+        if generation == 1:
+            return (
+                stable_id(
+                    "resourcekey",
+                    {
+                        "schema_version": "resource-key-v1",
+                        "domain": domain,
+                        "resource_id": resource_id,
+                    },
+                ),
+                stable_id(
                     "keytag",
                     {
                         "schema_version": "resource-key-tag-v1",
@@ -317,21 +364,23 @@ class InMemoryEncryptionKeyProvider:
                         "resource_id": resource_id,
                     },
                 ),
-                material=secrets.token_bytes(32),
-                created_at=created_at,
-                rotation_state="active",
-                resource_key=True,
-                parent_key=(parent.key_id, parent.key_version),
             )
-        else:
-            if not (
-                existing.resource_key
-                and existing.metadata.rotation_state == "active"
-                and existing.parent_key == (parent.key_id, parent.key_version)
-            ):
-                raise EncryptionKeyUnavailableError("resource key is unavailable")
-            metadata = existing.metadata
-        return self._seal_with_metadata(metadata, plaintext, aad)
+        generation_binding = {
+            "schema_version": "resource-key-v2",
+            "domain": domain,
+            "resource_id": resource_id,
+            "generation": generation,
+        }
+        return (
+            stable_id("resourcekey", generation_binding),
+            stable_id(
+                "keytag",
+                {
+                    **generation_binding,
+                    "schema_version": "resource-key-tag-v2",
+                },
+            ),
+        )
 
     def destroy_resource_key(self, metadata: EncryptionMetadata) -> None:
         identity = (metadata.key_domain, metadata.key_id, metadata.key_version)

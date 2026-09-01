@@ -241,6 +241,14 @@ class _StreamingSecretRedactor:
             cursor += 1
         if cursor == len(data):
             return None if final else "incomplete"
+        if data[cursor] in b"|>":
+            # YAML block scalars can carry an arbitrary indented body across
+            # chunk boundaries.  Publishing only the scalar indicator while
+            # passing that body through would expose the credential.  Until
+            # this streaming boundary has a complete indentation-aware YAML
+            # grammar, reject the credential construct before any part of its
+            # body can become LLM-visible.
+            raise SecretDetectionError("secret detection failed closed")
         value_quote = data[cursor] if data[cursor] in _QUOTE_BYTES else None
         if value_quote is not None:
             secret_start = cursor + 1
