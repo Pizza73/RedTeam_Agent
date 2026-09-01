@@ -436,11 +436,66 @@ class _EncryptedFileStore:
         return envelope
 
     def has_resource(self, *, mission_id: str, resource_id: str) -> bool:
-        path = self._path(mission_id, resource_id, create_parent=False)
-        exists = path.is_file()
-        if exists:
-            self._sync_parent_directory(path.parent)
-        return exists
+        self._validate_token(mission_id)
+        self._validate_token(resource_id)
+        directory_flags = os.O_RDONLY | os.O_CLOEXEC
+        if hasattr(os, "O_DIRECTORY"):
+            directory_flags |= os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            directory_flags |= os.O_NOFOLLOW
+        root_descriptor: int | None = None
+        mission_descriptor: int | None = None
+        try:
+            try:
+                root_descriptor = os.open(self._root, directory_flags)
+            except OSError as exc:
+                raise ArtifactSecurityError("store root is unavailable") from exc
+            root_metadata = os.fstat(root_descriptor)
+            if (
+                not stat.S_ISDIR(root_metadata.st_mode)
+                or (root_metadata.st_dev, root_metadata.st_ino)
+                != self._root_identity
+            ):
+                raise ArtifactSecurityError("store root identity changed")
+            try:
+                mission_descriptor = os.open(
+                    mission_id,
+                    directory_flags,
+                    dir_fd=root_descriptor,
+                )
+            except FileNotFoundError:
+                return False
+            except OSError as exc:
+                raise ArtifactSecurityError(
+                    "resource directory is unavailable"
+                ) from exc
+            mission_metadata = os.fstat(mission_descriptor)
+            if not stat.S_ISDIR(mission_metadata.st_mode):
+                raise ArtifactSecurityError("resource directory is invalid")
+            self._require_current_mission_identity(
+                mission_id=mission_id,
+                root_descriptor=root_descriptor,
+                mission_metadata=mission_metadata,
+                operation="existence check",
+            )
+            exists = self._resource_exists_anchored(
+                mission_descriptor=mission_descriptor,
+                resource_id=resource_id,
+            )
+            self._require_current_mission_identity(
+                mission_id=mission_id,
+                root_descriptor=root_descriptor,
+                mission_metadata=mission_metadata,
+                operation="existence check",
+            )
+            return exists
+        finally:
+            if mission_descriptor is not None:
+                with suppress(OSError):
+                    os.close(mission_descriptor)
+            if root_descriptor is not None:
+                with suppress(OSError):
+                    os.close(root_descriptor)
 
     def envelopes_for(self, mission_id: str) -> tuple[_StoredEnvelope, ...]:
         mission_root = self._root / mission_id
@@ -2171,7 +2226,7 @@ class ArtifactStore:
             raise ArtifactSecurityError(
                 "artifact stream cleanup binding is invalid"
             )
-        completed = False
+        completed_reference: ArtifactReference | None = None
         for artifact_id in self._store.resource_ids_with_prefix(
             mission_id=mission_id,
             prefix="artifact_",
@@ -2188,9 +2243,13 @@ class ArtifactStore:
                 and binding.get("attempt_id") == cleanup_id
                 and binding.get("source_execution_id") == source_execution_id
             ):
-                completed = True
+                completed_reference = self._stored_reference(
+                    mission_id=mission_id,
+                    artifact_id=artifact_id,
+                    now=None,
+                )
                 break
-        if not completed:
+        if completed_reference is None:
             maximum_chunks = max(
                 1,
                 (self._store._max_item_bytes + _ARTIFACT_STREAM_CHUNK_BYTES - 1)
@@ -2210,6 +2269,8 @@ class ArtifactStore:
                         mission_id=mission_id,
                         resource_id=resource_id,
                     )
+        else:
+            self._reconcile_create_audit(completed_reference)
         self._store.erase_resource(
             mission_id=mission_id,
             resource_id=cleanup_id,
@@ -2576,53 +2637,44 @@ class ArtifactStore:
         )
         binding = envelope.binding.to_dict()
         if binding.get("storage_format") == "artifact-stream-v1":
-            expected_keys = {
-                "artifact_id",
-                "media_type",
-                "classification",
-                "variant",
-                "derived_from_artifact_id",
-                "source_execution_id",
-                "storage_format",
-                "logical_size",
-                "logical_sha256",
-                "stream_id",
-                "attempt_id",
-            }
-            if set(binding) != expected_keys:
-                raise ArtifactSecurityError("artifact stream binding is invalid")
-            logical_size = binding["logical_size"]
-            classification = binding["classification"]
-            variant = binding["variant"]
-            if not (
-                binding["artifact_id"] == artifact_id
-                and isinstance(logical_size, int)
-                and not isinstance(logical_size, bool)
-                and classification in {"normal", "sensitive", "secret"}
-                and variant in {"redacted", "encrypted_raw"}
-                and isinstance(binding["source_execution_id"], str)
-                and isinstance(binding["stream_id"], str)
-                and isinstance(binding["attempt_id"], str)
-            ):
-                raise ArtifactSecurityError("artifact stream binding is invalid")
-            return ArtifactReference(
-                artifact_id=artifact_id,
+            raw, envelope = self._store.read_bound(
                 mission_id=mission_id,
-                media_type=str(binding["media_type"]),
-                size_bytes=logical_size,
-                sha256=str(binding["logical_sha256"]),
-                classification=classification,
-                variant=variant,
+                resource_id=artifact_id,
+                now=now,
+            )
+            try:
+                canonical_loads(raw)
+                manifest = _ArtifactStreamManifest.model_validate_json(
+                    raw,
+                    strict=True,
+                )
+            except (TypeError, ValueError) as exc:
+                raise ArtifactSecurityError(
+                    "artifact stream manifest is invalid"
+                ) from exc
+            reference = ArtifactReference(
+                artifact_id=manifest.artifact_id,
+                mission_id=manifest.mission_id,
+                media_type=manifest.media_type,
+                size_bytes=manifest.size_bytes,
+                sha256=manifest.sha256,
+                classification=manifest.classification,
+                variant=manifest.variant,
                 encrypted=True,
                 encryption_metadata_id=envelope.encryption_metadata_id,
-                derived_from_artifact_id=(
-                    None
-                    if binding["derived_from_artifact_id"] is None
-                    else str(binding["derived_from_artifact_id"])
-                ),
+                derived_from_artifact_id=manifest.derived_from_artifact_id,
                 created_at=envelope.created_at,
                 retention_until=envelope.retention_until,
             )
+            if not self._manifest_matches_reference(
+                manifest,
+                reference,
+                envelope,
+            ):
+                raise DigestIntegrityError(
+                    "artifact stream manifest binding failed"
+                )
+            return reference
         expected_keys = {
             "artifact_id",
             "media_type",

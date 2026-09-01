@@ -588,9 +588,11 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
         self._state_lock_path = parent / f".{absolute_path.name}.lock"
         self._state_lock = RLock()
         self._updating = False
-        with self._state_lock, self._locked_state_file():
+        with self._state_lock, self._locked_state_file() as directory_descriptor:
             if self._external_generation() > 0:
-                self._load_persisted_state()
+                self._load_persisted_state(
+                    directory_descriptor=directory_descriptor
+                )
 
     def register_key(
         self,
@@ -721,15 +723,20 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
 
     @contextmanager
     def _update_state(self) -> Iterator[None]:
-        with self._state_lock, self._locked_state_file():
+        with self._state_lock, self._locked_state_file() as directory_descriptor:
             if self._external_generation() > 0:
-                self._load_persisted_state()
+                self._load_persisted_state(
+                    directory_descriptor=directory_descriptor
+                )
             snapshot = self._snapshot()
             generation = self._generation
             self._updating = True
             try:
                 yield
-                self._persist_state(expected_generation=generation)
+                self._persist_state(
+                    expected_generation=generation,
+                    directory_descriptor=directory_descriptor,
+                )
             except Exception:
                 self._restore(snapshot)
                 self._generation = generation
@@ -741,10 +748,12 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
         with self._state_lock:
             if self._updating:
                 return
-            with self._locked_state_file():
+            with self._locked_state_file() as directory_descriptor:
                 if self._external_generation() == 0:
                     raise EncryptionKeyUnavailableError("key-state file is unavailable")
-                self._load_persisted_state()
+                self._load_persisted_state(
+                    directory_descriptor=directory_descriptor
+                )
 
     def _snapshot(self) -> tuple[
         dict[tuple[KeyDomain, str, int], _KeyRecord],
@@ -839,7 +848,12 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
             used_nonces=nonces,
         )
 
-    def _persist_state(self, *, expected_generation: int) -> None:
+    def _persist_state(
+        self,
+        *,
+        expected_generation: int,
+        directory_descriptor: int,
+    ) -> None:
         if self._external_generation() != expected_generation:
             raise EncryptionKeyUnavailableError("external key-state generation changed")
         generation = expected_generation + 1
@@ -873,7 +887,11 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
             ).model_dump(mode="python")
         )
         target_path = self._state_path_for_generation(generation)
-        self._write_wrapped_state_locked(target_path, wrapped)
+        self._write_wrapped_state_locked(
+            target_path,
+            wrapped,
+            directory_descriptor=directory_descriptor,
+        )
         try:
             advanced = self._generation_store.compare_and_set_generation(
                 expected=expected_generation,
@@ -889,12 +907,13 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
             )
         self._generation = generation
 
-    def _load_persisted_state(self) -> None:
+    def _load_persisted_state(self, *, directory_descriptor: int) -> None:
         external_generation = self._external_generation()
         if external_generation == 0:
             raise EncryptionKeyUnavailableError("key-state file is unavailable")
         raw = self._read_wrapped_state(
-            self._state_path_for_generation(external_generation)
+            self._state_path_for_generation(external_generation),
+            directory_descriptor=directory_descriptor,
         )
         try:
             duplicate_free = canonical_loads(raw)
@@ -1062,122 +1081,116 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
             self._material_fingerprints = fingerprints
             self._used_nonces = used_nonces
 
-    def _read_wrapped_state(self, state_path: Path) -> bytes:
+    def _read_wrapped_state(
+        self,
+        state_path: Path,
+        *,
+        directory_descriptor: int,
+    ) -> bytes:
+        self._validate_state_directory_descriptor(directory_descriptor)
+        descriptor_flags = os.O_RDONLY | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            descriptor_flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(
+                state_path.name,
+                descriptor_flags,
+                dir_fd=directory_descriptor,
+            )
+        except OSError as exc:
+            raise EncryptionKeyUnavailableError(
+                "key-state file is unavailable"
+            ) from exc
+        try:
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or stat.S_IMODE(metadata.st_mode) & 0o077
+            ):
+                raise EncryptionKeyUnavailableError(
+                    "key-state file permissions are invalid"
+                )
+            chunks: list[bytes] = []
+            total_size = 0
+            while True:
+                chunk = os.read(descriptor, 64 * 1024)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total_size += len(chunk)
+                if total_size > _MAX_WRAPPED_STATE_BYTES:
+                    raise EncryptionKeyUnavailableError(
+                        "key-state file exceeds provider limit"
+                    )
+            self._verify_state_parent_identity()
+            return b"".join(chunks)
+        finally:
+            os.close(descriptor)
+
+    @contextmanager
+    def _locked_state_file(self) -> Iterator[int]:
         directory_flags = os.O_RDONLY | os.O_CLOEXEC
         if hasattr(os, "O_DIRECTORY"):
             directory_flags |= os.O_DIRECTORY
         if hasattr(os, "O_NOFOLLOW"):
             directory_flags |= os.O_NOFOLLOW
+        lock_flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            lock_flags |= os.O_NOFOLLOW
+        directory_descriptor: int | None = None
+        lock_descriptor: int | None = None
+        locked = False
         try:
-            directory_descriptor = os.open(self._state_path.parent, directory_flags)
-        except OSError as exc:
-            raise EncryptionKeyUnavailableError(
-                "key-state directory is unavailable"
-            ) from exc
-        try:
-            directory_metadata = os.fstat(directory_descriptor)
-            if (
-                not stat.S_ISDIR(directory_metadata.st_mode)
-                or (directory_metadata.st_dev, directory_metadata.st_ino)
-                != self._state_parent_identity
-                or stat.S_IMODE(directory_metadata.st_mode) & 0o077
-            ):
-                raise EncryptionKeyUnavailableError(
-                    "key-state directory identity changed"
-                )
-            descriptor_flags = os.O_RDONLY | os.O_CLOEXEC
-            if hasattr(os, "O_NOFOLLOW"):
-                descriptor_flags |= os.O_NOFOLLOW
             try:
-                descriptor = os.open(
-                    state_path.name,
-                    descriptor_flags,
+                directory_descriptor = os.open(
+                    self._state_path.parent,
+                    directory_flags,
+                )
+                self._validate_state_directory_descriptor(directory_descriptor)
+                lock_descriptor = os.open(
+                    self._state_lock_path.name,
+                    lock_flags,
+                    0o600,
                     dir_fd=directory_descriptor,
                 )
             except OSError as exc:
                 raise EncryptionKeyUnavailableError(
-                    "key-state file is unavailable"
+                    "key-state lock is unavailable"
                 ) from exc
             try:
-                metadata = os.fstat(descriptor)
+                lock_metadata = os.fstat(lock_descriptor)
                 if (
-                    not stat.S_ISREG(metadata.st_mode)
-                    or metadata.st_nlink != 1
-                    or stat.S_IMODE(metadata.st_mode) & 0o077
+                    not stat.S_ISREG(lock_metadata.st_mode)
+                    or lock_metadata.st_nlink != 1
+                    or stat.S_IMODE(lock_metadata.st_mode) & 0o077
                 ):
-                    raise EncryptionKeyUnavailableError(
-                        "key-state file permissions are invalid"
-                    )
-                chunks: list[bytes] = []
-                total_size = 0
-                while True:
-                    chunk = os.read(descriptor, 64 * 1024)
-                    if not chunk:
-                        break
-                    chunks.append(chunk)
-                    total_size += len(chunk)
-                    if total_size > _MAX_WRAPPED_STATE_BYTES:
-                        raise EncryptionKeyUnavailableError(
-                            "key-state file exceeds provider limit"
-                        )
-                return b"".join(chunks)
-            finally:
-                os.close(descriptor)
+                    raise EncryptionKeyUnavailableError("key-state lock is invalid")
+                fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+                locked = True
+                self._verify_state_parent_identity()
+                yield directory_descriptor
+            except OSError as exc:
+                raise EncryptionKeyUnavailableError("key-state lock failed") from exc
         finally:
-            os.close(directory_descriptor)
+            if locked and lock_descriptor is not None:
+                with suppress(OSError):
+                    fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+            if lock_descriptor is not None:
+                os.close(lock_descriptor)
+            if directory_descriptor is not None:
+                os.close(directory_descriptor)
 
-    @contextmanager
-    def _locked_state_file(self) -> Iterator[None]:
-        lock_flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC
-        if hasattr(os, "O_NOFOLLOW"):
-            lock_flags |= os.O_NOFOLLOW
-        try:
-            lock_descriptor = os.open(self._state_lock_path, lock_flags, 0o600)
-        except OSError as exc:
-            raise EncryptionKeyUnavailableError(
-                "key-state lock is unavailable"
-            ) from exc
-        try:
-            lock_metadata = os.fstat(lock_descriptor)
-            if (
-                not stat.S_ISREG(lock_metadata.st_mode)
-                or lock_metadata.st_nlink != 1
-                or stat.S_IMODE(lock_metadata.st_mode) & 0o077
-            ):
-                raise EncryptionKeyUnavailableError("key-state lock is invalid")
-            fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
-            yield
-        except OSError as exc:
-            raise EncryptionKeyUnavailableError("key-state lock failed") from exc
-        finally:
-            with suppress(OSError):
-                fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
-            os.close(lock_descriptor)
-
-    def _write_wrapped_state_locked(self, state_path: Path, content: bytes) -> None:
-        directory_flags = os.O_RDONLY | os.O_CLOEXEC
-        if hasattr(os, "O_DIRECTORY"):
-            directory_flags |= os.O_DIRECTORY
-        if hasattr(os, "O_NOFOLLOW"):
-            directory_flags |= os.O_NOFOLLOW
-        try:
-            directory_descriptor = os.open(self._state_path.parent, directory_flags)
-        except OSError as exc:
-            raise EncryptionKeyUnavailableError(
-                "key-state directory is unavailable"
-            ) from exc
+    def _write_wrapped_state_locked(
+        self,
+        state_path: Path,
+        content: bytes,
+        *,
+        directory_descriptor: int,
+    ) -> None:
         temporary_name: str | None = None
         try:
-            directory_metadata = os.fstat(directory_descriptor)
-            if (
-                not stat.S_ISDIR(directory_metadata.st_mode)
-                or (directory_metadata.st_dev, directory_metadata.st_ino)
-                != self._state_parent_identity
-                or stat.S_IMODE(directory_metadata.st_mode) & 0o077
-            ):
-                raise EncryptionKeyUnavailableError(
-                    "key-state directory identity changed"
-                )
+            self._validate_state_directory_descriptor(directory_descriptor)
             try:
                 existing = os.stat(
                     state_path.name,
@@ -1223,10 +1236,42 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
             )
             temporary_name = None
             os.fsync(directory_descriptor)
+            self._verify_state_parent_identity()
         except OSError as exc:
             raise EncryptionKeyUnavailableError("key-state write failed") from exc
         finally:
             if temporary_name is not None:
                 with suppress(OSError):
                     os.unlink(temporary_name, dir_fd=directory_descriptor)
-            os.close(directory_descriptor)
+
+    def _validate_state_directory_descriptor(self, descriptor: int) -> None:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or (metadata.st_dev, metadata.st_ino)
+            != self._state_parent_identity
+            or stat.S_IMODE(metadata.st_mode) & 0o077
+        ):
+            raise EncryptionKeyUnavailableError(
+                "key-state directory identity changed"
+            )
+
+    def _verify_state_parent_identity(self) -> None:
+        try:
+            metadata = os.stat(
+                self._state_path.parent,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise EncryptionKeyUnavailableError(
+                "key-state directory is unavailable"
+            ) from exc
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or (metadata.st_dev, metadata.st_ino)
+            != self._state_parent_identity
+            or stat.S_IMODE(metadata.st_mode) & 0o077
+        ):
+            raise EncryptionKeyUnavailableError(
+                "key-state directory identity changed"
+            )
