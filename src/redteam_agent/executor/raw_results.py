@@ -44,6 +44,13 @@ class RawResultSink(Protocol):
 class RawResultSinkFactory(Protocol):
     def for_execution(self, execution_id: str) -> RawResultSink: ...
 
+    def recovery_metadata_for_failure(
+        self,
+        execution_id: str,
+        *,
+        updated_at: datetime,
+    ) -> RawResultRecoveryMetadata: ...
+
 
 class MockRawResultSink:
     """Metadata-only sink used by tests; bytes are incrementally hashed then discarded."""
@@ -235,6 +242,52 @@ class MockRawResultSinkFactory:
             )
             self.store.sinks[execution_id] = sink
         return sink
+
+    def recovery_metadata_for_failure(
+        self,
+        execution_id: str,
+        *,
+        updated_at: datetime,
+    ) -> RawResultRecoveryMetadata:
+        sink = self.store.sinks.get(execution_id)
+        if sink is not None:
+            sink.mark_recovery_required()
+            return sink.recovery_metadata(updated_at=updated_at)
+        quarantine_id = stable_id(
+            "quarantine",
+            {"schema_version": "mock-quarantine-v1", "execution_id": execution_id},
+        )
+        sink_id = stable_id(
+            "sink",
+            {"schema_version": "mock-sink-v1", "execution_id": execution_id},
+        )
+        provisional = RawResultRecoveryMetadata(
+            recovery_id=stable_id(
+                "recovery",
+                {
+                    "schema_version": "raw-result-recovery-v1",
+                    "execution_id": execution_id,
+                    "quarantine_id": quarantine_id,
+                },
+            ),
+            recovery_digest="pending",
+            execution_id=execution_id,
+            quarantine_id=quarantine_id,
+            sink_id=sink_id,
+            state="RECOVERY_REQUIRED",
+            bytes_received=0,
+            last_chunk_sequence=-1,
+            receipt_id=None,
+            updated_at=updated_at,
+        )
+        return provisional.model_copy(
+            update={
+                "recovery_digest": digest_model(
+                    provisional,
+                    exclude={"recovery_digest"},
+                )
+            }
+        )
 
     def mock_sink(self, execution_id: str) -> MockRawResultSink | None:
         return self.store.sinks.get(execution_id)

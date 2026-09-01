@@ -63,6 +63,7 @@ _ASCII_WORD_BYTES = frozenset(
 )
 _AUTHORIZATION_SCHEME_BYTES = _ASCII_WORD_BYTES | frozenset(b"!#$%&'*+-.^`|~")
 _STRUCTURED_KEY_BYTES = _ASCII_WORD_BYTES | frozenset(b"-")
+_XML_TAG_NAME_BYTES = _STRUCTURED_KEY_BYTES | frozenset(b":.")
 _MAX_PENDING_SECRET_MATCH_BYTES = 64 * 1024
 _JSON_KEY_SIMPLE_ESCAPES = {
     ord('"'): ord('"'),
@@ -100,7 +101,7 @@ class _StreamingSecretRedactor:
         while index < len(data):
             previous = data[index - 1] if index else self._previous_byte
             candidate = None
-            if data[index] in _QUOTE_BYTES or (
+            if data[index] == ord("<") or data[index] in _QUOTE_BYTES or (
                 previous is None or previous not in _ASCII_WORD_BYTES
             ):
                 candidate = self._candidate(data, index, final=final)
@@ -164,6 +165,13 @@ class _StreamingSecretRedactor:
         )
         if authorization is not None:
             return authorization
+        xml_element = _StreamingSecretRedactor._xml_element_candidate(
+            data,
+            index,
+            final=final,
+        )
+        if xml_element is not None:
+            return xml_element
         key_quote = data[index] if data[index] in _QUOTE_BYTES else None
         keyword_start = index + 1 if key_quote is not None else index
         keyword: bytes | None = None
@@ -268,6 +276,70 @@ class _StreamingSecretRedactor:
         if cursor == secret_start:
             return None
         return keyword_start, keyword_end, secret_start, cursor, cursor, keyword
+
+    @staticmethod
+    def _xml_element_candidate(
+        data: bytes,
+        index: int,
+        *,
+        final: bool,
+    ) -> _SecretMatch | Literal["incomplete"] | None:
+        """Redact a bounded ``<credential>value</credential>`` element."""
+
+        if data[index] != ord("<"):
+            return None
+        if index + 1 == len(data):
+            return None if final else "incomplete"
+        if data[index + 1] in b"/!?":
+            return None
+        open_end = data.find(b">", index + 1)
+        if open_end < 0:
+            candidate = data[index + 1 :]
+            if not candidate or candidate[0] not in _XML_TAG_NAME_BYTES:
+                return None
+            if final:
+                tag = candidate.split(maxsplit=1)[0].split(b":")[-1]
+                normalized = tag.lower().replace(b"_", b"").replace(b"-", b"")
+                if any(
+                    component in normalized
+                    for component in _CREDENTIAL_KEY_COMPONENTS
+                ):
+                    raise SecretDetectionError("secret detection failed closed")
+                return None
+            return "incomplete"
+        raw_tag = data[index + 1 : open_end]
+        if not raw_tag:
+            return None
+        parts = raw_tag.split(maxsplit=1)
+        tag = parts[0]
+        if not tag or any(value not in _XML_TAG_NAME_BYTES for value in tag):
+            return None
+        local_tag = tag.split(b":")[-1]
+        normalized = local_tag.lower().replace(b"_", b"").replace(b"-", b"")
+        is_credential = local_tag.lower() in _SECRET_KEYWORDS or any(
+            component in normalized for component in _CREDENTIAL_KEY_COMPONENTS
+        )
+        if not is_credential:
+            return None
+        if len(parts) > 1 and parts[1].strip():
+            raise SecretDetectionError("secret detection failed closed")
+        closing = b"</" + tag.lower() + b">"
+        secret_start = open_end + 1
+        closing_start = data.lower().find(closing, secret_start)
+        if closing_start < 0:
+            if final:
+                raise SecretDetectionError("secret detection failed closed")
+            return "incomplete"
+        if closing_start == secret_start:
+            return None
+        return (
+            index + 1,
+            index + 1 + len(tag),
+            secret_start,
+            closing_start,
+            closing_start + len(closing),
+            local_tag,
+        )
 
     @staticmethod
     def _private_key_candidate(

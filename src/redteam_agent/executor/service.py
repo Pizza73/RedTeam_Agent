@@ -473,7 +473,15 @@ class Executor:
             lease_expires_at=now + timedelta(minutes=1),
             now=now,
         )
-        sink = self.sink_factory.for_execution(record.execution_id)
+        try:
+            sink = self.sink_factory.for_execution(record.execution_id)
+        except (RawResultQuarantineError, RawResultStreamingError):
+            self._record_sink_construction_failure(record, now=now)
+            self.executions.release_result_collection_claim(
+                record.execution_id,
+                lease_id=collection_lease_id,
+            )
+            raise
         try:
             metadata = await adapter.collect_result(record.provider_task_id, sink)
             bound_receipt = await sink.commit()
@@ -583,6 +591,41 @@ class Executor:
         self.recovery.set_current(sink.recovery_metadata(updated_at=now))
         self.finalization_requester.pause_for_raw_result_failure(
             record.mission_id, now=now
+        )
+
+    def _record_sink_construction_failure(
+        self,
+        record: ExecutionRecord,
+        *,
+        now: datetime,
+    ) -> None:
+        proposed = self.sink_factory.recovery_metadata_for_failure(
+            record.execution_id,
+            updated_at=now,
+        )
+        existing = self.recovery.get(proposed.recovery_id)
+        if existing is None:
+            self.recovery.set_current(proposed)
+        elif existing.state in {"OPEN", "RECOVERY_REQUIRED"}:
+            updated = existing.model_copy(
+                update={
+                    "state": "RECOVERY_REQUIRED",
+                    "updated_at": now,
+                    "recovery_digest": "pending",
+                }
+            )
+            updated = updated.model_copy(
+                update={
+                    "recovery_digest": digest_model(
+                        updated,
+                        exclude={"recovery_digest"},
+                    )
+                }
+            )
+            self.recovery.set_current(updated)
+        self.finalization_requester.pause_for_raw_result_failure(
+            record.mission_id,
+            now=now,
         )
 
     async def ingest_result(

@@ -615,6 +615,56 @@ def test_quarantine_quota_failure_persists_recovery_and_blocks_later_dispatch() 
     assert adapter.submit_calls == 1
 
 
+def test_sink_construction_failure_persists_recovery_and_releases_claim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = build_execution_harness()
+    prepared = prepare_execution(harness)
+    later = prepare_additional_execution(harness)
+    running = asyncio.run(
+        harness.executor.dispatch(
+            prepared.execution_id,
+            now=FIXED_TIME + timedelta(minutes=3),
+        )
+    )
+
+    def fail_reconstruction(_execution_id: str):
+        raise RawResultQuarantineError("sink reconstruction failed closed")
+
+    monkeypatch.setattr(harness.sink_factory, "for_execution", fail_reconstruction)
+    failure_time = FIXED_TIME + timedelta(minutes=4)
+    with pytest.raises(RawResultQuarantineError, match="reconstruction"):
+        asyncio.run(
+            harness.executor.collect_result(
+                running.execution_id,
+                now=failure_time,
+            )
+        )
+
+    expected = harness.sink_factory.recovery_metadata_for_failure(
+        running.execution_id,
+        updated_at=failure_time,
+    )
+    recovery = harness.recovery.get(expected.recovery_id)
+    assert recovery is not None and recovery.state == "RECOVERY_REQUIRED"
+    assert recovery.bytes_received == 0
+    assert recovery.last_chunk_sequence == -1
+    assert harness.finalization.missions.current(running.mission_id).state == "PAUSED"
+    assert harness.database.connection.execute(
+        "SELECT COUNT(*) FROM result_collection_claims WHERE execution_id = ?",
+        (running.execution_id,),
+    ).fetchone()[0] == 0
+    blocked = asyncio.run(
+        harness.executor.dispatch(
+            later.execution_id,
+            now=FIXED_TIME + timedelta(minutes=5),
+        )
+    )
+    assert blocked.provider_execution_state == "BLOCKED"
+    assert harness.adapter.submit_calls == 1
+    assert harness.adapter.collect_calls == 0
+
+
 def test_mid_artifact_interruption_pauses_for_human_recovery() -> None:
     harness = build_execution_harness()
     artifact = MockArtifact(

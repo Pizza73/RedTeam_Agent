@@ -252,7 +252,10 @@ class _EncryptedFileStore:
         with self._lock, self._write_transaction():
             path = self._path(mission_id, resource_id, create_parent=True)
             if path.exists():
-                existing = self._load_envelope(path)
+                existing = self._load_envelope_anchored(
+                    mission_id=mission_id,
+                    resource_id=resource_id,
+                )
                 if not (
                     existing.created_at == created_at
                     and existing.retention_until == retention_until
@@ -370,8 +373,10 @@ class _EncryptedFileStore:
         now: datetime,
         expected_encryption_metadata_id: str,
     ) -> bytes:
-        path = self._path(mission_id, resource_id, create_parent=False)
-        envelope = self._load_envelope(path)
+        envelope = self._load_envelope_anchored(
+            mission_id=mission_id,
+            resource_id=resource_id,
+        )
         return self._open_envelope(
             envelope,
             mission_id=mission_id,
@@ -384,8 +389,10 @@ class _EncryptedFileStore:
     def read_bound(
         self, *, mission_id: str, resource_id: str, now: datetime | None
     ) -> tuple[bytes, _StoredEnvelope]:
-        path = self._path(mission_id, resource_id, create_parent=False)
-        envelope = self._load_envelope(path)
+        envelope = self._load_envelope_anchored(
+            mission_id=mission_id,
+            resource_id=resource_id,
+        )
         plaintext = self._open_envelope(
             envelope,
             mission_id=mission_id,
@@ -399,8 +406,10 @@ class _EncryptedFileStore:
     def verified_envelope(
         self, *, mission_id: str, resource_id: str, now: datetime | None
     ) -> _StoredEnvelope:
-        path = self._path(mission_id, resource_id, create_parent=False)
-        envelope = self._load_envelope(path)
+        envelope = self._load_envelope_anchored(
+            mission_id=mission_id,
+            resource_id=resource_id,
+        )
         self._verify_envelope(
             envelope,
             mission_id=mission_id,
@@ -427,9 +436,14 @@ class _EncryptedFileStore:
             raise ArtifactSecurityError("mission storage may not be a symbolic link")
         envelopes: list[_StoredEnvelope] = []
         for path in sorted(mission_root.iterdir()):
-            if path.is_symlink() or not path.is_file():
+            if path.is_symlink() or not path.is_file() or path.suffix != ".json":
                 raise ArtifactSecurityError("unexpected mission storage entry")
-            envelope = self._load_envelope(path)
+            resource_id = path.stem
+            self._validate_token(resource_id)
+            envelope = self._load_envelope_anchored(
+                mission_id=mission_id,
+                resource_id=resource_id,
+            )
             self._verify_envelope(
                 envelope,
                 mission_id=mission_id,
@@ -762,9 +776,14 @@ class _EncryptedFileStore:
             return 0
         total = 0
         for child in mission_root.iterdir():
-            if child.is_symlink() or not child.is_file():
+            if child.is_symlink() or not child.is_file() or child.suffix != ".json":
                 raise ArtifactSecurityError("unexpected mission storage entry")
-            envelope = self._load_envelope(child)
+            resource_id = child.stem
+            self._validate_token(resource_id)
+            envelope = self._load_envelope_anchored(
+                mission_id=mission_root.name,
+                resource_id=resource_id,
+            )
             if not (
                 envelope.domain == self._domain
                 and envelope.mission_id == mission_root.name
@@ -782,13 +801,113 @@ class _EncryptedFileStore:
             total += envelope.plaintext_size
         return total
 
-    @staticmethod
-    def _load_envelope(path: Path) -> _StoredEnvelope:
+    def _load_envelope_anchored(
+        self,
+        *,
+        mission_id: str,
+        resource_id: str,
+    ) -> _StoredEnvelope:
+        """Read relative to verified descriptors so directory swaps cannot redirect it."""
+
+        self._validate_token(mission_id)
+        self._validate_token(resource_id)
+        directory_flags = os.O_RDONLY | os.O_CLOEXEC
+        if hasattr(os, "O_DIRECTORY"):
+            directory_flags |= os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            directory_flags |= os.O_NOFOLLOW
+        root_descriptor: int | None = None
+        mission_descriptor: int | None = None
+        resource_descriptor: int | None = None
         try:
-            raw = path.read_bytes()
-        except OSError as exc:
-            raise ArtifactSecurityError("encrypted resource metadata is unavailable") from exc
-        return _EncryptedFileStore._parse_envelope(raw)
+            try:
+                root_descriptor = os.open(self._root, directory_flags)
+            except OSError as exc:
+                raise ArtifactSecurityError("store root is unavailable") from exc
+            root_metadata = os.fstat(root_descriptor)
+            if (
+                not stat.S_ISDIR(root_metadata.st_mode)
+                or (root_metadata.st_dev, root_metadata.st_ino)
+                != self._root_identity
+            ):
+                raise ArtifactSecurityError("store root identity changed")
+            try:
+                mission_descriptor = os.open(
+                    mission_id,
+                    directory_flags,
+                    dir_fd=root_descriptor,
+                )
+            except OSError as exc:
+                raise ArtifactSecurityError(
+                    "resource directory is unavailable"
+                ) from exc
+            mission_metadata = os.fstat(mission_descriptor)
+            if not stat.S_ISDIR(mission_metadata.st_mode):
+                raise ArtifactSecurityError("resource directory is invalid")
+            file_flags = os.O_RDONLY | os.O_CLOEXEC
+            if hasattr(os, "O_NOFOLLOW"):
+                file_flags |= os.O_NOFOLLOW
+            try:
+                resource_descriptor = os.open(
+                    f"{resource_id}.json",
+                    file_flags,
+                    dir_fd=mission_descriptor,
+                )
+            except OSError as exc:
+                raise ArtifactSecurityError(
+                    "encrypted resource metadata is unavailable"
+                ) from exc
+            resource_metadata = os.fstat(resource_descriptor)
+            maximum_envelope_bytes = self._max_item_bytes * 4 + 256 * 1024
+            if (
+                not stat.S_ISREG(resource_metadata.st_mode)
+                or resource_metadata.st_nlink != 1
+                or resource_metadata.st_size > maximum_envelope_bytes
+            ):
+                raise ArtifactSecurityError(
+                    "encrypted resource metadata is unavailable"
+                )
+            raw = bytearray()
+            while len(raw) <= maximum_envelope_bytes:
+                chunk = os.read(
+                    resource_descriptor,
+                    min(64 * 1024, maximum_envelope_bytes + 1 - len(raw)),
+                )
+                if not chunk:
+                    break
+                raw.extend(chunk)
+            if len(raw) > maximum_envelope_bytes:
+                raise ArtifactSecurityError(
+                    "encrypted resource metadata is unavailable"
+                )
+            try:
+                current_metadata = os.stat(
+                    mission_id,
+                    dir_fd=root_descriptor,
+                    follow_symlinks=False,
+                )
+            except OSError as exc:
+                raise ArtifactSecurityError(
+                    "resource directory identity is unavailable"
+                ) from exc
+            if (
+                not stat.S_ISDIR(current_metadata.st_mode)
+                or current_metadata.st_dev != mission_metadata.st_dev
+                or current_metadata.st_ino != mission_metadata.st_ino
+            ):
+                raise ArtifactSecurityError(
+                    "resource directory changed during read"
+                )
+            return self._parse_envelope(bytes(raw))
+        finally:
+            for descriptor in (
+                resource_descriptor,
+                mission_descriptor,
+                root_descriptor,
+            ):
+                if descriptor is not None:
+                    with suppress(OSError):
+                        os.close(descriptor)
 
     @staticmethod
     def _parse_envelope(raw: bytes) -> _StoredEnvelope:
@@ -1340,8 +1459,10 @@ class ArtifactStore:
         artifact_id = self._artifact_id(
             mission_id=mission_id,
             content_digest=content_digest,
+            media_type=media_type,
             classification=classification,
             variant=variant,
+            source_execution_id=source_execution_id,
             derived_from_artifact_id=derived_from_artifact_id,
         )
         binding = self._binding(
@@ -1619,8 +1740,10 @@ class ArtifactStore:
         artifact_id = self._artifact_id(
             mission_id=mission_id,
             content_digest=content_digest,
+            media_type=media_type,
             classification=resolved_classification,
             variant=variant,
+            source_execution_id=source_execution_id,
             derived_from_artifact_id=derived_from_artifact_id,
         )
         manifest = _ArtifactStreamManifest(
@@ -2447,17 +2570,22 @@ class ArtifactStore:
         *,
         mission_id: str,
         content_digest: str,
+        media_type: str,
         classification: str,
         variant: str,
+        source_execution_id: str,
         derived_from_artifact_id: str | None,
     ) -> str:
         return stable_id(
             "artifact",
             {
+                "schema_version": "artifact-v2",
                 "mission_id": mission_id,
                 "content_sha256": content_digest,
+                "media_type": media_type,
                 "classification": classification,
                 "variant": variant,
+                "source_execution_id": source_execution_id,
                 "derived_from": derived_from_artifact_id,
             },
         )
@@ -2574,8 +2702,9 @@ class ArtifactStore:
         )
 
     def _source_execution_id(self, reference: ArtifactReference) -> str:
-        envelope = self._store._load_envelope(
-            self._store._path(reference.mission_id, reference.artifact_id, create_parent=False)
+        envelope = self._store._load_envelope_anchored(
+            mission_id=reference.mission_id,
+            resource_id=reference.artifact_id,
         )
         value = envelope.binding.to_dict().get("source_execution_id")
         if not isinstance(value, str) or not value:

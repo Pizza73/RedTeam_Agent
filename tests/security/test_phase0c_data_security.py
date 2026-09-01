@@ -26,6 +26,7 @@ from redteam_agent.data_security import (
     EncryptedSecureResultIngester,
     InMemoryEncryptionKeyProvider,
     KeyedAuditChainAuthenticator,
+    KeyedFileAuditHeadStore,
     MissionAuditLog,
     MissionAuditRecorder,
     QuarantineStreamBinding,
@@ -205,6 +206,20 @@ def _wrapped_keys(
                 created_at=NOW,
             )
     return provider
+
+
+def _audit_head_store(
+    state_path: Path,
+    *,
+    keys: InMemoryEncryptionKeyProvider,
+    generation_store: _GenerationStore,
+) -> KeyedFileAuditHeadStore:
+    state_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return KeyedFileAuditHeadStore(
+        state_path=state_path,
+        authenticator=KeyedAuditChainAuthenticator(keys),
+        generation_store=generation_store,
+    )
 
 
 def _stores(
@@ -1007,8 +1022,8 @@ def test_oauth_fields_are_redacted_across_stream_chunks(tmp_path: Path) -> None:
         root=tmp_path / "oauth-quarantine",
         keys=keys,
         audit=audit,
-        max_item_bytes=4096,
-        mission_quota_bytes=16 * 1024,
+        max_item_bytes=8192,
+        mission_quota_bytes=32 * 1024,
     )
     binding = QuarantineStreamBinding(
         mission_id="mission-oauth",
@@ -1063,6 +1078,9 @@ def test_oauth_fields_are_redacted_across_stream_chunks(tmp_path: Path) -> None:
         )
         await sink.write_stdout(b"machine split.example login user pass")
         await sink.write_stdout(b"word split-netrc")
+        await sink.write_stdout(b" X<password>complete-xml</password> <client")
+        await sink.write_stdout(b"Secret>split-xml</clientSec")
+        await sink.write_stdout(b"ret>")
         receipt = await sink.commit()
         return await SecureIngestor(
             quarantine=quarantine,
@@ -1071,7 +1089,7 @@ def test_oauth_fields_are_redacted_across_stream_chunks(tmp_path: Path) -> None:
         ).ingest_stream(sink, receipt, now=NOW)
 
     result = asyncio.run(ingest_oauth_stream())
-    assert result.redaction_metadata.redaction_count == 15
+    assert result.redaction_metadata.redaction_count == 17
     assert result.redacted_artifacts[0].classification == "sensitive"
     assert {item.credential_type for item in result.detected_secrets} == {
         "tokenvalue",
@@ -1113,6 +1131,8 @@ def test_oauth_fields_are_redacted_across_stream_chunks(tmp_path: Path) -> None:
         b"passwordHash=[REDACTED] tokenValue: [REDACTED]"
         b" machine complete.example login user password [REDACTED] "
         b"machine split.example login user password [REDACTED]"
+        b" X<password>[REDACTED]</password> "
+        b"<clientSecret>[REDACTED]</clientSecret>"
     )
     for value in (
         b"prefix-value",
@@ -1130,6 +1150,8 @@ def test_oauth_fields_are_redacted_across_stream_chunks(tmp_path: Path) -> None:
         b"unquoted-token",
         b"complete-netrc",
         b"split-netrc",
+        b"complete-xml",
+        b"split-xml",
     ):
         assert value not in visible
         assert value.decode() not in result.model_dump_json()
@@ -2396,7 +2418,7 @@ def test_expired_committed_and_abandoned_streams_are_erased_after_restart(
         "erase_resource",
         interrupt_first_expiry_erasure,
     )
-    with pytest.raises(ArtifactSecurityError, match="expiry erasure interruption"):
+    with pytest.raises(RawResultQuarantineError, match="reconstruction"):
         committed_factory.for_execution("execution-expired-committed")
     monkeypatch.setattr(quarantine._store, "erase_resource", original_erase)
 
@@ -3419,6 +3441,129 @@ def test_artifact_quota_is_serialized_across_store_instances(
     assert first_store.read(first_reference, operation="read", now=NOW) == b"first!"
 
 
+def test_identical_streamed_artifacts_keep_cross_execution_provenance(
+    tmp_path: Path,
+) -> None:
+    _, artifacts, _, authorizer, _ = _stores(tmp_path / "artifact-provenance")
+    mission_id = "mission-artifact-provenance"
+    execution_ids = ("execution-artifact-first", "execution-artifact-second")
+    for execution_id in execution_ids:
+        authorizer.allow_ingestion_write(mission_id, execution_id)
+
+    async def empty_chunks():
+        if False:
+            yield b""
+
+    async def persist(execution_id: str) -> ArtifactReference:
+        return await artifacts.put_stream(
+            mission_id=mission_id,
+            chunks=empty_chunks(),
+            media_type="text/plain",
+            classification=lambda: "normal",
+            variant="redacted",
+            source_execution_id=execution_id,
+            created_at=NOW,
+        )
+
+    first = asyncio.run(persist(execution_ids[0]))
+    second = asyncio.run(persist(execution_ids[1]))
+
+    assert first.artifact_id != second.artifact_id
+    assert first.sha256 == second.sha256
+    assert first.size_bytes == second.size_bytes == 0
+    authorizer.set_grants(
+        mission_id,
+        tuple(
+            DataAccessGrant(
+                resource_type="artifact",
+                resource=ResourceBinding(
+                    resource_id=reference.artifact_id,
+                    resource_version="1",
+                    resource_digest=reference.sha256,
+                ),
+                operations=frozenset({"read"}),
+            )
+            for reference in (first, second)
+        ),
+    )
+    assert artifacts.read(first, operation="read", now=NOW) == b""
+    assert artifacts.read(second, operation="read", now=NOW) == b""
+
+
+@pytest.mark.parametrize("read_mode", ("read", "read_bound"))
+def test_artifact_reads_reject_concurrent_mission_directory_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    read_mode: str,
+) -> None:
+    _, artifacts, _, authorizer, _ = _stores(tmp_path / f"anchored-{read_mode}")
+    mission_id = "mission-anchored-read"
+    execution_id = "execution-anchored-read"
+    authorizer.allow_ingestion_write(mission_id, execution_id)
+    reference = artifacts.put(
+        mission_id=mission_id,
+        content=b"descriptor-anchored-content",
+        media_type="text/plain",
+        classification="normal",
+        variant="redacted",
+        source_execution_id=execution_id,
+        created_at=NOW,
+    )
+    authorizer.set_grants(
+        mission_id,
+        (
+            DataAccessGrant(
+                resource_type="artifact",
+                resource=ResourceBinding(
+                    resource_id=reference.artifact_id,
+                    resource_version="1",
+                    resource_digest=reference.sha256,
+                ),
+                operations=frozenset({"read"}),
+            ),
+        ),
+    )
+    mission_root = artifacts._store._root / mission_id
+    retained_root = artifacts._store._root / f"{mission_id}-retained"
+    replacement_root = tmp_path / f"outside-{read_mode}"
+    replacement_root.mkdir()
+    (replacement_root / f"{reference.artifact_id}.json").write_bytes(
+        b"x" * (1024 * 1024)
+    )
+    original_open = os.open
+    swapped = False
+
+    def swap_before_resource_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal swapped
+        if (
+            not swapped
+            and path == f"{reference.artifact_id}.json"
+            and dir_fd is not None
+        ):
+            mission_root.rename(retained_root)
+            mission_root.symlink_to(replacement_root, target_is_directory=True)
+            swapped = True
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", swap_before_resource_open)
+    with pytest.raises(ArtifactSecurityError, match="changed during read"):
+        if read_mode == "read":
+            artifacts.read(reference, operation="read", now=NOW)
+        else:
+            artifacts._store.read_bound(
+                mission_id=mission_id,
+                resource_id=reference.artifact_id,
+                now=NOW,
+            )
+    assert swapped
+
+
 def test_artifact_expiry_is_audited_and_resumes_cryptographic_erasure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3734,11 +3879,13 @@ def test_conflicting_artifact_stream_attempts_are_serialized_before_cleanup(
 
 def test_sqlite_audit_chain_persists_events_and_trusted_head(tmp_path: Path) -> None:
     database_path = tmp_path / "durable-audit.sqlite3"
+    head_state_path = tmp_path / "durable-audit-head" / "heads.json"
     key_state_directory = tmp_path / "audit-keys"
     key_state_directory.mkdir(mode=0o700)
     key_state_path = key_state_directory / "provider.json"
     wrapping_key = b"audit-os-keystore-root-key-material"
     generation_store = _GenerationStore()
+    head_generation_store = _GenerationStore()
     first_keys = _wrapped_keys(
         key_state_path,
         wrapping_key=wrapping_key,
@@ -3752,9 +3899,19 @@ def test_sqlite_audit_chain_persists_events_and_trusted_head(tmp_path: Path) -> 
         )
         with pytest.raises(AuditIntegrityError, match="external authenticator"):
             MissionAuditLog(database)
+        with pytest.raises(AuditIntegrityError, match="head store"):
+            MissionAuditLog(
+                database,
+                authenticator=KeyedAuditChainAuthenticator(first_keys),
+            )
         audit = MissionAuditLog(
             database,
             authenticator=KeyedAuditChainAuthenticator(first_keys),
+            head_store=_audit_head_store(
+                head_state_path,
+                keys=first_keys,
+                generation_store=head_generation_store,
+            ),
         )
         first = audit.append(
             mission_id="mission-durable",
@@ -3808,6 +3965,11 @@ def test_sqlite_audit_chain_persists_events_and_trusted_head(tmp_path: Path) -> 
         restarted = MissionAuditLog(
             database,
             authenticator=KeyedAuditChainAuthenticator(restarted_keys),
+            head_store=_audit_head_store(
+                head_state_path,
+                keys=restarted_keys,
+                generation_store=head_generation_store,
+            ),
         )
         assert restarted.verify("mission-durable") == (first, second)
         third = restarted.append(
@@ -3830,28 +3992,39 @@ def test_sqlite_audit_chain_persists_events_and_trusted_head(tmp_path: Path) -> 
 
     with Database(database_path) as database:
         database.connection.execute(
-            "DELETE FROM audit_logs WHERE event_id = ?", (second.event_id,)
+            "DELETE FROM audit_logs WHERE event_id = ?", (third.event_id,)
         )
-        with pytest.raises(AuditIntegrityError):
+        database.connection.execute(
+            "UPDATE audit_log_heads SET sequence_number = ?, event_hash = ? "
+            "WHERE mission_id = ?",
+            (second.sequence_number, second.event_hash, "mission-durable"),
+        )
+        with pytest.raises(AuditIntegrityError, match="head"):
+            truncated_keys = _wrapped_keys(
+                key_state_path,
+                wrapping_key=wrapping_key,
+                generation_store=generation_store,
+            )
             MissionAuditLog(
                 database,
-                authenticator=KeyedAuditChainAuthenticator(
-                    _wrapped_keys(
-                        key_state_path,
-                        wrapping_key=wrapping_key,
-                        generation_store=generation_store,
-                    )
+                authenticator=KeyedAuditChainAuthenticator(truncated_keys),
+                head_store=_audit_head_store(
+                    head_state_path,
+                    keys=truncated_keys,
+                    generation_store=head_generation_store,
                 ),
             ).verify("mission-durable")
 
 
 def test_keyed_sqlite_audit_rejects_recomputed_forged_chain(tmp_path: Path) -> None:
     database_path = tmp_path / "forged-audit.sqlite3"
+    head_state_path = tmp_path / "forged-audit-head" / "heads.json"
     key_state_directory = tmp_path / "forged-audit-keys"
     key_state_directory.mkdir(mode=0o700)
     key_state_path = key_state_directory / "provider.json"
     wrapping_key = b"forged-audit-os-keystore-key-material"
     generation_store = _GenerationStore()
+    head_generation_store = _GenerationStore()
     keys = _wrapped_keys(
         key_state_path,
         wrapping_key=wrapping_key,
@@ -3866,6 +4039,11 @@ def test_keyed_sqlite_audit_rejects_recomputed_forged_chain(tmp_path: Path) -> N
         audit = MissionAuditLog(
             database,
             authenticator=KeyedAuditChainAuthenticator(keys),
+            head_store=_audit_head_store(
+                head_state_path,
+                keys=keys,
+                generation_store=head_generation_store,
+            ),
         )
         for sequence in (1, 2):
             audit.append(
@@ -3942,6 +4120,11 @@ def test_keyed_sqlite_audit_rejects_recomputed_forged_chain(tmp_path: Path) -> N
             MissionAuditLog(
                 database,
                 authenticator=KeyedAuditChainAuthenticator(restarted_keys),
+                head_store=_audit_head_store(
+                    head_state_path,
+                    keys=restarted_keys,
+                    generation_store=head_generation_store,
+                ),
             ).verify("mission-forged")
 
 

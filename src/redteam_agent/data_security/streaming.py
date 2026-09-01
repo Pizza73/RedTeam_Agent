@@ -16,7 +16,11 @@ from redteam_agent.canonical import (
     stable_id,
 )
 from redteam_agent.errors import (
+    ArtifactSecurityError,
+    AuditIntegrityError,
     DigestIntegrityError,
+    EncryptionIntegrityError,
+    EncryptionKeyUnavailableError,
     RawResultQuarantineError,
     RawResultStreamingError,
 )
@@ -1460,11 +1464,68 @@ class EncryptedRawResultSinkFactory:
         self._clock = clock
 
     def for_execution(self, execution_id: str) -> EncryptedRawResultSink:
-        binding = self._bindings.resolve(execution_id)
-        if binding.execution_id != execution_id:
-            raise RawResultQuarantineError("stream binding resolver returned another execution")
-        return EncryptedRawResultSink(
-            quarantine=self._quarantine,
-            binding=binding,
-            clock=self._clock,
+        try:
+            binding = self._bindings.resolve(execution_id)
+            if binding.execution_id != execution_id:
+                raise RawResultQuarantineError(
+                    "stream binding resolver returned another execution"
+                )
+            return EncryptedRawResultSink(
+                quarantine=self._quarantine,
+                binding=binding,
+                clock=self._clock,
+            )
+        except (
+            ArtifactSecurityError,
+            AuditIntegrityError,
+            DigestIntegrityError,
+            EncryptionIntegrityError,
+            EncryptionKeyUnavailableError,
+            RawResultQuarantineError,
+            RawResultStreamingError,
+        ):
+            raise RawResultQuarantineError(
+                "encrypted raw-result sink reconstruction failed"
+            ) from None
+
+    def recovery_metadata_for_failure(
+        self,
+        execution_id: str,
+        *,
+        updated_at: datetime,
+    ) -> RawResultRecoveryMetadata:
+        quarantine_id = stable_id(
+            "quarantine",
+            {"schema_version": "encrypted-stream-v1", "execution_id": execution_id},
+        )
+        sink_id = stable_id(
+            "sink",
+            {"schema_version": "encrypted-stream-v1", "execution_id": execution_id},
+        )
+        provisional = RawResultRecoveryMetadata(
+            recovery_id=stable_id(
+                "recovery",
+                {
+                    "schema_version": "raw-result-recovery-v1",
+                    "execution_id": execution_id,
+                    "quarantine_id": quarantine_id,
+                },
+            ),
+            recovery_digest="pending",
+            execution_id=execution_id,
+            quarantine_id=quarantine_id,
+            sink_id=sink_id,
+            state="RECOVERY_REQUIRED",
+            bytes_received=0,
+            last_chunk_sequence=-1,
+            receipt_id=None,
+            updated_at=updated_at,
+        )
+        return provisional.model_copy(
+            update={
+                "recovery_digest": digest_model(
+                    provisional,
+                    exclude={"recovery_digest"},
+                )
+            }
         )
