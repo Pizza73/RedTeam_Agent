@@ -24,7 +24,7 @@ from redteam_agent.repositories.audit import AuditLogRepository
 from redteam_agent.storage import Database
 
 from .keys import EncryptionKeyProvider
-from .models import AuditEvent
+from .models import AuditEvent, EncryptionMetadata
 
 AuditResourceType = Literal[
     "artifact",
@@ -47,7 +47,15 @@ AuditOperation = Literal[
 
 
 class AuditChainAuthenticator(Protocol):
-    def digest(self, payload: dict[str, object]) -> str: ...
+    def active_signer(self) -> EncryptionMetadata: ...
+
+    def digest(
+        self,
+        payload: dict[str, object],
+        *,
+        signing_key_id: str,
+        signing_key_version: int,
+    ) -> str: ...
 
 
 class KeyedAuditChainAuthenticator:
@@ -56,11 +64,26 @@ class KeyedAuditChainAuthenticator:
     def __init__(self, keys: EncryptionKeyProvider) -> None:
         self._keys = keys
 
-    def digest(self, payload: dict[str, object]) -> str:
+    def active_signer(self) -> EncryptionMetadata:
+        return self._keys.get_active_key_metadata("audit_signing")
+
+    def digest(
+        self,
+        payload: dict[str, object],
+        *,
+        signing_key_id: str,
+        signing_key_version: int,
+    ) -> str:
+        metadata = self._keys.get_key_metadata(
+            "audit_signing",
+            signing_key_id,
+            signing_key_version,
+        )
         return self._keys.keyed_digest(
             "audit_signing",
             "mission-audit-event-v1",
             canonicalize(payload),
+            metadata=metadata,
         )
 
 
@@ -228,6 +251,7 @@ class MissionAuditLog:
             if expected_sequence_number is not None and expected_sequence_number != sequence:
                 raise AuditSequenceConflictError("audit sequence allocation conflict")
             previous_hash = mission_events[-1].event_hash if mission_events else None
+            signing_key_id, signing_key_version = self._active_signer_binding()
             base = self._event_payload(
                 event_id=event_id,
                 mission_id=mission_id,
@@ -235,6 +259,8 @@ class MissionAuditLog:
                 authorization_epoch=authorization_epoch,
                 sequence_number=sequence,
                 previous_event_hash=previous_hash,
+                signing_key_id=signing_key_id,
+                signing_key_version=signing_key_version,
                 event_type=event_type,
                 canonical_payload=canonical_payload,
                 occurred_at=occurred_at,
@@ -247,7 +273,13 @@ class MissionAuditLog:
                 chain_scope="mission",
                 sequence_number=sequence,
                 previous_event_hash=previous_hash,
-                event_hash=self._event_digest(base),
+                signing_key_id=signing_key_id,
+                signing_key_version=signing_key_version,
+                event_hash=self._event_digest(
+                    base,
+                    signing_key_id=signing_key_id,
+                    signing_key_version=signing_key_version,
+                ),
                 event_type=event_type,
                 canonical_payload=canonical_payload,
                 occurred_at=occurred_at,
@@ -300,10 +332,14 @@ class MissionAuditLog:
                     authorization_epoch=event.authorization_epoch,
                     sequence_number=event.sequence_number,
                     previous_event_hash=event.previous_event_hash,
+                    signing_key_id=event.signing_key_id,
+                    signing_key_version=event.signing_key_version,
                     event_type=event.event_type,
                     canonical_payload=event.canonical_payload,
                     occurred_at=event.occurred_at,
                 ),
+                signing_key_id=event.signing_key_id,
+                signing_key_version=event.signing_key_version,
             )
             if not hmac.compare_digest(expected_hash, event.event_hash):
                 raise AuditIntegrityError("mission audit event hash failed")
@@ -377,6 +413,7 @@ class MissionAuditLog:
                     raise AuditSequenceConflictError("audit sequence allocation conflict")
                 if head is None and self._repository.has_event(mission_id):
                     raise AuditIntegrityError("audit chain has no trusted head")
+                signing_key_id, signing_key_version = self._active_signer_binding()
                 base = self._event_payload(
                     event_id=event_id,
                     mission_id=mission_id,
@@ -384,6 +421,8 @@ class MissionAuditLog:
                     authorization_epoch=authorization_epoch,
                     sequence_number=sequence,
                     previous_event_hash=previous_hash,
+                    signing_key_id=signing_key_id,
+                    signing_key_version=signing_key_version,
                     event_type=event_type,
                     canonical_payload=canonical_payload,
                     occurred_at=occurred_at,
@@ -396,7 +435,13 @@ class MissionAuditLog:
                     chain_scope="mission",
                     sequence_number=sequence,
                     previous_event_hash=previous_hash,
-                    event_hash=self._event_digest(base),
+                    signing_key_id=signing_key_id,
+                    signing_key_version=signing_key_version,
+                    event_hash=self._event_digest(
+                        base,
+                        signing_key_id=signing_key_id,
+                        signing_key_version=signing_key_version,
+                    ),
                     event_type=event_type,
                     canonical_payload=canonical_payload,
                     occurred_at=occurred_at,
@@ -444,10 +489,32 @@ class MissionAuditLog:
             else (int(row["sequence_number"]), str(row["event_hash"]))
         )
 
-    def _event_digest(self, payload: dict[str, object]) -> str:
+    def _active_signer_binding(self) -> tuple[str | None, int | None]:
         if self._authenticator is None:
+            return None, None
+        signer = self._authenticator.active_signer()
+        if signer.key_domain != "audit_signing" or signer.rotation_state != "active":
+            raise AuditIntegrityError("audit signing key is unavailable")
+        return signer.key_id, signer.key_version
+
+    def _event_digest(
+        self,
+        payload: dict[str, object],
+        *,
+        signing_key_id: str | None,
+        signing_key_version: int | None,
+    ) -> str:
+        if self._authenticator is None:
+            if signing_key_id is not None or signing_key_version is not None:
+                raise AuditIntegrityError("unexpected audit signing-key binding")
             return sha256_digest(payload)
-        return self._authenticator.digest(payload)
+        if signing_key_id is None or signing_key_version is None:
+            raise AuditIntegrityError("audit signing-key binding is unavailable")
+        return self._authenticator.digest(
+            payload,
+            signing_key_id=signing_key_id,
+            signing_key_version=signing_key_version,
+        )
 
     @staticmethod
     def _parse_event(payload: str | bytes) -> AuditEvent:
@@ -466,6 +533,8 @@ class MissionAuditLog:
         authorization_epoch: int,
         sequence_number: int,
         previous_event_hash: str | None,
+        signing_key_id: str | None,
+        signing_key_version: int | None,
         event_type: str,
         canonical_payload: CanonicalJsonObject,
         occurred_at: datetime,
@@ -478,6 +547,8 @@ class MissionAuditLog:
             "chain_scope": "mission",
             "sequence_number": sequence_number,
             "previous_event_hash": previous_event_hash,
+            "signing_key_id": signing_key_id,
+            "signing_key_version": signing_key_version,
             "event_type": event_type,
             "canonical_payload": canonical_payload,
             "occurred_at": occurred_at,

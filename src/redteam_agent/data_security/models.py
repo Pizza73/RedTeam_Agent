@@ -130,7 +130,15 @@ class AuditEvent(StrictImmutableBoundaryModel):
     chain_scope: Literal["mission"]
     sequence_number: int = Field(ge=1)
     previous_event_hash: str | None
+    signing_key_id: str | None = None
+    signing_key_version: int | None = Field(default=None, ge=1)
     event_hash: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
     event_type: str = Field(min_length=1)
     canonical_payload: CanonicalJsonObject
     occurred_at: UtcDatetime
+
+    @model_validator(mode="after")
+    def signing_key_binding_is_complete(self) -> AuditEvent:
+        if (self.signing_key_id is None) != (self.signing_key_version is None):
+            raise ValueError("audit signing-key binding is incomplete")
+        return self

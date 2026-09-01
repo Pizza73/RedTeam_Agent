@@ -746,3 +746,105 @@ PHASE_GATE=phase-0c PASS
 - No protected governance file was modified.
 - A fresh independent Phase 0C review remains required on the resulting 40-character PR HEAD; this
   local PASS is not an independent Phase Gate PASS.
+
+## Sixteenth independent review correction cycle
+
+Current phase: `phase-0c`.
+
+Input review SHA: `ac6d2aae8c730ad5afb27d2ffba37947026c85c7`.
+
+Phase base: `5cda9a5f8792ee33c3e153d8e791499f5619d82e`.
+
+### Findings addressed
+
+- [`discussion_r3899412059`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3899412059):
+  every persistent key mutation now acquires the cross-process lock, reloads and validates the
+  latest wrapped state, applies the mutation, and advances its generation. Read/decrypt paths also
+  refresh the state, so two provider instances preserve each other's resource keys, nonce history,
+  rotations, and destructions rather than overwriting or using a stale snapshot.
+- [`discussion_r3899412070`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3899412070):
+  each audit event now persists its signing-key ID and version inside the authenticated event
+  payload. Verification resolves that exact retained/decrypt-only signing version, allowing an
+  intact pre-rotation chain to verify and accept new v2-signed events after provider reconstruction.
+- [`discussion_r3899412080`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3899412080):
+  wrapped-key state v2 binds its encrypted inner state and authenticated outer envelope to a
+  monotonically increasing generation held by an external OS-keystore/vault adapter. Missing,
+  replayed, rolled-back, or mismatched generations fail closed; external advancement uses an atomic
+  compare-and-set boundary.
+- [`discussion_r3899412089`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3899412089):
+  Artifact streaming now creates an authenticated cleanup intent before the first fixed-size chunk.
+  Failure cleanup erases deterministic chunk targets immediately when possible, and ArtifactStore
+  reconstruction sweeps remaining intents and cryptographically erases partial chunks after an
+  interrupted cleanup. Completed manifests preserve their referenced chunks.
+- [`discussion_r3899412098`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3899412098):
+  commit and abort terminal persistence now sanitize storage, encryption, quota, filesystem, and
+  audit failures into `RawResultQuarantineError` outside the failing frame. Executor collection
+  routes that type through durable raw-result recovery, pauses the Mission, and blocks later
+  dispatch; terminal storage, key, and audit failures remain retryable without another submission.
+
+### Modified files and regression tests
+
+Resulting working-tree diff: `9 files changed, 1081 insertions(+), 124 deletions(-)`.
+
+- `src/redteam_agent/data_security/__init__.py`
+- `src/redteam_agent/data_security/audit.py`
+- `src/redteam_agent/data_security/keys.py`
+- `src/redteam_agent/data_security/models.py`
+- `src/redteam_agent/data_security/stores.py`
+- `src/redteam_agent/data_security/streaming.py`
+- `tests/security/test_phase0b_execution_safety.py`
+- `tests/security/test_phase0c_data_security.py`
+- `docs/review/phase-0c-fix-report.md`
+
+Regression coverage reconstructs two stale provider instances and interleaves writes/destruction,
+replays a pre-destruction wrapped state, rotates and reconstructs the audit signer, interrupts
+partial-Artifact cleanup before restart, injects terminal Store and encryption-key failures, and
+verifies Executor recovery plus Mission pause on terminal failure. No test was deleted, skipped,
+weakened, or marked as an expected failure.
+
+### Validation
+
+Focused regression command:
+
+```text
+PYTHONPATH=src:. /home/kali/Red_Agent/.venv/bin/pytest -q \
+  tests/security/test_phase0c_data_security.py \
+  tests/security/test_phase0b_execution_safety.py \
+  -k 'wrapped_key_provider or sqlite_audit_chain_persists or \
+  partial_artifact_stream or terminal_storage_and_key or terminal_persistence_failure'
+```
+
+Result: `5 passed, 68 deselected`.
+
+Combined Phase 0B execution-safety and Phase 0C data-security modules: `73 passed`.
+
+Required phase-gate command:
+
+```text
+PATH="/home/kali/Red_Agent/.venv/bin:$PATH" \
+  bash scripts/ci/run_phase_gate.sh phase-0c
+```
+
+Result:
+
+```text
+AUTOMATION_VALIDATION=PASS
+ruff: All checks passed
+mypy: Success: no issues found in 78 source files
+unit: 200 passed
+integration: 7 passed
+security: 182 passed
+full/coverage run: 389 passed
+skipped=0, errors=0, failures=0
+coverage: 82% total (branch coverage enabled)
+pip check: No broken requirements found
+PHASE_GATE=phase-0c PASS
+```
+
+### Remaining constraints
+
+- No real C2, MCP, provider, subprocess, local-attack, credential-collection, or external-target
+  action was executed.
+- No protected governance file was modified.
+- A fresh independent Phase 0C review remains required on the resulting 40-character PR HEAD; this
+  local PASS is not an independent Phase Gate PASS.

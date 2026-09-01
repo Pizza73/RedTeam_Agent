@@ -662,6 +662,56 @@ def test_mid_artifact_interruption_pauses_for_human_recovery() -> None:
     assert adapter.collect_calls == 1
 
 
+def test_terminal_persistence_failure_pauses_for_raw_result_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = build_execution_harness()
+    adapter = MockExecutionAdapter(
+        capabilities=harness.environment.adapter_snapshot.adapters[0],
+        now=FIXED_TIME + timedelta(minutes=3),
+        stdout_chunks=(b"provider-result-before-terminal",),
+    )
+    harness.executor = executor_with_adapter(harness, adapter)
+    prepared = prepare_execution(harness)
+    later = prepare_additional_execution(harness)
+    running = asyncio.run(
+        harness.executor.dispatch(
+            prepared.execution_id,
+            now=FIXED_TIME + timedelta(minutes=3),
+        )
+    )
+    sink = harness.sink_factory.for_execution(running.execution_id)
+
+    async def fail_terminal() -> RawResultReceipt:
+        raise RawResultQuarantineError("terminal persistence failed closed")
+
+    monkeypatch.setattr(sink, "commit", fail_terminal)
+    with pytest.raises(RawResultQuarantineError, match="terminal persistence"):
+        asyncio.run(
+            harness.executor.collect_result(
+                running.execution_id,
+                now=FIXED_TIME + timedelta(minutes=4),
+            )
+        )
+
+    recovery = harness.recovery.get(
+        sink.recovery_metadata(
+            updated_at=FIXED_TIME + timedelta(minutes=4)
+        ).recovery_id
+    )
+    assert recovery is not None and recovery.state == "RECOVERY_REQUIRED"
+    assert harness.finalization.missions.current(running.mission_id).state == "PAUSED"
+    assert harness.receipts.get_by_execution(running.execution_id) is None
+    blocked = asyncio.run(
+        harness.executor.dispatch(
+            later.execution_id,
+            now=FIXED_TIME + timedelta(minutes=5),
+        )
+    )
+    assert blocked.provider_execution_state == "BLOCKED"
+    assert adapter.submit_calls == 1
+
+
 def test_adapter_receipt_must_exactly_match_bound_sink_commit() -> None:
     harness = build_execution_harness()
     adapter = _MismatchedReceiptAdapter(

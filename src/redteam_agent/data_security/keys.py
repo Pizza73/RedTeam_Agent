@@ -12,12 +12,15 @@ import hmac
 import os
 import secrets
 import stat
-from contextlib import suppress
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from threading import RLock
 from typing import Literal, Protocol
+
+from pydantic import Field
 
 from redteam_agent.canonical import (
     canonical_loads,
@@ -53,21 +56,38 @@ class _PersistedNonce(StrictImmutableBoundaryModel):
 
 
 class _PersistedKeyState(StrictImmutableBoundaryModel):
-    schema_version: Literal["wrapped-key-state-v1"]
+    schema_version: Literal["wrapped-key-state-v2"]
+    generation: int = Field(ge=1)
     records: tuple[_PersistedKeyRecord, ...]
     material_fingerprints: tuple[str, ...]
     used_nonces: tuple[_PersistedNonce, ...]
 
 
 class _WrappedKeyState(StrictImmutableBoundaryModel):
-    schema_version: Literal["wrapped-key-file-v1"]
+    schema_version: Literal["wrapped-key-file-v2"]
+    generation: int = Field(ge=1)
     nonce: str
     ciphertext: str
     authentication_tag: str
 
 
+class KeyStateGenerationStore(Protocol):
+    """OS-keystore/vault monotonic anchor for one wrapped state file."""
+
+    def current_generation(self) -> int: ...
+
+    def compare_and_set_generation(self, *, expected: int, new: int) -> bool: ...
+
+
 class EncryptionKeyProvider(Protocol):
     def get_active_key_metadata(self, domain: KeyDomain) -> EncryptionMetadata: ...
+
+    def get_key_metadata(
+        self,
+        domain: KeyDomain,
+        key_id: str,
+        key_version: int,
+    ) -> EncryptionMetadata: ...
 
     def seal(
         self, domain: KeyDomain, plaintext: bytes, aad: dict[str, object]
@@ -242,6 +262,18 @@ class InMemoryEncryptionKeyProvider:
             record = self._records.get((domain, *active)) if active is not None else None
             if record is None or record.metadata.rotation_state != "active":
                 raise EncryptionKeyUnavailableError("active key is unavailable")
+            return record.metadata
+
+    def get_key_metadata(
+        self,
+        domain: KeyDomain,
+        key_id: str,
+        key_version: int,
+    ) -> EncryptionMetadata:
+        with self._lock:
+            record = self._records.get((domain, key_id, key_version))
+            if record is None:
+                raise EncryptionKeyUnavailableError("key identity is unavailable")
             return record.metadata
 
     def seal(
@@ -511,7 +543,13 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
     written to the application database, configuration, or filesystem.
     """
 
-    def __init__(self, *, state_path: Path, wrapping_key: bytes) -> None:
+    def __init__(
+        self,
+        *,
+        state_path: Path,
+        wrapping_key: bytes,
+        generation_store: KeyStateGenerationStore,
+    ) -> None:
         super().__init__()
         if len(wrapping_key) < 32:
             raise EncryptionKeyUnavailableError(
@@ -541,10 +579,18 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
             parent_metadata.st_ino,
         )
         self._wrapping_key = bytes(wrapping_key)
+        self._generation_store = generation_store
+        self._generation = 0
         self._state_lock_path = parent / f".{absolute_path.name}.lock"
         self._state_lock = RLock()
-        if absolute_path.exists() or absolute_path.is_symlink():
-            self._load_persisted_state()
+        self._updating = False
+        with self._state_lock, self._locked_state_file():
+            if absolute_path.exists() or absolute_path.is_symlink():
+                self._load_persisted_state()
+            elif self._external_generation() != 0:
+                raise EncryptionKeyUnavailableError(
+                    "key-state file is missing for external generation"
+                )
 
     def register_key(
         self,
@@ -557,23 +603,16 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
         created_at: datetime,
         rotation_state: RotationState = "active",
     ) -> EncryptionMetadata:
-        with self._state_lock:
-            snapshot = self._snapshot()
-            try:
-                metadata = super().register_key(
-                    domain=domain,
-                    key_id=key_id,
-                    key_version=key_version,
-                    key_separation_tag=key_separation_tag,
-                    material=material,
-                    created_at=created_at,
-                    rotation_state=rotation_state,
-                )
-                self._persist_state()
-                return metadata
-            except Exception:
-                self._restore(snapshot)
-                raise
+        with self._update_state():
+            return super().register_key(
+                domain=domain,
+                key_id=key_id,
+                key_version=key_version,
+                key_separation_tag=key_separation_tag,
+                material=material,
+                created_at=created_at,
+                rotation_state=rotation_state,
+            )
 
     def set_rotation_state(
         self,
@@ -582,14 +621,8 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
         key_version: int,
         state: RotationState,
     ) -> None:
-        with self._state_lock:
-            snapshot = self._snapshot()
-            try:
-                super().set_rotation_state(domain, key_id, key_version, state)
-                self._persist_state()
-            except Exception:
-                self._restore(snapshot)
-                raise
+        with self._update_state():
+            super().set_rotation_state(domain, key_id, key_version, state)
 
     def seal(
         self,
@@ -599,15 +632,8 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
         *,
         nonce: bytes | None = None,
     ) -> EncryptedPayload:
-        with self._state_lock:
-            snapshot = self._snapshot()
-            try:
-                payload = super().seal(domain, plaintext, aad, nonce=nonce)
-                self._persist_state()
-                return payload
-            except Exception:
-                self._restore(snapshot)
-                raise
+        with self._update_state():
+            return super().seal(domain, plaintext, aad, nonce=nonce)
 
     def seal_for_resource(
         self,
@@ -618,21 +644,111 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
         *,
         created_at: datetime,
     ) -> EncryptedPayload:
-        with self._state_lock:
-            snapshot = self._snapshot()
-            try:
-                payload = super().seal_for_resource(
-                    domain,
-                    resource_id,
-                    plaintext,
-                    aad,
-                    created_at=created_at,
+        with self._update_state():
+            return super().seal_for_resource(
+                domain,
+                resource_id,
+                plaintext,
+                aad,
+                created_at=created_at,
+            )
+
+    def destroy_resource_key(self, metadata: EncryptionMetadata) -> None:
+        with self._update_state():
+            identity = (metadata.key_domain, metadata.key_id, metadata.key_version)
+            with self._lock:
+                record = self._records.get(identity)
+                if record is None or not record.resource_key:
+                    raise EncryptionKeyUnavailableError("resource key is unavailable")
+            InMemoryEncryptionKeyProvider.set_rotation_state(
+                self,
+                metadata.key_domain,
+                metadata.key_id,
+                metadata.key_version,
+                "destroyed",
+            )
+
+    def get_active_key_metadata(self, domain: KeyDomain) -> EncryptionMetadata:
+        self._refresh_if_idle()
+        return super().get_active_key_metadata(domain)
+
+    def get_key_metadata(
+        self,
+        domain: KeyDomain,
+        key_id: str,
+        key_version: int,
+    ) -> EncryptionMetadata:
+        self._refresh_if_idle()
+        return super().get_key_metadata(domain, key_id, key_version)
+
+    def open(
+        self,
+        domain: KeyDomain,
+        payload: EncryptedPayload,
+        aad: dict[str, object],
+    ) -> bytes:
+        self._refresh_if_idle()
+        return super().open(domain, payload, aad)
+
+    def verify(
+        self,
+        domain: KeyDomain,
+        payload: EncryptedPayload,
+        aad: dict[str, object],
+    ) -> None:
+        self._refresh_if_idle()
+        super().verify(domain, payload, aad)
+
+    def keyed_digest(
+        self,
+        domain: KeyDomain,
+        purpose: str,
+        value: bytes,
+        *,
+        metadata: EncryptionMetadata | None = None,
+    ) -> str:
+        self._refresh_if_idle()
+        return super().keyed_digest(
+            domain,
+            purpose,
+            value,
+            metadata=metadata,
+        )
+
+    def resource_key_destroyed(self, metadata: EncryptionMetadata) -> bool:
+        self._refresh_if_idle()
+        return super().resource_key_destroyed(metadata)
+
+    @contextmanager
+    def _update_state(self) -> Iterator[None]:
+        with self._state_lock, self._locked_state_file():
+            if self._state_path.exists() or self._state_path.is_symlink():
+                self._load_persisted_state()
+            elif self._external_generation() != 0:
+                raise EncryptionKeyUnavailableError(
+                    "key-state file is missing for external generation"
                 )
-                self._persist_state()
-                return payload
+            snapshot = self._snapshot()
+            generation = self._generation
+            self._updating = True
+            try:
+                yield
+                self._persist_state(expected_generation=generation)
             except Exception:
                 self._restore(snapshot)
+                self._generation = generation
                 raise
+            finally:
+                self._updating = False
+
+    def _refresh_if_idle(self) -> None:
+        with self._state_lock:
+            if self._updating:
+                return
+            with self._locked_state_file():
+                if not (self._state_path.exists() or self._state_path.is_symlink()):
+                    raise EncryptionKeyUnavailableError("key-state file is unavailable")
+                self._load_persisted_state()
 
     def _snapshot(self) -> tuple[
         dict[tuple[KeyDomain, str, int], _KeyRecord],
@@ -686,7 +802,7 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
                 self._used_nonces,
             ) = snapshot
 
-    def _persisted_state(self) -> _PersistedKeyState:
+    def _persisted_state(self, *, generation: int) -> _PersistedKeyState:
         with self._lock:
             records = tuple(
                 _PersistedKeyRecord(
@@ -720,36 +836,61 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
                 )
             )
         return _PersistedKeyState(
-            schema_version="wrapped-key-state-v1",
+            schema_version="wrapped-key-state-v2",
+            generation=generation,
             records=records,
             material_fingerprints=fingerprints,
             used_nonces=nonces,
         )
 
-    def _persist_state(self) -> None:
-        plaintext = canonicalize(self._persisted_state().model_dump(mode="python"))
+    def _persist_state(self, *, expected_generation: int) -> None:
+        if self._external_generation() != expected_generation:
+            raise EncryptionKeyUnavailableError("external key-state generation changed")
+        generation = expected_generation + 1
+        plaintext = canonicalize(
+            self._persisted_state(generation=generation).model_dump(mode="python")
+        )
         nonce = secrets.token_bytes(24)
         encryption_key = hmac.digest(
             self._wrapping_key,
-            b"redteam-key-state-encryption-v1",
+            b"redteam-key-state-encryption-v2",
             "sha256",
         )
         authentication_key = hmac.digest(
             self._wrapping_key,
-            b"redteam-key-state-authentication-v1",
+            b"redteam-key-state-authentication-v2",
             "sha256",
         )
         ciphertext = self._xor_stream(encryption_key, nonce, plaintext)
-        tag = hmac.digest(authentication_key, nonce + ciphertext, "sha256")
+        tag = hmac.digest(
+            authentication_key,
+            generation.to_bytes(16, "big") + nonce + ciphertext,
+            "sha256",
+        )
         wrapped = canonicalize(
             _WrappedKeyState(
-                schema_version="wrapped-key-file-v1",
+                schema_version="wrapped-key-file-v2",
+                generation=generation,
                 nonce=self._encode(nonce),
                 ciphertext=self._encode(ciphertext),
                 authentication_tag=self._encode(tag),
             ).model_dump(mode="python")
         )
-        self._write_wrapped_state(wrapped)
+        self._write_wrapped_state_locked(wrapped)
+        try:
+            advanced = self._generation_store.compare_and_set_generation(
+                expected=expected_generation,
+                new=generation,
+            )
+        except Exception as exc:
+            raise EncryptionKeyUnavailableError(
+                "external key-state generation is unavailable"
+            ) from exc
+        if not advanced:
+            raise EncryptionKeyUnavailableError(
+                "external key-state generation update conflicted"
+            )
+        self._generation = generation
 
     def _load_persisted_state(self) -> None:
         raw = self._read_wrapped_state()
@@ -768,19 +909,19 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
             raise EncryptionKeyUnavailableError("key-state nonce is invalid")
         authentication_key = hmac.digest(
             self._wrapping_key,
-            b"redteam-key-state-authentication-v1",
+            b"redteam-key-state-authentication-v2",
             "sha256",
         )
         expected_tag = hmac.digest(
             authentication_key,
-            nonce + ciphertext,
+            wrapped.generation.to_bytes(16, "big") + nonce + ciphertext,
             "sha256",
         )
         if not hmac.compare_digest(actual_tag, expected_tag):
             raise EncryptionKeyUnavailableError("key-state authentication failed")
         encryption_key = hmac.digest(
             self._wrapping_key,
-            b"redteam-key-state-encryption-v1",
+            b"redteam-key-state-encryption-v2",
             "sha256",
         )
         plaintext = self._xor_stream(encryption_key, nonce, ciphertext)
@@ -792,7 +933,33 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
             )
         except (TypeError, ValueError) as exc:
             raise EncryptionKeyUnavailableError("key-state payload is invalid") from exc
+        if state.generation != wrapped.generation:
+            raise EncryptionKeyUnavailableError("key-state generation binding failed")
+        external_generation = self._external_generation()
+        if state.generation != external_generation:
+            raise EncryptionKeyUnavailableError(
+                "key-state rollback or generation mismatch detected"
+            )
         self._restore_loaded_state(state)
+        self._generation = state.generation
+
+    def _external_generation(self) -> int:
+        try:
+            generation = self._generation_store.current_generation()
+        except Exception as exc:
+            raise EncryptionKeyUnavailableError(
+                "external key-state generation is unavailable"
+            ) from exc
+        if (
+            not isinstance(generation, int)
+            or isinstance(generation, bool)
+            or generation < 0
+            or generation >= 2**128
+        ):
+            raise EncryptionKeyUnavailableError(
+                "external key-state generation is invalid"
+            )
+        return generation
 
     def _restore_loaded_state(self, state: _PersistedKeyState) -> None:
         records: dict[tuple[KeyDomain, str, int], _KeyRecord] = {}
@@ -953,33 +1120,33 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
         finally:
             os.close(directory_descriptor)
 
-    def _write_wrapped_state(self, content: bytes) -> None:
-        with self._state_lock:
-            lock_flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC
-            if hasattr(os, "O_NOFOLLOW"):
-                lock_flags |= os.O_NOFOLLOW
-            try:
-                lock_descriptor = os.open(self._state_lock_path, lock_flags, 0o600)
-            except OSError as exc:
-                raise EncryptionKeyUnavailableError(
-                    "key-state lock is unavailable"
-                ) from exc
-            try:
-                lock_metadata = os.fstat(lock_descriptor)
-                if (
-                    not stat.S_ISREG(lock_metadata.st_mode)
-                    or lock_metadata.st_nlink != 1
-                    or stat.S_IMODE(lock_metadata.st_mode) & 0o077
-                ):
-                    raise EncryptionKeyUnavailableError("key-state lock is invalid")
-                fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
-                self._write_wrapped_state_locked(content)
-            except OSError as exc:
-                raise EncryptionKeyUnavailableError("key-state write failed") from exc
-            finally:
-                with suppress(OSError):
-                    fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
-                os.close(lock_descriptor)
+    @contextmanager
+    def _locked_state_file(self) -> Iterator[None]:
+        lock_flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            lock_flags |= os.O_NOFOLLOW
+        try:
+            lock_descriptor = os.open(self._state_lock_path, lock_flags, 0o600)
+        except OSError as exc:
+            raise EncryptionKeyUnavailableError(
+                "key-state lock is unavailable"
+            ) from exc
+        try:
+            lock_metadata = os.fstat(lock_descriptor)
+            if (
+                not stat.S_ISREG(lock_metadata.st_mode)
+                or lock_metadata.st_nlink != 1
+                or stat.S_IMODE(lock_metadata.st_mode) & 0o077
+            ):
+                raise EncryptionKeyUnavailableError("key-state lock is invalid")
+            fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+            yield
+        except OSError as exc:
+            raise EncryptionKeyUnavailableError("key-state lock failed") from exc
+        finally:
+            with suppress(OSError):
+                fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+            os.close(lock_descriptor)
 
     def _write_wrapped_state_locked(self, content: bytes) -> None:
         directory_flags = os.O_RDONLY | os.O_CLOEXEC

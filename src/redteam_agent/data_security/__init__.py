@@ -14,6 +14,7 @@ from .ingestion import EncryptedSecureResultIngester, SecureIngestor
 from .keys import (
     EncryptionKeyProvider,
     InMemoryEncryptionKeyProvider,
+    KeyStateGenerationStore,
     WrappedFileEncryptionKeyProvider,
 )
 from .models import (
@@ -62,6 +63,7 @@ __all__ = [
     "InMemoryEncryptionKeyProvider",
     "KeyDomain",
     "KeyedAuditChainAuthenticator",
+    "KeyStateGenerationStore",
     "MissionAuditLog",
     "MissionAuditRecorder",
     "QuarantineReference",

@@ -312,6 +312,17 @@ class EncryptedRawResultSink:
         self._commit_artifact(metadata, metadata_digest=metadata_digest)
 
     async def commit(self) -> RawResultReceipt:
+        try:
+            return self._commit_terminal()
+        except (RawResultQuarantineError, RawResultStreamingError):
+            raise
+        except Exception as failure:
+            failure.__traceback__ = None
+        raise RawResultQuarantineError(
+            "raw-result terminal persistence failed closed"
+        ) from None
+
+    def _commit_terminal(self) -> RawResultReceipt:
         if self._deleted:
             raise RawResultQuarantineError("deleted quarantine cannot be committed")
         if self._aborted:
@@ -388,6 +399,18 @@ class EncryptedRawResultSink:
         return receipt
 
     async def abort(self) -> None:
+        try:
+            self._abort_terminal()
+            return
+        except (RawResultQuarantineError, RawResultStreamingError):
+            raise
+        except Exception as failure:
+            failure.__traceback__ = None
+        raise RawResultQuarantineError(
+            "raw-result terminal persistence failed closed"
+        ) from None
+
+    def _abort_terminal(self) -> None:
         if self._deleted:
             raise RawResultQuarantineError("deleted quarantine cannot be aborted")
         if self._receipt is not None:

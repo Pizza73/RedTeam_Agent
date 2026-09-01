@@ -9,7 +9,7 @@ import stat
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from threading import Event
+from threading import Event, Lock
 
 import pytest
 from pydantic import ValidationError
@@ -118,6 +118,23 @@ class _StreamBindings:
         return self.binding
 
 
+class _GenerationStore:
+    def __init__(self) -> None:
+        self.generation = 0
+        self._lock = Lock()
+
+    def current_generation(self) -> int:
+        with self._lock:
+            return self.generation
+
+    def compare_and_set_generation(self, *, expected: int, new: int) -> bool:
+        with self._lock:
+            if self.generation != expected or new != expected + 1:
+                return False
+            self.generation = new
+            return True
+
+
 def _keys() -> InMemoryEncryptionKeyProvider:
     provider = InMemoryEncryptionKeyProvider()
     for index, domain in enumerate(
@@ -137,12 +154,14 @@ def _keys() -> InMemoryEncryptionKeyProvider:
 def _wrapped_keys(
     state_path: Path,
     *,
+    generation_store: _GenerationStore,
     wrapping_key: bytes = b"wrapped-provider-root-key-material",
 ) -> WrappedFileEncryptionKeyProvider:
     first_creation = not state_path.exists()
     provider = WrappedFileEncryptionKeyProvider(
         state_path=state_path,
         wrapping_key=wrapping_key,
+        generation_store=generation_store,
     )
     if first_creation:
         for index, domain in enumerate(
@@ -1086,6 +1105,78 @@ def test_raw_chunk_failures_leave_no_secret_in_streaming_traceback(
     assert checked_streaming_frame
 
 
+def test_terminal_storage_and_key_failures_are_typed_for_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    keys = _keys()
+    audit = MissionAuditRecorder(
+        audit_log=MissionAuditLog(),
+        contexts=_AuditContexts(),
+    )
+    quarantine = EncryptedRawResultQuarantine(
+        root=tmp_path / "terminal-failures",
+        keys=keys,
+        audit=audit,
+        max_item_bytes=1024,
+        mission_quota_bytes=8192,
+    )
+
+    def factory(execution_id: str) -> EncryptedRawResultSinkFactory:
+        return EncryptedRawResultSinkFactory(
+            quarantine=quarantine,
+            bindings=_StreamBindings(
+                QuarantineStreamBinding(
+                    mission_id=f"mission-{execution_id}",
+                    mission_revision=1,
+                    execution_id=execution_id,
+                    retention_until=NOW + timedelta(hours=1),
+                    max_result_bytes=1024,
+                    resume_mode="from_start",
+                )
+            ),
+            clock=lambda: NOW,
+        )
+
+    storage_factory = factory("execution-terminal-storage")
+    storage_sink = storage_factory.for_execution("execution-terminal-storage")
+    asyncio.run(storage_sink.write_stdout(b"durable-before-terminal"))
+    original_write = storage_sink._store.write
+
+    def fail_terminal_write(**kwargs):
+        if str(kwargs["resource_id"]).startswith("streamterminal_"):
+            raise ArtifactSecurityError("simulated terminal filesystem failure")
+        return original_write(**kwargs)
+
+    monkeypatch.setattr(storage_sink._store, "write", fail_terminal_write)
+    with pytest.raises(RawResultQuarantineError, match="terminal persistence"):
+        asyncio.run(storage_sink.commit())
+    assert storage_sink.recovery_metadata(updated_at=NOW).state == "RECOVERY_REQUIRED"
+    monkeypatch.setattr(storage_sink._store, "write", original_write)
+    assert asyncio.run(storage_sink.commit()).stdout_bytes == len(
+        b"durable-before-terminal"
+    )
+
+    key_factory = factory("execution-terminal-key")
+    key_sink = key_factory.for_execution("execution-terminal-key")
+    asyncio.run(key_sink.write_stdout(b"durable-before-key-failure"))
+    original_seal = keys.seal_for_resource
+
+    def fail_terminal_key(*args, **kwargs):
+        if str(args[1]).startswith("streamterminal_"):
+            raise EncryptionKeyUnavailableError("simulated terminal key failure")
+        return original_seal(*args, **kwargs)
+
+    monkeypatch.setattr(keys, "seal_for_resource", fail_terminal_key)
+    with pytest.raises(RawResultQuarantineError, match="terminal persistence"):
+        asyncio.run(key_sink.commit())
+    assert key_sink.recovery_metadata(updated_at=NOW).state == "RECOVERY_REQUIRED"
+    monkeypatch.setattr(keys, "seal_for_resource", original_seal)
+    assert asyncio.run(key_sink.commit()).stdout_bytes == len(
+        b"durable-before-key-failure"
+    )
+
+
 def test_encrypted_store_fsyncs_parent_before_acknowledging_write(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1835,7 +1926,7 @@ def test_aborted_stream_erasure_resumes_after_interruption(
             raise ArtifactSecurityError("simulated abort erasure interruption")
 
     monkeypatch.setattr(sink._store, "erase_resource", interrupt_after_first_erasure)
-    with pytest.raises(ArtifactSecurityError, match="abort erasure interruption"):
+    with pytest.raises(RawResultQuarantineError, match="terminal persistence"):
         asyncio.run(sink.abort())
     assert sink._terminal_envelope is not None
     terminal_metadata = sink._terminal_envelope.payload.metadata
@@ -1873,7 +1964,12 @@ def test_wrapped_key_provider_recovers_committed_stream_after_restart(
     key_state_path = key_state_directory / "provider.json"
     quarantine_root = tmp_path / "persistent-quarantine"
     wrapping_key = b"external-os-keystore-root-key-material"
-    first_keys = _wrapped_keys(key_state_path, wrapping_key=wrapping_key)
+    generation_store = _GenerationStore()
+    first_keys = _wrapped_keys(
+        key_state_path,
+        wrapping_key=wrapping_key,
+        generation_store=generation_store,
+    )
     first_audit_log = MissionAuditLog(
         authenticator=KeyedAuditChainAuthenticator(first_keys)
     )
@@ -1912,7 +2008,11 @@ def test_wrapped_key_provider_recovers_committed_stream_after_restart(
     for index in range(1, 5):
         assert base64.b64encode(bytes([index]) * 32) not in persisted
 
-    restarted_keys = _wrapped_keys(key_state_path, wrapping_key=wrapping_key)
+    restarted_keys = _wrapped_keys(
+        key_state_path,
+        wrapping_key=wrapping_key,
+        generation_store=generation_store,
+    )
     restarted_quarantine = EncryptedRawResultQuarantine(
         root=quarantine_root,
         keys=restarted_keys,
@@ -1948,6 +2048,44 @@ def test_wrapped_key_provider_recovers_committed_stream_after_restart(
         WrappedFileEncryptionKeyProvider(
             state_path=key_state_path,
             wrapping_key=b"different-external-keystore-key-material",
+            generation_store=generation_store,
+        )
+
+    concurrent_keys = _wrapped_keys(
+        key_state_path,
+        wrapping_key=wrapping_key,
+        generation_store=generation_store,
+    )
+    aad = {"mission_id": binding.mission_id, "purpose": "concurrency-regression"}
+    first_resource = restarted_keys.seal_for_resource(
+        "artifact_store",
+        "artifact_concurrent_first",
+        b"first-concurrent-resource",
+        aad,
+        created_at=NOW,
+    )
+    second_resource = concurrent_keys.seal_for_resource(
+        "artifact_store",
+        "artifact_concurrent_second",
+        b"second-concurrent-resource",
+        aad,
+        created_at=NOW,
+    )
+    assert (
+        restarted_keys.open("artifact_store", second_resource, aad)
+        == b"second-concurrent-resource"
+    )
+    pre_destruction_state = key_state_path.read_bytes()
+    concurrent_keys.destroy_resource_key(first_resource.metadata)
+    with pytest.raises(EncryptionKeyUnavailableError, match="unavailable"):
+        restarted_keys.open("artifact_store", first_resource, aad)
+
+    key_state_path.write_bytes(pre_destruction_state)
+    with pytest.raises(EncryptionKeyUnavailableError, match="rollback"):
+        WrappedFileEncryptionKeyProvider(
+            state_path=key_state_path,
+            wrapping_key=wrapping_key,
+            generation_store=generation_store,
         )
 
 
@@ -2592,7 +2730,7 @@ def test_storage_rejects_traversal_symlink_quota_retention_and_corruption(
     async def crash_before_commit_audit() -> None:
         sink = failed_audit_factory.for_execution("execution-audit-crash")
         await sink.write_stdout(b"auditable")
-        with pytest.raises(AuditIntegrityError):
+        with pytest.raises(RawResultQuarantineError, match="terminal persistence"):
             await sink.commit()
 
     asyncio.run(crash_before_commit_audit())
@@ -2956,13 +3094,84 @@ def test_artifact_expiry_is_audited_and_resumes_cryptographic_erasure(
     ) == 1
 
 
+def test_partial_artifact_stream_cleanup_resumes_after_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    keys = _keys()
+    authorizer = _ExactEnvelopeAuthorizer()
+    authorizer.allow_ingestion_write("mission-partial", "execution-partial")
+    audit_log = MissionAuditLog()
+    audit = MissionAuditRecorder(audit_log=audit_log, contexts=_AuditContexts())
+    artifact_root = tmp_path / "partial-artifacts"
+    artifacts = ArtifactStore(
+        root=artifact_root,
+        keys=keys,
+        authorizer=authorizer,
+        audit=audit,
+        max_item_bytes=16 * 1024,
+        mission_quota_bytes=32 * 1024,
+    )
+
+    async def failing_chunks():
+        yield b"A" * 4096
+        raise ArtifactSecurityError("simulated redaction failure")
+
+    def interrupt_cleanup(**kwargs) -> None:
+        del kwargs
+        raise ArtifactSecurityError("simulated cleanup interruption")
+
+    monkeypatch.setattr(artifacts._store, "erase_resource", interrupt_cleanup)
+    with pytest.raises(ArtifactSecurityError, match="redaction failure"):
+        asyncio.run(
+            artifacts.put_stream(
+                mission_id="mission-partial",
+                chunks=failing_chunks(),
+                media_type="application/octet-stream",
+                classification=lambda: "normal",
+                variant="redacted",
+                source_execution_id="execution-partial",
+                created_at=NOW,
+            )
+        )
+    pending_envelopes = artifacts._store.envelopes_for("mission-partial")
+    pending_metadata = tuple(
+        envelope.payload.metadata for envelope in pending_envelopes
+    )
+    assert any(
+        envelope.resource_id.startswith("artifactchunk_")
+        for envelope in pending_envelopes
+    )
+    assert any(
+        envelope.resource_id.startswith("artifactcleanup_")
+        for envelope in pending_envelopes
+    )
+
+    ArtifactStore(
+        root=artifact_root,
+        keys=keys,
+        authorizer=authorizer,
+        audit=audit,
+        max_item_bytes=16 * 1024,
+        mission_quota_bytes=32 * 1024,
+    )
+    assert not list((artifact_root / "mission-partial").glob("*.json"))
+    assert all(keys.resource_key_destroyed(metadata) for metadata in pending_metadata)
+    assert audit_log.events_for("mission-partial") == ()
+
+
 def test_sqlite_audit_chain_persists_events_and_trusted_head(tmp_path: Path) -> None:
     database_path = tmp_path / "durable-audit.sqlite3"
     key_state_directory = tmp_path / "audit-keys"
     key_state_directory.mkdir(mode=0o700)
     key_state_path = key_state_directory / "provider.json"
     wrapping_key = b"audit-os-keystore-root-key-material"
-    first_keys = _wrapped_keys(key_state_path, wrapping_key=wrapping_key)
+    generation_store = _GenerationStore()
+    first_keys = _wrapped_keys(
+        key_state_path,
+        wrapping_key=wrapping_key,
+        generation_store=generation_store,
+    )
     with Database(database_path) as database:
         database.connection.execute(
             "INSERT INTO missions(mission_id, payload_json, created_at, created_by) "
@@ -3002,9 +3211,28 @@ def test_sqlite_audit_chain_persists_events_and_trusted_head(tmp_path: Path) -> 
             occurred_at=NOW + timedelta(seconds=1),
         )
         assert audit.verify("mission-durable") == (first, second)
+        first_keys.set_rotation_state(
+            "audit_signing",
+            "audit_signing-key-v1",
+            1,
+            "decrypt_only",
+        )
+        first_keys.register_key(
+            domain="audit_signing",
+            key_id="audit_signing-key-v2",
+            key_version=2,
+            key_separation_tag="audit_signing-separation-v2",
+            material=b"\x05" * 32,
+            created_at=NOW + timedelta(minutes=1),
+        )
+        assert audit.verify("mission-durable") == (first, second)
 
     with Database(database_path) as database:
-        restarted_keys = _wrapped_keys(key_state_path, wrapping_key=wrapping_key)
+        restarted_keys = _wrapped_keys(
+            key_state_path,
+            wrapping_key=wrapping_key,
+            generation_store=generation_store,
+        )
         restarted = MissionAuditLog(
             database,
             authenticator=KeyedAuditChainAuthenticator(restarted_keys),
@@ -3024,6 +3252,8 @@ def test_sqlite_audit_chain_persists_events_and_trusted_head(tmp_path: Path) -> 
             occurred_at=NOW + timedelta(seconds=2),
         )
         assert third.sequence_number == 3
+        assert third.signing_key_id == "audit_signing-key-v2"
+        assert first.signing_key_id == "audit_signing-key-v1"
         assert restarted.verify("mission-durable") == (first, second, third)
 
     with Database(database_path) as database:
@@ -3034,7 +3264,11 @@ def test_sqlite_audit_chain_persists_events_and_trusted_head(tmp_path: Path) -> 
             MissionAuditLog(
                 database,
                 authenticator=KeyedAuditChainAuthenticator(
-                    _wrapped_keys(key_state_path, wrapping_key=wrapping_key)
+                    _wrapped_keys(
+                        key_state_path,
+                        wrapping_key=wrapping_key,
+                        generation_store=generation_store,
+                    )
                 ),
             ).verify("mission-durable")
 
@@ -3045,7 +3279,12 @@ def test_keyed_sqlite_audit_rejects_recomputed_forged_chain(tmp_path: Path) -> N
     key_state_directory.mkdir(mode=0o700)
     key_state_path = key_state_directory / "provider.json"
     wrapping_key = b"forged-audit-os-keystore-key-material"
-    keys = _wrapped_keys(key_state_path, wrapping_key=wrapping_key)
+    generation_store = _GenerationStore()
+    keys = _wrapped_keys(
+        key_state_path,
+        wrapping_key=wrapping_key,
+        generation_store=generation_store,
+    )
     with Database(database_path) as database:
         database.connection.execute(
             "INSERT INTO missions(mission_id, payload_json, created_at, created_by) "
@@ -3096,6 +3335,8 @@ def test_keyed_sqlite_audit_rejects_recomputed_forged_chain(tmp_path: Path) -> N
                     "chain_scope",
                     "sequence_number",
                     "previous_event_hash",
+                    "signing_key_id",
+                    "signing_key_version",
                     "event_type",
                     "canonical_payload",
                     "occurred_at",
@@ -3120,7 +3361,11 @@ def test_keyed_sqlite_audit_rejects_recomputed_forged_chain(tmp_path: Path) -> N
         )
 
     with Database(database_path) as database:
-        restarted_keys = _wrapped_keys(key_state_path, wrapping_key=wrapping_key)
+        restarted_keys = _wrapped_keys(
+            key_state_path,
+            wrapping_key=wrapping_key,
+            generation_store=generation_store,
+        )
         with pytest.raises(AuditIntegrityError, match="event hash failed"):
             MissionAuditLog(
                 database,

@@ -6,6 +6,7 @@ import fcntl
 import hashlib
 import os
 import re
+import secrets
 import stat
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import contextmanager, suppress
@@ -143,6 +144,13 @@ class _ArtifactDeletionIntent(StrictImmutableBoundaryModel):
     record_type: Literal["artifact_delete_intent"]
     reference: ArtifactReference
     resource_ids: tuple[str, ...] = Field(min_length=1)
+
+
+class _ArtifactStreamCleanupIntent(StrictImmutableBoundaryModel):
+    record_type: Literal["artifact_stream_cleanup_intent"]
+    cleanup_id: str = Field(min_length=1)
+    stream_id: str = Field(min_length=1)
+    source_execution_id: str = Field(min_length=1)
 
 
 class _EncryptedFileStore:
@@ -424,6 +432,39 @@ class _EncryptedFileStore:
             )
             envelopes.append(envelope)
         return tuple(envelopes)
+
+    def mission_ids(self) -> tuple[str, ...]:
+        mission_ids: list[str] = []
+        for path in sorted(self._root.iterdir()):
+            if path.name.startswith("."):
+                continue
+            self._validate_token(path.name)
+            if path.is_symlink() or not path.is_dir():
+                raise ArtifactSecurityError("unexpected Store-root entry")
+            mission_ids.append(path.name)
+        return tuple(mission_ids)
+
+    def resource_ids_with_prefix(
+        self,
+        *,
+        mission_id: str,
+        prefix: str,
+    ) -> tuple[str, ...]:
+        self._validate_token(mission_id)
+        mission_root = self._root / mission_id
+        if not mission_root.exists():
+            return ()
+        if mission_root.is_symlink() or not mission_root.is_dir():
+            raise ArtifactSecurityError("mission storage is invalid")
+        resource_ids: list[str] = []
+        for path in sorted(mission_root.iterdir()):
+            if path.is_symlink() or not path.is_file() or path.suffix != ".json":
+                raise ArtifactSecurityError("unexpected mission storage entry")
+            resource_id = path.stem
+            self._validate_token(resource_id)
+            if resource_id.startswith(prefix):
+                resource_ids.append(resource_id)
+        return tuple(resource_ids)
 
     def _open_envelope(
         self,
@@ -1055,6 +1096,7 @@ class ArtifactStore:
         self._authorizer = authorizer
         self._audit = audit
         self.max_observed_stream_chunk_bytes = 0
+        self._resume_pending_stream_cleanups()
 
     def put(
         self,
@@ -1164,6 +1206,65 @@ class ArtifactStore:
         retention_until: datetime | None = None,
         derived_from_artifact_id: str | None = None,
     ) -> ArtifactReference:
+        """Persist a stream with a restartable intent for orphan-chunk cleanup."""
+
+        stream_id = self._artifact_stream_id(
+            mission_id=mission_id,
+            media_type=media_type,
+            variant=variant,
+            source_execution_id=source_execution_id,
+            derived_from_artifact_id=derived_from_artifact_id,
+        )
+        cleanup_id = self._begin_stream_cleanup(
+            mission_id=mission_id,
+            stream_id=stream_id,
+            source_execution_id=source_execution_id,
+            created_at=created_at,
+        )
+        try:
+            reference = await self._put_stream_unreconciled(
+                mission_id=mission_id,
+                chunks=chunks,
+                media_type=media_type,
+                classification=classification,
+                variant=variant,
+                source_execution_id=source_execution_id,
+                created_at=created_at,
+                retention_until=retention_until,
+                derived_from_artifact_id=derived_from_artifact_id,
+            )
+        except Exception:
+            with suppress(Exception):
+                self._resume_stream_cleanup(
+                    mission_id=mission_id,
+                    cleanup_id=cleanup_id,
+                    stream_id=stream_id,
+                    source_execution_id=source_execution_id,
+                )
+            raise
+        self._finish_stream_cleanup(
+            mission_id=mission_id,
+            cleanup_id=cleanup_id,
+            stream_id=stream_id,
+            source_execution_id=source_execution_id,
+        )
+        return reference
+
+    async def _put_stream_unreconciled(
+        self,
+        *,
+        mission_id: str,
+        chunks: AsyncIterator[bytes],
+        media_type: str,
+        classification: Callable[
+            [], Literal["normal", "sensitive", "secret"]
+        ],
+        variant: Literal["redacted", "encrypted_raw"],
+        source_execution_id: str,
+        created_at: datetime,
+        retention_until: datetime | None = None,
+        derived_from_artifact_id: str | None = None,
+    ) -> ArtifactReference:
         """Persist a logical artifact without materializing the complete content."""
 
         _require_time(created_at)
@@ -1173,16 +1274,12 @@ class ArtifactStore:
             _require_time(retention_until)
             if retention_until <= created_at:
                 raise ArtifactSecurityError("artifact retention is invalid")
-        stream_id = stable_id(
-            "artifactstream",
-            {
-                "schema_version": "artifact-stream-v1",
-                "mission_id": mission_id,
-                "media_type": media_type,
-                "variant": variant,
-                "source_execution_id": source_execution_id,
-                "derived_from_artifact_id": derived_from_artifact_id,
-            },
+        stream_id = self._artifact_stream_id(
+            mission_id=mission_id,
+            media_type=media_type,
+            variant=variant,
+            source_execution_id=source_execution_id,
+            derived_from_artifact_id=derived_from_artifact_id,
         )
         stream_metadata_digest = sha256_digest(
             {
@@ -1226,14 +1323,7 @@ class ArtifactStore:
                 plaintext_size=len(content),
                 plaintext_sha256=content_digest,
             )
-            resource_id = stable_id(
-                "artifactchunk",
-                {
-                    "schema_version": "artifact-stream-chunk-v1",
-                    "stream_id": stream_id,
-                    "sequence_number": sequence,
-                },
-            )
+            resource_id = self._artifact_stream_chunk_id(stream_id, sequence)
             if self._store.has_resource(
                 mission_id=mission_id, resource_id=resource_id
             ):
@@ -1390,6 +1480,173 @@ class ArtifactStore:
         )
         self._reconcile_create_audit(reference)
         return reference
+
+    def _resume_pending_stream_cleanups(self) -> None:
+        for mission_id in self._store.mission_ids():
+            for cleanup_id in self._store.resource_ids_with_prefix(
+                mission_id=mission_id,
+                prefix="artifactcleanup_",
+            ):
+                intent = self._load_stream_cleanup_intent(
+                    mission_id=mission_id,
+                    cleanup_id=cleanup_id,
+                )
+                self._resume_stream_cleanup(
+                    mission_id=mission_id,
+                    cleanup_id=cleanup_id,
+                    stream_id=intent.stream_id,
+                    source_execution_id=intent.source_execution_id,
+                )
+
+    def _begin_stream_cleanup(
+        self,
+        *,
+        mission_id: str,
+        stream_id: str,
+        source_execution_id: str,
+        created_at: datetime,
+    ) -> str:
+        for pending_id in self._store.resource_ids_with_prefix(
+            mission_id=mission_id,
+            prefix="artifactcleanup_",
+        ):
+            pending = self._load_stream_cleanup_intent(
+                mission_id=mission_id,
+                cleanup_id=pending_id,
+            )
+            if (
+                pending.stream_id == stream_id
+                and pending.source_execution_id == source_execution_id
+            ):
+                self._resume_stream_cleanup(
+                    mission_id=mission_id,
+                    cleanup_id=pending_id,
+                    stream_id=stream_id,
+                    source_execution_id=source_execution_id,
+                )
+        cleanup_id = stable_id(
+            "artifactcleanup",
+            {
+                "schema_version": "artifact-stream-cleanup-v1",
+                "stream_id": stream_id,
+                "nonce": secrets.token_hex(16),
+            },
+        )
+        intent = _ArtifactStreamCleanupIntent(
+            record_type="artifact_stream_cleanup_intent",
+            cleanup_id=cleanup_id,
+            stream_id=stream_id,
+            source_execution_id=source_execution_id,
+        )
+        self._store.write(
+            mission_id=mission_id,
+            resource_id=cleanup_id,
+            content=b"",
+            binding=intent.model_dump(mode="python"),
+            created_at=created_at,
+            retention_until=None,
+        )
+        return cleanup_id
+
+    def _finish_stream_cleanup(
+        self,
+        *,
+        mission_id: str,
+        cleanup_id: str,
+        stream_id: str,
+        source_execution_id: str,
+    ) -> None:
+        self._resume_stream_cleanup(
+            mission_id=mission_id,
+            cleanup_id=cleanup_id,
+            stream_id=stream_id,
+            source_execution_id=source_execution_id,
+        )
+
+    def _resume_stream_cleanup(
+        self,
+        *,
+        mission_id: str,
+        cleanup_id: str,
+        stream_id: str,
+        source_execution_id: str,
+    ) -> None:
+        intent = self._load_stream_cleanup_intent(
+            mission_id=mission_id,
+            cleanup_id=cleanup_id,
+        )
+        if not (
+            intent.cleanup_id == cleanup_id
+            and intent.stream_id == stream_id
+            and intent.source_execution_id == source_execution_id
+        ):
+            raise ArtifactSecurityError(
+                "artifact stream cleanup binding is invalid"
+            )
+        completed = False
+        for artifact_id in self._store.resource_ids_with_prefix(
+            mission_id=mission_id,
+            prefix="artifact_",
+        ):
+            envelope = self._store.verified_envelope(
+                mission_id=mission_id,
+                resource_id=artifact_id,
+                now=None,
+            )
+            binding = envelope.binding.to_dict()
+            if (
+                binding.get("storage_format") == "artifact-stream-v1"
+                and binding.get("stream_id") == stream_id
+                and binding.get("source_execution_id") == source_execution_id
+            ):
+                completed = True
+                break
+        if not completed:
+            maximum_chunks = max(
+                1,
+                (self._store._max_item_bytes + _ARTIFACT_STREAM_CHUNK_BYTES - 1)
+                // _ARTIFACT_STREAM_CHUNK_BYTES,
+            )
+            for sequence in range(maximum_chunks):
+                resource_id = self._artifact_stream_chunk_id(stream_id, sequence)
+                if self._store.has_resource(
+                    mission_id=mission_id,
+                    resource_id=resource_id,
+                ):
+                    self._store.erase_resource(
+                        mission_id=mission_id,
+                        resource_id=resource_id,
+                    )
+        self._store.erase_resource(
+            mission_id=mission_id,
+            resource_id=cleanup_id,
+        )
+
+    def _load_stream_cleanup_intent(
+        self,
+        *,
+        mission_id: str,
+        cleanup_id: str,
+    ) -> _ArtifactStreamCleanupIntent:
+        raw, envelope = self._store.read_bound(
+            mission_id=mission_id,
+            resource_id=cleanup_id,
+            now=None,
+        )
+        if raw:
+            raise ArtifactSecurityError("artifact stream cleanup content is invalid")
+        try:
+            intent = _ArtifactStreamCleanupIntent.model_validate_json(
+                canonicalize(envelope.binding.to_dict()),
+                strict=True,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ArtifactSecurityError(
+                "artifact stream cleanup intent is invalid"
+            ) from exc
+        if intent.cleanup_id != cleanup_id:
+            raise ArtifactSecurityError("artifact stream cleanup binding is invalid")
+        return intent
 
     def read(
         self,
@@ -1836,6 +2093,38 @@ class ArtifactStore:
                 "classification": classification,
                 "variant": variant,
                 "derived_from": derived_from_artifact_id,
+            },
+        )
+
+    @staticmethod
+    def _artifact_stream_id(
+        *,
+        mission_id: str,
+        media_type: str,
+        variant: str,
+        source_execution_id: str,
+        derived_from_artifact_id: str | None,
+    ) -> str:
+        return stable_id(
+            "artifactstream",
+            {
+                "schema_version": "artifact-stream-v1",
+                "mission_id": mission_id,
+                "media_type": media_type,
+                "variant": variant,
+                "source_execution_id": source_execution_id,
+                "derived_from_artifact_id": derived_from_artifact_id,
+            },
+        )
+
+    @staticmethod
+    def _artifact_stream_chunk_id(stream_id: str, sequence_number: int) -> str:
+        return stable_id(
+            "artifactchunk",
+            {
+                "schema_version": "artifact-stream-chunk-v1",
+                "stream_id": stream_id,
+                "sequence_number": sequence_number,
             },
         )
 
