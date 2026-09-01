@@ -15,7 +15,6 @@ from .audit import (
 )
 from .authorization import (
     DataAccessAuthorizer,
-    IngestionWriteEvidence,
     RepositoryDataAccessAuthorizer,
     ingestion_output_authority,
 )
@@ -71,7 +70,6 @@ __all__ = [
     "EncryptionKeyProvider",
     "EncryptionMetadata",
     "InMemoryEncryptionKeyProvider",
-    "IngestionWriteEvidence",
     "KeyDomain",
     "KeyedAuditChainAuthenticator",
     "KeyedFileAuditHeadStore",

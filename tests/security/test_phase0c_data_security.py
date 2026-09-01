@@ -24,7 +24,6 @@ from redteam_agent.data_security import (
     EncryptedRawResultQuarantine,
     EncryptedRawResultSinkFactory,
     EncryptedSecureResultIngester,
-    IngestionWriteEvidence,
     InMemoryEncryptionKeyProvider,
     KeyedAuditChainAuthenticator,
     KeyedFileAuditHeadStore,
@@ -143,7 +142,7 @@ def _ExactEnvelopeAuthorizer() -> _TestAuthorizer:
         source_execution_id: str,
         resource_type: str,
         resource: ResourceBinding,
-        evidence: IngestionWriteEvidence | None,
+        evidence: object | None,
         now: datetime,
     ) -> None:
         del evidence, now
@@ -151,33 +150,13 @@ def _ExactEnvelopeAuthorizer() -> _TestAuthorizer:
             raise SecretAccessError("trusted ingestion authorization denied resource write")
         ingestion_write_resources.append((resource_type, resource))
 
-    def current_ingestion_evidence(
+    def begin_ingestion_write(
         *,
         receipt: RawResultReceipt,
         now: datetime,
-    ) -> IngestionWriteEvidence:
-        del now
-        execution_id = receipt.execution_id
-        receipt_id = receipt.receipt_id
-        quarantine_id = receipt.quarantine_id
-        return IngestionWriteEvidence(
-            execution_id=execution_id,
-            ingestion_id=stable_id(
-                "ingestion",
-                {
-                    "schema_version": "result-ingestion-v1",
-                    "execution_id": execution_id,
-                    "receipt_id": receipt_id,
-                },
-            ),
-            ingestion_digest="sha256:test-ingestion",
-            ingestion_state_version=1,
-            ingestion_attempt=1,
-            lease_id="lease-test",
-            receipt_id=receipt_id,
-            receipt_digest=receipt.receipt_digest,
-            quarantine_id=quarantine_id,
-        )
+    ) -> object:
+        del receipt, now
+        return object()
 
     authorizer.set_grants = set_grants  # type: ignore[attr-defined]
     authorizer.allow_ingestion_write = allow_ingestion_write  # type: ignore[attr-defined]
@@ -185,8 +164,8 @@ def _ExactEnvelopeAuthorizer() -> _TestAuthorizer:
     authorizer.require_ingestion_write = (  # type: ignore[method-assign]
         require_ingestion_write
     )
-    authorizer.current_ingestion_evidence = (  # type: ignore[method-assign]
-        current_ingestion_evidence
+    authorizer._begin_ingestion_write = (  # type: ignore[method-assign]
+        begin_ingestion_write
     )
     authorizer.ingestion_write_resources = (  # type: ignore[attr-defined]
         ingestion_write_resources
@@ -389,6 +368,11 @@ def test_repository_authorizer_revalidates_decision_execution_and_current_policy
             ),
             DataAccessRule(
                 resource_type="artifact",
+                resource_pattern="artifactstream_*",
+                operations=frozenset({"write"}),
+            ),
+            DataAccessRule(
+                resource_type="artifact",
                 resource_pattern="ingestionoutput_*",
                 operations=frozenset({"write"}),
             ),
@@ -405,7 +389,10 @@ def test_repository_authorizer_revalidates_decision_execution_and_current_policy
         ),
         prohibited=(),
     )
-    harness = build_execution_harness(data_access_policy=policy)
+    harness = build_execution_harness(
+        approval_rule="always",
+        data_access_policy=policy,
+    )
     authorizer = RepositoryDataAccessAuthorizer(
         database=harness.database,
     )
@@ -473,9 +460,45 @@ def test_repository_authorizer_revalidates_decision_execution_and_current_policy
     prepared_writer = prepare_additional_execution(
         harness,
         requested_data_access_factory=authorize_ingestion_outputs,
+        approval_expires_at=FIXED_TIME + timedelta(minutes=6),
+    )
+    written_at = FIXED_TIME + timedelta(minutes=4, seconds=30)
+    quarantine = EncryptedRawResultQuarantine(
+        root=tmp_path / "repository-authorized-quarantine",
+        keys=_keys(),
+        audit=MissionAuditRecorder(
+            audit_log=MissionAuditLog(),
+            contexts=_AuditContexts(),
+        ),
+        max_item_bytes=4096,
+        mission_quota_bytes=32 * 1024,
+        clock=lambda: written_at,
+    )
+    stream_binding = QuarantineStreamBinding(
+        mission_id=prepared_writer.mission_id,
+        mission_revision=prepared_writer.mission_revision,
+        execution_id=prepared_writer.execution_id,
+        retention_until=FIXED_TIME + timedelta(minutes=20),
+        max_result_bytes=4096,
+        resume_mode="from_start",
+    )
+    sink_factory = EncryptedRawResultSinkFactory(
+        quarantine=quarantine,
+        bindings=_StreamBindings(stream_binding),
+        clock=lambda: written_at,
+    )
+    adapter = MockExecutionAdapter(
+        capabilities=harness.environment.adapter_snapshot.adapters[0],
+        now=FIXED_TIME + timedelta(minutes=3),
+        stdout_chunks=(b"password=repository-authorized-secret",),
+    )
+    executor = executor_with_adapter(
+        harness,
+        adapter,
+        sink_factory=sink_factory,  # type: ignore[arg-type]
     )
     running = asyncio.run(
-        harness.executor.dispatch(
+        executor.dispatch(
             prepared_writer.execution_id,
             now=FIXED_TIME + timedelta(minutes=3),
         )
@@ -504,7 +527,6 @@ def test_repository_authorizer_revalidates_decision_execution_and_current_policy
         mission_quota_bytes=16 * 1024,
         clock=lambda: FIXED_TIME + timedelta(minutes=3),
     )
-    written_at = FIXED_TIME + timedelta(minutes=4, seconds=30)
     with pytest.raises(SecretAccessError, match="ingestion evidence"):
         artifacts.put(
             mission_id=running.mission_id,
@@ -516,79 +538,80 @@ def test_repository_authorizer_revalidates_decision_execution_and_current_policy
             created_at=written_at,
         )
 
-    adapter_result = asyncio.run(
-        harness.executor.collect_result(
-            running.execution_id,
-            now=FIXED_TIME + timedelta(minutes=4),
-        )
-    )
-    pending = harness.ingestions.get_by_execution(running.execution_id)
-    assert pending is not None
-    active = harness.ingestions.transition(
-        pending.ingestion_id,
-        expected_state_version=pending.state_version,
-        status="INGESTING",
-        lease_id="lease-repository-authorizer",
-        lease_expires_at=FIXED_TIME + timedelta(minutes=10),
-        now=FIXED_TIME + timedelta(minutes=4, seconds=1),
-    )
-    collected = harness.executions.get(running.execution_id)
-    assert collected is not None
-    harness.executions.transition_ingestion(
-        collected.execution_id,
-        expected_state_version=collected.state_version,
-        new_state="INGESTING",
-        quarantine_id=adapter_result.receipt.quarantine_id,
-        now=FIXED_TIME + timedelta(minutes=4, seconds=1),
-    )
-    ingestion_evidence = artifacts.current_ingestion_evidence(
-        receipt=adapter_result.receipt,
-        now=written_at,
-    )
-    reference = artifacts.put(
-        mission_id=running.mission_id,
-        content=b"repository-authorized-content",
-        media_type="text/plain",
-        classification="normal",
-        variant="redacted",
-        source_execution_id=running.execution_id,
-        created_at=written_at,
-        ingestion_evidence=ingestion_evidence,
-    )
-    secret = secrets.create(
-        mission_id=running.mission_id,
-        secret_value=b"repository-authorized-secret",
-        credential_type="password",
-        associated_principal_ref=None,
-        source_execution_id=running.execution_id,
-        created_at=written_at,
-        ingestion_evidence=ingestion_evidence,
+    trusted_ingester = EncryptedSecureResultIngester(
+        ingestor=SecureIngestor(
+            quarantine=quarantine,
+            artifacts=artifacts,
+            secrets=secrets,
+        ),
+        sinks=sink_factory,
+        clock=lambda: written_at,
     )
 
-    succeeded = harness.ingestions.transition(
-        active.ingestion_id,
-        expected_state_version=active.state_version,
-        status="SUCCEEDED",
-        now=FIXED_TIME + timedelta(minutes=5),
+    class DirectWriteProbe:
+        async def ingest(self, receipt: RawResultReceipt):
+            with pytest.raises(SecretAccessError, match="ingestion evidence"):
+                artifacts.put(
+                    mission_id=running.mission_id,
+                    content=b"receipt-backed-direct-write",
+                    media_type="text/plain",
+                    classification="normal",
+                    variant="redacted",
+                    source_execution_id=receipt.execution_id,
+                    created_at=written_at,
+                )
+            with pytest.raises(SecretAccessError, match="ingestion evidence"):
+                secrets.create(
+                    mission_id=running.mission_id,
+                    secret_value=b"receipt-backed-direct-secret",
+                    credential_type="password",
+                    associated_principal_ref=None,
+                    source_execution_id=receipt.execution_id,
+                    created_at=written_at,
+                )
+            return await trusted_ingester.ingest(receipt)
+
+        async def acknowledge_persisted(self, receipt, result) -> None:
+            await trusted_ingester.acknowledge_persisted(receipt, result)
+
+    asyncio.run(
+        executor.ingest_result(
+            running.execution_id,
+            ingester=DirectWriteProbe(),
+            now=written_at,
+        )
     )
-    ingesting_execution = harness.executions.get(running.execution_id)
-    assert ingesting_execution is not None
-    harness.executions.transition_ingestion(
-        ingesting_execution.execution_id,
-        expected_state_version=ingesting_execution.state_version,
-        new_state=succeeded.status,
-        now=FIXED_TIME + timedelta(minutes=5),
+    artifact_ids = artifacts._store.resource_ids_with_prefix(
+        mission_id=running.mission_id,
+        prefix="artifact_",
     )
-    with pytest.raises(SecretAccessError, match="actively leased"):
+    assert len(artifact_ids) == 1
+    reference = artifacts._stored_reference(
+        mission_id=running.mission_id,
+        artifact_id=artifact_ids[0],
+        now=None,
+    )
+    secret_ids = secrets._store.resource_ids_with_prefix(
+        mission_id=running.mission_id,
+        prefix="secret_",
+    )
+    assert len(secret_ids) == 1
+    secret, _ = secrets._metadata_from_detected_envelope(
+        secrets._store.verified_envelope(
+            mission_id=running.mission_id,
+            resource_id=secret_ids[0],
+            now=None,
+        )
+    )
+    with pytest.raises(SecretAccessError, match="ingestion evidence"):
         artifacts.put(
             mission_id=running.mission_id,
-            content=b"repository-authorized-content",
+            content=b"post-ingestion-direct-write",
             media_type="text/plain",
             classification="normal",
             variant="redacted",
             source_execution_id=running.execution_id,
             created_at=written_at,
-            ingestion_evidence=ingestion_evidence,
         )
 
     persisted = ResourceBinding(
@@ -648,6 +671,7 @@ def test_repository_authorizer_revalidates_decision_execution_and_current_policy
         requested_data_access=(grant, secret_grant),
         objective="Read the secure-ingestion artifact",
         run_seed="phase-0c-repository-reader",
+        approval_expires_at=FIXED_TIME + timedelta(minutes=6),
     )
     assert prepared_reader.provider_execution_state == "AUTHORIZED"
     with pytest.raises(SecretAccessError, match="exact resource grant"):
@@ -662,7 +686,7 @@ def test_repository_authorizer_revalidates_decision_execution_and_current_policy
         execution_id=prepared_reader.execution_id,
         operation="read",
         now=FIXED_TIME + timedelta(minutes=5),
-    ) == b"repository-authorized-content"
+    ) == b"password=[REDACTED]"
     with pytest.raises(SecretAccessError, match="exact resource grant"):
         secrets.resolve(
             secret,
@@ -730,13 +754,22 @@ def test_repository_authorizer_revalidates_decision_execution_and_current_policy
             execution_id=prepared_reader.execution_id,
             now=FIXED_TIME + timedelta(minutes=5, seconds=3),
         )
+    with pytest.raises(SecretAccessError, match="approval is stale"):
+        authorizer.require_access(
+            mission_id=running.mission_id,
+            execution_id=prepared_reader.execution_id,
+            resource_type="artifact",
+            resource=persisted,
+            operation="read",
+            now=FIXED_TIME + timedelta(minutes=6, seconds=1),
+        )
 
     PolicyStateRepository(harness.database).set_current(
         build_policy_state(
             mission_id=running.mission_id,
             state_version=1,
             policy_version="policy-v2",
-            updated_at=FIXED_TIME + timedelta(minutes=4),
+            updated_at=FIXED_TIME + timedelta(minutes=7),
         )
     )
     with pytest.raises(SecretAccessError, match="current data access authorization"):
@@ -746,7 +779,7 @@ def test_repository_authorizer_revalidates_decision_execution_and_current_policy
             resource_type="artifact",
             resource=persisted,
             operation="read",
-            now=FIXED_TIME + timedelta(minutes=4),
+            now=FIXED_TIME + timedelta(minutes=7),
         )
 
 
@@ -6986,6 +7019,135 @@ def test_expired_secret_erasure_resumes_after_restart(
             if event.event_type == "secret_reference.delete"
         ]
     ) == 1
+
+
+@pytest.mark.parametrize("store_type", ("artifact", "secret", "quarantine"))
+def test_live_store_operation_sweeps_expired_resources_without_access_or_restart(
+    tmp_path: Path,
+    store_type: Literal["artifact", "secret", "quarantine"],
+) -> None:
+    keys = _keys()
+    authorizer = _ExactEnvelopeAuthorizer()
+    mission_id = f"mission-live-retention-{store_type}"
+    execution_id = f"execution-live-retention-{store_type}"
+    trigger_execution_id = f"execution-live-retention-trigger-{store_type}"
+    authorizer.allow_ingestion_write(mission_id, execution_id)
+    authorizer.allow_ingestion_write(mission_id, trigger_execution_id)
+    audit = MissionAuditRecorder(
+        audit_log=MissionAuditLog(),
+        contexts=_AuditContexts(),
+    )
+    retention_until = NOW + timedelta(minutes=1)
+    trigger_time = retention_until + timedelta(seconds=1)
+
+    if store_type == "artifact":
+        artifacts = ArtifactStore(
+            root=tmp_path / "live-retention-artifacts",
+            keys=keys,
+            authorizer=authorizer,
+            audit=audit,
+            max_item_bytes=4096,
+            mission_quota_bytes=32 * 1024,
+            clock=lambda: NOW,
+        )
+        reference = artifacts.put(
+            mission_id=mission_id,
+            content=b"expired-without-artifact-access",
+            media_type="text/plain",
+            classification="normal",
+            variant="redacted",
+            source_execution_id=execution_id,
+            created_at=NOW,
+            retention_until=retention_until,
+        )
+        envelope = artifacts._store.verified_envelope(
+            mission_id=mission_id,
+            resource_id=reference.artifact_id,
+            now=None,
+        )
+        artifacts.put(
+            mission_id=mission_id,
+            content=b"operation-triggering-artifact-sweep",
+            media_type="text/plain",
+            classification="normal",
+            variant="redacted",
+            source_execution_id=trigger_execution_id,
+            created_at=trigger_time,
+        )
+        resource_id = reference.artifact_id
+        store = artifacts._store
+    elif store_type == "secret":
+        secrets = SecretStore(
+            root=tmp_path / "live-retention-secrets",
+            keys=keys,
+            authorizer=authorizer,
+            audit=audit,
+            max_item_bytes=4096,
+            mission_quota_bytes=32 * 1024,
+            clock=lambda: NOW,
+        )
+        reference = secrets.create(
+            mission_id=mission_id,
+            secret_value=b"expired-without-secret-access",
+            credential_type="password",
+            associated_principal_ref=None,
+            source_execution_id=execution_id,
+            created_at=NOW,
+            expires_at=retention_until,
+        )
+        envelope = secrets._store.verified_envelope(
+            mission_id=mission_id,
+            resource_id=reference.secret_reference_id,
+            now=None,
+        )
+        secrets.create(
+            mission_id=mission_id,
+            secret_value=b"operation-triggering-secret-sweep",
+            credential_type="password",
+            associated_principal_ref=None,
+            source_execution_id=trigger_execution_id,
+            created_at=trigger_time,
+        )
+        resource_id = reference.secret_reference_id
+        store = secrets._store
+    else:
+        quarantine = EncryptedRawResultQuarantine(
+            root=tmp_path / "live-retention-quarantine",
+            keys=keys,
+            audit=audit,
+            max_item_bytes=4096,
+            mission_quota_bytes=32 * 1024,
+            clock=lambda: NOW,
+        )
+        reference = quarantine.commit(
+            mission_id=mission_id,
+            mission_revision=1,
+            execution_id=execution_id,
+            content=b"expired-without-quarantine-access",
+            created_at=NOW,
+            retention_until=retention_until,
+        )
+        envelope = quarantine._store.verified_envelope(
+            mission_id=mission_id,
+            resource_id=reference.quarantine_id,
+            now=None,
+        )
+        quarantine.commit(
+            mission_id=mission_id,
+            mission_revision=1,
+            execution_id=trigger_execution_id,
+            content=b"operation-triggering-quarantine-sweep",
+            created_at=trigger_time,
+            retention_until=trigger_time + timedelta(minutes=1),
+        )
+        resource_id = reference.quarantine_id
+        store = quarantine._store
+
+    assert not store.has_resource(
+        mission_id=mission_id,
+        resource_id=resource_id,
+    )
+    assert keys.resource_key_destroyed(envelope.payload.metadata)
 
 
 def test_long_ordinary_tokens_do_not_exhaust_uri_stream_lookahead(

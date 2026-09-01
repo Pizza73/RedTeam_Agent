@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from redteam_agent.executor import (
     ExecutionAdapter,
@@ -21,6 +21,7 @@ from redteam_agent.models.context import DataAccessGrant
 from redteam_agent.models.execution import WorkflowRunBinding
 from redteam_agent.models.plans import ExecutionPlan
 from redteam_agent.models.scope import DataAccessPolicy
+from redteam_agent.policy.approval import ApprovalService
 from redteam_agent.policy.issuance import PolicyDecisionIssuanceService
 from redteam_agent.policy.plans import create_execution_plan
 from redteam_agent.repositories import (
@@ -208,6 +209,7 @@ def prepare_additional_execution(
     ) = None,
     objective: str = "Inspect another in-scope mock target",
     run_seed: str = "phase-0b-additional-action",
+    approval_expires_at: datetime | None = None,
 ):
     """Prepare another independently authorized action before a safety pause."""
 
@@ -242,9 +244,37 @@ def prepare_additional_execution(
         created_at=FIXED_TIME + timedelta(minutes=1),
     )
     WorkflowRunRepository(harness.database).add(run)
+    approval_request_id: str | None = None
+    approval_record_id: str | None = None
+    if decision.decision == "REQUIRE_APPROVAL" and approval_expires_at is not None:
+        approvals = ApprovalService(
+            runtime_resolver=harness.kernel.runtime_resolver,
+            plans=harness.kernel.plans,
+            decisions=harness.kernel.decisions,
+            requests=harness.kernel.approval_requests,
+            records=harness.kernel.approvals,
+        )
+        request = approvals.request(
+            plan_id=plan.plan_id,
+            policy_decision_id=decision.decision_id,
+            issued_at=FIXED_TIME + timedelta(minutes=1, seconds=10),
+            expires_at=approval_expires_at,
+        )
+        approval = approvals.record(
+            approval_request_id=request.approval_request_id,
+            human_decision="APPROVED",
+            approver_id="phase-0c-test-operator",
+            approver_role="redteam-lead",
+            issued_at=FIXED_TIME + timedelta(minutes=1, seconds=20),
+            expires_at=approval_expires_at,
+        )
+        approval_request_id = request.approval_request_id
+        approval_record_id = approval.approval_id
     return harness.executor.prepare(
         run=run,
         plan_id=plan.plan_id,
         policy_decision_id=decision.decision_id,
+        approval_request_id=approval_request_id,
+        approval_record_id=approval_record_id,
         now=FIXED_TIME + timedelta(minutes=2),
     )

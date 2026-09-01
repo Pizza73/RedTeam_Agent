@@ -23,6 +23,8 @@ from redteam_agent.models.scope import DataAccessOperation, DataResourceType
 from redteam_agent.policy.data_access import DataAccessEvaluator
 from redteam_agent.repositories import (
     AdapterCapabilitySnapshotRepository,
+    ApprovalRecordRepository,
+    ApprovalRequestRepository,
     AuthorizationRuntimeBindingRepository,
     AvailableToolSnapshotRepository,
     ContextResourceIndexRepository,
@@ -41,8 +43,8 @@ from redteam_agent.repositories import (
 from redteam_agent.storage import Database
 
 
-class IngestionWriteEvidence(StrictImmutableBoundaryModel):
-    """Current lease and receipt binding required for secure-ingestion writes."""
+class _IngestionWriteEvidence(StrictImmutableBoundaryModel):
+    """Internal lease and receipt binding held only by the trusted ingestor."""
 
     execution_id: str = Field(min_length=1)
     ingestion_id: str = Field(min_length=1)
@@ -53,6 +55,7 @@ class IngestionWriteEvidence(StrictImmutableBoundaryModel):
     receipt_id: str = Field(min_length=1)
     receipt_digest: str = Field(min_length=1)
     quarantine_id: str = Field(min_length=1)
+    quarantine_ciphertext_digest: str = Field(min_length=1)
 
 
 def ingestion_output_authority(
@@ -99,17 +102,9 @@ class DataAccessAuthorizer(ABC):
         source_execution_id: str,
         resource_type: Literal["artifact", "secret_reference"],
         resource: ResourceBinding,
-        evidence: IngestionWriteEvidence | None,
+        evidence: _IngestionWriteEvidence | None,
         now: datetime,
     ) -> None: ...
-
-    @abstractmethod
-    def current_ingestion_evidence(
-        self,
-        *,
-        receipt: RawResultReceipt,
-        now: datetime,
-    ) -> IngestionWriteEvidence: ...
 
 
 @final
@@ -142,6 +137,8 @@ class RepositoryDataAccessAuthorizer(DataAccessAuthorizer):
         )
         self._decisions = PolicyDecisionRepository(database)
         self._executions = ExecutionRepository(database)
+        self._approval_requests = ApprovalRequestRepository(database)
+        self._approvals = ApprovalRecordRepository(database)
         self._resources = ContextResourceIndexRepository(database)
         self._ingestions = ResultIngestionRepository(database)
         self._receipts = RawResultReceiptRepository(database)
@@ -211,7 +208,7 @@ class RepositoryDataAccessAuthorizer(DataAccessAuthorizer):
         source_execution_id: str,
         resource_type: Literal["artifact", "secret_reference"],
         resource: ResourceBinding,
-        evidence: IngestionWriteEvidence | None,
+        evidence: _IngestionWriteEvidence | None,
         now: datetime,
     ) -> None:
         runtime = self._current_runtime(mission_id=mission_id, now=now)
@@ -276,12 +273,12 @@ class RepositoryDataAccessAuthorizer(DataAccessAuthorizer):
                 "write is not bound to current ingestion output authority"
             )
 
-    def current_ingestion_evidence(
+    def _begin_ingestion_write(
         self,
         *,
         receipt: RawResultReceipt,
         now: datetime,
-    ) -> IngestionWriteEvidence:
+    ) -> _IngestionWriteEvidence:
         try:
             require_utc(now)
             execution = self._executions.get(receipt.execution_id)
@@ -296,6 +293,8 @@ class RepositoryDataAccessAuthorizer(DataAccessAuthorizer):
                 evidence.receipt_id == receipt.receipt_id
                 and evidence.receipt_digest == receipt.receipt_digest
                 and evidence.quarantine_id == receipt.quarantine_id
+                and evidence.quarantine_ciphertext_digest
+                == receipt.ciphertext_digest
             ):
                 raise SecretAccessError(
                     "receipt is not bound to the current result ingestion"
@@ -313,7 +312,7 @@ class RepositoryDataAccessAuthorizer(DataAccessAuthorizer):
         *,
         execution: ExecutionRecord,
         now: datetime,
-    ) -> IngestionWriteEvidence:
+    ) -> _IngestionWriteEvidence:
         ingestion = self._ingestions.get_by_execution(execution.execution_id)
         if (
             ingestion is None
@@ -332,7 +331,7 @@ class RepositoryDataAccessAuthorizer(DataAccessAuthorizer):
             and receipt.quarantine_id == ingestion.quarantine_id
         ):
             raise SecretAccessError("result-ingestion receipt binding is invalid")
-        return IngestionWriteEvidence(
+        return _IngestionWriteEvidence(
             execution_id=execution.execution_id,
             ingestion_id=ingestion.ingestion_id,
             ingestion_digest=ingestion.ingestion_digest,
@@ -342,6 +341,7 @@ class RepositoryDataAccessAuthorizer(DataAccessAuthorizer):
             receipt_id=receipt.receipt_id,
             receipt_digest=receipt.receipt_digest,
             quarantine_id=receipt.quarantine_id,
+            quarantine_ciphertext_digest=receipt.ciphertext_digest,
         )
 
     def _current_execution_decision(
@@ -369,7 +369,42 @@ class RepositoryDataAccessAuthorizer(DataAccessAuthorizer):
             )
         ):
             raise SecretAccessError("execution authorization is stale or denied")
+        if decision.decision == "REQUIRE_APPROVAL":
+            self._require_current_approval(
+                execution=execution,
+                decision=decision,
+                now=now,
+            )
         return execution, decision
+
+    def _require_current_approval(
+        self,
+        *,
+        execution: ExecutionRecord,
+        decision: PolicyDecision,
+        now: datetime,
+    ) -> None:
+        if (
+            execution.approval_request_id is None
+            or execution.approval_record_id is None
+        ):
+            raise SecretAccessError("approval-required execution lacks evidence")
+        request = self._approval_requests.get(execution.approval_request_id)
+        approval = self._approvals.get(execution.approval_record_id)
+        if request is None or approval is None or not (
+            request.issued_at <= now < request.expires_at
+            and approval.issued_at <= now < approval.expires_at
+            and request.policy_decision_id == decision.decision_id
+            and request.authorization_digest == decision.authorization_digest
+            and approval.policy_decision_id == decision.decision_id
+            and approval.authorization_digest == decision.authorization_digest
+            and approval.approval_request_id == request.approval_request_id
+            and approval.approval_request_digest == request.request_digest
+            and approval.approval_presentation_digest
+            == request.approval_presentation_digest
+            and approval.decision == "APPROVED"
+        ):
+            raise SecretAccessError("execution approval is stale or invalid")
 
     def _current_runtime(
         self,

@@ -2061,3 +2061,107 @@ PHASE_GATE=phase-0c PASS
 - No protected governance file was modified.
 - A fresh independent Phase 0C review remains required on the resulting 40-character PR HEAD; this
   local PASS is not an independent Phase Gate PASS.
+
+## Twenty-ninth independent review correction cycle
+
+Current phase: `phase-0c`.
+
+Input review SHA: `60a6a79e7385792fa584f8975f717f02547eb0b7`.
+
+Phase base: `5cda9a5f8792ee33c3e153d8e791499f5619d82e`.
+
+### Findings addressed
+
+- [`discussion_r3901131587`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3901131587):
+  ingestion write authority is now internal to the trusted repository authorizer, Artifact Store,
+  and encrypted Secure Ingestor path rather than an exported caller-supplied capability. The
+  internal evidence is bound to the exact active Execution/ingestion state, persisted receipt,
+  Quarantine identifier, and encrypted Quarantine ciphertext digest. Public Artifact and Secret
+  creation methods cannot accept that evidence. A concrete repository/executor regression invokes
+  direct public writes while the exact receipt is persisted and the Execution is INGESTING, proves
+  both writes fail closed, and then proves the trusted encrypted pipeline can publish the redacted
+  Artifact and Secret reference.
+- [`discussion_r3901131590`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3901131590):
+  every repository-authorized Artifact/Secret access and ingestion write now reloads and verifies
+  the trusted ApprovalRequest and ApprovalRecord for `REQUIRE_APPROVAL` decisions. Both records must
+  be within their issued/expiry intervals and remain bound to the exact authorization digest,
+  PolicyDecision, request digest, structured presentation digest, and APPROVED result. The concrete
+  repository regression advances time beyond approval expiry before the decision or resource
+  expires and proves data access is rejected as stale.
+- [`discussion_r3901131595`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3901131595):
+  live Quarantine, Artifact, and Secret stores now run operation-driven retention sweeps after
+  construction. Writes/creates and relevant reads/resumes sweep the active Mission at the supplied
+  trusted operation time, resume durable deletion/expiry intents first, audit deletion, erase the
+  ciphertext, and destroy the resource key. Parameterized regressions leave each resource untouched
+  past expiry, perform an unrelated operation in the same live store without restart or resource
+  access, and prove both the expired ciphertext and key are gone.
+
+### Modified files and regression tests
+
+Resulting working-tree diff: `7 files changed, 680 insertions(+), 148 deletions(-)`.
+
+- `src/redteam_agent/data_security/__init__.py`
+- `src/redteam_agent/data_security/authorization.py`
+- `src/redteam_agent/data_security/ingestion.py`
+- `src/redteam_agent/data_security/stores.py`
+- `tests/phase0b_helpers.py`
+- `tests/security/test_phase0c_data_security.py`
+- `docs/review/phase-0c-fix-report.md`
+
+Regression coverage exercises direct Artifact and Secret writes during an exact active ingestion
+receipt, successful trusted encrypted ingestion, approval expiry before decision/resource expiry,
+and operation-driven Artifact, Secret, and Quarantine retention expiry without restart or direct
+access. Existing directory anchoring, key destruction, audit recovery, quota, streaming, lifecycle,
+scope, and detector regressions continue to pass. No test was deleted, skipped, weakened, or marked
+as an expected failure.
+
+### Validation
+
+Phase 0C data-security module:
+
+```text
+PYTHONPATH=. /home/kali/Red_Agent/.venv/bin/pytest -q \
+  tests/security/test_phase0c_data_security.py -x
+```
+
+Result: `82 passed`.
+
+Required phase-gate command:
+
+```text
+PATH=/home/kali/Red_Agent/.venv/bin:$PATH \
+  scripts/ci/run_phase_gate.sh phase-0c
+```
+
+Result:
+
+```text
+AUTOMATION_VALIDATION=PASS
+ruff: All checks passed
+mypy: Success: no issues found in 79 source files
+unit: 200 passed
+integration: 7 passed
+security: 228 passed
+full/coverage run: 435 passed
+skipped=0, errors=0, failures=0
+coverage: 81% total (branch coverage enabled)
+pip check: No broken requirements found
+PHASE_GATE=phase-0c PASS
+```
+
+### Remaining constraints
+
+- Retention cleanup is operation-driven per active Mission and also performs a full recovery sweep
+  when a store instance starts. An entirely idle long-lived Mission therefore relies on the next
+  same-Mission store operation; no background thread or external scheduler is introduced in this
+  phase.
+- Resource-creation and expiry recovery assume the configured key provider performs durable
+  cryptographic destruction. The wrapped-file provider supplies that property through its
+  externally anchored generation protocol.
+- The key-state and audit-head external generation adapters remain integration boundaries supplied
+  by an OS keystore, vault, or equivalently protected monotonic service.
+- No real C2, MCP, provider, subprocess, local-attack, credential-collection, or external-target
+  action was executed.
+- No protected governance file was modified.
+- A fresh independent Phase 0C review remains required on the resulting 40-character PR HEAD; this
+  local PASS is not an independent Phase Gate PASS.

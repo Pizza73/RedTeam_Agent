@@ -37,8 +37,8 @@ from redteam_agent.models.execution import RawResultReceipt
 
 from .audit import DataStoreAuditRecorder
 from .authorization import (
-    IngestionWriteEvidence,
     RepositoryDataAccessAuthorizer,
+    _IngestionWriteEvidence,
 )
 from .keys import EncryptionKeyProvider
 from .models import (
@@ -2349,10 +2349,18 @@ class EncryptedRawResultQuarantine:
                 self._reference_from_envelope(envelope)
             )
 
-    def _sweep_expired(self) -> None:
-        now = self._clock()
+    def _sweep_expired(
+        self,
+        *,
+        now: datetime | None = None,
+        mission_id: str | None = None,
+    ) -> None:
+        now = self._clock() if now is None else now
         _require_time(now)
-        for mission_id in self._store.mission_ids():
+        mission_ids = (
+            self._store.mission_ids() if mission_id is None else (mission_id,)
+        )
+        for mission_id in mission_ids:
             for intent_id in self._store.resource_ids_with_prefix(
                 mission_id=mission_id,
                 prefix="quarantineexpiry_",
@@ -2393,6 +2401,7 @@ class EncryptedRawResultQuarantine:
         _require_time(retention_until)
         if mission_revision < 1 or retention_until <= created_at:
             raise ArtifactSecurityError("quarantine binding or retention is invalid")
+        self._sweep_expired(now=created_at, mission_id=mission_id)
         binding: dict[str, object] = {
             "mission_revision": mission_revision,
             "execution_id": execution_id,
@@ -2455,6 +2464,7 @@ class EncryptedRawResultQuarantine:
 
     def resume(self, reference: QuarantineReference, *, now: datetime) -> bytes:
         _require_time(now)
+        self._sweep_expired(now=now, mission_id=reference.mission_id)
         if now >= reference.retention_until:
             self._expire_reference(reference, now=now)
             raise ArtifactSecurityError("encrypted resource retention has expired")
@@ -2662,6 +2672,7 @@ class EncryptedRawResultQuarantine:
         )
 
     def delete(self, reference: QuarantineReference, *, now: datetime) -> None:
+        _require_time(now)
         self._audit.record(
             mission_id=reference.mission_id,
             resource_type="raw_result_quarantine",
@@ -2712,13 +2723,13 @@ class ArtifactStore:
         self._resume_pending_stream_cleanups()
         self._sweep_expired_artifacts()
 
-    def current_ingestion_evidence(
+    def _begin_ingestion_write(
         self,
         *,
         receipt: RawResultReceipt,
         now: datetime,
-    ) -> IngestionWriteEvidence:
-        return self._authorizer.current_ingestion_evidence(
+    ) -> _IngestionWriteEvidence:
+        return self._authorizer._begin_ingestion_write(
             receipt=receipt,
             now=now,
         )
@@ -2747,11 +2758,68 @@ class ArtifactStore:
         variant: Literal["redacted", "encrypted_raw"],
         source_execution_id: str,
         created_at: datetime,
-        ingestion_evidence: IngestionWriteEvidence | None = None,
         retention_until: datetime | None = None,
         derived_from_artifact_id: str | None = None,
     ) -> ArtifactReference:
+        return self._put(
+            mission_id=mission_id,
+            content=content,
+            media_type=media_type,
+            classification=classification,
+            variant=variant,
+            source_execution_id=source_execution_id,
+            created_at=created_at,
+            ingestion_evidence=None,
+            retention_until=retention_until,
+            derived_from_artifact_id=derived_from_artifact_id,
+        )
+
+    def _put_ingested(
+        self,
+        *,
+        mission_id: str,
+        content: bytes,
+        media_type: str,
+        classification: Literal["normal", "sensitive", "secret"],
+        variant: Literal["redacted", "encrypted_raw"],
+        source_execution_id: str,
+        created_at: datetime,
+        ingestion_evidence: _IngestionWriteEvidence,
+        retention_until: datetime | None = None,
+        derived_from_artifact_id: str | None = None,
+    ) -> ArtifactReference:
+        return self._put(
+            mission_id=mission_id,
+            content=content,
+            media_type=media_type,
+            classification=classification,
+            variant=variant,
+            source_execution_id=source_execution_id,
+            created_at=created_at,
+            ingestion_evidence=ingestion_evidence,
+            retention_until=retention_until,
+            derived_from_artifact_id=derived_from_artifact_id,
+        )
+
+    def _put(
+        self,
+        *,
+        mission_id: str,
+        content: bytes,
+        media_type: str,
+        classification: Literal["normal", "sensitive", "secret"],
+        variant: Literal["redacted", "encrypted_raw"],
+        source_execution_id: str,
+        created_at: datetime,
+        ingestion_evidence: _IngestionWriteEvidence | None,
+        retention_until: datetime | None,
+        derived_from_artifact_id: str | None,
+    ) -> ArtifactReference:
         _require_bytes(content)
+        self._sweep_expired_artifacts(
+            now=created_at,
+            mission_id=mission_id,
+        )
         self._validate_metadata(
             media_type=media_type,
             classification=classification,
@@ -2847,12 +2915,73 @@ class ArtifactStore:
         variant: Literal["redacted", "encrypted_raw"],
         source_execution_id: str,
         created_at: datetime,
-        ingestion_evidence: IngestionWriteEvidence | None = None,
         retention_until: datetime | None = None,
         derived_from_artifact_id: str | None = None,
     ) -> ArtifactReference:
+        return await self._put_stream(
+            mission_id=mission_id,
+            chunks=chunks,
+            media_type=media_type,
+            classification=classification,
+            variant=variant,
+            source_execution_id=source_execution_id,
+            created_at=created_at,
+            ingestion_evidence=None,
+            retention_until=retention_until,
+            derived_from_artifact_id=derived_from_artifact_id,
+        )
+
+    async def _put_ingested_stream(
+        self,
+        *,
+        mission_id: str,
+        chunks: AsyncIterator[bytes],
+        media_type: str,
+        classification: Callable[
+            [], Literal["normal", "sensitive", "secret"]
+        ],
+        variant: Literal["redacted", "encrypted_raw"],
+        source_execution_id: str,
+        created_at: datetime,
+        ingestion_evidence: _IngestionWriteEvidence,
+        retention_until: datetime | None = None,
+        derived_from_artifact_id: str | None = None,
+    ) -> ArtifactReference:
+        return await self._put_stream(
+            mission_id=mission_id,
+            chunks=chunks,
+            media_type=media_type,
+            classification=classification,
+            variant=variant,
+            source_execution_id=source_execution_id,
+            created_at=created_at,
+            ingestion_evidence=ingestion_evidence,
+            retention_until=retention_until,
+            derived_from_artifact_id=derived_from_artifact_id,
+        )
+
+    async def _put_stream(
+        self,
+        *,
+        mission_id: str,
+        chunks: AsyncIterator[bytes],
+        media_type: str,
+        classification: Callable[
+            [], Literal["normal", "sensitive", "secret"]
+        ],
+        variant: Literal["redacted", "encrypted_raw"],
+        source_execution_id: str,
+        created_at: datetime,
+        ingestion_evidence: _IngestionWriteEvidence | None,
+        retention_until: datetime | None,
+        derived_from_artifact_id: str | None,
+    ) -> ArtifactReference:
         """Persist a stream with a restartable intent for orphan-chunk cleanup."""
 
+        self._sweep_expired_artifacts(
+            now=created_at,
+            mission_id=mission_id,
+        )
         stream_id = self._artifact_stream_id(
             mission_id=mission_id,
             media_type=media_type,
@@ -2910,7 +3039,7 @@ class ArtifactStore:
         variant: Literal["redacted", "encrypted_raw"],
         source_execution_id: str,
         created_at: datetime,
-        ingestion_evidence: IngestionWriteEvidence | None,
+        ingestion_evidence: _IngestionWriteEvidence | None,
         retention_until: datetime | None = None,
         derived_from_artifact_id: str | None = None,
         attempt_id: str,
@@ -3191,10 +3320,18 @@ class ArtifactStore:
                         source_execution_id=intent.source_execution_id,
                     )
 
-    def _sweep_expired_artifacts(self) -> None:
-        now = self._clock()
+    def _sweep_expired_artifacts(
+        self,
+        *,
+        now: datetime | None = None,
+        mission_id: str | None = None,
+    ) -> None:
+        now = self._clock() if now is None else now
         _require_time(now)
-        for mission_id in self._store.mission_ids():
+        mission_ids = (
+            self._store.mission_ids() if mission_id is None else (mission_id,)
+        )
+        for mission_id in mission_ids:
             for intent_id in self._store.resource_ids_with_prefix(
                 mission_id=mission_id,
                 prefix="artifactdeletion_",
@@ -3487,6 +3624,10 @@ class ArtifactStore:
         operation: Literal["read", "export"],
         now: datetime,
     ) -> bytes:
+        self._sweep_expired_artifacts(
+            now=now,
+            mission_id=reference.mission_id,
+        )
         authoritative = self._stored_reference(
             mission_id=reference.mission_id,
             artifact_id=reference.artifact_id,
@@ -4189,10 +4330,18 @@ class SecretStore:
             metadata, _ = self._metadata_from_detected_envelope(envelope)
             self._reconcile_create_audit(metadata)
 
-    def _sweep_expired_secrets(self) -> None:
-        now = self._clock()
+    def _sweep_expired_secrets(
+        self,
+        *,
+        now: datetime | None = None,
+        mission_id: str | None = None,
+    ) -> None:
+        now = self._clock() if now is None else now
         _require_time(now)
-        for mission_id in self._store.mission_ids():
+        mission_ids = (
+            self._store.mission_ids() if mission_id is None else (mission_id,)
+        )
+        for mission_id in mission_ids:
             for intent_id in self._store.resource_ids_with_prefix(
                 mission_id=mission_id,
                 prefix="secretexpiry_",
@@ -4366,11 +4515,60 @@ class SecretStore:
         associated_principal_ref: str | None,
         source_execution_id: str,
         created_at: datetime,
-        ingestion_evidence: IngestionWriteEvidence | None = None,
         expires_at: datetime | None = None,
+    ) -> SecretReferenceMetadata:
+        return self._create(
+            mission_id=mission_id,
+            secret_value=secret_value,
+            credential_type=credential_type,
+            associated_principal_ref=associated_principal_ref,
+            source_execution_id=source_execution_id,
+            created_at=created_at,
+            ingestion_evidence=None,
+            expires_at=expires_at,
+        )
+
+    def _create_ingested(
+        self,
+        *,
+        mission_id: str,
+        secret_value: bytes,
+        credential_type: str,
+        associated_principal_ref: str | None,
+        source_execution_id: str,
+        created_at: datetime,
+        ingestion_evidence: _IngestionWriteEvidence,
+        expires_at: datetime | None = None,
+    ) -> SecretReferenceMetadata:
+        return self._create(
+            mission_id=mission_id,
+            secret_value=secret_value,
+            credential_type=credential_type,
+            associated_principal_ref=associated_principal_ref,
+            source_execution_id=source_execution_id,
+            created_at=created_at,
+            ingestion_evidence=ingestion_evidence,
+            expires_at=expires_at,
+        )
+
+    def _create(
+        self,
+        *,
+        mission_id: str,
+        secret_value: bytes,
+        credential_type: str,
+        associated_principal_ref: str | None,
+        source_execution_id: str,
+        created_at: datetime,
+        ingestion_evidence: _IngestionWriteEvidence | None,
+        expires_at: datetime | None,
     ) -> SecretReferenceMetadata:
         _require_bytes(secret_value)
         _require_time(created_at)
+        self._sweep_expired_secrets(
+            now=created_at,
+            mission_id=mission_id,
+        )
         if not secret_value or not credential_type or not source_execution_id:
             raise SecretAccessError("secret metadata or value is incomplete")
         if expires_at is not None:

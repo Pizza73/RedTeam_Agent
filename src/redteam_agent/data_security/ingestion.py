@@ -14,7 +14,7 @@ from redteam_agent.models.execution import (
     SecureIngestionSummary,
 )
 
-from .authorization import IngestionWriteEvidence
+from .authorization import _IngestionWriteEvidence
 from .models import (
     ArtifactReference,
     QuarantineReference,
@@ -712,14 +712,12 @@ class SecureIngestor:
         reference: QuarantineReference,
         *,
         now: datetime,
-        ingestion_evidence: IngestionWriteEvidence | None = None,
         retain_encrypted_raw: bool = False,
     ) -> SecureIngestionResult:
         try:
             return self._ingest_quarantined(
                 reference,
                 now=now,
-                ingestion_evidence=ingestion_evidence,
                 retain_encrypted_raw=retain_encrypted_raw,
             )
         except Exception as failure:
@@ -731,7 +729,6 @@ class SecureIngestor:
         reference: QuarantineReference,
         *,
         now: datetime,
-        ingestion_evidence: IngestionWriteEvidence | None,
         retain_encrypted_raw: bool,
     ) -> SecureIngestionResult:
         """Run secret-bearing work outside the replacement exception frame."""
@@ -743,7 +740,7 @@ class SecureIngestor:
             mission_id=reference.mission_id,
             source_execution_id=reference.execution_id,
             detections=detections,
-            ingestion_evidence=ingestion_evidence,
+            ingestion_evidence=None,
             now=now,
         )
         redacted_reference = self._artifacts.put(
@@ -754,7 +751,6 @@ class SecureIngestor:
             variant="redacted",
             source_execution_id=reference.execution_id,
             created_at=now,
-            ingestion_evidence=ingestion_evidence,
             derived_from_artifact_id=None,
         )
         encrypted_raw: tuple[ArtifactReference, ...] = ()
@@ -768,7 +764,6 @@ class SecureIngestor:
                     variant="encrypted_raw",
                     source_execution_id=reference.execution_id,
                     created_at=now,
-                    ingestion_evidence=ingestion_evidence,
                     derived_from_artifact_id=redacted_reference.artifact_id,
                 ),
             )
@@ -819,7 +814,7 @@ class SecureIngestor:
         if durable_result is not None:
             sink._delete_committed(now=now)
             return durable_result
-        ingestion_evidence = self._artifacts.current_ingestion_evidence(
+        ingestion_evidence = self._artifacts._begin_ingestion_write(
             receipt=receipt,
             now=now,
         )
@@ -848,7 +843,7 @@ class SecureIngestor:
             if final:
                 yield final
 
-        redacted_reference = await self._artifacts.put_stream(
+        redacted_reference = await self._artifacts._put_ingested_stream(
             mission_id=sink.binding.mission_id,
             chunks=redacted_chunks(),
             media_type="application/octet-stream",
@@ -877,7 +872,7 @@ class SecureIngestor:
         mission_id: str,
         source_execution_id: str,
         detections: list[SecretDiscoveryReference],
-        ingestion_evidence: IngestionWriteEvidence | None,
+        ingestion_evidence: _IngestionWriteEvidence | None,
         now: datetime,
     ) -> bytes:
         def replace(keyword: bytes, secret_value: bytes) -> bytes:
@@ -908,19 +903,29 @@ class SecureIngestor:
         mission_id: str,
         source_execution_id: str,
         detections: list[SecretDiscoveryReference],
-        ingestion_evidence: IngestionWriteEvidence | None,
+        ingestion_evidence: _IngestionWriteEvidence | None,
         now: datetime,
     ) -> None:
         credential_type = keyword.decode("ascii").lower().replace("-", "_")
-        secret = self._secrets.create(
-            mission_id=mission_id,
-            secret_value=secret_value,
-            credential_type=credential_type,
-            associated_principal_ref=None,
-            source_execution_id=source_execution_id,
-            created_at=now,
-            ingestion_evidence=ingestion_evidence,
-        )
+        if ingestion_evidence is None:
+            secret = self._secrets.create(
+                mission_id=mission_id,
+                secret_value=secret_value,
+                credential_type=credential_type,
+                associated_principal_ref=None,
+                source_execution_id=source_execution_id,
+                created_at=now,
+            )
+        else:
+            secret = self._secrets._create_ingested(
+                mission_id=mission_id,
+                secret_value=secret_value,
+                credential_type=credential_type,
+                associated_principal_ref=None,
+                source_execution_id=source_execution_id,
+                created_at=now,
+                ingestion_evidence=ingestion_evidence,
+            )
         detections.append(
             SecretDiscoveryReference(
                 secret_reference_id=secret.secret_reference_id,
