@@ -1318,3 +1318,105 @@ PHASE_GATE=phase-0c PASS
 - No protected governance file was modified.
 - A fresh independent Phase 0C review remains required on the resulting 40-character PR HEAD; this
   local PASS is not an independent Phase Gate PASS.
+
+## Twenty-second independent review correction cycle
+
+Current phase: `phase-0c`.
+
+Input review SHA: `6c21d2986ebe1b1c4bce9f5d69c603320018b67a`.
+
+Phase base: `5cda9a5f8792ee33c3e153d8e791499f5619d82e`.
+
+### Findings addressed
+
+- [`discussion_r3900200945`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3900200945):
+  each encrypted Store opens and validates its root with no-follow semantics, retains that root
+  descriptor while opening and holding the quota transaction lock, and verifies root reachability
+  around the transaction. Two Store instances therefore cannot acquire different lock inodes during
+  a transient root rename and then overcommit one restored mission directory.
+- [`discussion_r3900200950`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3900200950):
+  mission accounting now charges at least one quota unit for every durable encrypted record as an
+  explicit record-count cap in addition to plaintext-size accounting. Repeated empty Artifacts,
+  terminals, or intents can no longer grow encrypted envelopes and resource-key state without
+  consuming the configured mission quota.
+- [`discussion_r3900200956`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3900200956):
+  Artifact Store startup now resumes authenticated deletion intents and discovers expired durable
+  Artifacts using a trusted clock. It reconstructs each authoritative reference, reconciles its
+  creation and deterministic deletion audits, and cryptographically erases all manifest/chunk or
+  non-stream target keys without requiring a caller to retain and submit the reference.
+- [`discussion_r3900200963`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3900200963):
+  Store mission and resource discovery now enumerates verified root and mission descriptors, checks
+  every entry without following links, and revalidates path identity after enumeration. Constructor
+  recovery sees quarantine expiry work and Artifact stream cleanup work even when the mission path is
+  temporarily replaced with an empty directory during the scan.
+- [`discussion_r3900200967`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3900200967):
+  after the external key-state generation advances, the provider now reopens the configured parent,
+  validates the original identity, decrypts and authenticates the generation-named slot through that
+  fresh descriptor, and verifies path reachability again before acknowledging the operation. A swap
+  between the pre-CAS check and generation commit is reported as an uncertain failure; restoring the
+  expected directory lets restart reconcile the externally committed generation.
+
+### Modified files and regression tests
+
+Resulting working-tree diff: `4 files changed, 835 insertions(+), 57 deletions(-)`.
+
+- `src/redteam_agent/data_security/keys.py`
+- `src/redteam_agent/data_security/stores.py`
+- `tests/security/test_phase0c_data_security.py`
+- `docs/review/phase-0c-fix-report.md`
+
+Regression coverage runs two quota writers through a transient Store-root swap, fills a mission with
+zero-byte Artifacts, restarts after an Artifact expires without invoking `expire()`, swaps a mission
+directory during quarantine and stream-cleanup discovery, and moves the key-state parent only during
+external generation commit. No test was deleted, skipped, weakened, or marked as an expected failure.
+
+### Validation
+
+Focused regression command:
+
+```text
+PATH="/home/kali/Red_Agent/.venv/bin:$PATH" python -m pytest -q \
+  tests/security/test_phase0c_data_security.py \
+  -k 'post_commit_state_reachability or quota_lock_stays \
+      or empty_artifacts_consume or expiry_sweeps_without \
+      or restart_enumeration or partial_artifact_stream_cleanup'
+```
+
+Result: `6 passed, 51 deselected`.
+
+Phase 0C data-security module: `57 passed`.
+
+Required phase-gate command:
+
+```text
+PATH="/home/kali/Red_Agent/.venv/bin:$PATH" \
+  bash scripts/ci/run_phase_gate.sh phase-0c
+```
+
+Result:
+
+```text
+AUTOMATION_VALIDATION=PASS
+ruff: All checks passed
+mypy: Success: no issues found in 78 source files
+unit: 200 passed
+integration: 7 passed
+security: 203 passed
+full/coverage run: 410 passed
+skipped=0, errors=0, failures=0
+coverage: 81% total (branch coverage enabled)
+pip check: No broken requirements found
+PHASE_GATE=phase-0c PASS
+```
+
+### Remaining constraints
+
+- The key-state and audit-head external generation adapters remain integration boundaries supplied by
+  an OS keystore, vault, or equivalently protected monotonic service; the application treats an
+  advanced but temporarily unreachable generation as an uncertain failure and never acknowledges
+  dependent ciphertext as durable.
+- No real C2, MCP, provider, subprocess, local-attack, credential-collection, or external-target
+  action was executed.
+- No protected governance file was modified.
+- A fresh independent Phase 0C review remains required on the resulting 40-character PR HEAD; this
+  local PASS is not an independent Phase Gate PASS.

@@ -906,6 +906,37 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
                 "external key-state generation update conflicted"
             )
         self._generation = generation
+        self._reconcile_committed_state_reachability(generation)
+
+    def _reconcile_committed_state_reachability(self, generation: int) -> None:
+        """Reload the generation through the configured path before acknowledging it."""
+
+        directory_flags = os.O_RDONLY | os.O_CLOEXEC
+        if hasattr(os, "O_DIRECTORY"):
+            directory_flags |= os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            directory_flags |= os.O_NOFOLLOW
+        try:
+            directory_descriptor = os.open(
+                self._state_path.parent,
+                directory_flags,
+            )
+        except OSError as exc:
+            raise EncryptionKeyUnavailableError(
+                "committed key-state directory is unavailable"
+            ) from exc
+        try:
+            self._validate_state_directory_descriptor(directory_descriptor)
+            self._load_persisted_state(
+                directory_descriptor=directory_descriptor
+            )
+            self._verify_state_parent_identity()
+            if self._generation != generation:
+                raise EncryptionKeyUnavailableError(
+                    "committed key-state generation is unavailable"
+                )
+        finally:
+            os.close(directory_descriptor)
 
     def _load_persisted_state(self, *, directory_descriptor: int) -> None:
         external_generation = self._external_generation()

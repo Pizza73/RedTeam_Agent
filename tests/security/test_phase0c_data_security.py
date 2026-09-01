@@ -2494,6 +2494,65 @@ def test_wrapped_key_providers_share_lock_during_parent_directory_swap(
     )
 
 
+def test_wrapped_key_generation_requires_post_commit_state_reachability(
+    tmp_path: Path,
+) -> None:
+    key_directory = tmp_path / "post-commit-key-state"
+    key_directory.mkdir(mode=0o700)
+    detached_directory = tmp_path / "detached-post-commit-key-state"
+    state_path = key_directory / "provider.json"
+
+    class SwappingGenerationStore(_GenerationStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.swap_on_next_commit = False
+
+        def compare_and_set_generation(self, *, expected: int, new: int) -> bool:
+            advanced = super().compare_and_set_generation(
+                expected=expected,
+                new=new,
+            )
+            if self.swap_on_next_commit and advanced:
+                self.swap_on_next_commit = False
+                key_directory.rename(detached_directory)
+                key_directory.mkdir(mode=0o700)
+            return advanced
+
+    generation_store = SwappingGenerationStore()
+    provider = _wrapped_keys(
+        state_path,
+        generation_store=generation_store,
+    )
+    provider.set_rotation_state(
+        "audit_signing",
+        "audit_signing-key-v1",
+        1,
+        "decrypt_only",
+    )
+    generation_before_swap = generation_store.current_generation()
+    generation_store.swap_on_next_commit = True
+    with pytest.raises(EncryptionKeyUnavailableError, match="directory identity"):
+        provider.register_key(
+            domain="audit_signing",
+            key_id="audit_signing-key-v2",
+            key_version=2,
+            key_separation_tag="audit_signing-separation-v2",
+            material=b"N" * 32,
+            created_at=NOW + timedelta(minutes=1),
+        )
+
+    assert generation_store.current_generation() == generation_before_swap + 1
+    assert not list(key_directory.iterdir())
+    key_directory.rmdir()
+    detached_directory.rename(key_directory)
+    restarted = _wrapped_keys(
+        state_path,
+        generation_store=generation_store,
+    )
+    active = restarted.get_active_key_metadata("audit_signing")
+    assert (active.key_id, active.key_version) == ("audit_signing-key-v2", 2)
+
+
 def test_expired_committed_and_abandoned_streams_are_erased_after_restart(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3567,6 +3626,89 @@ def test_expired_quarantine_existence_check_uses_anchored_mission_directory(
     ) == 1
 
 
+def test_quarantine_restart_enumeration_uses_anchored_mission_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    keys = _keys()
+    audit_log = MissionAuditLog()
+    audit = MissionAuditRecorder(
+        audit_log=audit_log,
+        contexts=_AuditContexts(),
+    )
+    current_time = [NOW]
+    root = tmp_path / "anchored-recovery-enumeration"
+    quarantine = EncryptedRawResultQuarantine(
+        root=root,
+        keys=keys,
+        audit=audit,
+        max_item_bytes=1024,
+        mission_quota_bytes=4096,
+        clock=lambda: current_time[0],
+    )
+    retention_until = NOW + timedelta(minutes=5)
+    reference = quarantine.commit(
+        mission_id="mission-anchored-recovery",
+        mission_revision=1,
+        execution_id="execution-anchored-recovery",
+        content=b"restart-enumeration-secret",
+        created_at=NOW,
+        retention_until=retention_until,
+    )
+    envelope = quarantine._store.verified_envelope(
+        mission_id=reference.mission_id,
+        resource_id=reference.quarantine_id,
+        now=None,
+    )
+    mission_root = root / reference.mission_id
+    detached_root = root / "detached-anchored-recovery"
+    mission_metadata = os.stat(mission_root, follow_symlinks=False)
+    original_scandir = os.scandir
+    swap_count = 0
+
+    def swap_during_recovery_enumeration(
+        path: int | str | bytes | os.PathLike[str] | os.PathLike[bytes] = ".",
+    ):
+        nonlocal swap_count
+        if isinstance(path, int):
+            metadata = os.fstat(path)
+            scans_mission = (
+                metadata.st_dev == mission_metadata.st_dev
+                and metadata.st_ino == mission_metadata.st_ino
+            )
+        else:
+            scans_mission = Path(os.path.abspath(path)) == mission_root
+        if scans_mission and swap_count < 2:
+            mission_root.rename(detached_root)
+            mission_root.mkdir(mode=0o700)
+            try:
+                iterator = original_scandir(path)
+            finally:
+                mission_root.rmdir()
+                detached_root.rename(mission_root)
+                swap_count += 1
+            return iterator
+        return original_scandir(path)
+
+    current_time[0] = retention_until
+    monkeypatch.setattr(os, "scandir", swap_during_recovery_enumeration)
+    restarted = EncryptedRawResultQuarantine(
+        root=root,
+        keys=keys,
+        audit=audit,
+        max_item_bytes=1024,
+        mission_quota_bytes=4096,
+        clock=lambda: current_time[0],
+    )
+
+    assert swap_count == 2
+    assert not restarted._store.has_resource(
+        mission_id=reference.mission_id,
+        resource_id=reference.quarantine_id,
+    )
+    assert keys.resource_key_destroyed(envelope.payload.metadata)
+
+
 def test_artifact_quota_is_serialized_across_store_instances(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3772,6 +3914,183 @@ def test_artifact_quota_scan_stays_on_anchored_mission_directory(
 
     assert swapped
     assert len(list(mission_root.glob("*.json"))) == 1
+
+
+def test_artifact_quota_lock_stays_on_anchored_store_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    keys = _keys()
+    authorizer = _ExactEnvelopeAuthorizer()
+    mission_id = "mission-root-lock-quota"
+    authorizer.allow_ingestion_write(mission_id, "execution-first")
+    authorizer.allow_ingestion_write(mission_id, "execution-second")
+    artifact_root = tmp_path / "root-lock-artifacts"
+    detached_root = tmp_path / "detached-root-lock-artifacts"
+    outside_root = tmp_path / "outside-root-lock-artifacts"
+    outside_root.mkdir(mode=0o700)
+    audit = MissionAuditRecorder(
+        audit_log=MissionAuditLog(),
+        contexts=_AuditContexts(),
+    )
+    first_store = ArtifactStore(
+        root=artifact_root,
+        keys=keys,
+        authorizer=authorizer,
+        audit=audit,
+        max_item_bytes=10,
+        mission_quota_bytes=10,
+    )
+    second_store = ArtifactStore(
+        root=artifact_root,
+        keys=keys,
+        authorizer=authorizer,
+        audit=audit,
+        max_item_bytes=10,
+        mission_quota_bytes=10,
+    )
+    original_open = os.open
+    original_first_write = first_store._store._atomic_write_anchored
+    original_second_write = second_store._store._atomic_write_anchored
+    first_write_started = Event()
+    release_first_write = Event()
+    second_call_started = Event()
+    second_write_started = Event()
+    swapped = False
+
+    def swap_root_on_lock_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal swapped
+        path_name = Path(os.fsdecode(os.fspath(path))).name
+        if not swapped and path_name == ".write-transaction.lock":
+            artifact_root.rename(detached_root)
+            artifact_root.symlink_to(outside_root, target_is_directory=True)
+            try:
+                descriptor = original_open(
+                    path,
+                    flags,
+                    mode,
+                    dir_fd=dir_fd,
+                )
+            finally:
+                artifact_root.unlink()
+                detached_root.rename(artifact_root)
+            swapped = True
+            return descriptor
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    def pause_first_write(**kwargs: object) -> None:
+        first_write_started.set()
+        if not release_first_write.wait(timeout=5):
+            raise AssertionError("timed out waiting to release anchored root write")
+        original_first_write(**kwargs)  # type: ignore[arg-type]
+
+    def observe_second_write(**kwargs: object) -> None:
+        second_write_started.set()
+        original_second_write(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "open", swap_root_on_lock_open)
+    monkeypatch.setattr(
+        first_store._store,
+        "_atomic_write_anchored",
+        pause_first_write,
+    )
+    monkeypatch.setattr(
+        second_store._store,
+        "_atomic_write_anchored",
+        observe_second_write,
+    )
+
+    def put_first():
+        return first_store.put(
+            mission_id=mission_id,
+            content=b"first!",
+            media_type="text/plain",
+            classification="normal",
+            variant="redacted",
+            source_execution_id="execution-first",
+            created_at=NOW,
+        )
+
+    def put_second():
+        second_call_started.set()
+        return second_store.put(
+            mission_id=mission_id,
+            content=b"second",
+            media_type="text/plain",
+            classification="normal",
+            variant="redacted",
+            source_execution_id="execution-second",
+            created_at=NOW,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first_future = executor.submit(put_first)
+        assert first_write_started.wait(timeout=5)
+        second_future = executor.submit(put_second)
+        assert second_call_started.wait(timeout=5)
+        try:
+            assert not second_write_started.wait(timeout=0.2)
+        finally:
+            release_first_write.set()
+        first_future.result(timeout=5)
+        with pytest.raises(ArtifactSecurityError, match="quota"):
+            second_future.result(timeout=5)
+
+    assert swapped
+    assert not second_write_started.is_set()
+    assert not list(outside_root.iterdir())
+    assert len(list((artifact_root / mission_id).glob("*.json"))) == 1
+
+
+def test_empty_artifacts_consume_record_quota(
+    tmp_path: Path,
+) -> None:
+    keys = _keys()
+    authorizer = _ExactEnvelopeAuthorizer()
+    mission_id = "mission-empty-record-quota"
+    execution_ids = tuple(f"execution-empty-{index}" for index in range(4))
+    for execution_id in execution_ids:
+        authorizer.allow_ingestion_write(mission_id, execution_id)
+    artifacts = ArtifactStore(
+        root=tmp_path / "empty-record-quota",
+        keys=keys,
+        authorizer=authorizer,
+        audit=MissionAuditRecorder(
+            audit_log=MissionAuditLog(),
+            contexts=_AuditContexts(),
+        ),
+        max_item_bytes=10,
+        mission_quota_bytes=3,
+    )
+    for execution_id in execution_ids[:3]:
+        reference = artifacts.put(
+            mission_id=mission_id,
+            content=b"",
+            media_type="text/plain",
+            classification="normal",
+            variant="redacted",
+            source_execution_id=execution_id,
+            created_at=NOW,
+        )
+        assert reference.size_bytes == 0
+    with pytest.raises(ArtifactSecurityError, match="quota"):
+        artifacts.put(
+            mission_id=mission_id,
+            content=b"",
+            media_type="text/plain",
+            classification="normal",
+            variant="redacted",
+            source_execution_id=execution_ids[3],
+            created_at=NOW,
+        )
+
+    assert len(list((artifacts._store._root / mission_id).glob("*.json"))) == 3
 
 
 def test_identical_streamed_artifacts_keep_cross_execution_provenance(
@@ -4046,6 +4365,79 @@ def test_artifact_expiry_is_audited_and_resumes_cryptographic_erasure(
     ) == 1
 
 
+def test_artifact_expiry_sweeps_without_caller_reference_after_restart(
+    tmp_path: Path,
+) -> None:
+    keys = _keys()
+    authorizer = _ExactEnvelopeAuthorizer()
+    mission_id = "mission-autonomous-artifact-expiry"
+    execution_id = "execution-autonomous-artifact-expiry"
+    authorizer.allow_ingestion_write(mission_id, execution_id)
+    audit_log = MissionAuditLog()
+    audit = MissionAuditRecorder(
+        audit_log=audit_log,
+        contexts=_AuditContexts(),
+    )
+    current_time = [NOW]
+    artifact_root = tmp_path / "autonomous-artifact-expiry"
+    artifacts = ArtifactStore(
+        root=artifact_root,
+        keys=keys,
+        authorizer=authorizer,
+        audit=audit,
+        max_item_bytes=1024,
+        mission_quota_bytes=4096,
+        clock=lambda: current_time[0],
+    )
+    retention_until = NOW + timedelta(minutes=5)
+    reference = artifacts.put(
+        mission_id=mission_id,
+        content=b"autonomously-expired-artifact",
+        media_type="text/plain",
+        classification="normal",
+        variant="redacted",
+        source_execution_id=execution_id,
+        created_at=NOW,
+        retention_until=retention_until,
+    )
+    envelope = artifacts._store.verified_envelope(
+        mission_id=mission_id,
+        resource_id=reference.artifact_id,
+        now=None,
+    )
+    current_time[0] = retention_until
+
+    restarted = ArtifactStore(
+        root=artifact_root,
+        keys=keys,
+        authorizer=authorizer,
+        audit=audit,
+        max_item_bytes=1024,
+        mission_quota_bytes=4096,
+        clock=lambda: current_time[0],
+    )
+
+    assert not restarted._store.has_resource(
+        mission_id=mission_id,
+        resource_id=reference.artifact_id,
+    )
+    assert keys.resource_key_destroyed(envelope.payload.metadata)
+    assert len(
+        [
+            event
+            for event in audit_log.events_for(mission_id)
+            if event.event_type == "artifact.create"
+        ]
+    ) == 1
+    assert len(
+        [
+            event
+            for event in audit_log.events_for(mission_id)
+            if event.event_type == "artifact.delete"
+        ]
+    ) == 1
+
+
 def test_completed_stream_cleanup_reconciles_create_audit_after_restart(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -4207,6 +4599,38 @@ def test_partial_artifact_stream_cleanup_resumes_after_restart(
         for envelope in pending_envelopes
     )
 
+    mission_root = artifact_root / "mission-partial"
+    detached_root = artifact_root / "detached-mission-partial"
+    mission_metadata = os.stat(mission_root, follow_symlinks=False)
+    original_scandir = os.scandir
+    swapped = False
+
+    def swap_during_cleanup_enumeration(
+        path: int | str | bytes | os.PathLike[str] | os.PathLike[bytes] = ".",
+    ):
+        nonlocal swapped
+        if isinstance(path, int):
+            metadata = os.fstat(path)
+            scans_mission = (
+                metadata.st_dev == mission_metadata.st_dev
+                and metadata.st_ino == mission_metadata.st_ino
+            )
+        else:
+            scans_mission = Path(os.path.abspath(path)) == mission_root
+        if scans_mission and not swapped:
+            mission_root.rename(detached_root)
+            mission_root.mkdir(mode=0o700)
+            try:
+                iterator = original_scandir(path)
+            finally:
+                mission_root.rmdir()
+                detached_root.rename(mission_root)
+                swapped = True
+            return iterator
+        return original_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", swap_during_cleanup_enumeration)
+
     ArtifactStore(
         root=artifact_root,
         keys=keys,
@@ -4215,6 +4639,7 @@ def test_partial_artifact_stream_cleanup_resumes_after_restart(
         max_item_bytes=16 * 1024,
         mission_quota_bytes=32 * 1024,
     )
+    assert swapped
     assert not list((artifact_root / "mission-partial").glob("*.json"))
     assert all(keys.resource_key_destroyed(metadata) for metadata in pending_metadata)
     assert audit_log.events_for("mission-partial") == ()

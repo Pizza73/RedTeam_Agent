@@ -295,7 +295,7 @@ class _EncryptedFileStore:
                         mission_id=mission_id,
                         mission_descriptor=mission_descriptor,
                     )
-                    + len(content)
+                    + self._quota_charge(len(content))
                     > self._mission_quota_bytes
                 ):
                     raise ArtifactSecurityError("mission storage quota exceeded")
@@ -351,33 +351,58 @@ class _EncryptedFileStore:
 
     @contextmanager
     def _write_transaction(self) -> Iterator[None]:
-        flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC
+        directory_flags = os.O_RDONLY | os.O_CLOEXEC
+        if hasattr(os, "O_DIRECTORY"):
+            directory_flags |= os.O_DIRECTORY
         if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        try:
-            descriptor = os.open(self._transaction_lock_path, flags, 0o600)
-        except OSError as exc:
-            raise ArtifactSecurityError(
-                "store transaction lock is unavailable"
-            ) from exc
+            directory_flags |= os.O_NOFOLLOW
+        lock_flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            lock_flags |= os.O_NOFOLLOW
+        root_descriptor: int | None = None
+        lock_descriptor: int | None = None
         locked = False
         try:
-            metadata = os.fstat(descriptor)
+            try:
+                root_descriptor = os.open(self._root, directory_flags)
+                root_metadata = os.fstat(root_descriptor)
+                if (
+                    not stat.S_ISDIR(root_metadata.st_mode)
+                    or (root_metadata.st_dev, root_metadata.st_ino)
+                    != self._root_identity
+                ):
+                    raise ArtifactSecurityError("store root identity changed")
+                lock_descriptor = os.open(
+                    self._transaction_lock_path.name,
+                    lock_flags,
+                    0o600,
+                    dir_fd=root_descriptor,
+                )
+            except OSError as exc:
+                raise ArtifactSecurityError(
+                    "store transaction lock is unavailable"
+                ) from exc
+            metadata = os.fstat(lock_descriptor)
             if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
                 raise ArtifactSecurityError("store transaction lock is invalid")
             try:
-                fcntl.flock(descriptor, fcntl.LOCK_EX)
+                fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
             except OSError as exc:
                 raise ArtifactSecurityError(
                     "store transaction lock acquisition failed"
                 ) from exc
             locked = True
+            self._require_current_root_identity()
             yield
+            self._require_current_root_identity()
         finally:
-            if locked:
+            if locked and lock_descriptor is not None:
                 with suppress(OSError):
-                    fcntl.flock(descriptor, fcntl.LOCK_UN)
-            os.close(descriptor)
+                    fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+            if lock_descriptor is not None:
+                os.close(lock_descriptor)
+            if root_descriptor is not None:
+                os.close(root_descriptor)
 
     def read(
         self,
@@ -498,18 +523,8 @@ class _EncryptedFileStore:
                     os.close(root_descriptor)
 
     def envelopes_for(self, mission_id: str) -> tuple[_StoredEnvelope, ...]:
-        mission_root = self._root / mission_id
-        self._validate_token(mission_id)
-        if not mission_root.exists():
-            return ()
-        if mission_root.is_symlink():
-            raise ArtifactSecurityError("mission storage may not be a symbolic link")
         envelopes: list[_StoredEnvelope] = []
-        for path in sorted(mission_root.iterdir()):
-            if path.is_symlink() or not path.is_file() or path.suffix != ".json":
-                raise ArtifactSecurityError("unexpected mission storage entry")
-            resource_id = path.stem
-            self._validate_token(resource_id)
+        for resource_id in self._mission_resource_ids(mission_id):
             envelope = self._load_envelope_anchored(
                 mission_id=mission_id,
                 resource_id=resource_id,
@@ -526,15 +541,49 @@ class _EncryptedFileStore:
         return tuple(envelopes)
 
     def mission_ids(self) -> tuple[str, ...]:
+        directory_flags = os.O_RDONLY | os.O_CLOEXEC
+        if hasattr(os, "O_DIRECTORY"):
+            directory_flags |= os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            directory_flags |= os.O_NOFOLLOW
+        try:
+            root_descriptor = os.open(self._root, directory_flags)
+        except OSError as exc:
+            raise ArtifactSecurityError("store root is unavailable") from exc
         mission_ids: list[str] = []
-        for path in sorted(self._root.iterdir()):
-            if path.name.startswith("."):
-                continue
-            self._validate_token(path.name)
-            if path.is_symlink() or not path.is_dir():
-                raise ArtifactSecurityError("unexpected Store-root entry")
-            mission_ids.append(path.name)
-        return tuple(mission_ids)
+        try:
+            root_metadata = os.fstat(root_descriptor)
+            if (
+                not stat.S_ISDIR(root_metadata.st_mode)
+                or (root_metadata.st_dev, root_metadata.st_ino)
+                != self._root_identity
+            ):
+                raise ArtifactSecurityError("store root identity changed")
+            try:
+                entries = sorted(os.listdir(root_descriptor))
+            except OSError as exc:
+                raise ArtifactSecurityError("store root is unavailable") from exc
+            for entry in entries:
+                if entry.startswith("."):
+                    continue
+                self._validate_token(entry)
+                try:
+                    metadata = os.stat(
+                        entry,
+                        dir_fd=root_descriptor,
+                        follow_symlinks=False,
+                    )
+                except OSError as exc:
+                    raise ArtifactSecurityError(
+                        "unexpected Store-root entry"
+                    ) from exc
+                if not stat.S_ISDIR(metadata.st_mode):
+                    raise ArtifactSecurityError("unexpected Store-root entry")
+                mission_ids.append(entry)
+            self._require_current_root_identity()
+            return tuple(mission_ids)
+        finally:
+            os.close(root_descriptor)
 
     def resource_ids_with_prefix(
         self,
@@ -542,21 +591,96 @@ class _EncryptedFileStore:
         mission_id: str,
         prefix: str,
     ) -> tuple[str, ...]:
+        return tuple(
+            resource_id
+            for resource_id in self._mission_resource_ids(mission_id)
+            if resource_id.startswith(prefix)
+        )
+
+    def _mission_resource_ids(self, mission_id: str) -> tuple[str, ...]:
         self._validate_token(mission_id)
-        mission_root = self._root / mission_id
-        if not mission_root.exists():
-            return ()
-        if mission_root.is_symlink() or not mission_root.is_dir():
-            raise ArtifactSecurityError("mission storage is invalid")
-        resource_ids: list[str] = []
-        for path in sorted(mission_root.iterdir()):
-            if path.is_symlink() or not path.is_file() or path.suffix != ".json":
-                raise ArtifactSecurityError("unexpected mission storage entry")
-            resource_id = path.stem
-            self._validate_token(resource_id)
-            if resource_id.startswith(prefix):
+        directory_flags = os.O_RDONLY | os.O_CLOEXEC
+        if hasattr(os, "O_DIRECTORY"):
+            directory_flags |= os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            directory_flags |= os.O_NOFOLLOW
+        root_descriptor: int | None = None
+        mission_descriptor: int | None = None
+        try:
+            try:
+                root_descriptor = os.open(self._root, directory_flags)
+            except OSError as exc:
+                raise ArtifactSecurityError("store root is unavailable") from exc
+            root_metadata = os.fstat(root_descriptor)
+            if (
+                not stat.S_ISDIR(root_metadata.st_mode)
+                or (root_metadata.st_dev, root_metadata.st_ino)
+                != self._root_identity
+            ):
+                raise ArtifactSecurityError("store root identity changed")
+            try:
+                mission_descriptor = os.open(
+                    mission_id,
+                    directory_flags,
+                    dir_fd=root_descriptor,
+                )
+            except FileNotFoundError:
+                return ()
+            except OSError as exc:
+                raise ArtifactSecurityError(
+                    "resource directory is unavailable"
+                ) from exc
+            mission_metadata = os.fstat(mission_descriptor)
+            if not stat.S_ISDIR(mission_metadata.st_mode):
+                raise ArtifactSecurityError("resource directory is invalid")
+            self._require_current_mission_identity(
+                mission_id=mission_id,
+                root_descriptor=root_descriptor,
+                mission_metadata=mission_metadata,
+                operation="enumeration",
+            )
+            try:
+                with os.scandir(mission_descriptor) as iterator:
+                    entries = sorted(entry.name for entry in iterator)
+            except OSError as exc:
+                raise ArtifactSecurityError("mission storage is unavailable") from exc
+            resource_ids: list[str] = []
+            for entry in entries:
+                if not entry.endswith(".json"):
+                    raise ArtifactSecurityError(
+                        "unexpected mission storage entry"
+                    )
+                resource_id = entry.removesuffix(".json")
+                self._validate_token(resource_id)
+                try:
+                    metadata = os.stat(
+                        entry,
+                        dir_fd=mission_descriptor,
+                        follow_symlinks=False,
+                    )
+                except OSError as exc:
+                    raise ArtifactSecurityError(
+                        "unexpected mission storage entry"
+                    ) from exc
+                if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                    raise ArtifactSecurityError(
+                        "unexpected mission storage entry"
+                    )
                 resource_ids.append(resource_id)
-        return tuple(resource_ids)
+            self._require_current_mission_identity(
+                mission_id=mission_id,
+                root_descriptor=root_descriptor,
+                mission_metadata=mission_metadata,
+                operation="enumeration",
+            )
+            return tuple(resource_ids)
+        finally:
+            if mission_descriptor is not None:
+                with suppress(OSError):
+                    os.close(mission_descriptor)
+            if root_descriptor is not None:
+                with suppress(OSError):
+                    os.close(root_descriptor)
 
     def _open_envelope(
         self,
@@ -930,8 +1054,14 @@ class _EncryptedFileStore:
                 expected_encryption_metadata_id=envelope.encryption_metadata_id,
                 now=None,
             )
-            total += envelope.plaintext_size
+            total += self._quota_charge(envelope.plaintext_size)
         return total
+
+    @staticmethod
+    def _quota_charge(plaintext_size: int) -> int:
+        """Cap physical record count even when the plaintext is empty."""
+
+        return max(plaintext_size, 1)
 
     def _load_envelope_anchored(
         self,
@@ -1060,6 +1190,17 @@ class _EncryptedFileStore:
             raise ArtifactSecurityError(
                 f"resource directory changed during {operation}"
             )
+
+    def _require_current_root_identity(self) -> None:
+        try:
+            metadata = os.stat(self._root, follow_symlinks=False)
+        except OSError as exc:
+            raise ArtifactSecurityError("store root is unavailable") from exc
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or (metadata.st_dev, metadata.st_ino) != self._root_identity
+        ):
+            raise ArtifactSecurityError("store root identity changed")
 
     @staticmethod
     def _parse_envelope(raw: bytes) -> _StoredEnvelope:
@@ -1584,6 +1725,7 @@ class ArtifactStore:
         audit: DataStoreAuditRecorder,
         max_item_bytes: int,
         mission_quota_bytes: int,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._store = _EncryptedFileStore(
             root=root,
@@ -1594,8 +1736,10 @@ class ArtifactStore:
         )
         self._authorizer = authorizer
         self._audit = audit
+        self._clock = clock or (lambda: datetime.now(UTC))
         self.max_observed_stream_chunk_bytes = 0
         self._resume_pending_stream_cleanups()
+        self._sweep_expired_artifacts()
 
     def put(
         self,
@@ -2042,6 +2186,34 @@ class ArtifactStore:
                         source_execution_id=intent.source_execution_id,
                     )
 
+    def _sweep_expired_artifacts(self) -> None:
+        now = self._clock()
+        _require_time(now)
+        for mission_id in self._store.mission_ids():
+            for intent_id in self._store.resource_ids_with_prefix(
+                mission_id=mission_id,
+                prefix="artifactdeletion_",
+            ):
+                intent, intent_envelope = self._load_deletion_intent_by_id(
+                    mission_id=mission_id,
+                    intent_id=intent_id,
+                )
+                self._resume_artifact_expiry(intent, intent_envelope)
+            for artifact_id in self._store.resource_ids_with_prefix(
+                mission_id=mission_id,
+                prefix="artifact_",
+            ):
+                reference = self._stored_reference(
+                    mission_id=mission_id,
+                    artifact_id=artifact_id,
+                    now=None,
+                )
+                if (
+                    reference.retention_until is not None
+                    and now >= reference.retention_until
+                ):
+                    self._expire_authoritative(reference, now=now)
+
     @asynccontextmanager
     async def _serialized_artifact_stream(
         self,
@@ -2417,7 +2589,6 @@ class ArtifactStore:
             raise DigestIntegrityError("artifact reference integrity failed")
         if reference.retention_until is None or now < reference.retention_until:
             raise ArtifactSecurityError("artifact retention has not expired")
-        self._reconcile_create_audit(authoritative)
         self._authorizer.require_access(
             mission_id=reference.mission_id,
             resource_type="artifact",
@@ -2429,6 +2600,25 @@ class ArtifactStore:
             operation="write",
             now=now,
         )
+        self._expire_authoritative(
+            authoritative,
+            now=now,
+            intent=intent,
+            intent_envelope=intent_envelope,
+        )
+
+    def _expire_authoritative(
+        self,
+        reference: ArtifactReference,
+        *,
+        now: datetime,
+        intent: _ArtifactDeletionIntent | None = None,
+        intent_envelope: _StoredEnvelope | None = None,
+    ) -> None:
+        if reference.retention_until is None or now < reference.retention_until:
+            raise ArtifactSecurityError("artifact retention has not expired")
+        self._reconcile_create_audit(reference)
+        intent_id = self._deletion_intent_id(reference.artifact_id)
         if intent is None:
             intent = _ArtifactDeletionIntent(
                 record_type="artifact_delete_intent",
@@ -2449,24 +2639,40 @@ class ArtifactStore:
             )
         if intent_envelope is None:
             raise ArtifactSecurityError("artifact deletion intent is unavailable")
+        self._resume_artifact_expiry(intent, intent_envelope)
+
+    def _resume_artifact_expiry(
+        self,
+        intent: _ArtifactDeletionIntent,
+        intent_envelope: _StoredEnvelope,
+    ) -> None:
+        reference = intent.reference
+        if (
+            reference.retention_until is None
+            or intent_envelope.created_at < reference.retention_until
+        ):
+            raise ArtifactSecurityError(
+                "artifact deletion intent predates retention"
+            )
+        self._reconcile_create_audit(reference)
         self._audit.record(
-            mission_id=reference.mission_id,
+            mission_id=intent.reference.mission_id,
             resource_type="artifact",
-            resource_id=reference.artifact_id,
+            resource_id=intent.reference.artifact_id,
             operation="delete",
             operation_id=stable_id(
                 "auditop",
                 {
                     "schema_version": "artifact-expiry-audit-v1",
-                    "artifact_id": reference.artifact_id,
+                    "artifact_id": intent.reference.artifact_id,
                 },
             ),
-            metadata_digest=reference.sha256,
+            metadata_digest=intent.reference.sha256,
             occurred_at=intent_envelope.created_at,
         )
         for resource_id in intent.resource_ids:
             self._store.erase_resource(
-                mission_id=reference.mission_id,
+                mission_id=intent.reference.mission_id,
                 resource_id=resource_id,
             )
 
@@ -2476,9 +2682,23 @@ class ArtifactStore:
         mission_id: str,
         artifact_id: str,
     ) -> tuple[_ArtifactDeletionIntent, _StoredEnvelope]:
+        intent, envelope = self._load_deletion_intent_by_id(
+            mission_id=mission_id,
+            intent_id=self._deletion_intent_id(artifact_id),
+        )
+        if intent.reference.artifact_id != artifact_id:
+            raise ArtifactSecurityError("artifact deletion intent binding is invalid")
+        return intent, envelope
+
+    def _load_deletion_intent_by_id(
+        self,
+        *,
+        mission_id: str,
+        intent_id: str,
+    ) -> tuple[_ArtifactDeletionIntent, _StoredEnvelope]:
         raw, envelope = self._store.read_bound(
             mission_id=mission_id,
-            resource_id=self._deletion_intent_id(artifact_id),
+            resource_id=intent_id,
             now=None,
         )
         if raw:
@@ -2492,11 +2712,11 @@ class ArtifactStore:
             raise ArtifactSecurityError("artifact deletion intent is invalid") from exc
         if not (
             intent.reference.mission_id == mission_id
-            and intent.reference.artifact_id == artifact_id
+            and self._deletion_intent_id(intent.reference.artifact_id) == intent_id
             and len(set(intent.resource_ids)) == len(intent.resource_ids)
-            and intent.resource_ids[-1] == artifact_id
+            and intent.resource_ids[-1] == intent.reference.artifact_id
             and all(
-                resource_id == artifact_id
+                resource_id == intent.reference.artifact_id
                 or resource_id.startswith("artifactchunk_")
                 for resource_id in intent.resource_ids
             )
