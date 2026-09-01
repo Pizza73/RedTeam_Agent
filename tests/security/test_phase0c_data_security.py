@@ -2106,12 +2106,18 @@ def test_aborted_stream_erasure_resumes_after_interruption(
     assert not list(
         (tmp_path / "aborted-quarantine").rglob("streamterminal_*.json")
     )
+    assert not list(
+        (tmp_path / "aborted-quarantine").rglob("streamdeletion_*.json")
+    )
     assert all(
         keys.resource_key_destroyed(metadata)
         for metadata in (*chunk_metadata, *artifact_metadata, terminal_metadata)
     )
     recovered_again = factory.for_execution("execution-aborted")
     assert recovered_again.recovery_metadata(updated_at=NOW).state == "ABORTED"
+    assert not list(
+        (tmp_path / "aborted-quarantine").rglob("streamdeletion_*.json")
+    )
     event_types = tuple(
         event.event_type for event in audit_log.events_for("mission-aborted")
     )
@@ -2655,6 +2661,11 @@ def test_expired_committed_and_abandoned_streams_are_erased_after_restart(
             event.event_type for event in audit_log.events_for(mission_id)
         )
         assert event_types.count("raw_result_quarantine.delete") == 1
+        recovered_again = factory_for(execution_id).for_execution(execution_id)
+        assert recovered_again._deleted
+    assert not list(
+        (tmp_path / "expired-streams").rglob("streamdeletion_*.json")
+    )
 
 
 def test_secret_revocation_reconciles_interrupted_erasure(
@@ -3175,6 +3186,12 @@ def test_storage_rejects_traversal_symlink_quota_retention_and_corruption(
                 self.failed = True
                 raise AuditIntegrityError("simulated crash before commit audit")
             return durable_audit.record(**kwargs)
+
+        def operation_recorded(self, **kwargs):
+            return durable_audit.operation_recorded(**kwargs)
+
+        def operation_metadata_digest(self, **kwargs):
+            return durable_audit.operation_metadata_digest(**kwargs)
 
     audit_crash_root = tmp_path / "audit-crash-quarantine"
     audit_crash_quarantine = EncryptedRawResultQuarantine(
@@ -5805,7 +5822,7 @@ def test_connection_uri_credentials_are_redacted_complete_and_split(
         mission_revision=1,
         execution_id=complete_execution,
         content=(
-            b"dsn=postgresql://alice:"
+            b"dsn=ssh://alice:"
             + complete_secret
             + b"@database.local/app status=ok"
         ),
@@ -5840,7 +5857,7 @@ def test_connection_uri_credentials_are_redacted_complete_and_split(
         now=NOW,
     )
     assert complete_secret not in complete_visible
-    assert b"postgresql://alice:[REDACTED]@database.local/app" in complete_visible
+    assert b"ssh://alice:[REDACTED]@database.local/app" in complete_visible
 
     split_mission = "mission-uri-split"
     split_execution = "execution-uri-split"
@@ -5861,9 +5878,9 @@ def test_connection_uri_credentials_are_redacted_complete_and_split(
     ).for_execution(split_execution)
 
     async def ingest_split_uri():
-        await split_sink.write_stdout(b"cache=red")
-        await split_sink.write_stdout(b"is://worker:split-uri-")
-        await split_sink.write_stdout(b"password@cache.local/0 status=ok")
+        await split_sink.write_stdout(b"transfer=sf")
+        await split_sink.write_stdout(b"tp://worker:split-uri-")
+        await split_sink.write_stdout(b"password@files.local/home status=ok")
         receipt = await split_sink.commit()
         return await SecureIngestor(
             quarantine=quarantine,
@@ -5891,7 +5908,7 @@ def test_connection_uri_credentials_are_redacted_complete_and_split(
     )
     split_visible = artifacts.read(split_artifact, operation="read", now=NOW)
     assert split_secret not in split_visible
-    assert b"redis://worker:[REDACTED]@cache.local/0" in split_visible
+    assert b"sftp://worker:[REDACTED]@files.local/home" in split_visible
 
 
 def test_full_quota_quarantine_cleanup_survives_restart(
@@ -5993,3 +6010,132 @@ def test_full_quota_quarantine_cleanup_survives_restart(
         clock=lambda: NOW + timedelta(minutes=6),
     ).for_execution(stream_execution)
     assert restarted._deleted
+
+
+def test_audit_head_generation_requires_post_commit_path_reachability(
+    tmp_path: Path,
+) -> None:
+    key_directory = tmp_path / "post-cas-audit-head-keys"
+    key_directory.mkdir(mode=0o700)
+    keys = _wrapped_keys(
+        key_directory / "provider.json",
+        generation_store=_GenerationStore(),
+    )
+    authenticator = KeyedAuditChainAuthenticator(keys)
+    mission_id = "mission-post-cas-audit-head"
+    event = MissionAuditLog(authenticator=authenticator).append(
+        mission_id=mission_id,
+        mission_revision=1,
+        authorization_epoch=0,
+        payload=AuditReferencePayload(
+            resource_type="artifact",
+            resource_id="artifact_" + "a" * 32,
+            operation="create",
+            operation_id="auditop_" + "a" * 32,
+            metadata_digest="sha256:" + "a" * 64,
+        ),
+        occurred_at=NOW,
+    )
+    head_directory = tmp_path / "post-cas-audit-head"
+    detached_directory = tmp_path / "detached-post-cas-audit-head"
+
+    class SwappingGenerationStore(_GenerationStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.swap_on_commit = True
+
+        def compare_and_set_generation(self, *, expected: int, new: int) -> bool:
+            advanced = super().compare_and_set_generation(
+                expected=expected,
+                new=new,
+            )
+            if self.swap_on_commit and advanced:
+                self.swap_on_commit = False
+                head_directory.rename(detached_directory)
+                head_directory.mkdir(mode=0o700)
+            return advanced
+
+    generation_store = SwappingGenerationStore()
+    head_store = _audit_head_store(
+        head_directory / "heads.json",
+        keys=keys,
+        generation_store=generation_store,
+    )
+    with pytest.raises(AuditIntegrityError, match="directory identity changed"):
+        head_store.prepare_append(
+            mission_id,
+            expected=None,
+            event=event,
+        )
+
+    assert generation_store.current_generation() == 1
+    assert not list(head_directory.iterdir())
+    assert (detached_directory / "heads.json").is_file()
+    head_directory.rmdir()
+    detached_directory.rename(head_directory)
+    recovered = _audit_head_store(
+        head_directory / "heads.json",
+        keys=keys,
+        generation_store=generation_store,
+    )
+    assert recovered.prepared_append(mission_id) == event
+
+
+def test_deterministic_audit_operation_is_idempotent_across_epoch_change() -> None:
+    class EpochContexts:
+        def __init__(self) -> None:
+            self.epoch = 0
+
+        def current_context(
+            self,
+            mission_id: str,
+            *,
+            now: datetime,
+        ) -> AuditContext:
+            del mission_id, now
+            return AuditContext(
+                mission_revision=1,
+                authorization_epoch=self.epoch,
+            )
+
+    contexts = EpochContexts()
+    audit_log = MissionAuditLog()
+    recorder = MissionAuditRecorder(
+        audit_log=audit_log,
+        contexts=contexts,
+    )
+    mission_id = "mission-epoch-audit-retry"
+    resource_id = "artifact_" + "e" * 32
+    operation_id = "auditop_" + "e" * 32
+    metadata_digest = "sha256:" + "e" * 64
+    first = recorder.record(
+        mission_id=mission_id,
+        resource_type="artifact",
+        resource_id=resource_id,
+        operation="create",
+        operation_id=operation_id,
+        metadata_digest=metadata_digest,
+        occurred_at=NOW,
+    )
+    contexts.epoch = 1
+    retried = recorder.record(
+        mission_id=mission_id,
+        resource_type="artifact",
+        resource_id=resource_id,
+        operation="create",
+        operation_id=operation_id,
+        metadata_digest=metadata_digest,
+        occurred_at=NOW + timedelta(hours=1),
+    )
+
+    assert retried == first
+    assert retried.authorization_epoch == 0
+    assert audit_log.events_for(mission_id) == (first,)
+    assert recorder.operation_recorded(
+        mission_id=mission_id,
+        resource_type="artifact",
+        resource_id=resource_id,
+        operation="create",
+        operation_id=operation_id,
+        metadata_digest=metadata_digest,
+    )

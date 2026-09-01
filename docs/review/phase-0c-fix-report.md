@@ -1634,3 +1634,104 @@ PHASE_GATE=phase-0c PASS
 - No protected governance file was modified.
 - A fresh independent Phase 0C review remains required on the resulting 40-character PR HEAD; this
   local PASS is not an independent Phase Gate PASS.
+
+## Twenty-fifth independent review correction cycle
+
+Current phase: `phase-0c`.
+
+Input review SHA: `982c4a37d088532665443984141074ebcec46c16`.
+
+Phase base: `5cda9a5f8792ee33c3e153d8e791499f5619d82e`.
+
+### Findings addressed
+
+- [`discussion_r3900605989`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3900605989):
+  credential-bearing URI detection now parses the generic RFC scheme grammar instead of consulting
+  an allowlist. It recognizes complete `ssh://` and arbitrarily split `sftp://` authority user-info,
+  redacts only the password, and fails closed for ambiguous multiple-authority separators, missing
+  principals, or empty passwords.
+- [`discussion_r3900605993`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3900605993):
+  successful expiry and abort recovery now erase their quota-independent stream deletion intent and
+  its resource key after every target and deterministic delete audit is durable. On later restart,
+  the verified audit chain supplies the exact completion evidence, so the sink remains terminal
+  without recreating a tombstone. Existing interrupted expiry and abort regressions now repeat the
+  reconstruction and assert no deletion-intent envelope remains.
+- [`discussion_r3900605996`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3900605996):
+  an audit-head generation CAS is now followed by a no-follow reopen and authenticated reload through
+  the configured path, with parent identity and external generation rechecked before acknowledgment.
+  A parent-swap regression advances the anchor only after moving the prepared state, observes the
+  typed reachability failure, restores the detached validated directory, and proves restart recovers
+  the exact prepared event.
+- [`discussion_r3900605998`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3900605998):
+  deterministic audit operations are looked up and fully verified before resolving a new mission
+  context or appending. A PAUSE/Resume-style authorization-epoch change therefore returns the
+  original event rather than creating a second operation ID; mismatched or duplicate bindings still
+  fail closed. The regression proves one epoch-zero event remains after an epoch-one retry.
+
+### Modified files and regression tests
+
+Resulting working-tree diff: `5 files changed, 429 insertions(+), 44 deletions(-)`.
+
+- `src/redteam_agent/data_security/audit.py`
+- `src/redteam_agent/data_security/ingestion.py`
+- `src/redteam_agent/data_security/streaming.py`
+- `tests/security/test_phase0c_data_security.py`
+- `docs/review/phase-0c-fix-report.md`
+
+Regression coverage exercises complete and split URI schemes absent from the former allowlist,
+interrupted and repeated stream expiry/abort cleanup with no retained intent, audit-head parent
+replacement in the post-write/pre-CAS window, detached-directory recovery across restart, and a
+deterministic audit retry after authorization-epoch advancement. No test was deleted, skipped,
+weakened, or marked as an expected failure.
+
+### Validation
+
+Focused regression command:
+
+```text
+/home/kali/Red_Agent/.venv/bin/python -m pytest -q \
+  tests/security/test_phase0c_data_security.py \
+  -k 'connection_uri_credentials or aborted_stream_erasure \
+      or expired_committed_and_abandoned or audit_head_generation_requires \
+      or deterministic_audit_operation'
+```
+
+Result: `5 passed, 61 deselected`.
+
+Phase 0C data-security module: `66 passed`.
+
+Required phase-gate command:
+
+```text
+PATH="/home/kali/Red_Agent/.venv/bin:$PATH" \
+  bash scripts/ci/run_phase_gate.sh phase-0c
+```
+
+Result:
+
+```text
+AUTOMATION_VALIDATION=PASS
+ruff: All checks passed
+mypy: Success: no issues found in 78 source files
+unit: 200 passed
+integration: 7 passed
+security: 212 passed
+full/coverage run: 419 passed
+skipped=0, errors=0, failures=0
+coverage: 81% total (branch coverage enabled)
+pip check: No broken requirements found
+PHASE_GATE=phase-0c PASS
+```
+
+### Remaining constraints
+
+- URI authority candidates with malformed credential user-info are deliberately rejected rather than
+  partially published.
+- The key-state and audit-head external generation adapters remain integration boundaries supplied by
+  an OS keystore, vault, or equivalently protected monotonic service. A detected post-CAS path swap
+  requires restoring or reconciling the validated state directory before normal operation resumes.
+- No real C2, MCP, provider, subprocess, local-attack, credential-collection, or external-target
+  action was executed.
+- No protected governance file was modified.
+- A fresh independent Phase 0C review remains required on the resulting 40-character PR HEAD; this
+  local PASS is not an independent Phase Gate PASS.

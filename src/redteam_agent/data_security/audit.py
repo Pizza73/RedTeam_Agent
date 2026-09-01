@@ -481,6 +481,46 @@ class KeyedFileAuditHeadStore:
             raise AuditIntegrityError(
                 "external audit-head generation update conflicted"
             )
+        self._reconcile_committed_state_reachability(next_generation)
+
+    def _reconcile_committed_state_reachability(self, generation: int) -> None:
+        """Acknowledge the generation only if its configured path can reload it."""
+
+        directory_flags = os.O_RDONLY | os.O_CLOEXEC
+        if hasattr(os, "O_DIRECTORY"):
+            directory_flags |= os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            directory_flags |= os.O_NOFOLLOW
+        try:
+            directory_descriptor = os.open(
+                self._state_path.parent,
+                directory_flags,
+            )
+        except OSError as exc:
+            raise AuditIntegrityError(
+                "committed audit-head directory is unavailable"
+            ) from exc
+        try:
+            directory_metadata = os.fstat(directory_descriptor)
+            if (
+                not stat.S_ISDIR(directory_metadata.st_mode)
+                or (directory_metadata.st_dev, directory_metadata.st_ino)
+                != self._parent_identity
+            ):
+                raise AuditIntegrityError(
+                    "audit-head state directory identity changed"
+                )
+            self._load_state(
+                directory_descriptor=directory_descriptor,
+                expected_generation=generation,
+            )
+            self._verify_parent_identity()
+            if self._external_generation() != generation:
+                raise AuditIntegrityError(
+                    "committed audit-head generation is unavailable"
+                )
+        finally:
+            os.close(directory_descriptor)
 
     @staticmethod
     def _state_digest_payload(
@@ -795,6 +835,16 @@ class DataStoreAuditRecorder(Protocol):
         metadata_digest: str,
     ) -> bool: ...
 
+    def operation_metadata_digest(
+        self,
+        *,
+        mission_id: str,
+        resource_type: AuditResourceType,
+        resource_id: str,
+        operation: AuditOperation,
+        operation_id: str,
+    ) -> str | None: ...
+
 
 class MissionAuditRecorder:
     """Resolves current mission authority before appending a typed store event."""
@@ -814,6 +864,17 @@ class MissionAuditRecorder:
         occurred_at: datetime,
         operation_id: str | None = None,
     ) -> AuditEvent:
+        if operation_id is not None:
+            existing = self._verified_operation(
+                mission_id=mission_id,
+                resource_type=resource_type,
+                resource_id=resource_id,
+                operation=operation,
+                operation_id=operation_id,
+                metadata_digest=metadata_digest,
+            )
+            if existing is not None:
+                return existing
         context = self._contexts.current_context(mission_id, now=occurred_at)
         payload = AuditReferencePayload(
             resource_type=resource_type,
@@ -846,27 +907,82 @@ class MissionAuditRecorder:
     ) -> bool:
         """Verify an exact idempotent operation against the trusted audit chain."""
 
-        expected = AuditReferencePayload(
+        return self._verified_operation(
+            mission_id=mission_id,
             resource_type=resource_type,
             resource_id=resource_id,
             operation=operation,
             operation_id=operation_id,
             metadata_digest=metadata_digest,
+        ) is not None
+
+    def operation_metadata_digest(
+        self,
+        *,
+        mission_id: str,
+        resource_type: AuditResourceType,
+        resource_id: str,
+        operation: AuditOperation,
+        operation_id: str,
+    ) -> str | None:
+        """Return the verified digest for one exact deterministic operation."""
+
+        event = self._verified_operation(
+            mission_id=mission_id,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            operation=operation,
+            operation_id=operation_id,
+            metadata_digest=None,
         )
-        expected_payload = CanonicalJsonObject(expected.model_dump(mode="json"))
+        if event is None:
+            return None
+        try:
+            payload = AuditReferencePayload.model_validate(
+                event.canonical_payload.to_dict()
+            )
+        except ValueError as exc:
+            raise AuditIntegrityError("audit operation binding failed") from exc
+        return payload.metadata_digest
+
+    def _verified_operation(
+        self,
+        *,
+        mission_id: str,
+        resource_type: AuditResourceType,
+        resource_id: str,
+        operation: AuditOperation,
+        operation_id: str,
+        metadata_digest: str | None,
+    ) -> AuditEvent | None:
         matches = tuple(
             event
             for event in self._audit_log.verify(mission_id)
             if event.canonical_payload.to_dict().get("operation_id") == operation_id
         )
         if not matches:
-            return False
-        if len(matches) != 1 or not (
+            return None
+        if len(matches) != 1:
+            raise AuditIntegrityError("audit operation binding failed")
+        try:
+            payload = AuditReferencePayload.model_validate(
+                matches[0].canonical_payload.to_dict()
+            )
+        except ValueError as exc:
+            raise AuditIntegrityError("audit operation binding failed") from exc
+        if not (
             matches[0].event_type == f"{resource_type}.{operation}"
-            and matches[0].canonical_payload == expected_payload
+            and payload.resource_type == resource_type
+            and payload.resource_id == resource_id
+            and payload.operation == operation
+            and payload.operation_id == operation_id
+            and (
+                metadata_digest is None
+                or payload.metadata_digest == metadata_digest
+            )
         ):
             raise AuditIntegrityError("audit operation binding failed")
-        return True
+        return matches[0]
 
 
 class MissionAuditLog:

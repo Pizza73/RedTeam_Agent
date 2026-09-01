@@ -47,18 +47,6 @@ _SECRET_KEYWORDS = (
 )
 _AUTHORIZATION_HEADER = b"authorization"
 _SUPPORTED_AUTHORIZATION_SCHEMES = (b"bearer", b"basic")
-_SUPPORTED_CREDENTIAL_URI_SCHEMES = (
-    b"amqp",
-    b"ftp",
-    b"https",
-    b"http",
-    b"mariadb",
-    b"mongodb",
-    b"mysql",
-    b"postgresql",
-    b"postgres",
-    b"redis",
-)
 _PEM_BEGIN_PREFIX = b"-----BEGIN "
 _PEM_LABEL_SUFFIX = b"-----"
 _CREDENTIAL_KEY_COMPONENTS = (
@@ -78,6 +66,10 @@ _ASCII_WORD_BYTES = frozenset(
     b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
 )
 _AUTHORIZATION_SCHEME_BYTES = _ASCII_WORD_BYTES | frozenset(b"!#$%&'*+-.^`|~")
+_URI_SCHEME_START_BYTES = frozenset(
+    b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+)
+_URI_SCHEME_BYTES = _URI_SCHEME_START_BYTES | frozenset(b"0123456789+.-")
 _STRUCTURED_KEY_BYTES = _ASCII_WORD_BYTES | frozenset(b"-")
 _XML_TAG_NAME_BYTES = _STRUCTURED_KEY_BYTES | frozenset(b":.")
 _MAX_PENDING_SECRET_MATCH_BYTES = 64 * 1024
@@ -475,27 +467,13 @@ class _StreamingSecretRedactor:
     ) -> _SecretMatch | Literal["incomplete"] | None:
         """Redact the password in a supported URI authority user-info component."""
 
-        available = data[index:].lower()
-        matching_schemes = tuple(
-            scheme
-            for scheme in _SUPPORTED_CREDENTIAL_URI_SCHEMES
-            if scheme.startswith(available)
-        )
-        if matching_schemes and all(
-            len(available) < len(scheme) for scheme in matching_schemes
-        ):
-            return None if final else "incomplete"
-        scheme = next(
-            (
-                candidate
-                for candidate in _SUPPORTED_CREDENTIAL_URI_SCHEMES
-                if available[: len(candidate)] == candidate
-            ),
-            None,
-        )
-        if scheme is None:
+        if data[index] not in _URI_SCHEME_START_BYTES:
             return None
-        scheme_end = index + len(scheme)
+        scheme_end = index + 1
+        while scheme_end < len(data) and data[scheme_end] in _URI_SCHEME_BYTES:
+            scheme_end += 1
+        if scheme_end == len(data):
+            return None if final else "incomplete"
         delimiter = b"://"
         available_delimiter = data[scheme_end : scheme_end + len(delimiter)]
         if delimiter.startswith(available_delimiter) and len(available_delimiter) < len(
@@ -511,12 +489,16 @@ class _StreamingSecretRedactor:
         if cursor == len(data) and not final:
             return "incomplete"
         authority = data[authority_start:cursor]
+        if authority.count(b"@") > 1:
+            raise SecretDetectionError("secret detection failed closed")
         userinfo_end = authority.rfind(b"@")
         if userinfo_end < 0:
             return None
         password_separator = authority.find(b":", 0, userinfo_end)
         if password_separator < 0:
             return None
+        if password_separator == 0:
+            raise SecretDetectionError("secret detection failed closed")
         secret_start = authority_start + password_separator + 1
         secret_end = authority_start + userinfo_end
         if secret_start == secret_end:

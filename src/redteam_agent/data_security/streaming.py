@@ -186,6 +186,8 @@ class EncryptedRawResultSink:
             return
         self._load_durable_state()
         self._load_ingestion_result()
+        if self._completed_terminal_deletion():
+            return
         if self._aborted:
             self._delete_aborted(now=self._clock())
             return
@@ -1196,6 +1198,36 @@ class EncryptedRawResultSink:
             },
         )
 
+    def _completed_terminal_deletion(self) -> bool:
+        if (
+            self._chunks
+            or self._artifact_terminals
+            or self._terminal_envelope is not None
+            or self._ingestion_result is not None
+        ):
+            return False
+        completed = tuple(
+            identity
+            for identity in ("abort-intent", "expiry-intent")
+            if self._audit.operation_metadata_digest(
+                mission_id=self.binding.mission_id,
+                resource_type="raw_result_quarantine",
+                resource_id=self.quarantine_id,
+                operation="delete",
+                operation_id=self._audit_operation_id("delete", identity),
+            )
+            is not None
+        )
+        if len(completed) > 1:
+            raise AuditIntegrityError(
+                "terminal stream deletion completion is ambiguous"
+            )
+        if not completed:
+            return False
+        self._aborted = completed[0] == "abort-intent"
+        self._deleted = True
+        return True
+
     def _resume_deletion(self) -> None:
         raw, envelope = self._store.read_bound(
             mission_id=self.binding.mission_id,
@@ -1518,6 +1550,10 @@ class EncryptedRawResultSink:
             mission_id=self.binding.mission_id,
             resource_id=terminal_resource_id,
         )
+        self._store.erase_resource(
+            mission_id=self.binding.mission_id,
+            resource_id=self._deletion_resource_id(),
+        )
         self._chunks.clear()
         self._artifact_terminals.clear()
         self._receipt = None
@@ -1628,6 +1664,10 @@ class EncryptedRawResultSink:
         self._store.erase_resource(
             mission_id=self.binding.mission_id,
             resource_id=self._terminal_resource_id("abort"),
+        )
+        self._store.erase_resource(
+            mission_id=self.binding.mission_id,
+            resource_id=self._deletion_resource_id(),
         )
         self._chunks.clear()
         self._artifact_terminals.clear()
