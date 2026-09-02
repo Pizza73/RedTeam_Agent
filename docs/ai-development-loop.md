@@ -234,14 +234,20 @@ trigger Codex. The workflow's confirmation mode records one consumed transition 
 HEAD, new HEAD, target base SHA, phase and blocking gate on the new current HEAD; another update
 cannot reuse it.
 
-If another human-reviewed governance change reaches `main` before Design Approval, the original
+If another human-reviewed governance change reaches `main` while the PR remains blocked, the original
 Gate is not authority for an arbitrary newer HEAD. After each exact-HEAD update, the runner invokes
 the approver-restricted confirmation mode of the same workflow. It verifies only the new HEAD's immediate edge: the
 previous PR HEAD is the first parent, the authorized default-branch SHA is the second parent, and
 the previous HEAD carries the matching `github-actions[bot]` authorization. The workflow then
 publishes a digest-bound `BASE_REFRESH_APPLIED` status on the new current HEAD. Only that current
-checkpoint permits one more expected-HEAD refresh; it never permits Resume or implementation by
-itself. Until the checkpoint exists, the runner remains in `REFRESH_AWAITING_CONFIRMATION`.
+checkpoint permits one more expected-HEAD refresh. This applies to both ordinary `BLOCKED_LIMIT`
+and Design Stop gates; it never permits Resume or implementation by itself. Until the checkpoint
+exists, the runner remains in `REFRESH_AWAITING_CONFIRMATION`.
+
+On a checkpointed HEAD, the runner and generic Resume workflow resolve the blocking Gate directly
+from the checkpoint's authorization permalink. They do not recompute a maximal Gate by comparing
+every historical Gate pair. A bot-authored current-HEAD Gate supersedes the checkpoint and blocks
+generic Resume until the new Gate's required transition is satisfied.
 
 After the single-use Design Approval is consumed, the authorized implementation request may
 produce a normal child commit. That output proceeds through current-HEAD CI and review without
