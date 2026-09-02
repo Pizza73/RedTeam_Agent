@@ -32,6 +32,7 @@ from automation.run_phase_loop import (
     select_finding_key,
     strict_json_loads,
     validate_base_refresh,
+    validate_design_approval,
     validate_final_merge_attempt_payload,
     validate_final_merge_phase_chain,
     validate_final_phase_status,
@@ -424,6 +425,73 @@ def test_implementation_request_with_unknown_field_is_rejected() -> None:
             phase="phase-0a",
             head_sha=HEAD_SHA,
             phase_prompt="prompts/phases/phase-0a-security-fix.md",
+        )
+
+
+def test_design_resume_request_requires_exact_approval_reference() -> None:
+    payload = implementation_request()
+    payload.update(
+        {
+            "action": "IMPLEMENT_PHASE",
+            "trigger": "RESUME_AFTER_DESIGN_APPROVAL",
+            "phase": "phase-0c",
+            "phase_prompt": "prompts/phases/phase-0c.md",
+        }
+    )
+    with pytest.raises(UntrustedEvidenceError, match="schema failure"):
+        validate_implementation_request(
+            payload,
+            schema=load_schema("implementation-request.schema.json"),
+            phase="phase-0c",
+            head_sha=HEAD_SHA,
+            phase_prompt="prompts/phases/phase-0c.md",
+        )
+
+    payload["design_approval_reference"] = (
+        f"{PULL_REQUEST_PREFIX}#issuecomment-99"
+    )
+    validate_implementation_request(
+        payload,
+        schema=load_schema("implementation-request.schema.json"),
+        phase="phase-0c",
+        head_sha=HEAD_SHA,
+        phase_prompt="prompts/phases/phase-0c.md",
+    )
+
+
+def test_design_approval_is_closed_and_fully_bound() -> None:
+    payload: dict[str, object] = {
+        "schema_version": "1.0",
+        "phase": "phase-0c",
+        "head_sha": HEAD_SHA,
+        "blocked_gate_reference": f"{PULL_REQUEST_PREFIX}#issuecomment-88",
+        "design_commit_sha": "c" * 40,
+        "design_reference": "https://github.com/example/repo/pull/28",
+        "policy_digest": "f" * 64,
+        "approved_by": ACTOR_LOGIN,
+    }
+    validate_design_approval(
+        payload,
+        schema=load_schema("design-approval.schema.json"),
+        phase="phase-0c",
+        head_sha=HEAD_SHA,
+        blocked_gate_reference=f"{PULL_REQUEST_PREFIX}#issuecomment-88",
+        policy_digest="f" * 64,
+        approver_login=ACTOR_LOGIN,
+        pull_request_prefix=PULL_REQUEST_PREFIX,
+    )
+
+    payload["secret_override"] = True
+    with pytest.raises(UntrustedEvidenceError, match="schema failure"):
+        validate_design_approval(
+            payload,
+            schema=load_schema("design-approval.schema.json"),
+            phase="phase-0c",
+            head_sha=HEAD_SHA,
+            blocked_gate_reference=f"{PULL_REQUEST_PREFIX}#issuecomment-88",
+            policy_digest="f" * 64,
+            approver_login=ACTOR_LOGIN,
+            pull_request_prefix=PULL_REQUEST_PREFIX,
         )
 
 
@@ -1757,7 +1825,7 @@ def test_refreshed_blocked_phase_dispatches_one_bounded_resume() -> None:
     loop.check_state = lambda _head: "success"  # type: ignore[method-assign]
 
     assert loop.perform_post_blocked_refresh_resume(
-        state, [], [base_pass, gate], evidence, DEFAULT_BRANCH_SHA
+        state, [], [base_pass, gate], [], evidence, DEFAULT_BRANCH_SHA
     ) is True
     assert len(github.workflow_calls) == 1
     workflow, branch, inputs = github.workflow_calls[0]
@@ -1766,9 +1834,74 @@ def test_refreshed_blocked_phase_dispatches_one_bounded_resume() -> None:
     assert inputs["resolution_reference"] == gate.url
 
     assert loop.perform_post_blocked_refresh_resume(
-        state, [], [base_pass, gate], evidence, DEFAULT_BRANCH_SHA
+        state, [], [base_pass, gate], [], evidence, DEFAULT_BRANCH_SHA
     ) is True
     assert len(github.workflow_calls) == 1
+
+
+def test_refreshed_design_stop_never_dispatches_generic_resume() -> None:
+    base_pass, gate = blocked_refresh_records()
+    prior_review_sha = "9" * 40
+    prior_family = MarkerEvidence(
+        {
+            "schema_version": "1.0",
+            "phase": "phase-0b",
+            "reviewed_sha": prior_review_sha,
+            "review_reference": f"{PULL_REQUEST_PREFIX}#pullrequestreview-8",
+            "verdict": "CHANGES_REQUESTED",
+            "families": ["authorization-lifecycle"],
+        },
+        f"{PULL_REQUEST_PREFIX}#issuecomment-family-8",
+        "github-actions[bot]",
+        "",
+    )
+    current_family = MarkerEvidence(
+        {
+            "schema_version": "1.0",
+            "phase": "phase-0b",
+            "reviewed_sha": HEAD_SHA,
+            "review_reference": gate.payload["review_reference"],
+            "verdict": "CHANGES_REQUESTED",
+            "families": ["authorization-lifecycle"],
+        },
+        f"{PULL_REQUEST_PREFIX}#issuecomment-family-9",
+        "github-actions[bot]",
+        "",
+    )
+    status = base_refresh_status(
+        from_phase="phase-0c",
+        revalidate_phase="phase-0b",
+        target_url=gate.url,
+    )
+    loop, github = blocked_refresh_loop({HEAD_SHA: [status]})
+    github.ancestors.update(
+        {
+            (prior_review_sha, HEAD_SHA),
+            (HEAD_SHA, REFRESHED_HEAD_SHA),
+            (DEFAULT_BRANCH_SHA, REFRESHED_HEAD_SHA),
+        }
+    )
+    state = replace(
+        blocked_phase_state(),
+        head_sha=REFRESHED_HEAD_SHA,
+        base_sha=DEFAULT_BRANCH_SHA,
+        labels=frozenset({"ai-loop", "ai-loop-blocked", "phase-0b"}),
+    )
+    evidence = loop.trusted_base_refresh_statuses(state, [base_pass, gate])
+    loop.default_branch = "main"
+    loop.dispatched_blocked_resumes = set()
+    loop.dry_run = False
+    loop.log = lambda _message: None  # type: ignore[method-assign]
+
+    assert loop.perform_post_blocked_refresh_resume(
+        state,
+        [],
+        [base_pass, gate],
+        [prior_family, current_family],
+        evidence,
+        DEFAULT_BRANCH_SHA,
+    ) is True
+    assert github.workflow_calls == []
 
 
 def blocked_run_loop(
@@ -1804,7 +1937,7 @@ def blocked_run_loop(
         lambda _state, _records, _default: False
     )
     loop.perform_post_blocked_refresh_resume = (  # type: ignore[method-assign]
-        lambda _state, _requests, _phase_records, _refresh_records, _default: False
+        lambda _state, _requests, _phase_records, _family_records, _refresh_records, _default: False
     )
     loop.base_refresh_candidate = (  # type: ignore[method-assign]
         lambda _state, _requests, _phase_records, _default: None

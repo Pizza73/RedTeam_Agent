@@ -229,6 +229,9 @@ jobs:
               'review_reference', 'reviewer_login', 'recorded_by', 'finding_key',
               'required_checks', 'loop_state'
             ];
+            const designStopGateKeys = [
+              ...gateKeys, 'stop_reason', 'recurring_families', 'finding_references'
+            ];
             const gateCandidates = [];
             const passCandidates = [];
             for (const comment of comments) {
@@ -240,7 +243,11 @@ jobs:
               } catch (_) {
                 continue;
               }
-              if (!exactKeys(record, gateKeys) || record.schema_version !== '1.0' ||
+              const baseGate = exactKeys(record, gateKeys) &&
+                record.schema_version === '1.0';
+              const designStopGate = exactKeys(record, designStopGateKeys) &&
+                record.schema_version === '1.1';
+              if ((!baseGate && !designStopGate) ||
                   record.evidence_format !== 'codex-native-v1') continue;
               const evidence = {comment, record};
               if (record.phase === sourcePhase && record.reviewed_sha === reviewedHead &&
@@ -277,6 +284,69 @@ jobs:
               return;
             }
             const priorPass = priorPasses[0];
+
+            const familyKeys = [
+              'schema_version', 'phase', 'reviewed_sha', 'review_reference',
+              'verdict', 'families',
+            ];
+            const familyRecords = [];
+            for (const comment of comments) {
+              if (comment.user?.login !== 'github-actions[bot]' ||
+                  !comment.body?.includes('redteam-invariant-family-review')) continue;
+              let familyRecord;
+              try {
+                familyRecord = singleMarker(
+                  comment.body, 'redteam-invariant-family-review'
+                );
+              } catch (_) {
+                core.setFailed('Trusted invariant-family marker is malformed.');
+                return;
+              }
+              if (!exactKeys(familyRecord, familyKeys) ||
+                  familyRecord.schema_version !== '1.0' ||
+                  !/^[0-9a-f]{40}$/.test(familyRecord.reviewed_sha || '') ||
+                  !['PASS', 'CHANGES_REQUESTED'].includes(familyRecord.verdict) ||
+                  !Array.isArray(familyRecord.families) ||
+                  familyRecord.families.length !== new Set(familyRecord.families).size ||
+                  !familyRecord.families.every((item) =>
+                    /^[a-z][a-z0-9-]{2,63}$/.test(item))) {
+                core.setFailed('Trusted invariant-family marker is malformed.');
+                return;
+              }
+              familyRecords.push(familyRecord);
+            }
+            const currentFamilyRecords = familyRecords.filter((item) =>
+              item.phase === sourcePhase && item.reviewed_sha === reviewedHead &&
+              item.review_reference === sourceGate.record.review_reference &&
+              item.verdict === 'CHANGES_REQUESTED'
+            );
+            const currentFamilyIdentities = new Set(
+              currentFamilyRecords.map((item) => JSON.stringify(item))
+            );
+            if (currentFamilyIdentities.size > 1) {
+              core.setFailed('Current invariant-family evidence is ambiguous.');
+              return;
+            }
+            const recurringFamilies = new Set();
+            if (currentFamilyRecords.length > 0) {
+              const currentFamilies = new Set(currentFamilyRecords[0].families);
+              for (const item of familyRecords) {
+                if (item.phase !== sourcePhase ||
+                    item.verdict !== 'CHANGES_REQUESTED' ||
+                    item.reviewed_sha === reviewedHead ||
+                    !await isAncestor(item.reviewed_sha, reviewedHead)) continue;
+                for (const family of item.families) {
+                  if (currentFamilies.has(family)) recurringFamilies.add(family);
+                }
+              }
+            }
+            if (sourceGate.record.stop_reason === 'INVARIANT_FAMILY_RECURRENCE' ||
+                recurringFamilies.size > 0) {
+              core.setFailed(
+                'DESIGN_CHANGE_REQUIRED cannot use Recover Blocked AI Loop Current Phase.'
+              );
+              return;
+            }
 
             const requiredCheckNames = [
               'tests (3.12)', 'tests (3.14)', 'quality', 'governance-integrity',
