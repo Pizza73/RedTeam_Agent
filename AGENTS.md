@@ -53,6 +53,15 @@ dominates every earlier refresh / Resume record. Implementation may resume only 
 `DESIGN_APPROVED` record bound to that gate, the current Phase / full HEAD, and an approved design
 commit incorporated from the default branch.
 
+Lifecycle labels such as `ai-needs-implementation`, `ai-needs-fix`, `ai-needs-review`, and
+`ai-review-passed` are operator-visible projections, not authorization evidence. Current-HEAD
+trusted records take precedence over delayed or stale lifecycle projections. The exact Phase label
+remains routing evidence, and `ai-loop-blocked` remains a conservative stop latch that only a
+trusted Resume, Design Approval, or Phase transition may remove. A trusted transition may
+idempotently reconcile lifecycle projections after it revalidates the unchanged PR, full HEAD,
+Phase, required checks, and applicable authority record; projection drift alone is not a new
+product-design failure.
+
 ## Protected Files
 
 Implementation tasks must not modify the following unless the user explicitly requests governance changes:

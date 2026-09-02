@@ -606,21 +606,21 @@ def test_fix_request_takes_precedence_over_old_ready_marker() -> None:
         select_evidence_action(
             request_exists=True,
             ready_exists=True,
-            labels=frozenset({"ai-loop", "ai-needs-fix"}),
         )
         == "implementation"
     )
 
 
-def test_ready_marker_is_reviewed_when_no_implementation_is_pending() -> None:
-    assert (
-        select_evidence_action(
-            request_exists=True,
-            ready_exists=True,
-            labels=frozenset({"ai-loop", "ai-needs-review"}),
-        )
-        == "review"
-    )
+def test_missing_current_head_evidence_waits() -> None:
+    assert select_evidence_action(request_exists=False, ready_exists=False) == "wait"
+
+
+def test_current_head_request_is_authority_when_projection_label_is_delayed() -> None:
+    assert select_evidence_action(request_exists=True, ready_exists=False) == "implementation"
+
+
+def test_ready_evidence_is_authority_when_no_request_exists() -> None:
+    assert select_evidence_action(request_exists=False, ready_exists=True) == "review"
 
 
 @pytest.mark.parametrize("phase", PHASES)
@@ -1891,7 +1891,21 @@ def test_refreshed_design_stop_never_dispatches_generic_resume() -> None:
     loop.default_branch = "main"
     loop.dispatched_blocked_resumes = set()
     loop.dry_run = False
-    loop.log = lambda _message: None  # type: ignore[method-assign]
+    messages: list[str] = []
+    loop.log = messages.append  # type: ignore[method-assign]
+    loop.check_state = lambda _head: "pending"  # type: ignore[method-assign]
+
+    assert loop.perform_post_blocked_refresh_resume(
+        state,
+        [],
+        [base_pass, gate],
+        [prior_family, current_family],
+        evidence,
+        DEFAULT_BRANCH_SHA,
+    ) is True
+    assert messages == []
+
+    loop.check_state = lambda _head: "success"  # type: ignore[method-assign]
 
     assert loop.perform_post_blocked_refresh_resume(
         state,
@@ -1902,6 +1916,9 @@ def test_refreshed_design_stop_never_dispatches_generic_resume() -> None:
         DEFAULT_BRANCH_SHA,
     ) is True
     assert github.workflow_calls == []
+    assert messages == [
+        f"waiting for dedicated design approval in phase-0b at {REFRESHED_HEAD_SHA[:12]}"
+    ]
 
 
 def blocked_run_loop(

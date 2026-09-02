@@ -5166,6 +5166,14 @@ Branchから取り込んだ承認済みDesign commitへBindingした単回`DESIG
 Generic Resume、旧base-refresh Status、Label変更は再開権限ではない。Exact FindingとPhase全体の既存
 5回上限はDefense-in-Depthとして残す。
 
+AI Development Loopの制御状態は、Current Phase / full HEADへBindingされたTrusted Implementation
+Request、Review Ready、Phase Gate、Design Approvalから決定論的に解決する。`ai-needs-implementation`、
+`ai-needs-fix`、`ai-needs-review`、`ai-review-passed`はOperator向けProjectionであり、Action認可の
+Source of Truthにしない。CIは`ai-loop-blocked`中のHEADで決定論的Checkだけを実行し、Review Ready
+Projectionを生成しない。既存のTransient Projectionが遅延または残存しても、Stop latch、Phase、HEAD、
+Gate、Approval、Required Checkが不変ならTrusted TransitionがIdempotentに正規化する。Stop latchの欠落、
+Authority Recordの不一致、Head Drift、Phase Base不整合は従来どおりFail Closedとする。
+
 ---
 
 # 41. Revision Summary
