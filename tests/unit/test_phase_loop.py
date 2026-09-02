@@ -2099,6 +2099,125 @@ def test_completed_blocked_refresh_repairs_missing_stop_projection() -> None:
     assert pending == (gate, HEAD_SHA, DEFAULT_BRANCH_SHA)
 
 
+def test_prepared_blocked_refresh_restores_stop_latch_before_branch_update() -> None:
+    base_pass, gate = blocked_refresh_records()
+    prepared_status = base_refresh_status(
+        from_phase="phase-0c",
+        revalidate_phase="phase-0b",
+        target_url=gate.url,
+    )
+    loop, github = blocked_refresh_loop({HEAD_SHA: [prepared_status]})
+    state = blocked_phase_state()
+    expected_state = replace(
+        state,
+        labels=frozenset({"ai-loop", "ai-loop-blocked", "phase-0b"}),
+    )
+    records = loop.trusted_base_refresh_statuses(state, [base_pass, gate])
+    loop.dry_run = False
+    loop.log = lambda _message: None  # type: ignore[method-assign]
+    observed_states = iter((state, expected_state))
+    loop.pr_state = lambda: next(observed_states)  # type: ignore[method-assign]
+    loop.current_default_branch_sha = (  # type: ignore[method-assign]
+        lambda: DEFAULT_BRANCH_SHA
+    )
+    loop.live_base_refresh_transition_snapshot = (  # type: ignore[method-assign]
+        lambda _state: loop.require_unique_base_refresh_transition_identity(
+            state, records
+        )
+    )
+
+    assert loop.repair_prepared_blocked_refresh_projection(
+        state, [base_pass, gate], records, DEFAULT_BRANCH_SHA
+    ) is True
+    assert github.label_calls == [(3, expected_state.labels)]
+    assert github.update_calls == []
+
+
+def test_prior_pass_base_refresh_does_not_restore_blocked_projection() -> None:
+    phase_pass = chained_phase_passes()[1]
+    prepared_status = base_refresh_status(
+        from_phase="phase-0c",
+        revalidate_phase="phase-0b",
+        target_url=phase_pass.url,
+    )
+    loop, github = blocked_refresh_loop({HEAD_SHA: [prepared_status]})
+    state = blocked_phase_state()
+    records = base_refresh_evidence_from_statuses(
+        [prepared_status], head_sha=HEAD_SHA
+    )
+
+    assert loop.repair_prepared_blocked_refresh_projection(
+        state, [phase_pass], records, DEFAULT_BRANCH_SHA
+    ) is False
+    assert github.label_calls == []
+
+
+def test_applied_blocked_refresh_restores_stop_latch_before_confirmation() -> None:
+    base_pass, gate = blocked_refresh_records()
+    prepared = base_refresh_status(
+        from_phase="phase-0c",
+        revalidate_phase="phase-0b",
+        target_url=gate.url,
+    )
+    loop, github = blocked_refresh_loop({HEAD_SHA: [prepared]})
+    github.ancestors.add((HEAD_SHA, REFRESHED_HEAD_SHA))
+    state = replace(
+        blocked_phase_state(),
+        head_sha=REFRESHED_HEAD_SHA,
+        labels=frozenset({"ai-loop", "ai-needs-implementation", "phase-0b"}),
+    )
+    expected_state = replace(
+        state,
+        labels=frozenset({"ai-loop", "ai-loop-blocked", "phase-0b"}),
+    )
+    pending = loop.pending_base_refresh_checkpoint(state, [base_pass, gate])
+    assert pending is not None
+    loop.dry_run = False
+    loop.log = lambda _message: None  # type: ignore[method-assign]
+    observed_states = iter((state, expected_state))
+    loop.pr_state = lambda: next(observed_states)  # type: ignore[method-assign]
+
+    assert loop.repair_applied_blocked_refresh_projection(
+        state, [base_pass, gate], pending
+    ) is True
+    assert github.label_calls == [(3, expected_state.labels)]
+
+
+def test_applied_blocked_refresh_projection_fails_closed_on_pr_drift() -> None:
+    base_pass, gate = blocked_refresh_records()
+    prepared = base_refresh_status(
+        from_phase="phase-0c",
+        revalidate_phase="phase-0b",
+        target_url=gate.url,
+    )
+    loop, github = blocked_refresh_loop({HEAD_SHA: [prepared]})
+    github.ancestors.add((HEAD_SHA, REFRESHED_HEAD_SHA))
+    state = replace(
+        blocked_phase_state(),
+        head_sha=REFRESHED_HEAD_SHA,
+        labels=frozenset({"ai-loop", "ai-needs-implementation", "phase-0b"}),
+    )
+    pending = loop.pending_base_refresh_checkpoint(state, [base_pass, gate])
+    assert pending is not None
+    drifted_state = replace(
+        state,
+        head_sha=IMPLEMENTATION_OUTPUT_HEAD_SHA,
+        labels=frozenset({"ai-loop", "ai-loop-blocked", "phase-0b"}),
+    )
+    loop.dry_run = False
+    loop.log = lambda _message: None  # type: ignore[method-assign]
+    observed_states = iter((state, drifted_state))
+    loop.pr_state = lambda: next(observed_states)  # type: ignore[method-assign]
+
+    with pytest.raises(UntrustedEvidenceError, match="changed during"):
+        loop.repair_applied_blocked_refresh_projection(
+            state, [base_pass, gate], pending
+        )
+    assert github.label_calls == [
+        (3, frozenset({"ai-loop", "ai-loop-blocked", "phase-0b"}))
+    ]
+
+
 def test_unblocked_non_refresh_output_does_not_request_a_checkpoint() -> None:
     base_pass, gate = blocked_refresh_records()
     loop, _github = blocked_refresh_loop({})

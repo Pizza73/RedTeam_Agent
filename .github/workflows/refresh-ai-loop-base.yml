@@ -39,7 +39,6 @@ concurrency:
 
 permissions:
   contents: read
-  issues: write
   pull-requests: read
   statuses: write
 
@@ -507,67 +506,6 @@ jobs:
                   'Exactly one unique trusted current-phase implementation request is required.'
                 );
                 return;
-              }
-            }
-
-            if (isBlockedCurrentPhase) {
-              const staleLifecycleLabels = [
-                'ai-needs-implementation', 'ai-needs-fix', 'ai-needs-review',
-                'ai-review-passed', 'ai-human-gate',
-              ];
-              const expectedLabels = new Set(labels);
-              expectedLabels.add('ai-loop-blocked');
-              for (const name of staleLifecycleLabels) expectedLabels.delete(name);
-              const expectedLabelList = [...expectedLabels].sort();
-              if (JSON.stringify([...labels].sort()) !==
-                  JSON.stringify(expectedLabelList)) {
-                try {
-                  const {data: beforeProjectionPr} = await github.rest.pulls.get({
-                    owner, repo, pull_number,
-                  });
-                  const beforeProjectionLabels = beforeProjectionPr.labels
-                    .map((item) => item.name).sort();
-                  if (beforeProjectionPr.state !== 'open' ||
-                      beforeProjectionPr.head.sha !== expectedHeadSha ||
-                      JSON.stringify(beforeProjectionLabels) !==
-                        JSON.stringify([...labels].sort())) {
-                    throw new Error(
-                      'Pull request changed before blocked refresh projection repair.'
-                    );
-                  }
-                  if (!labels.includes('ai-loop-blocked')) {
-                    await github.rest.issues.addLabels({
-                      owner, repo, issue_number: pull_number,
-                      labels: ['ai-loop-blocked'],
-                    });
-                  }
-                  for (const name of staleLifecycleLabels) {
-                    if (!labels.includes(name)) continue;
-                    await github.rest.issues.removeLabel({
-                      owner, repo, issue_number: pull_number, name,
-                    });
-                  }
-                  const {data: afterProjectionPr} = await github.rest.pulls.get({
-                    owner, repo, pull_number,
-                  });
-                  const afterProjectionLabels = afterProjectionPr.labels
-                    .map((item) => item.name).sort();
-                  if (afterProjectionPr.state !== 'open' ||
-                      afterProjectionPr.head.sha !== expectedHeadSha ||
-                      JSON.stringify(afterProjectionLabels) !==
-                        JSON.stringify(expectedLabelList)) {
-                    throw new Error(
-                      'Pull request changed during blocked refresh projection repair.'
-                    );
-                  }
-                  labels = expectedLabelList;
-                } catch (error) {
-                  core.setFailed(
-                    error instanceof Error ? error.message :
-                      'Blocked refresh projection repair failed.'
-                  );
-                  return;
-                }
               }
             }
 
