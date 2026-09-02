@@ -248,7 +248,7 @@ jobs:
               return;
             }
             const plan = JSON.parse(Buffer.from(planFile.content, 'base64').toString('utf8'));
-            const labels = pr.labels.map((item) => item.name);
+            let labels = pr.labels.map((item) => item.name);
             const phases = labels.filter((name) => /^phase-(0a|0b|0c|[1-5])$/.test(name));
             if (!labels.includes('ai-loop') || phases.length !== 1) {
               core.setFailed('The pull request must be an AI loop with exactly one phase.');

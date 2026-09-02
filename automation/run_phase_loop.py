@@ -1987,7 +1987,8 @@ class PhaseLoop:
         phase_records: list[MarkerEvidence],
     ) -> tuple[MarkerEvidence, str, str] | None:
         """Find one completed refresh edge that still needs current-HEAD certification."""
-        if "ai-loop-blocked" not in state.labels:
+        recovery_projection = "ai-loop-blocked" not in state.labels
+        if recovery_projection and "ai-needs-implementation" not in state.labels:
             return None
         if any(
             record.payload.get("phase") == state.phase
@@ -2002,6 +2003,8 @@ class PhaseLoop:
             return None
         parents = self.github.commit_parents(state.head_sha)
         if len(parents) != 2 or parents[0] == parents[1]:
+            if recovery_projection:
+                return None
             raise UntrustedEvidenceError(
                 "base-refresh checkpoint requires one exact two-parent merge"
             )
@@ -2020,6 +2023,8 @@ class PhaseLoop:
             canonical_digest(record.payload) for record in prepared
         }
         if len(prepared_identities) != 1:
+            if recovery_projection and not prepared:
+                return None
             raise UntrustedEvidenceError(
                 "refresh edge lacks one trusted previous-HEAD authorization"
             )
@@ -2037,6 +2042,8 @@ class PhaseLoop:
             for record in gate_candidates
         }
         if len(gate_identities) != 1:
+            if recovery_projection and not gate_candidates:
+                return None
             raise UntrustedEvidenceError(
                 "refresh edge is not bound to one blocking Phase Gate"
             )
@@ -2069,6 +2076,157 @@ class PhaseLoop:
             gate=gate,
         )
         return gate, previous_head_sha, target_base_sha
+
+    @staticmethod
+    def blocked_refresh_projection_state(state: PullRequestState) -> PullRequestState:
+        labels = set(state.labels)
+        labels.difference_update(
+            {
+                "ai-needs-implementation",
+                "ai-needs-fix",
+                "ai-needs-review",
+                "ai-review-passed",
+                "ai-human-gate",
+            }
+        )
+        labels.add("ai-loop-blocked")
+        return replace(state, labels=frozenset(labels))
+
+    def repair_prepared_blocked_refresh_projection(
+        self,
+        state: PullRequestState,
+        phase_records: list[MarkerEvidence],
+        refresh_records: list[MarkerEvidence],
+        default_branch_sha: str,
+    ) -> bool:
+        """Restore the stop latch before applying one trusted blocked refresh."""
+        phase_index = PHASES.index(state.phase)
+        if (
+            "ai-loop-blocked" in state.labels
+            or "ai-needs-implementation" not in state.labels
+            or phase_index < 1
+            or phase_index > 5
+        ):
+            return False
+        matches = [
+            record
+            for record in refresh_records
+            if record.payload.get("head_sha") == state.head_sha
+            and record.payload.get("from_phase") == PHASES[phase_index + 1]
+            and record.payload.get("revalidate_phase") == state.phase
+            and record.payload.get("target_base_sha") == default_branch_sha
+        ]
+        identities = {canonical_digest(record.payload) for record in matches}
+        if not matches:
+            return False
+        if len(identities) != 1:
+            raise UntrustedEvidenceError(
+                "blocked refresh projection has ambiguous prepared evidence"
+            )
+        transition_snapshot = self.require_unique_base_refresh_transition_identity(
+            state, refresh_records
+        )
+        authorization_reference = str(matches[-1].payload["prior_pass_reference"])
+        gates = [
+            record
+            for record in phase_records
+            if record.url == authorization_reference
+            and record.payload.get("phase") == state.phase
+            and record.payload.get("verdict") == "CHANGES_REQUESTED"
+            and record.payload.get("loop_state") == "BLOCKED_LIMIT"
+        ]
+        gate_identities = {
+            (record.url, canonical_digest(record.payload)) for record in gates
+        }
+        if not gates:
+            return False
+        if len(gate_identities) != 1:
+            raise UntrustedEvidenceError(
+                "blocked refresh projection has ambiguous Gate evidence"
+            )
+        gate = gates[-1]
+        self.validate_blocked_refresh_gate(gate, phase_records)
+        if gate.payload.get("reviewed_sha") != state.head_sha:
+            checkpoint = self.trusted_base_refresh_checkpoint(
+                head_sha=state.head_sha,
+                phase=state.phase,
+                gate=gate,
+            )
+            if checkpoint is None:
+                raise UntrustedEvidenceError(
+                    "blocked refresh projection lacks a current-HEAD checkpoint"
+                )
+
+        expected_state = self.blocked_refresh_projection_state(state)
+        self.log(
+            f"restoring blocked refresh stop latch at exact HEAD "
+            f"{state.head_sha[:12]} before branch update"
+        )
+        if not self.dry_run:
+            if self.pr_state() != state:
+                raise UntrustedEvidenceError(
+                    "pull request changed before blocked refresh projection repair"
+                )
+            if self.current_default_branch_sha() != default_branch_sha:
+                raise UntrustedEvidenceError(
+                    "default branch changed before blocked refresh projection repair"
+                )
+            self.revalidate_base_refresh_transition_snapshot(
+                state, transition_snapshot
+            )
+            self.github.set_pull_request_labels(state.number, expected_state.labels)
+            if self.pr_state() != expected_state:
+                raise UntrustedEvidenceError(
+                    "pull request changed during blocked refresh projection repair"
+                )
+            if self.current_default_branch_sha() != default_branch_sha:
+                raise UntrustedEvidenceError(
+                    "default branch changed during blocked refresh projection repair"
+                )
+            self.revalidate_base_refresh_transition_snapshot(
+                expected_state, transition_snapshot
+            )
+        return True
+
+    def repair_applied_blocked_refresh_projection(
+        self,
+        state: PullRequestState,
+        phase_records: list[MarkerEvidence],
+        pending: tuple[MarkerEvidence, str, str],
+    ) -> bool:
+        """Recover an older applied refresh before publishing its checkpoint."""
+        if "ai-loop-blocked" in state.labels:
+            return False
+        if "ai-needs-implementation" not in state.labels:
+            raise UntrustedEvidenceError(
+                "applied blocked refresh lacks the recoverable lifecycle projection"
+            )
+        expected_state = self.blocked_refresh_projection_state(state)
+        self.log(
+            f"restoring blocked refresh stop latch at exact HEAD "
+            f"{state.head_sha[:12]} before checkpoint confirmation"
+        )
+        if not self.dry_run:
+            if self.pr_state() != state:
+                raise UntrustedEvidenceError(
+                    "pull request changed before applied refresh projection repair"
+                )
+            if self.pending_base_refresh_checkpoint(state, phase_records) != pending:
+                raise UntrustedEvidenceError(
+                    "applied refresh evidence changed before projection repair"
+                )
+            self.github.set_pull_request_labels(state.number, expected_state.labels)
+            if self.pr_state() != expected_state:
+                raise UntrustedEvidenceError(
+                    "pull request changed during applied refresh projection repair"
+                )
+            if self.pending_base_refresh_checkpoint(
+                expected_state, phase_records
+            ) != pending:
+                raise UntrustedEvidenceError(
+                    "applied refresh evidence changed during projection repair"
+                )
+        return True
 
     def recurring_invariant_families(
         self,
@@ -3517,6 +3675,21 @@ class PhaseLoop:
                 self.sleep()
                 continue
 
+            if self.repair_prepared_blocked_refresh_projection(
+                state,
+                phase_records,
+                refresh_records,
+                default_branch_sha,
+            ):
+                status = f"waiting for blocked refresh stop latch: {state.phase}"
+                if status != last_status:
+                    self.log(status)
+                    last_status = status
+                if self.dry_run:
+                    return f"DRY_RUN:{status}"
+                self.sleep()
+                continue
+
             if self.perform_pending_base_refresh(
                 state, refresh_records, default_branch_sha
             ):
@@ -3533,6 +3706,19 @@ class PhaseLoop:
                 state, phase_records
             )
             if pending_checkpoint is not None:
+                if self.repair_applied_blocked_refresh_projection(
+                    state, phase_records, pending_checkpoint
+                ):
+                    status = (
+                        f"waiting for applied refresh stop latch: {state.phase}"
+                    )
+                    if status != last_status:
+                        self.log(status)
+                        last_status = status
+                    if self.dry_run:
+                        return f"DRY_RUN:{status}"
+                    self.sleep()
+                    continue
                 checkpoint_gate, previous_head_sha, target_base_sha = pending_checkpoint
                 self.request_base_refresh_confirmation(
                     state,

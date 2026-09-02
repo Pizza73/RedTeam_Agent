@@ -179,8 +179,10 @@ default branch into the long-lived PR branch only after the approver-restricted 
 SHA-bound `redteam/base-refresh/...` commit status. The status is attached to the old full HEAD,
 encodes the adjacent Phase rollback and exact target-base SHA in its context, and links to the prior
 PASS. The workflow token has `statuses: write` and only `pull-requests: read`; it cannot write labels
-or merge the PR. The local runner verifies that status, re-reads the full PR state, replaces the
-labels with the exact adjacent-Phase rollback set, and verifies the full resulting state. It also
+or merge the PR. The local runner verifies that status, re-reads the full PR state, and performs the
+exact label projection required by the transition. A normal refresh gets the adjacent-Phase
+rollback set. A blocked current-Phase refresh restores `ai-loop-blocked` and removes stale
+lifecycle labels before the branch update. The runner then verifies the full resulting state. It also
 re-fetches the trusted transition snapshot immediately before and after both the label and branch
 writes. The branch-update request includes the old full HEAD as `expected_head_sha`, so a concurrent
 Codex or human commit is rejected. CI must then produce a new SHA-bound PASS. This operation does
@@ -234,6 +236,9 @@ machine-readable phase record.
   confirmation; `REFRESH_AWAITING_CONFIRMATION` cannot Resume, implement, or refresh again. The
   checkpoint authorization permalink selects the Gate directly; Resume does not compare every
   historical Gate pair. A bot-authored current-HEAD Gate always supersedes an older checkpoint.
+  For a blocked-Phase refresh, the trusted workflow restores `ai-loop-blocked` and removes stale
+  lifecycle projections before branch update. Confirmation may perform the same conservative
+  repair for an already-applied exact refresh, but it never issues the implementation request.
 - For `DESIGN_CHANGE_REQUIRED`, first review and merge the coherent design as a governance PR.
   Refresh the blocked PR to incorporate that exact design commit, wait for current-HEAD checks,
   then run **Approve AI Loop Design Resume** with the latest blocking gate permalink, full current
@@ -275,7 +280,8 @@ machine-readable phase record.
   PR HEAD/checks and single-use Design Approval marker before restarting.
 - `waiting for trusted base-refresh transition`: inspect **Prepare AI Loop Base Refresh**. It must
   be dispatched by `AI_GATE_APPROVER_LOGIN` and bind the old PR HEAD, current `main`, prior PASS and
-  current implementation request.
+  current implementation request. Its token deliberately cannot change PR labels; the local runner
+  restores a blocked stop latch only after consuming the trusted status.
 - `waiting for refreshed PR head`: GitHub accepted or is processing the exact-HEAD branch update.
   A changed HEAD causes the request to fail closed; restart from current clean `main` and inspect
   the PR evidence rather than forcing an update.
