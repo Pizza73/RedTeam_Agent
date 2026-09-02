@@ -1907,9 +1907,7 @@ class PhaseLoop:
             for record in phase_records
         ):
             return None
-        gate = self.incorporated_design_stop_gate(state, phase_records)
-        if gate is None:
-            gate = self.latest_incorporated_phase_gate(state, phase_records)
+        gate = self.latest_incorporated_phase_gate(state, phase_records)
         if (
             gate is None
             or gate.payload.get("verdict") != "CHANGES_REQUESTED"
@@ -2055,6 +2053,21 @@ class PhaseLoop:
         state: PullRequestState,
         phase_records: list[MarkerEvidence],
     ) -> MarkerEvidence | None:
+        direct = [
+            record
+            for record in phase_records
+            if record.payload.get("phase") == state.phase
+            and record.payload.get("reviewed_sha") == state.head_sha
+        ]
+        if direct:
+            identities = {
+                (record.url, canonical_digest(record.payload)) for record in direct
+            }
+            if len(identities) != 1:
+                raise UntrustedEvidenceError(
+                    "latest incorporated current-Phase gate is ambiguous"
+                )
+            return direct[-1]
         candidates = [
             record
             for record in phase_records
@@ -2214,16 +2227,6 @@ class PhaseLoop:
             and SHA_PATTERN.fullmatch(str(record.payload.get("reviewed_sha", "")))
         ]
         inherited_gate = self.incorporated_design_stop_gate(state, phase_records)
-        inherited_checkpoint: MarkerEvidence | None = None
-        if (
-            inherited_gate is not None
-            and inherited_gate.payload.get("reviewed_sha") != state.head_sha
-        ):
-            inherited_checkpoint = self.trusted_base_refresh_checkpoint(
-                head_sha=state.head_sha,
-                phase=state.phase,
-                gate=inherited_gate,
-            )
         candidate_heads = {state.head_sha}
         candidate_heads.update(
             str(record.payload["reviewed_sha"]) for record in authorization_records
@@ -2251,14 +2254,19 @@ class PhaseLoop:
                 if (
                     matching_record is None
                     and inherited_gate is not None
-                    and inherited_checkpoint is not None
                     and inherited_gate.url == prior_reference
                     and head_sha == state.head_sha
                     and phase_index <= 5
                     and item.payload.get("from_phase") == PHASES[phase_index + 1]
                     and item.payload.get("revalidate_phase") == state.phase
                 ):
-                    matching_record = inherited_gate
+                    inherited_checkpoint = self.trusted_base_refresh_checkpoint(
+                        head_sha=state.head_sha,
+                        phase=state.phase,
+                        gate=inherited_gate,
+                    )
+                    if inherited_checkpoint is not None:
+                        matching_record = inherited_gate
                 if matching_record is None:
                     raise UntrustedEvidenceError(
                         "base-refresh status is not bound to trusted Phase evidence"
@@ -2660,9 +2668,7 @@ class PhaseLoop:
         ):
             return False
         expected_source = PHASES[phase_index + 1]
-        gate = self.incorporated_design_stop_gate(state, phase_records)
-        if gate is None:
-            gate = self.latest_incorporated_phase_gate(state, phase_records)
+        gate = self.latest_incorporated_phase_gate(state, phase_records)
         if (
             gate is None
             or gate.payload.get("verdict") != "CHANGES_REQUESTED"
@@ -2670,6 +2676,8 @@ class PhaseLoop:
         ):
             return False
         self.validate_blocked_refresh_gate(gate, phase_records)
+        if gate.payload.get("reviewed_sha") == state.head_sha:
+            return False
         checkpoint = self.trusted_base_refresh_checkpoint(
             head_sha=state.head_sha,
             phase=state.phase,

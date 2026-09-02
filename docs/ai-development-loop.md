@@ -147,6 +147,12 @@ current output HEAD, phase-specific report path and canonical report digest. Leg
 evidence created before this policy remains readable, but every newly issued implementation or fix
 request uses the audited path.
 
+Inside the audit file, `request.head_sha` remains the trusted implementation input HEAD and must be
+an ancestor of the reviewed output. The ready marker separately binds that output HEAD. The marker's
+`audit_digest` is calculated from recursively key-sorted, whitespace-free JSON rather than the
+file's raw bytes. Those intentional input/output and canonical/raw differences are not stale
+evidence.
+
 ```html
 <!-- redteam-invariant-audit
 {"schema_version":"1.0","phase":"phase-0c","head_sha":"<output-sha>","audit_path":"docs/review/phase-0c-invariant-audit.json","audit_digest":"<sha256>","request_reference":"https://github.com/..."}
@@ -236,6 +242,12 @@ the previous HEAD carries the matching `github-actions[bot]` authorization. The 
 publishes a digest-bound `BASE_REFRESH_APPLIED` status on the new current HEAD. Only that current
 checkpoint permits one more expected-HEAD refresh; it never permits Resume or implementation by
 itself. Until the checkpoint exists, the runner remains in `REFRESH_AWAITING_CONFIRMATION`.
+
+After the single-use Design Approval is consumed, the authorized implementation request may
+produce a normal child commit. That output proceeds through current-HEAD CI and review without
+being mistaken for another base-refresh edge or requiring a new two-parent checkpoint. It does not
+inherit authority to Resume or perform another refresh; either action must independently satisfy
+the current trusted transition rules.
 
 The approver then invokes the separate `Approve AI Loop Design Resume` operation. The workflow
 revalidates the latest recurrence gate, unique adjacent phase base, current open PR, exact current

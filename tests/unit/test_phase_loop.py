@@ -51,6 +51,7 @@ DEFAULT_BRANCH_SHA = "d" * 40
 REFRESHED_HEAD_SHA = "e" * 40
 SECOND_DEFAULT_BRANCH_SHA = "f" * 40
 SECOND_REFRESHED_HEAD_SHA = "7" * 40
+IMPLEMENTATION_OUTPUT_HEAD_SHA = "8" * 40
 ACTOR_LOGIN = "operator"
 REVIEWER_LOGIN = "chatgpt-codex-connector[bot]"
 READY_URL = "https://github.com/example/repo/pull/1#issuecomment-ready"
@@ -1886,6 +1887,49 @@ def test_checkpoint_binds_next_prepared_refresh_to_inherited_gate() -> None:
     )
 
 
+def test_design_approved_implementation_output_does_not_require_checkpoint() -> None:
+    base_pass, gate = design_stop_refresh_records()
+    first_status = base_refresh_status(
+        from_phase="phase-0c",
+        revalidate_phase="phase-0b",
+        target_url=gate.url,
+    )
+    loop, github = blocked_refresh_loop({HEAD_SHA: [first_status]})
+    github.ancestors.add((HEAD_SHA, IMPLEMENTATION_OUTPUT_HEAD_SHA))
+    state = replace(
+        blocked_phase_state(),
+        head_sha=IMPLEMENTATION_OUTPUT_HEAD_SHA,
+        labels=frozenset({"ai-loop", "ai-needs-review", "phase-0b"}),
+    )
+
+    evidence = loop.trusted_base_refresh_statuses(state, [base_pass, gate])
+
+    assert len(evidence) == 1
+    assert evidence[0].payload["head_sha"] == HEAD_SHA
+
+
+def test_normal_output_cannot_inherit_gate_for_another_refresh() -> None:
+    base_pass, gate = design_stop_refresh_records()
+    next_status = base_refresh_status(
+        from_phase="phase-0c",
+        revalidate_phase="phase-0b",
+        target_url=gate.url,
+        target_base_sha=SECOND_DEFAULT_BRANCH_SHA,
+    )
+    loop, github = blocked_refresh_loop(
+        {IMPLEMENTATION_OUTPUT_HEAD_SHA: [next_status]}
+    )
+    github.ancestors.add((HEAD_SHA, IMPLEMENTATION_OUTPUT_HEAD_SHA))
+    state = replace(
+        blocked_phase_state(),
+        head_sha=IMPLEMENTATION_OUTPUT_HEAD_SHA,
+        labels=frozenset({"ai-loop", "ai-needs-review", "phase-0b"}),
+    )
+
+    with pytest.raises(UntrustedEvidenceError, match="two-parent merge"):
+        loop.trusted_base_refresh_statuses(state, [base_pass, gate])
+
+
 def test_only_a_design_stop_gate_can_authorize_a_later_refresh() -> None:
     base_pass, gate = blocked_refresh_records()
     first_status = base_refresh_status(
@@ -2107,6 +2151,46 @@ def test_blocked_current_phase_refresh_rejects_missing_adjacent_base_pass() -> N
 
     with pytest.raises(UntrustedEvidenceError, match="adjacent PASS"):
         loop.trusted_base_refresh_statuses(blocked_phase_state(), [gate])
+
+
+def test_fresh_blocked_gate_routes_before_post_refresh_checkpoint() -> None:
+    base_pass, gate = blocked_refresh_records()
+    loop, _github = blocked_refresh_loop({})
+
+    assert loop.perform_post_blocked_refresh_resume(
+        blocked_phase_state(), [], [base_pass, gate], [], DEFAULT_BRANCH_SHA
+    ) is False
+
+
+def test_latest_gate_supersedes_consumed_design_stop_for_post_refresh_routing() -> None:
+    base_pass, design_stop = design_stop_refresh_records()
+    _same_base, latest_gate = blocked_refresh_records()
+    latest_gate = MarkerEvidence(
+        {**latest_gate.payload, "reviewed_sha": IMPLEMENTATION_OUTPUT_HEAD_SHA},
+        f"{PULL_REQUEST_PREFIX}#issuecomment-latest-gate",
+        latest_gate.author,
+        latest_gate.body,
+    )
+    loop, github = blocked_refresh_loop({})
+    github.ancestors.update(
+        {
+            (HEAD_SHA, IMPLEMENTATION_OUTPUT_HEAD_SHA),
+            (str(base_pass.payload["reviewed_sha"]), IMPLEMENTATION_OUTPUT_HEAD_SHA),
+        }
+    )
+    state = replace(
+        blocked_phase_state(),
+        head_sha=IMPLEMENTATION_OUTPUT_HEAD_SHA,
+        labels=frozenset({"ai-loop", "ai-loop-blocked", "phase-0b"}),
+    )
+
+    assert loop.perform_post_blocked_refresh_resume(
+        state,
+        [],
+        [base_pass, design_stop, latest_gate],
+        [],
+        DEFAULT_BRANCH_SHA,
+    ) is False
 
 
 def test_refreshed_blocked_phase_dispatches_one_bounded_resume() -> None:

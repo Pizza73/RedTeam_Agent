@@ -261,6 +261,10 @@ machine-readable phase record.
 - Native review remains pending: confirm the single runner-authored `@codex review` follows the
   current-head ready marker and contains `redteam-local-codex-trigger`. Manual review comments are
   not accepted as phase-gate evidence.
+- An audit-binding review finding must distinguish the implementation request's input HEAD from the
+  ready marker's output HEAD and compare the marker against canonical JSON digest, not raw file
+  bytes. CI already rejects a non-ancestor input, wrong request binding, wrong output HEAD, or wrong
+  canonical digest; do not rewrite valid audit evidence to satisfy the opposite interpretation.
 - `AI_LOOP=BLOCKED`: inspect the latest trusted bot marker and workflow run. Do not remove the stop
   latch, alter review evidence, or weaken CI to continue. A transient lifecycle projection mismatch
   should be reconciled by the trusted transition rather than treated as new authorization.
@@ -277,6 +281,10 @@ machine-readable phase record.
   exact current-HEAD `redteam/base-refresh-applied/...` checkpoint, its immediate two-parent merge,
   and the matching `redteam/base-refresh/...` authorization on the previous HEAD. A missing
   checkpoint requires confirmation or governance repair, not a manual branch update.
+- If a Design-Approved implementation output reports `base-refresh checkpoint requires one exact
+  two-parent merge`, the runner is incorrectly applying refresh inheritance to a normal output
+  commit. That commit should proceed to current-HEAD review, but it does not authorize Resume or a
+  later refresh.
 - Automatic final merge blocked: inspect the Phase 0A→5 PASS chain, latest
   `redteam/phase-review`, four Check Runs, stop labels, current `main` ancestry, the exact-HEAD
   attempt comment and `refs/redteam-final-merge-attempts/pr-<PR>-<HEAD>`. Do not retry an uncertain

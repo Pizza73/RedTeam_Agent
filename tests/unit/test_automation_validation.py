@@ -37,6 +37,16 @@ def test_runtime_family_ids_match_machine_policy() -> None:
     assert tuple(item["id"] for item in policy["families"]) == INVARIANT_FAMILIES
 
 
+def test_review_prompt_defines_invariant_audit_transition_bindings() -> None:
+    prompt = (REPO_ROOT / "automation" / "chatgpt-event-task-prompt.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "`audit.request.head_sha` is the full input HEAD" in prompt
+    assert "ready marker's `head_sha` is the full output HEAD" in prompt
+    assert "not a hash of the file's raw bytes" in prompt
+
+
 def _audit_repo(tmp_path: Path) -> tuple[Path, Path]:
     repo = tmp_path / "audit-repo"
     shutil.copytree(REPO_ROOT / "automation", repo / "automation")
