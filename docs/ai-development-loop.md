@@ -201,8 +201,10 @@ creator: github-actions[bot]
 
 The workflow uses `statuses: write` for this evidence and retains only `pull-requests: read`; it has
 neither label-write nor merge authority. After validating the status creator, exact context, state,
-description, prior PASS link and SHA, the local orchestrator re-reads the complete PR state, replaces
-the labels with the exact adjacent-Phase rollback set, and verifies the complete resulting PR state.
+description, prior PASS link and SHA, the local orchestrator re-reads the complete PR state and
+applies the exact transition projection. It either replaces the labels with the adjacent-Phase
+rollback set or, for a blocked current-Phase refresh, restores `ai-loop-blocked` and removes stale
+lifecycle labels. It verifies the complete resulting PR state before continuing.
 It first rejects multiple source/restart transition identities for the same HEAD and current Phase,
 then re-fetches and compares the trusted PASS/status transition snapshot immediately before and
 after both local side effects. The post-label snapshot uses the rolled-back Phase while retaining
@@ -245,11 +247,12 @@ and Design Stop gates; it never permits Resume or implementation by itself. Unti
 exists, the runner remains in `REFRESH_AWAITING_CONFIRMATION`.
 
 A blocked-Phase refresh also restores `ai-loop-blocked` and removes stale lifecycle projections
-before it authorizes the branch update. This is required when a trusted Resume already removed the
-stop latch but `main` advanced before implementation began. If an older transition already applied
-the exact two-parent refresh without restoring the latch, confirmation may repair that projection
-only after it revalidates the same Gate, prepared status, previous HEAD, target base and current
-HEAD. The repair does not create an implementation request.
+before the local orchestrator applies the branch update. This is required when a trusted Resume
+already removed the stop latch but `main` advanced before implementation began. If an older
+transition already applied the exact two-parent refresh without restoring the latch, the local
+orchestrator repairs that projection before requesting confirmation, only after it revalidates the
+same Gate, prepared status, previous HEAD, target base and current HEAD. The workflow itself checks
+the restored exact state and records the checkpoint; neither step creates an implementation request.
 
 On a checkpointed HEAD, the runner and generic Resume workflow resolve the blocking Gate directly
 from the checkpoint's authorization permalink. They do not recompute a maximal Gate by comparing
