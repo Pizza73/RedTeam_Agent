@@ -41,7 +41,16 @@
 - Formal Reviewは監査を自己合格証跡として扱わず、各Required Familyを独立に再検証する。
   各P0/P1はTrusted PolicyのInvariant Familyを正確に1件保持する
 - 同じInvariant FamilyがPhase内の2回目のFormal Reviewへ再出現した場合は新しいFix Requestを
-  発行せず`BLOCKED_LIMIT`で停止し、coherent redesignを記録したHuman Resumeを要求する
+  発行せず`DESIGN_CHANGE_REQUIRED`理由付き`BLOCKED_LIMIT`で停止し、coherent redesignを記録した
+  専用Human Design Approvalを要求する
+- `DESIGN_CHANGE_REQUIRED`の最新Gateが存在する場合、通常の`Resume AI Loop`、旧base-refresh Status、
+  過去のbounded Resume、Label変更だけではImplementation Requestを発行できない
+- Base Refresh EvidenceはExpected HEAD固定のBranch Updateを1回だけ認可し、Resume権限を含まない。
+  使用済みTransitionまたは後発Gateを越えたTransitionを再利用できない
+- Design Stop後の再開Recordは、停止Gate permalink、Current Phase、Current 40桁HEAD、Current default
+  branchへ包含されたDesign commit、Design permalink、Policy Digestを完全Bindingし、1回だけ消費できる
+- Runnerはbase refresh、Label write、Workflow dispatchの各後、およびCodex Trigger直前に最新Gate、Current
+  HEAD、全managed / stop label、Transition消費状態を再取得し、Drift時は`ai-loop-blocked`を維持する
 - Phase Cycle、同一exact Root Cause、CI Failureの自動Loop上限はすべて5回とし、設定値が5以外なら
   Fail Closedにする。Semantic Invariant Familyの再発上限は2回とし、設定値が2以外ならFail Closedにする
 - Required Check成功前にReview Gateを記録しない
@@ -60,7 +69,8 @@
 - Phase 0B～3の`BLOCKED_LIMIT` HEADがCurrent default branchの必須Governanceを含まない場合、
   trusted current-Phase Gateとその唯一の隣接Base PASSを検証したStatusだけが、Phase Labelを維持した
   exact-HEAD base refreshを認可する。取込み後は旧HEADとtarget baseの両方を祖先に持つこと、
-  Current-HEAD Check成功、同Gateへのbounded Resume bindingを要求する
+  Current-HEAD Check成功を要求する。Invariant Family再発以外のStopだけが同Gateへのbounded Resumeへ
+  進める。`DESIGN_CHANGE_REQUIRED`は停止Labelを維持し、専用Design Approvalを要求する
 - Default BranchをPRへ取り込む前にCurrent Phaseを1つ戻し、旧HEADのPASSを再利用せず、
   取込み後HEADで同Phase Gateを再実行する
 - Base-refresh Workflowは旧HEAD、Current default-branch SHA、隣接Prior PASSを固定したStatusのみ
@@ -140,6 +150,12 @@ External Tool Dispatch = 0
 - Non-idempotent actionの不確実な結果を自動再送しない
 - `reconcile()`の不確実結果を`OUTCOME_UNKNOWN`へ遷移
 - Pre-dispatch不一致は`AUTHORIZED -> BLOCKED`、Provider Callなし、ExecutionResultなし
+- `AUTHORIZED`はSecret解決権限ではなく、Pre-dispatch成功と同一Transactionで作成した未消費の
+  Dispatch ClaimだけがTrusted Adapter ChannelへのJIT Secret Injectionを許可する
+- Dispatch Claim確定後のCrashまたはSubmit結果不明では自動再送せずReconciliationへ進む
+- Result Collection開始時にexact Tool Registry / Tool Definition、Provider Task、Trusted Clock、Sinkへ
+  BindingしたAuthorityを永続化し、Tool固有Output上限をCaller / Global設定で拡大しない
+- Quarantine RetentionはCollection開始時刻からMission Deadline内で一度だけ確定し、Restart時に再計算しない
 - External Side Effect NodeにLangGraph Automatic Retryなし
 - Raw ResultをChunk Streamingし、全量Memory保持なし
 - Crash後はResult ingestionだけを再開し、External Actionを再実行しない
@@ -151,6 +167,12 @@ External Tool Dispatch = 0
 
 - Secret ValueがPrompt、通常DB/Log、Exception、Traceback、Knowledge Baseへ入らない
 - Raw OutputはQuarantine -> Classification -> Secret Detection -> Redactionを通る
+- Caller生成Receipt、Quarantine Reference、Publication Object、Full-object compatibility loaderから
+  Quarantine平文を取得できず、Repository-bound `ingestion_id`だけがSecure Ingestionを開始できる
+- Artifact / Secret ReferenceとSecure Ingestion ManifestをDurableに確定しread-back検証する前に
+  Quarantine Deletion Intentを作成しない
+- Manifest Commit、Deletion Intent、Key破棄、Ciphertext削除、ExecutionResult確定の全Crash境界を
+  Provider再実行や手動File修復なしに回復する
 - Context BuilderがEncrypted Raw Artifact/Secret Resolveへアクセス不可
 - Artifact Path Traversal/Symlink Escapeを拒否
 - Artifact size/quota/integrity/classification/retention/auditを強制
@@ -159,6 +181,9 @@ External Tool Dispatch = 0
 - Nonce再利用、plaintext export、cross-domain fallbackを禁止
 - Key unavailable/revoked/mismatch時は`EncryptionKeyUnavailableError`
 - Mission単位Audit SequenceとHash Chainの改ざん検出がPASS
+- Audit Head / Wrapped Key StateのExternal AnchorがGeneration、State Digest、Immutable Blob IDへBindingされ、
+  Directory置換後のRestartでも正確なCommitted Stateを回復する
+- Anchorが指すBlobの欠落 / 改ざん時は旧Local AlternateへFallbackせずFail Closedにする
 
 ## Phase 1: Agent Loop
 

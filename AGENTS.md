@@ -46,7 +46,12 @@ may remain only as that phase's incorporated base, never as a PASS for the rolle
 If a blocked cumulative Phase 0B through Phase 3 HEAD predates required governance on `main`, a
 trusted current-Phase `BLOCKED_LIMIT` gate may authorize an exact-HEAD base refresh without changing
 the Phase label. The gate's adjacent base PASS, default-branch SHA, resulting ancestry, current-HEAD
-checks, and bounded Resume must all be revalidated; a free-form branch update is not authority.
+checks, and transition consumption must all be revalidated; a free-form branch update is not
+authority. A base refresh authorizes only one expected-HEAD branch update and never authorizes
+Resume. If the latest gate records invariant-family recurrence, it is `DESIGN_CHANGE_REQUIRED` and
+dominates every earlier refresh / Resume record. Implementation may resume only from a single-use
+`DESIGN_APPROVED` record bound to that gate, the current Phase / full HEAD, and an approved design
+commit incorporated from the default branch.
 
 ## Protected Files
 
@@ -121,10 +126,18 @@ The final implementation report must include:
 - Security-sensitive records are verified on write and read.
 - Untrusted JSON duplicate keys and unknown fields are rejected at the actual boundary.
 - Secrets never enter Planner, Analyzer, Knowledge Base, normal DB/logs, exceptions, tracebacks, or prompts.
-- Only references are carried in plans; trusted Executor/Adapter resolves secrets just in time.
+- Only references are carried in plans. `AUTHORIZED` is not secret-resolution authority; only a
+  repository-backed, unconsumed post-pre-dispatch Dispatch Claim may inject a secret just in time
+  into the fixed trusted Adapter channel. No general plaintext-returning resolve API is allowed.
 - Raw tool output is classified, scanned, redacted, and only then made LLM-visible.
+- Caller-created receipts, quarantine references, publication objects, or compatibility loaders are
+  not ingestion authority. Durable ingestion manifest verification precedes quarantine erasure.
 - Secret Store, raw-result quarantine, and artifact encryption use separate key domains.
 - Encryption failure is fail-closed; there is no plaintext or cross-domain fallback.
+- Result collection retention starts at the trusted persisted collection-start time, uses the exact
+  trusted ToolDefinition output limit, and is stable across restart.
+- Audit-head and wrapped-key generation anchors bind generation, state digest, and immutable blob
+  identity; missing committed blobs fail closed without local alternate fallback.
 - External side-effect dispatch is absent in Phase 0A and uses no automatic retry in later phases.
 - Final PR merge is unavailable to Codex and GitHub Actions. Only the trusted local orchestrator may
   issue one exact-HEAD merge after every configured Phase and final check passes; an uncertain merge
@@ -177,7 +190,9 @@ checks. If review inputs cannot be verified, post no approval and do not impleme
 Use the SHA-bound invariant audit as a routing checklist rather than correctness evidence. Inspect
 all required families independently. Every P0/P1 finding must contain exactly one standalone
 `Invariant family: \`<family-id>\`` line using the trusted policy. A family recurring in a second
-formal review is a design-stop condition and requires Human Resume evidence for a coherent redesign.
+formal review is a `DESIGN_CHANGE_REQUIRED` stop. Generic Resume and older base-refresh evidence are
+invalid. Review or implementation may continue only after the coherent redesign is incorporated
+and a single-use current-HEAD Design Approval record is bound to the blocking gate.
 
 
 ## Codex Cloud Implementation Rules

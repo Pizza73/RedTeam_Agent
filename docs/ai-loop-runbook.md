@@ -195,12 +195,13 @@ machine-readable phase record.
 - `CHANGES_REQUESTED`: the runner requests one same-phase fix covering all findings and every
   sibling path in their semantic invariant families. The fifth occurrence of one exact root-cause
   key or the fifth change cycle blocks the loop. A semantic family appearing in a second formal
-  review blocks immediately for a documented coherent redesign.
+  review blocks immediately as `DESIGN_CHANGE_REQUIRED` for a documented coherent redesign.
 - CI failure: the runner consumes the bounded failure request and asks Codex for a same-phase fix;
   CI failure never counts as PASS.
 - `BLOCKED`: resolve the recorded cause. For Phase 0A through Phase 3, run **Resume AI Loop** with
   the current HEAD SHA and a repository permalink documenting the resolution, then restart the
-  local command.
+  local command. Do not use this workflow when the latest trusted gate has
+  `stop_reason=INVARIANT_FAMILY_RECURRENCE`; it is intentionally rejected.
 - If an older control version incorrectly relabeled cumulative later-Phase code as the adjacent
   prior Phase, do not use Resume AI Loop first and do not change labels manually. Run **Recover
   Blocked AI Loop Current Phase** with the source Phase, exact reviewed HEAD, exact current HEAD,
@@ -215,7 +216,15 @@ machine-readable phase record.
   current `main`; it dispatches **Prepare AI Loop Base Refresh** using the trusted current-Phase
   `BLOCKED_LIMIT` gate as the authorization reference. The workflow validates that gate and its
   adjacent base PASS, and the runner performs one expected-HEAD update without a Phase rollback.
-  After current-HEAD CI succeeds, only the gate-bound bounded Resume path may restart remediation.
+  The refresh authorizes only that branch update; it must keep `ai-loop-blocked` and cannot trigger
+  Resume or Codex. After current-HEAD CI succeeds, a recurrence stop still requires the dedicated
+  **Approve AI Loop Design Resume** operation.
+- For `DESIGN_CHANGE_REQUIRED`, first review and merge the coherent design as a governance PR.
+  Refresh the blocked PR to incorporate that exact design commit, wait for current-HEAD checks,
+  then run **Approve AI Loop Design Resume** with the latest blocking gate permalink, full current
+  HEAD, full design commit SHA and repository design permalink. Restart the runner only after the
+  trusted `redteam-design-approval` marker exists. The marker is single-use; do not remove the stop
+  label or post a generic Resume manually.
 - Before Phase 4 or Phase 5: approve `automation/provider-gates.json` in a separate,
   human-reviewed `governance-change` PR, merge it to `main`, run **Advance AI Loop Phase**, then
   restart the local command. The approved phase is automated, but the gate itself is not.
@@ -238,6 +247,9 @@ machine-readable phase record.
   not accepted as phase-gate evidence.
 - `AI_LOOP=BLOCKED`: inspect the latest trusted bot marker and workflow run. Do not bypass labels,
   alter review evidence, or weaken CI to continue.
+- `DESIGN_CHANGE_REQUIRED`: stop the runner. A base refresh may incorporate approved governance but
+  cannot resume implementation. Confirm the latest recurrence gate, merged design commit, current
+  PR HEAD/checks and single-use Design Approval marker before restarting.
 - `waiting for trusted base-refresh transition`: inspect **Prepare AI Loop Base Refresh**. It must
   be dispatched by `AI_GATE_APPROVER_LOGIN` and bind the old PR HEAD, current `main`, prior PASS and
   current implementation request.

@@ -9,6 +9,7 @@
       "review_questions": [
         "Are all executable decisions and lifecycle transitions loaded from trusted current source of truth?",
         "Do omitted, stale or caller-controlled scope, target, approval, adapter or lifecycle fields fail closed?",
+        "Is AUTHORIZED kept distinct from a durable post-pre-dispatch claim for secret injection, provider submit and result collection?",
         "Were all public entry points, alternate callers and sibling state transitions audited?"
       ]
     },
@@ -18,7 +19,8 @@
       "stateful": false,
       "review_questions": [
         "Can secret values or raw output reach prompts, normal storage, logs, exceptions or reports?",
-        "Do every public resolve, read, export and recovery path enforce the same reference-only boundary?"
+        "Do every public resolve, read, export and recovery path enforce the same reference-only boundary?",
+        "Can caller-created receipts, quarantine references, publications, callbacks or compatibility loaders obtain plaintext or choose its destination?"
       ]
     },
     {
@@ -27,7 +29,8 @@
       "stateful": true,
       "review_questions": [
         "Are digests, IDs, bindings, algorithms, nonces and key domains checked on both write and read?",
-        "Do rotation, revocation and unavailable-key paths fail closed without plaintext or cross-domain fallback?"
+        "Do rotation, revocation and unavailable-key paths fail closed without plaintext or cross-domain fallback?",
+        "Do external generation anchors bind the exact state digest and immutable blob identity, not only an integer generation?"
       ]
     },
     {
@@ -36,7 +39,8 @@
       "stateful": true,
       "review_questions": [
         "Are crash, retry, reconciliation and unknown-outcome transitions complete and non-duplicating?",
-        "Are audit ordering, integrity and recovery decisions derived from durable trusted state?"
+        "Are audit ordering, integrity and recovery decisions derived from durable trusted state?",
+        "Is a durable ingestion manifest committed and verified before quarantine erasure, with recovery at every commit/delete/ack boundary?"
       ]
     },
     {
@@ -45,7 +49,8 @@
       "stateful": true,
       "review_questions": [
         "Are traversal, symlink, race, atomicity, ownership, quota and cleanup paths covered?",
-        "Are retention and lease decisions based on trusted time and durable current state?"
+        "Are retention and lease decisions based on trusted time and durable current state?",
+        "Does result retention start at the persisted trusted collection time and use the exact trusted tool output limit across restart?"
       ]
     },
     {
