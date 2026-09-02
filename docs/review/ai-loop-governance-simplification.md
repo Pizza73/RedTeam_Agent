@@ -67,8 +67,12 @@ Reconcile without a product-design stop on:
 ## Current PR migration
 
 PR #3 remains blocked at `91392eb375bd10d840cae542acf36d79a00a3f4f`. The failed Design Approval
-run created no current-HEAD approval or implementation request. After this governance change is
-human-reviewed and merged, the existing exact-HEAD base-refresh path incorporates it while retaining
-Phase 0C and the stop latch. Current-HEAD checks run without producing Review Ready, then the existing
-PR #30 design commit and recurrence Gate can be bound to one Design Approval and one implementation
-request.
+run created no current-HEAD approval or implementation request. PR #31 merged the projection
+simplification, then exposed one additional constraint: the original exact-HEAD refresh path could
+not authorize a second governance advance after its first merge output. The follow-up rule records
+one bot-authored, digest-bound `BASE_REFRESH_APPLIED` checkpoint on each new current HEAD after
+verifying its immediate merge edge. Future decisions read only that current checkpoint rather than
+reconstructing the full refresh history. After that rule is merged, PR #3's existing refresh is
+certified once, then it can incorporate current `main` while retaining Phase 0C and the stop latch.
+Current-HEAD checks run without producing Review Ready, then the existing PR #30 design commit and
+recurrence Gate can be bound to one Design Approval and one implementation request.

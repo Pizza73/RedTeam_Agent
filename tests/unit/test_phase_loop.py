@@ -7,6 +7,8 @@ from pathlib import Path
 import pytest
 
 from automation.run_phase_loop import (
+    BASE_REFRESH_CHECKPOINT_STATUS_DESCRIPTION,
+    BASE_REFRESH_CHECKPOINT_STATUS_PREFIX,
     BASE_REFRESH_STATUS_DESCRIPTION,
     PHASES,
     FinalMergeReconciliationRequiredError,
@@ -19,6 +21,8 @@ from automation.run_phase_loop import (
     PullRequestState,
     ReviewEvidence,
     UntrustedEvidenceError,
+    base_refresh_checkpoint_from_statuses,
+    base_refresh_checkpoint_payload,
     base_refresh_evidence_from_statuses,
     canonical_digest,
     codex_implementation_blocker,
@@ -45,6 +49,8 @@ HEAD_SHA = "a" * 40
 BASE_SHA = "b" * 40
 DEFAULT_BRANCH_SHA = "d" * 40
 REFRESHED_HEAD_SHA = "e" * 40
+SECOND_DEFAULT_BRANCH_SHA = "f" * 40
+SECOND_REFRESHED_HEAD_SHA = "7" * 40
 ACTOR_LOGIN = "operator"
 REVIEWER_LOGIN = "chatgpt-codex-connector[bot]"
 READY_URL = "https://github.com/example/repo/pull/1#issuecomment-ready"
@@ -1123,17 +1129,47 @@ def base_refresh_status(
     from_phase: str = "phase-0b",
     revalidate_phase: str = "phase-0a",
     target_url: str = PHASE_RECORD_URL,
+    target_base_sha: str = DEFAULT_BRANCH_SHA,
 ) -> dict[str, object]:
     return {
         "context": (
             f"redteam/base-refresh/{from_phase}/{revalidate_phase}/"
-            f"{DEFAULT_BRANCH_SHA}"
+            f"{target_base_sha}"
         ),
         "state": state,
         "description": description,
         "target_url": target_url,
         "creator": {"login": creator},
         "url": "https://api.github.com/repos/example/repo/statuses/1",
+    }
+
+
+def base_refresh_checkpoint_status(
+    *,
+    head_sha: str = REFRESHED_HEAD_SHA,
+    previous_head_sha: str = HEAD_SHA,
+    target_base_sha: str = DEFAULT_BRANCH_SHA,
+    source_phase: str = "phase-0c",
+    revalidation_phase: str = "phase-0b",
+    authorization_reference: str = f"{PULL_REQUEST_PREFIX}#issuecomment-2",
+    creator: str = "github-actions[bot]",
+    description: str = BASE_REFRESH_CHECKPOINT_STATUS_DESCRIPTION,
+) -> dict[str, object]:
+    payload = base_refresh_checkpoint_payload(
+        head_sha=head_sha,
+        previous_head_sha=previous_head_sha,
+        target_base_sha=target_base_sha,
+        source_phase=source_phase,
+        revalidation_phase=revalidation_phase,
+        authorization_reference=authorization_reference,
+    )
+    return {
+        "context": f"{BASE_REFRESH_CHECKPOINT_STATUS_PREFIX}{canonical_digest(payload)}",
+        "state": "success",
+        "description": description,
+        "target_url": authorization_reference,
+        "creator": {"login": creator},
+        "url": "https://api.github.com/repos/example/repo/statuses/checkpoint",
     }
 
 
@@ -1244,6 +1280,9 @@ class _BaseTransitionGitHub(_StatusGitHub):
         self.update_calls: list[tuple[int, str]] = []
         self.workflow_calls: list[tuple[str, str, dict[str, str]]] = []
         self.ancestors: set[tuple[str, str]] = set()
+        self.parents: dict[str, tuple[str, ...]] = {
+            REFRESHED_HEAD_SHA: (HEAD_SHA, DEFAULT_BRANCH_SHA),
+        }
 
     def set_pull_request_labels(
         self, number: int, labels: frozenset[str]
@@ -1260,10 +1299,14 @@ class _BaseTransitionGitHub(_StatusGitHub):
         self.workflow_calls.append((workflow, branch, inputs))
 
     def is_ancestor(self, ancestor_sha: str, descendant_sha: str) -> bool:
-        return (ancestor_sha, descendant_sha) in self.ancestors
+        return ancestor_sha == descendant_sha or (
+            ancestor_sha, descendant_sha
+        ) in self.ancestors
+
+    def commit_parents(self, sha: str) -> tuple[str, ...]:
+        return self.parents.get(sha, ())
 
     def compare(self, base_sha: str, head_sha: str) -> dict[str, object]:
-        assert (base_sha, head_sha) == (HEAD_SHA, DEFAULT_BRANCH_SHA)
         return {"ahead_by": 1}
 
 
@@ -1707,6 +1750,19 @@ def blocked_refresh_records() -> tuple[MarkerEvidence, MarkerEvidence]:
     return base_pass, gate
 
 
+def design_stop_refresh_records() -> tuple[MarkerEvidence, MarkerEvidence]:
+    base_pass, gate = blocked_refresh_records()
+    gate.payload.update(
+        {
+            "schema_version": "1.1",
+            "stop_reason": "INVARIANT_FAMILY_RECURRENCE",
+            "recurring_families": ["authorization-lifecycle"],
+            "finding_references": [f"{PULL_REQUEST_PREFIX}#discussion_r123"],
+        }
+    )
+    return base_pass, gate
+
+
 def blocked_phase_state() -> PullRequestState:
     state = phase_state(phase="phase-0b")
     return replace(
@@ -1767,6 +1823,259 @@ def test_blocked_current_phase_gate_accepts_identical_trusted_duplicates() -> No
     ) == duplicate
 
 
+def test_refreshed_blocked_gate_authorizes_another_exact_base_refresh() -> None:
+    base_pass, gate = design_stop_refresh_records()
+    first_status = base_refresh_status(
+        from_phase="phase-0c",
+        revalidate_phase="phase-0b",
+        target_url=gate.url,
+    )
+    checkpoint = base_refresh_checkpoint_status(authorization_reference=gate.url)
+    loop, github = blocked_refresh_loop(
+        {HEAD_SHA: [first_status], REFRESHED_HEAD_SHA: [checkpoint]}
+    )
+    github.ancestors.add((HEAD_SHA, REFRESHED_HEAD_SHA))
+    state = replace(
+        blocked_phase_state(),
+        head_sha=REFRESHED_HEAD_SHA,
+        base_sha=DEFAULT_BRANCH_SHA,
+        labels=frozenset(
+            {"ai-loop", "ai-loop-blocked", "ai-needs-review", "phase-0b"}
+        ),
+    )
+
+    assert loop.blocked_base_refresh_candidate(
+        state, [base_pass, gate], SECOND_DEFAULT_BRANCH_SHA
+    ) == gate
+
+
+def test_checkpoint_binds_next_prepared_refresh_to_inherited_gate() -> None:
+    base_pass, gate = design_stop_refresh_records()
+    first_status = base_refresh_status(
+        from_phase="phase-0c",
+        revalidate_phase="phase-0b",
+        target_url=gate.url,
+    )
+    checkpoint = base_refresh_checkpoint_status(authorization_reference=gate.url)
+    next_status = base_refresh_status(
+        from_phase="phase-0c",
+        revalidate_phase="phase-0b",
+        target_url=gate.url,
+        target_base_sha=SECOND_DEFAULT_BRANCH_SHA,
+    )
+    loop, github = blocked_refresh_loop(
+        {
+            HEAD_SHA: [first_status],
+            REFRESHED_HEAD_SHA: [checkpoint, next_status],
+        }
+    )
+    github.ancestors.add((HEAD_SHA, REFRESHED_HEAD_SHA))
+    state = replace(
+        blocked_phase_state(),
+        head_sha=REFRESHED_HEAD_SHA,
+        base_sha=DEFAULT_BRANCH_SHA,
+        labels=frozenset({"ai-loop", "ai-loop-blocked", "phase-0b"}),
+    )
+
+    evidence = loop.trusted_base_refresh_statuses(state, [base_pass, gate])
+
+    assert any(
+        record.payload["head_sha"] == REFRESHED_HEAD_SHA
+        and record.payload["target_base_sha"] == SECOND_DEFAULT_BRANCH_SHA
+        for record in evidence
+    )
+
+
+def test_only_a_design_stop_gate_can_authorize_a_later_refresh() -> None:
+    base_pass, gate = blocked_refresh_records()
+    first_status = base_refresh_status(
+        from_phase="phase-0c",
+        revalidate_phase="phase-0b",
+        target_url=gate.url,
+    )
+    loop, github = blocked_refresh_loop({HEAD_SHA: [first_status]})
+    github.ancestors.add((HEAD_SHA, REFRESHED_HEAD_SHA))
+    state = replace(
+        blocked_phase_state(),
+        head_sha=REFRESHED_HEAD_SHA,
+        labels=frozenset({"ai-loop", "ai-loop-blocked", "phase-0b"}),
+    )
+
+    assert (
+        loop.blocked_base_refresh_candidate(
+            state, [base_pass, gate], SECOND_DEFAULT_BRANCH_SHA
+        )
+        is None
+    )
+
+
+def test_current_head_checkpoint_replaces_historical_chain_walk() -> None:
+    base_pass, gate = design_stop_refresh_records()
+    current_checkpoint = base_refresh_checkpoint_status(
+        head_sha=SECOND_REFRESHED_HEAD_SHA,
+        previous_head_sha=REFRESHED_HEAD_SHA,
+        target_base_sha=SECOND_DEFAULT_BRANCH_SHA,
+        authorization_reference=gate.url,
+    )
+    loop, github = blocked_refresh_loop(
+        {SECOND_REFRESHED_HEAD_SHA: [current_checkpoint]}
+    )
+    github.parents[SECOND_REFRESHED_HEAD_SHA] = (
+        REFRESHED_HEAD_SHA,
+        SECOND_DEFAULT_BRANCH_SHA,
+    )
+    github.ancestors.update(
+        {
+            (HEAD_SHA, REFRESHED_HEAD_SHA),
+            (HEAD_SHA, SECOND_REFRESHED_HEAD_SHA),
+            (REFRESHED_HEAD_SHA, SECOND_REFRESHED_HEAD_SHA),
+        }
+    )
+    state = replace(
+        blocked_phase_state(),
+        head_sha=SECOND_REFRESHED_HEAD_SHA,
+        base_sha=SECOND_DEFAULT_BRANCH_SHA,
+        labels=frozenset({"ai-loop", "ai-loop-blocked", "phase-0b"}),
+    )
+
+    evidence = loop.trusted_base_refresh_checkpoint(
+        head_sha=state.head_sha,
+        phase=state.phase,
+        gate=gate,
+    )
+
+    assert evidence is not None
+    assert evidence.payload["previous_head_sha"] == REFRESHED_HEAD_SHA
+    assert evidence.payload["target_base_sha"] == SECOND_DEFAULT_BRANCH_SHA
+
+
+def test_completed_refresh_without_checkpoint_awaits_confirmation() -> None:
+    base_pass, gate = design_stop_refresh_records()
+    prepared = base_refresh_status(
+        from_phase="phase-0c",
+        revalidate_phase="phase-0b",
+        target_url=gate.url,
+    )
+    loop, github = blocked_refresh_loop({HEAD_SHA: [prepared]})
+    github.ancestors.add((HEAD_SHA, REFRESHED_HEAD_SHA))
+    state = replace(
+        blocked_phase_state(),
+        head_sha=REFRESHED_HEAD_SHA,
+        labels=frozenset({"ai-loop", "ai-loop-blocked", "phase-0b"}),
+    )
+
+    pending = loop.pending_base_refresh_checkpoint(state, [base_pass, gate])
+
+    assert pending == (gate, HEAD_SHA, DEFAULT_BRANCH_SHA)
+
+
+def test_pending_checkpoint_dispatches_one_exact_confirmation() -> None:
+    _base_pass, gate = design_stop_refresh_records()
+    loop, github = blocked_refresh_loop({})
+    state = replace(blocked_phase_state(), head_sha=REFRESHED_HEAD_SHA)
+    loop.default_branch = "main"
+    loop.dispatched_base_refresh_confirmations = set()
+    loop.dry_run = False
+    loop.log = lambda _message: None  # type: ignore[method-assign]
+
+    loop.request_base_refresh_confirmation(
+        state,
+        gate,
+        previous_head_sha=HEAD_SHA,
+        target_base_sha=DEFAULT_BRANCH_SHA,
+    )
+    loop.request_base_refresh_confirmation(
+        state,
+        gate,
+        previous_head_sha=HEAD_SHA,
+        target_base_sha=DEFAULT_BRANCH_SHA,
+    )
+
+    assert github.workflow_calls == [
+        (
+            "refresh-ai-loop-base.yml",
+            "main",
+            {
+                "pull_request_number": "3",
+                "source_phase": "phase-0c",
+                "expected_head_sha": REFRESHED_HEAD_SHA,
+                "previous_head_sha": HEAD_SHA,
+                "target_base_sha": DEFAULT_BRANCH_SHA,
+                "prior_pass_reference": gate.url,
+                "confirmation": "CONFIRM_AI_LOOP_BASE_REFRESH",
+            },
+        )
+    ]
+
+
+def test_checkpoint_confirmation_rejects_a_non_merge_commit() -> None:
+    base_pass, gate = design_stop_refresh_records()
+    loop, github = blocked_refresh_loop({})
+    github.parents[REFRESHED_HEAD_SHA] = (HEAD_SHA,)
+    github.ancestors.add((HEAD_SHA, REFRESHED_HEAD_SHA))
+    state = replace(
+        blocked_phase_state(),
+        head_sha=REFRESHED_HEAD_SHA,
+        labels=frozenset({"ai-loop", "ai-loop-blocked", "phase-0b"}),
+    )
+
+    with pytest.raises(UntrustedEvidenceError, match="two-parent merge"):
+        loop.pending_base_refresh_checkpoint(state, [base_pass, gate])
+
+
+def test_second_refresh_rejects_a_missing_previous_checkpoint() -> None:
+    base_pass, gate = design_stop_refresh_records()
+    next_status = base_refresh_status(
+        from_phase="phase-0c",
+        revalidate_phase="phase-0b",
+        target_url=gate.url,
+        target_base_sha=SECOND_DEFAULT_BRANCH_SHA,
+    )
+    loop, github = blocked_refresh_loop({REFRESHED_HEAD_SHA: [next_status]})
+    github.parents[SECOND_REFRESHED_HEAD_SHA] = (
+        REFRESHED_HEAD_SHA,
+        SECOND_DEFAULT_BRANCH_SHA,
+    )
+    github.ancestors.add((HEAD_SHA, SECOND_REFRESHED_HEAD_SHA))
+    state = replace(
+        blocked_phase_state(),
+        head_sha=SECOND_REFRESHED_HEAD_SHA,
+        labels=frozenset({"ai-loop", "ai-loop-blocked", "phase-0b"}),
+    )
+
+    with pytest.raises(UntrustedEvidenceError, match="previous HEAD lacks"):
+        loop.pending_base_refresh_checkpoint(state, [base_pass, gate])
+
+
+def test_first_refresh_confirmation_rejects_missing_previous_authorization() -> None:
+    base_pass, gate = design_stop_refresh_records()
+    loop, github = blocked_refresh_loop({})
+    github.ancestors.add((HEAD_SHA, REFRESHED_HEAD_SHA))
+    state = replace(
+        blocked_phase_state(),
+        head_sha=REFRESHED_HEAD_SHA,
+        labels=frozenset({"ai-loop", "ai-loop-blocked", "phase-0b"}),
+    )
+
+    with pytest.raises(UntrustedEvidenceError, match="previous-HEAD authorization"):
+        loop.pending_base_refresh_checkpoint(state, [base_pass, gate])
+
+
+def test_checkpoint_digest_rejects_parent_or_gate_mismatch() -> None:
+    status = base_refresh_checkpoint_status()
+
+    with pytest.raises(UntrustedEvidenceError, match="checkpoint is malformed"):
+        base_refresh_checkpoint_from_statuses(
+            [status],
+            head_sha=REFRESHED_HEAD_SHA,
+            previous_head_sha=HEAD_SHA,
+            target_base_sha=SECOND_DEFAULT_BRANCH_SHA,
+            source_phase="phase-0c",
+            revalidation_phase="phase-0b",
+            authorization_reference=f"{PULL_REQUEST_PREFIX}#issuecomment-2",
+        )
+
+
 def test_blocked_current_phase_gate_rejects_distinct_trusted_duplicates() -> None:
     base_pass, gate = blocked_refresh_records()
     conflicting_payload = dict(gate.payload)
@@ -1807,7 +2116,10 @@ def test_refreshed_blocked_phase_dispatches_one_bounded_resume() -> None:
         revalidate_phase="phase-0b",
         target_url=gate.url,
     )
-    loop, github = blocked_refresh_loop({HEAD_SHA: [status]})
+    checkpoint = base_refresh_checkpoint_status(authorization_reference=gate.url)
+    loop, github = blocked_refresh_loop(
+        {HEAD_SHA: [status], REFRESHED_HEAD_SHA: [checkpoint]}
+    )
     github.ancestors.update(
         {(HEAD_SHA, REFRESHED_HEAD_SHA), (DEFAULT_BRANCH_SHA, REFRESHED_HEAD_SHA)}
     )
@@ -1817,7 +2129,6 @@ def test_refreshed_blocked_phase_dispatches_one_bounded_resume() -> None:
         base_sha=DEFAULT_BRANCH_SHA,
         labels=frozenset({"ai-loop", "ai-loop-blocked", "phase-0b"}),
     )
-    evidence = loop.trusted_base_refresh_statuses(state, [base_pass, gate])
     loop.default_branch = "main"
     loop.dispatched_blocked_resumes = set()
     loop.dry_run = False
@@ -1825,7 +2136,7 @@ def test_refreshed_blocked_phase_dispatches_one_bounded_resume() -> None:
     loop.check_state = lambda _head: "success"  # type: ignore[method-assign]
 
     assert loop.perform_post_blocked_refresh_resume(
-        state, [], [base_pass, gate], [], evidence, DEFAULT_BRANCH_SHA
+        state, [], [base_pass, gate], [], DEFAULT_BRANCH_SHA
     ) is True
     assert len(github.workflow_calls) == 1
     workflow, branch, inputs = github.workflow_calls[0]
@@ -1834,7 +2145,7 @@ def test_refreshed_blocked_phase_dispatches_one_bounded_resume() -> None:
     assert inputs["resolution_reference"] == gate.url
 
     assert loop.perform_post_blocked_refresh_resume(
-        state, [], [base_pass, gate], [], evidence, DEFAULT_BRANCH_SHA
+        state, [], [base_pass, gate], [], DEFAULT_BRANCH_SHA
     ) is True
     assert len(github.workflow_calls) == 1
 
@@ -1873,7 +2184,10 @@ def test_refreshed_design_stop_never_dispatches_generic_resume() -> None:
         revalidate_phase="phase-0b",
         target_url=gate.url,
     )
-    loop, github = blocked_refresh_loop({HEAD_SHA: [status]})
+    checkpoint = base_refresh_checkpoint_status(authorization_reference=gate.url)
+    loop, github = blocked_refresh_loop(
+        {HEAD_SHA: [status], REFRESHED_HEAD_SHA: [checkpoint]}
+    )
     github.ancestors.update(
         {
             (prior_review_sha, HEAD_SHA),
@@ -1887,7 +2201,6 @@ def test_refreshed_design_stop_never_dispatches_generic_resume() -> None:
         base_sha=DEFAULT_BRANCH_SHA,
         labels=frozenset({"ai-loop", "ai-loop-blocked", "phase-0b"}),
     )
-    evidence = loop.trusted_base_refresh_statuses(state, [base_pass, gate])
     loop.default_branch = "main"
     loop.dispatched_blocked_resumes = set()
     loop.dry_run = False
@@ -1900,7 +2213,6 @@ def test_refreshed_design_stop_never_dispatches_generic_resume() -> None:
         [],
         [base_pass, gate],
         [prior_family, current_family],
-        evidence,
         DEFAULT_BRANCH_SHA,
     ) is True
     assert messages == []
@@ -1912,7 +2224,6 @@ def test_refreshed_design_stop_never_dispatches_generic_resume() -> None:
         [],
         [base_pass, gate],
         [prior_family, current_family],
-        evidence,
         DEFAULT_BRANCH_SHA,
     ) is True
     assert github.workflow_calls == []
@@ -1954,7 +2265,7 @@ def blocked_run_loop(
         lambda _state, _records, _default: False
     )
     loop.perform_post_blocked_refresh_resume = (  # type: ignore[method-assign]
-        lambda _state, _requests, _phase_records, _family_records, _refresh_records, _default: False
+        lambda _state, _requests, _phase_records, _family_records, _default: False
     )
     loop.base_refresh_candidate = (  # type: ignore[method-assign]
         lambda _state, _requests, _phase_records, _default: None

@@ -5174,6 +5174,17 @@ Projectionを生成しない。既存のTransient Projectionが遅延または�
 Gate、Approval、Required Checkが不変ならTrusted TransitionがIdempotentに正規化する。Stop latchの欠落、
 Authority Recordの不一致、Head Drift、Phase Base不整合は従来どおりFail Closedとする。
 
+Design Stop中にDefault Branch上の承認済みGovernanceが複数回進んだ場合、Blocked Base Refreshの権限は
+自由に継承しない。各更新後にApprover限定WorkflowがCurrent PR HEADの直前1 Edgeだけを検証し、そのCommitが
+Previous PR HEADを第1親、認可済みExact Default-Branch SHAを第2親とする2親Mergeであり、第1親に
+`github-actions[bot]`の対応するSHA-bound Base Refresh Authorizationが存在することを確認する。成功時は
+Current HEAD、Previous HEAD、Default SHA、Phase pair、Design Stop GateをCanonical DigestへBindingした
+`BASE_REFRESH_APPLIED` StatusをCurrent HEADへ発行する。次のExpected-HEAD RefreshはCurrent HEAD上の単一で
+正しいCheckpointだけから同じGateを継承する。更新後からCheckpoint発行までを
+`REFRESH_AWAITING_CONFIRMATION`として扱い、Resume、Implementation Request、次Refreshを禁止する。通常Commit、
+Status欠落、親順序・Digest・Gate不一致、Checkpoint欠落または曖昧性はFail Closedとする。過去Edgeは監査履歴
+として残すが通常判定で再走査せず、CheckpointはResumeやImplementation Requestを認可しない。
+
 ---
 
 # 41. Revision Summary

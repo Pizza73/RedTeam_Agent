@@ -40,12 +40,18 @@ ACTIVE PR STATE: Resolve from trusted GitHub evidence; do not copy from this sna
 - Required checks passed on the refreshed HEAD, but Design Approval run `33601359533` correctly
   emitted no marker because CI had projected `ai-needs-review` while the stop latch was present and
   the approval workflow treated that projection as a conflicting authority state.
-- The current governance branch simplifies that control boundary: stopped CI emits checks only,
-  trusted evidence selects the next action, and an older `ai-needs-review` projection is normalized
-  during the exact-HEAD Design Approval transition.
+- PR #31 merged the lifecycle-projection simplification as
+  `3adac80f42842631208ea59ef3593cf99a75db82`: stopped CI emits checks only, trusted evidence
+  selects the next action, and an older `ai-needs-review` projection is normalized during the
+  exact-HEAD Design Approval transition.
+- A post-merge dry run then exposed that the first refresh output could not receive another
+  exact-HEAD refresh authorization when `main` advanced again. The follow-up governance change
+  certifies each completed two-parent refresh on its new current HEAD and permits another update
+  only from that digest-bound checkpoint; it does not authorize Resume or implementation.
 
 This snapshot does not itself authorize work. The trusted current-Phase gate, adjacent Phase 0A
-base PASS, exact labels/request, and current default-branch evidence remain the active authority.
+base PASS, exact Phase label / stop latch, SHA-bound request, and current default-branch evidence
+remain the active authority.
 
 ## Phase 0A evidence snapshot
 
@@ -64,10 +70,13 @@ base PASS, exact labels/request, and current default-branch evidence remain the 
 ## Next allowed action
 
 Do not restart the local runner or issue a generic Resume while the latest Phase 0C gate is the
-recurrence stop above. After this governance simplification is human-reviewed and merged:
+recurrence stop above. After the current-HEAD refresh-checkpoint governance change is human-reviewed
+and merged:
 
-1. incorporate the resulting governance commit into PR #3 using only the exact-HEAD base-refresh
-   operation; keep the Phase 0C label and stop latch;
+1. certify PR #3's existing `91392eb...` refresh edge using the confirmation mode of
+   **Prepare AI Loop Base Refresh**, then
+   incorporate the resulting governance commit using only the next exact-HEAD base-refresh
+   operation; certify that new HEAD too and keep the Phase 0C label and stop latch;
 2. wait for the four current-HEAD required checks; stopped CI must not publish Review Ready;
 3. issue the dedicated Design Approval bound to the latest recurrence gate, full current HEAD,
    Phase 0C and the incorporated PR #30 design commit;

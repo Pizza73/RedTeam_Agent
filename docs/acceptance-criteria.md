@@ -77,8 +77,9 @@
   進める。`DESIGN_CHANGE_REQUIRED`は停止Labelを維持し、専用Design Approvalを要求する
 - Default BranchをPRへ取り込む前にCurrent Phaseを1つ戻し、旧HEADのPASSを再利用せず、
   取込み後HEADで同Phase Gateを再実行する
-- Base-refresh Workflowは旧HEAD、Current default-branch SHA、隣接Prior PASSを固定したStatusのみ
-  書込み、PR labelの完全置換はLocal Orchestratorが変更前後の全PR状態を再取得して実行する
+- Base-refresh WorkflowのPreparation modeは旧HEAD、Current default-branch SHA、隣接Prior PASSを固定した
+  Authorization Statusだけを書き、Confirmation modeは検証済みCurrent HEADへCheckpoint Statusだけを書く。
+  どちらもPR labelを変更せず、完全置換はLocal Orchestratorが変更前後の全PR状態を再取得して実行する
 - 同じHEAD/Current Phaseにsource側とrollback済み側の複数Base-refresh遷移Identityが成立する
   場合は、label置換とbranch updateのどちらも行わずFail Closedにする
 - Local Orchestratorはlabel置換とbranch updateの直前・直後にCurrent PR、Default Branch、
@@ -91,6 +92,14 @@
   祖先となるPartial Orderで唯一の最大候補だけをReview Baseにし、最大候補が複数ならFail Closedにする
 - Base refreshは`expected_head_sha`とCurrent default-branch SHAへ固定し、Final merge APIを
   呼ばない
+- Base refresh後はApprover限定WorkflowがCurrent HEADの直前1 Edgeについて、2親Mergeの第1親が
+  Previous PR HEAD、第2親が認可済みDefault SHAであり、第1親上のTrusted Base Refresh Statusが
+  同じGate / Phase / SHAをBindingすることを検証する。検証済み遷移はCurrent / Previous HEAD、
+  Default SHA、Phase pair、GateをDigest Bindingしたbot-authored `BASE_REFRESH_APPLIED` Statusとして
+  Current HEADへ記録する
+- Design Stop後にDefault Branchが再度進んだ場合、同じGateの継承はCurrent HEAD上の単一で正しい
+  `BASE_REFRESH_APPLIED` Checkpointだけを認可根拠とする。Checkpoint発行前、通常Commit、親・Digest・
+  Gate不一致、欠落または曖昧なCheckpointは実装・Resume・次Refreshへ進めずFail Closedにする
 - Design ApprovalはStop latch、Current Phase / HEAD、最新Blocking Gate、Required Check、Design commit
   の包含を再検証する。Current HEADの旧`ai-needs-review`はAuthorityではないため許容して最終Label遷移で
   除去するが、`ai-needs-fix`、`ai-review-passed`、`ai-human-gate`等の競合状態は拒否する
