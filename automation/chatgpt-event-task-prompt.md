@@ -55,6 +55,10 @@ fix that covers all of them.
 7. Trace every phase acceptance criterion to implementation and positive, negative and failure-path
    evidence. For affected stateful families, require property-based or state-machine coverage.
 8. Search for alternate/bypass paths; do not review only the happy path.
+   For Phase 0C and later, explicitly verify that `AUTHORIZED` cannot resolve Secret plaintext,
+   Result Collection loads the exact trusted Tool limit and persisted collection-start retention,
+   no caller-created Receipt / Quarantine Reference / Publication can release plaintext, durable
+   ingestion precedes erasure, and generation anchors identify the exact immutable state blob.
 9. Check backward compatibility with every earlier phase invariant.
 10. Confirm no real external C2/MCP/target dispatch occurred in CI.
 11. Re-read the current head SHA. If it changed during review, do not post a verdict for the old SHA.

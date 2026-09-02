@@ -9,8 +9,9 @@ deterministic validation and trusted state transitions only. Set the GitHub Acti
 to zero when the private-repository included quota must not be exceeded.
 
 The orchestrator reads GitHub credentials only through `gh`; it never places the credential in a
-Codex prompt or process environment. GitHub comments, labels and checks are the durable source of
-state, so terminating the local process pauses polling without losing phase progress.
+Codex prompt or process environment. Trusted machine comments / statuses and checks are the durable
+authority events; labels are operator-visible projections that must agree with those events. Thus,
+terminating the local process pauses polling without losing phase progress.
 `docs/implementation-status.md` is a default-branch/bootstrap snapshot; an active PR's Phase
 authority is the exact label plus the trusted current-HEAD implementation request and the unique
 maximal adjacent prior-Phase PASS incorporated in the current HEAD. Comment order is never phase
@@ -83,13 +84,17 @@ IMPLEMENTATION_REQUESTED
        -> PROJECT_COMPLETE -> LOCAL_EXACT_SHA_MERGE or BLOCKED
        -> BLOCKED -> HUMAN_GATE
             -> TRUSTED_CURRENT_PHASE_BASE_REFRESH -> CURRENT_PHASE_CI -> BOUNDED_RESUME
+       -> DESIGN_CHANGE_REQUIRED -> TRUSTED_BASE_REFRESH_ONLY
+            -> CURRENT_HEAD_CI -> HUMAN_DESIGN_APPROVAL -> DESIGN_RESUME
 ```
 
 `PASS` never starts an AI process inside GitHub Actions. It creates the next SHA-bound
 implementation request; the local orchestrator detects the trusted request and asks Codex Cloud to
 perform it through the ChatGPT-linked GitHub identity.
 `BLOCKED` can be resumed for Phase 0A through Phase 3 only through the approver-restricted
-`Resume AI Loop` workflow with a repository-local resolution reference. Phase 4/5 use their
+`Resume AI Loop` workflow with a repository-local resolution reference, except when the latest
+trusted gate stopped for invariant-family recurrence. A recurrence stop is
+`DESIGN_CHANGE_REQUIRED`; the generic Resume workflow must reject it. Phase 4/5 use their
 dedicated provider Human Gate and cannot use the generic resume path.
 
 If an older control version incorrectly relabeled a cumulative PR to the adjacent prior Phase,
@@ -106,7 +111,10 @@ only a trusted current-HEAD `BLOCKED_LIMIT` gate, validates its unique adjacent 
 ancestry, and writes the same SHA-bound status used by the local update mechanism. The local runner
 does not roll the Phase label back. It performs one expected-HEAD branch update, verifies both the
 old HEAD and target default SHA are ancestors of the result, waits for current-HEAD checks, and can
-then dispatch only the existing bounded Resume workflow bound to the blocked gate permalink.
+then remain blocked. The base-refresh evidence authorizes exactly one expected-HEAD branch update;
+it is not Resume authority. If the blocking gate is `DESIGN_CHANGE_REQUIRED`, remediation may
+restart only after current-HEAD CI and a separate approver-restricted Design Approval bound to the
+blocking gate, current Phase/HEAD and an approved design commit incorporated from `main`.
 
 ## Machine comments
 
@@ -191,6 +199,42 @@ Gate, the adjacent next-Phase state detects the newer `main`, rolls back again, 
 Gate on another refreshed HEAD. A later default-branch SHA is never substituted into an earlier
 review, and the earlier PASS never authorizes implementation across the new base.
 
+### Design approval authorization
+
+An invariant-family recurrence gate records `loop_state="BLOCKED_LIMIT"` together with
+`stop_reason="INVARIANT_FAMILY_RECURRENCE"`, the closed set of `recurring_families`, and the exact
+review / finding references. This gate dominates every earlier base-refresh status, resume marker,
+fix request and label state. Labels are projections for operators, not authorization evidence.
+
+After the coherent redesign is human-reviewed and merged to the default branch, a base refresh may
+incorporate it into the blocked implementation PR. That update consumes only the exact refresh
+transition. It must not remove `ai-loop-blocked`, issue a fix request, dispatch `Resume AI Loop`, or
+trigger Codex. The runner records or derives one consumed transition identity bound to old HEAD,
+new HEAD, target base SHA, phase and blocking gate; another update cannot reuse it.
+
+The approver then invokes the separate `Approve AI Loop Design Resume` operation. The workflow
+revalidates the latest recurrence gate, unique adjacent phase base, current open PR, exact current
+HEAD, current default branch ancestry, successful required checks, exact Phase label, stop label,
+and that the approved design commit is contained in both current `main` and the PR HEAD. It emits:
+
+```html
+<!-- redteam-design-approval
+{"schema_version":"1.0","phase":"phase-0c","head_sha":"<current-head>","blocked_gate_reference":"https://github.com/...","design_commit_sha":"<sha>","design_reference":"https://github.com/...","policy_digest":"<sha256>","approved_by":"<login>"}
+-->
+```
+
+Unknown fields, duplicate keys, a stale or shortened SHA, a design commit not incorporated in the
+current HEAD, a non-latest blocking gate, a changed family set or prior use of the same approval
+fail closed. Only this marker can authorize one `RESUME_AFTER_DESIGN_APPROVAL` implementation
+request. Generic `HUMAN_RESUME` and post-refresh bounded Resume cannot consume it.
+
+Immediately before any implementation trigger, the runner re-queries the current PR head, latest
+trusted gate, complete managed / stop label set, required checks, design approval and transition
+consumption. A new gate, head change, missing stop label before approval consumption, or any drift
+stops without posting a Codex trigger. The approved resume removes `ai-loop-blocked` only as part
+of the same bounded transition that writes the exact-HEAD implementation request; failure after
+either write is reconciled from GitHub evidence rather than replayed blindly.
+
 ## Review recording
 
 After CI posts the review-ready marker:
@@ -220,7 +264,9 @@ is fail-closed. The loop stops after five change cycles in a phase or five occur
 root-cause key.
 The exact-finding and Phase limits remain five. Separately, if any semantic invariant family
 appears in a second formal review for the Phase, the workflow emits no new fix request and enters
-`BLOCKED_LIMIT` for coherent redesign and bounded Human Resume.
+`BLOCKED_LIMIT` with `stop_reason=INVARIANT_FAMILY_RECURRENCE`. This is the
+`DESIGN_CHANGE_REQUIRED` terminal condition. It requires a coherent redesign and the dedicated
+Design Approval path above; ordinary bounded Human Resume is invalid.
 
 ## Phase progression
 

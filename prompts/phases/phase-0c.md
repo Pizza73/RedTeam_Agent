@@ -3,14 +3,19 @@
 ## Preconditions
 
 - Phase 0B Gate PASS and all earlier invariants preserved.
+- A recurrence-stop resume must use a valid `RESUME_AFTER_DESIGN_APPROVAL` request and implement the complete mapping in `docs/review/phase-0c-coherent-redesign.md`; a generic Resume or partial-finding patch is not authorized.
 
 ## Implement
 
 - Artifact Store with mission-scoped access, internal paths, traversal/symlink defense, quota, integrity, retention and audit
 - Encrypted Raw Result Quarantine with crash-safe chunk metadata and resume
-- Secure ingestion: classification, secret detection, redaction and reference generation
+- Secure ingestion from a repository-bound `ingestion_id` only: classification, secret detection, redaction and reference generation; remove plaintext-returning full-object compatibility paths and caller-minted publication authority
+- Durable Secure Ingestion Manifest and Quarantine Deletion Intent with explicit `INGESTED_DURABLE -> DELETE_PENDING -> QUARANTINE_ERASED -> SUCCEEDED` recovery
 - Secret Store interface and reference-only application model
+- Post-pre-dispatch, unconsumed Dispatch Claim binding for just-in-time Secret injection into a fixed trusted Adapter channel; `AUTHORIZED` alone must never resolve plaintext
+- Result Collection Authority bound to trusted collection start time, exact Tool Registry / `ToolDefinition.max_output_bytes`, provider task, sink and mission deadline
 - EncryptionKeyProvider with separated secret/quarantine/artifact domains
+- Shared Authenticated Generation Coordinator for Audit Head and Wrapped Key State, with external CAS anchors bound to generation, state digest and immutable blob identity
 - Authenticated encryption metadata and AAD bindings
 - Key rotation/revocation/unavailable fail-closed behavior
 - Data access enforcement for artifact and secret operations
@@ -23,9 +28,15 @@
 - No secret/raw output in prompt, normal DB/log, exception or traceback
 - Path traversal, symlink escape, quota and digest corruption
 - Quarantine streaming crash/resume and secure deletion lifecycle
+- Direct full-object factory / compatibility loader / caller receipt and quarantine-reference plaintext release denial
+- Pre-dispatch blocked, `AUTHORIZED`, expired or consumed Dispatch Claim, and Tool / Adapter mismatch secret-resolution denial
+- Long-running provider collection retention starts at trusted collection time, remains stable across restart and cannot exceed the mission deadline
+- Cross-tool output limits use the exact trusted Tool Definition and cannot be expanded by caller or global configuration
+- Crash before / after Manifest Commit, Deletion Intent, key destruction, ciphertext unlink and ExecutionResult acknowledgement recovers without provider replay
 - Secret/Quarantine/Artifact key ID/tag reuse rejection
 - Nonce/AAD/domain mismatch and unavailable/revoked key fail-closed
 - Audit deletion/reorder/content/previous-hash tamper detection
 - Sequence conflict and independent mission chain verification
+- Audit / key generation crash and directory-replacement restart recovers from the digest/blob-bound external anchor without manual path repair; missing or corrupt committed blobs fail closed
 
 Do not introduce plaintext or normal-artifact fallback.
