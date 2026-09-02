@@ -137,6 +137,11 @@ PlannerおよびAnalyzerの出力は、Pydantic Validationに成功しても信�
 27. Secure Ingestionは呼出側が持ち込むReceipt、Quarantine Reference、Publication Objectから権限を組み立てず、Trusted Repositoryから完全なBindingを解決する
 28. Quarantineを消去する前に、Redacted Artifact、Secret Reference、Secure Ingestion ManifestをDurableに確定する
 29. Audit HeadとWrapped Key StateのGeneration Commitは、Generation番号だけでなくState DigestとImmutable Blob Identityへ外部CAS AnchorをBindingする
+30. Secret配送はExecutor内部の固定Adapter Dispatch Transactionだけが所有し、Claimを平文解放前にDurable消費する
+31. Caller supplied timeをAuthorization、Collection、Lease、RetentionのEvidenceとして使用せず、Composition Rootから注入したTrusted Clockだけを使用する
+32. QuarantineのConstructor、Factory、Lookup、Readerは副作用を持たず、Manifest、Result Projection、全参照Resource、Deletion Intentの検証後にだけ明示的Erasureを実行する
+33. `INGESTED_DURABLE`以後のExecutionResultはDurable Manifest / Result Projectionだけから再構築し、Adapter Collection、Provider照会、Quarantine復号を再実行しない
+34. ProductionのAudit / Wrapped Key GenerationはDurable Authenticated Backendを必須とし、Integer-only、Local-slot、In-memory Test DoubleへFallbackしない
 
 ---
 
@@ -899,22 +904,22 @@ Executorの役割:
 8. Mission State / Validity、Authorization Epoch、Session Freshness、Adapter / Sandbox / Remote MCP Trust Capability、Canonical DigestのPre-dispatch Check
 9. Pre-dispatch失敗時の`AUTHORIZED -> BLOCKED`永続化
 10. Pre-dispatch成功時に、Execution、PolicyDecision、Tool、Adapter、Approval、TTLへ完全Bindingした単回`DispatchClaim`を同一Transactionで永続化し、`DISPATCH_CLAIMED`へ遷移
-11. 有効なDispatch Claimを持つTrusted Adapter ChannelだけへのJust-in-time Secret Injection
+11. Dispatch Claimを平文解放前にDurable消費し、Executor内部の固定Adapter Dispatch TransactionだけでJust-in-time Secret Injection
 12. Idempotency Key付き要求の送信と、結果不明時のReconciliation
 13. Task状態、Timeout、Cancellationの管理
-14. Result取得開始時にTrusted Tool Definition、Collection開始時刻、Retention、Size上限へBindingした`ResultCollectionAuthority`を永続化
+14. Result取得開始時にExecutor所有のTrusted ClockとTrusted Tool DefinitionからCollection開始時刻、Retention、Size上限へBindingした`ResultCollectionAuthority`を永続化
 15. Authority-bound RawResultSinkを用いたEncrypted QuarantineへのChunk StreamingとReceipt取得
 16. Metadata-only AdapterRawResult取得
 17. Result Ingestion State更新とRepository-bound Secure Ingestionの実行
-18. Durable Secure Ingestion Manifest確定後のQuarantine消去
-19. PolicyDecision、Normalized Target、SecureIngestionResultを統合したExecutionResult生成
+18. Durable Secure Ingestion Manifest、ExecutionResultProjection、全参照Resource、Deletion Intentをread-back検証した後の明示的Quarantine消去
+19. Adapter / Providerへ再アクセスせずManifestとExecutionResultProjectionからExecutionResult生成
 20. Audit Logへの記録
 
 PolicyDecisionが存在しない、Decisionが`DENY`、または`REQUIRE_APPROVAL`が未承認 / 拒否済みの場合はExecutionRecordを作成せずAuthorization Gateで拒否または待機する。Executable Predicateを満たすDecisionに対してだけExecutionRecordを`PLANNED`で作成し、Registry BindingとPredicateを同一OCC処理で再検証して`AUTHORIZED`へ遷移する。`PLANNED`からのCrash RecoveryはProvider未送信としてPolicy Revalidationを行い、暗黙Dispatchしない。
 
 `AUTHORIZED`は、保存済みPolicyDecisionを実行候補へBindingした状態であり、Secret Valueを復号する権限、Raw Result Sinkを発行する権限、Provider APIを呼ぶ権限のいずれも表さない。`AUTHORIZED`後にAuthorization Epoch / TTL / authorization_digest、その他Pre-dispatch条件が不一致になった場合は`BLOCKED`へ遷移させる。Approval後もPolicyDecisionを書き換えてはならない。
 
-Provider APIを呼ぶ直前にMission State Repositoryから`state=RUNNING`、現在Epoch、`valid_from <= current_time < valid_until`を再確認する。成功時は、同じOCC TransactionでExecutionを`DISPATCH_CLAIMED`へ遷移し、目的限定・単回・短寿命のDispatch Claimを作成する。Secret Valueが必要な場合も、Secret Storeの公開`resolve()`からbytesをApplication Callerへ返さず、Dispatch ClaimへBindingされたTrusted Adapter Channelへだけ注入する。Claim確定後のCrashまたは送信結果不明はReconciliationへ進め、Provider Submitを自動再送しない。
+Provider APIを呼ぶ直前にMission State Repositoryから`state=RUNNING`、現在Epoch、`valid_from <= current_time < valid_until`を再確認する。成功時は、同じOCC TransactionでExecutionを`DISPATCH_CLAIMED`へ遷移し、目的限定・単回・短寿命のDispatch Claimを作成する。Secret Valueが必要な場合、ExecutorはCurrent Claimと完全なSecret Reference集合を再検証し、同じClaimを平文復号前にOCCで消費・read-back検証してから、Composition Rootで固定済みのAdapter Dispatch Portへだけ注入する。Broker、Channel Registry、Callback、ConsumerをApplication Callerが生成または指定できる公開Interfaceを設けない。Claim消費後のCrash、Adapter応答不明または送信結果不明はReconciliationへ進め、Secret InjectionとProvider Submitを自動再送しない。
 
 Local Tool AdapterではTool Registryに登録された型付きToolだけを実行可能とする。任意文字列をOS Shellへ渡す汎用Toolは自動実行モードで提供しない。
 
@@ -978,6 +983,22 @@ class AdapterRawResult(StrictImmutableBoundaryModel):
     exit_code: int | None
     started_at: datetime
     finished_at: datetime
+
+class ExecutionResultProjection(StrictImmutableBoundaryModel):
+    projection_id: str
+    projection_digest: str
+    execution_id: str
+    provider_task_id: str
+    receipt_id: str
+    receipt_digest: str
+    provider_status: Literal["succeeded", "failed", "cancelled"]
+    exit_code: int | None
+    timed_out: bool
+    started_at: datetime
+    finished_at: datetime
+    stdout_preview_artifact_id: str | None
+    stderr_preview_artifact_id: str | None
+    redaction_metadata_digest: str
 
 class RawResultSink(Protocol):
     async def write_stdout(self, chunk: bytes) -> None:
@@ -1135,6 +1156,7 @@ class DispatchClaim(StrictImmutableBoundaryModel):
     approval_record_id: str | None
     issued_at: datetime
     expires_at: datetime
+    consumption_id: str | None
     consumed_at: datetime | None
 
 class ResultCollectionAuthority(StrictImmutableBoundaryModel):
@@ -1150,7 +1172,7 @@ class ResultCollectionAuthority(StrictImmutableBoundaryModel):
     lease_expires_at: datetime
 ```
 
-`DispatchClaim`と`ResultCollectionAuthority`はBearer Tokenではない。CallerがObjectまたはIDを提示しただけでは権限を得られず、各ServiceはExecution IDからTrusted RepositoryのCurrent Recordをロードし、Execution State Version、現在Mission、Decision、Tool Registry、Adapter、Approval、TTL、Claim未消費を再検証する。呼出側がClaimのField、Tool上限、Retention時刻、Receipt、Quarantine Referenceを差し替えるInterfaceを禁止する。
+`DispatchClaim`と`ResultCollectionAuthority`はBearer Tokenではない。CallerがObjectまたはIDを提示しただけでは権限を得られず、各ServiceはExecution IDからTrusted RepositoryのCurrent Recordをロードし、Execution State Version、現在Mission、Decision、Tool Registry、Adapter、Approval、TTL、Claim未消費を再検証する。`consumption_id`はExecution、Claim、authorization_digest、State Versionから決定論的に生成し、平文解放前のOCC Consumptionを冪等に照合する。同じConsumption IDへの同一遷移だけを受理し、異なるConsumptionまたは消費済みClaimからの再配送を拒否する。呼出側がClaimのField、Tool上限、Retention時刻、Receipt、Quarantine Referenceを差し替えるInterfaceを禁止する。
 
 Result Ingestion State Machine:
 
@@ -1234,13 +1256,19 @@ Checkpointからの再開時は、`DISPATCH_CLAIMED`、`DISPATCHED`または`RUN
 
 Secret Valueを必要とするExecutionでも、Plan、PolicyDecision、ExecutionRequest、Graph StateはSecret Referenceだけを保持する。Secret解決は`DISPATCH_CLAIMED`かつ未消費・未失効のDispatch Claimに対してだけ許可し、`AUTHORIZED`、`BLOCKED`、`RUNNING`、Terminal Stateからの直接解決を拒否する。
 
-Secret StoreはApplication Callerへ平文bytesを返す汎用`resolve(reference, execution_id)`を公開しない。`SecretInjectionBroker`がTrusted RepositoryからCurrent Dispatch Claim、PolicyDecision内のexact DataAccessGrant、Current Secret Metadata、Mission State、Tool、Adapter Channelをロードし、固定されたTrusted Adapter Channelへだけ値を渡す。Callerが任意Consumer、Callback、Environment名、Command Line、Endpointを指定できるInterfaceを禁止する。Phase 0CのTest Doubleも同じInterfaceを使用し、受信値をLog、Snapshot、Exceptionへ出力しない。
+Secret StoreはApplication Callerへ平文bytesを返す汎用`resolve(reference, execution_id)`を公開しない。Secret配送は別Serviceとして公開または構築可能にせず、Trusted Application Composition Rootが生成したExecutorと固定`TrustedAdapterRegistry`だけが所有する内部Dispatch Transactionとする。Package Public Export、Public ConstructorまたはPublic Methodとして`SecretInjectionBroker`、`TrustedSecretChannelRegistry`、`SecretAdapterChannel`、任意Callback / Consumer Protocolを提供しない。Runtime Type Check、`final`、Private命名だけをComposition Root Provenanceの代替にしてはならない。
 
-解決された値のLifetimeは1回のAdapter Submit呼出しに限定する。成功・失敗・Cancellationに関係なくBufferを破棄し、Claimを消費済みとして記録する。Secret Injection後にSubmit結果が不明な場合も、同じClaimでSecretを再解決・再送せずReconciliationへ進む。
+ExecutorはTrusted RepositoryからCurrent Mission、Execution、PolicyDecision内のexact DataAccessGrant、Current Dispatch Claim、Tool / Adapter Binding、Current Secret Metadataをロードする。Claimはauthorization_digestへ含まれる完全なSecret Reference集合にもBindingする。全Binding検証後、同じClaimをOCC Transactionで`unconsumed -> consumed`へ遷移し、保存済みDigest、State Version、Consumption Identityをread-back検証する。Consumption Commitが成功する前にSecretを復号せず、Adapterへ値を渡さない。
+
+Durable Consumption確認後にだけ、Executor内部処理がSecretをBounded Mutable Bufferへ復号し、既に選択済みの固定Adapter Dispatch Portを1回呼び出す。成功・失敗・Cancellationに関係なくBufferをzeroizeする。Claim消費後、Adapter呼出し前・呼出し中・Return直後・Task Identity保存前のどこでCrashしてもSecret注入またはProvider Submitを再実行せず、ImmutableなExecution ID / Idempotency KeyでReconciliationへ進む。確認不能なら`OUTCOME_UNKNOWN`とし、Cross-process Exactly Onceを主張しない。
+
+CallerはRegistry、Adapter Channel、Consumer、Callback、Environment名、Command Line、Endpointを指定できない。Phase 0CのTest Adapterは受信値を呼出し中に検証し、Call Countと非秘密Control Metadataだけを記録する。Secret ValueをTest Object、Log、Snapshot、Exception、TracebackへCopyしない。Phase 4 / 5のProduction AdapterはSandbox Policyが要求するProcess-isolated Channelを使用し、Untrusted PluginをExecutor / Adapter Composition TCB内で実行しない。
 
 ## 10.3 Result Collection Authority
 
-Result CollectionはProvider Executionとは別の回復可能な処理である。Executorは`collect_result()`を呼ぶ前にTrusted Clockから`collection_started_at`を取得し、Current Execution、Provider Task、PolicyDecision、exact ToolRef、Tool Registry Digest、`ToolDefinition.max_output_bytes`、Sink IDへBindingした`ResultCollectionAuthority`をTransactionally永続化する。
+Result CollectionはProvider Executionとは別の回復可能な処理である。ExecutorはApplication Composition Rootから注入されたTrusted Clockを所有する。`collect_result()`、Authority生成、Lease取得、Retention計算を行うSecurity-sensitive Public Entry PointはCaller supplied `now`を受け取らない。Caller / ProviderのTimestampはObservation Metadataとして保存できるが、Authorization、LeaseまたはRetentionのEvidenceに使用しない。
+
+Executorは`collect_result()`を呼ぶ前にTrusted Clockを1回だけ読み、その値を`collection_started_at`と初回Lease計算へ共用する。Current Execution、Provider Task、PolicyDecision、exact ToolRef、Tool Registry Digest、`ToolDefinition.max_output_bytes`、Sink IDへBindingした`ResultCollectionAuthority`をTransactionally永続化する。
 
 ```text
 retention_until = min(
@@ -1253,7 +1281,7 @@ max_result_bytes = min(
 )
 ```
 
-`mission.valid_until <= collection_started_at`、Tool Definition欠落、Registry Revision不一致、Provider Task不一致では新しいSinkを発行しない。RetentionはExecution作成時刻から計算せず、Authority作成時に一度だけ確定してRepositoryへ保存し、Crash Resume時に再計算しない。Global設定またはCaller引数でTool固有上限を拡大できず、System Hard Capは上限を狭める目的にだけ使用できる。
+`mission.valid_until <= collection_started_at`、Tool Definition欠落、Registry Revision不一致、Provider Task不一致では新しいSinkを発行しない。RetentionはExecution作成時刻、Caller Timestamp、Provider Timestampから計算せず、Authority作成時に一度だけ確定してRepositoryへ保存し、Crash Resume時に再計算しない。Global設定またはCaller引数でTool固有上限を拡大できず、System Hard Capは上限を狭める目的にだけ使用できる。
 
 RawResultSink FactoryはExecution IDだけから暗黙にBindingを再構築せず、有効なCurrent ResultCollectionAuthorityをRepositoryからロードする。Lease期限切れ後の再開は同じ`collection_started_at`、`retention_until`、Tool上限、Sink IDおよびResume Cursorを維持し、External Actionを再Submitしない。
 
@@ -1542,7 +1570,7 @@ ExecutionAdapter
 
 ExecutionRequestはExecutorがExecutionPlan、PolicyDecision、Tool Registryから生成する信頼境界内のRequestである。`policy_decision_id`からImmutableなPolicyDecisionを取得し、`authorized_data_access`を含むExecution Authorization Envelope全体を検証する。独立したDataAccessGrant IDをExecutionRequestへ渡したり、DataAccessGrant EntryをBearer Tokenとして扱ったりしない。
 
-`provider_operation`はTool Registryの`provider_tool_name`から設定し、Planner入力から直接取得しない。Secret Valueが必要な場合は、Section 10.2のSecretInjectionBrokerがCurrent Dispatch ClaimとPolicyDecision Envelopeを検証し、実行直前にRegistry固定のTrusted Adapter Channelへ注入する。Executor / Adapterの汎用APIからSecret平文を返さず、永続化するExecutionRequestへ値を埋め込まない。
+`provider_operation`はTool Registryの`provider_tool_name`から設定し、Planner入力から直接取得しない。Secret Valueが必要な場合は、Section 10.2のExecutor-owned Dispatch TransactionがCurrent Dispatch ClaimとPolicyDecision Envelopeを検証し、ClaimをDurable消費した後、実行直前にComposition Root固定のTrusted Adapter Dispatch Portへ注入する。Executor / Adapterの汎用APIからSecret平文、Broker、Channel Registry、Callbackを返さず、永続化するExecutionRequestへ値を埋め込まない。
 
 Adapterの公開Interfaceから任意Provider Method、任意Endpoint、自由形式Commandを呼び出せるようにしない。AdapterはToolRef、Provider Operation、Session、Normalized TargetのRegistry Bindingを再検証し、不一致をProviderへ送信しない。Providerから得たStatus、Session Metadata、Resultは信頼済みControl Responseと非信頼Payloadを分離して正規化する。
 
@@ -1813,6 +1841,7 @@ Source of Truthを以下に固定し、同じ情報へ複数のSource of Truth�
 | Result Collection Start / Tool Limit / Retention / Sink Binding | Result Collection Authority Repository |
 | Result Ingestion State | Result Ingestion Repository |
 | Durable Secure Ingestion Output | Secure Ingestion Manifest Repository |
+| Post-erasure ExecutionResult inputs | Manifest-bound Execution Result Projection Repository |
 | Quarantine Erasure Progress | Quarantine Deletion Intent Repository |
 | Raw Result Ciphertext | Encrypted Raw Result Quarantine |
 | Raw Result Receipt / Quarantine Metadata | Result Ingestion / Quarantine Metadata Repository |
@@ -1832,7 +1861,7 @@ Source of Truthを以下に固定し、同じ情報へ複数のSource of Truth�
 | Local LLM Profile / Capability Result | LLM Profile Repository |
 | Encryption Key Material | External Key Provider |
 | Encryption Key Metadata | Key Metadata Repository |
-| Audit / Wrapped Key Committed Generation | External digest/blob-bound Generation Anchor Store |
+| Audit / Wrapped Key Committed Generation | Durable Authenticated Generation Backend（Immutable Blob + Authenticated CAS Anchor） |
 | Audit Event / Mission Chain Sequence | Tamper-evident Audit Store |
 
 `Session Manager / trusted Adapter`は二重管理を意味しない。External RuntimeについてはProviderが上流の事実源であり、Application内ではSession ManagerがRefresh結果を正規化して保持する唯一のSession Runtime Stateとする。Analyzer、Knowledge Base、Checkpointが別のSession Runtime Stateを保持して上書きしてはならない。Authorizationについては、PolicyDecisionがExecution Authorization、ContextDataAccessGrantがLLM Context用Read AuthorizationのSource of Truthであり、同じ操作を重複して許可するものではない。CapabilityやSecurity ContextはDigestだけでなくDigest生成元のImmutable Snapshotも保持し、後から判断根拠を再構築できるようにする。
@@ -3426,42 +3455,44 @@ Discovery Planner
 
 17. Pre-dispatch Enforcementを再実施し、不一致ならAUTHORIZED -> BLOCKEDとしてProviderを呼ばない
 
-18. ExecutionAdapterへIdempotency Key付きで送信。Graph Automatic Retryは使用しない
+18. Secretが必要な場合はExecutor内部TransactionがCurrent Dispatch Claimを平文解放前にDurable消費し、Composition Root固定Adapter Dispatch Portへだけ注入する
 
-19. Provider ResultをRawResultSinkへChunk Streamingし、Encrypted Raw Result QuarantineへDurable Commitする
+19. ExecutionAdapterへIdempotency Key付きで1回送信。Claim消費後を含めGraph Automatic Retryは使用しない
 
-20. AdapterはRaw Contentを含まないRawResultReceipt / AdapterRawResult Metadataを返す
+20. Provider ResultをRawResultSinkへChunk Streamingし、Encrypted Raw Result QuarantineへDurable Commitする
 
-21. Result Ingestion StateをPENDING -> INGESTINGとしてSecure Ingestionを実行
+21. AdapterはRaw Contentを含まないRawResultReceipt / AdapterRawResult Metadataを返す
 
-22. ExecutorがSecureIngestionResult、PolicyDecision、Normalized TargetからExecutionResultを生成
+22. Result Ingestion StateをPENDING -> INGESTINGとしてSecure Ingestionを実行し、Manifest / ExecutionResultProjection / 全参照ResourceをDurable Commit・read-back検証後にだけ明示的Erasureを行う
 
-23. Analyzer Context SelectorがIndex MetadataからCandidate Resource Referencesを選択
+23. ExecutorがAdapter / Providerへ再アクセスせずManifest / ExecutionResultProjection、PolicyDecision、Normalized TargetからExecutionResultを生成
 
-24. Analyzer用Context Authorizationを計算・冪等保存し、Context BuilderがAuthorized Contextを生成
+24. Analyzer Context SelectorがIndex MetadataからCandidate Resource Referencesを選択
 
-25. AnalyzerがCandidateObservationを抽出
+25. Analyzer用Context Authorizationを計算・冪等保存し、Context BuilderがAuthorized Contextを生成
 
-26. Knowledge ReducerがCandidateObservationとSecretDiscoveryReferenceを検証
+26. AnalyzerがCandidateObservationを抽出
 
-27. Knowledge BaseへConfirmed FindingまたはProvenance付き状態を保存
+27. Knowledge ReducerがCandidateObservationとSecretDiscoveryReferenceを検証
 
-28. CandidateSessionObservationを契機にSession Managerがtrusted AdapterからRefresh
+28. Knowledge BaseへConfirmed FindingまたはProvenance付き状態を保存
 
-29. Goal EvaluatorがConditionを三値評価
+29. CandidateSessionObservationを契機にSession Managerがtrusted AdapterからRefresh
 
-30. not_achieved
+30. Goal EvaluatorがConditionを三値評価
+
+31. not_achieved
        |
        +--> Session Refresh / Context Selectorから次Iteration
 
-31. indeterminate
+32. indeterminate
        |
        +--> Indeterminate Handler
                  |
                  +--> Bounded Refresh / Reconciliation
                  +--> PAUSED / Human Review
 
-32. achieved
+33. achieved
        |
        +--> FINALIZING
                  |
@@ -3823,6 +3854,7 @@ SQLite
  +-- result_collection_authorities
  +-- result_ingestions
  +-- secure_ingestion_manifests
+ +-- execution_result_projections
  +-- raw_result_receipts
  +-- raw_result_quarantine_metadata
  +-- quarantine_deletion_intents
@@ -3859,7 +3891,7 @@ LangGraph Checkpoint StoreはApplication Databaseと同じSQLite Instanceを利�
 
 `dispatch_claims`はPre-dispatch成功時のExecution State Version、PolicyDecision、Authorization Digest、Mission Revision / Epoch、Tool、Adapter、Approval、TTL、消費状態を保持する。`result_collection_authorities`はTrusted Collection開始時刻、exact Tool Registry Digest、Tool固有Size上限、Retention、Provider Task、Sink、Leaseを保持する。いずれもCaller提示のBearer Tokenとして参照せず、Current ExecutionからRepository解決する。
 
-`result_ingestions`にはResultIngestionStatus、Lease、Receipt / Quarantine Binding、Secure Ingestion Manifest ID / Digest、Deletion Intent Bindingだけを保存し、AdapterRawResult、Raw stdout、Raw stderr、Secret Valueを保存しない。`secure_ingestion_manifests`はRedacted Artifact、Secret Reference、Redaction Metadata、全参照Digestを保持し、Quarantine消去後のExecutionResult再構築に使用する。`raw_result_receipts`はByte Count、Ciphertext Digest、Quarantine Binding等のMetadataだけを保存する。`raw_result_quarantine_metadata`にも暗号化Storage Handle、Binding、Digest、Size、Retention、Stateだけを保存する。`quarantine_deletion_intents`はManifest Commit後にだけ作成し、Cryptographic ErasureとCiphertext削除のReconciliationを行う。
+`result_ingestions`にはResultIngestionStatus、Lease、Receipt / Quarantine Binding、Secure Ingestion Manifest ID / Digest、Deletion Intent Bindingだけを保存し、AdapterRawResult、Raw stdout、Raw stderr、Secret Valueを保存しない。`secure_ingestion_manifests`はRedacted Artifact、Secret Reference、Redaction Metadata、全参照Digestと`execution_result_projections`のID / Digestを保持する。ProjectionはProvider Status、Exit Code、Timeout / Cancellation、開始 / 終了時刻、安全なPreview Reference等、Quarantine消去後のExecutionResult再構築に必要な型付きControl Metadataだけを保持し、Raw Content、Secret Value、Provider一時Pathを含めない。`raw_result_receipts`はByte Count、Ciphertext Digest、Quarantine Binding等のMetadataだけを保存する。`raw_result_quarantine_metadata`にも暗号化Storage Handle、Binding、Digest、Size、Retention、Stateだけを保存する。`quarantine_deletion_intents`はManifest / Projection / 全参照Resourceのread-back検証後にだけ作成し、Cryptographic ErasureとCiphertext削除のReconciliationを行う。
 
 `data_access_grants`はPolicyDecisionまたはContextDataAccessGrantに内包されたEntryを正規化保存するChild Tableであり、`owner_type + owner_id + entry_index`等の内部Composite Keyで所有EnvelopeへBindingする。単独で外部へ提示できるGrant TokenやExecutionRequestのBearer IDを発行してはならない。
 
@@ -3964,7 +3996,8 @@ PENDING
   -> INGESTING
   -> output publication prepare
   -> Artifact / Secret create-or-verify
-  -> SecureIngestionManifest commit + read-back verify
+  -> ExecutionResultProjection create-or-verify
+  -> SecureIngestionManifest commit + complete read-back verify
   -> INGESTED_DURABLE
   -> Quarantine deletion intent commit
   -> DELETE_PENDING
@@ -3976,18 +4009,20 @@ PENDING
 
 Artifact ID、Secret Reference ID、Manifest IDはExecution、Receipt、Quarantine Digest、Rule Version、Output Sequenceから決定論的に生成する。Crash後に同じIdentityへ同じPayloadを再適用する場合だけIdempotentに受理し、異なるDigestを上書きしない。Artifact Body / Secret Ciphertextは内部Staging Namespaceへ先にDurable Writeできるが、そのMetadataをCurrent Context Resourceとして公開してはならない。全Staging Payloadのread-back検証後、公開Artifact / Secret Metadata、SecureIngestionManifest、Result Ingestionの`INGESTED_DURABLE`遷移を同じApplication Database TransactionでCommitする。Manifest確定前のStaging IDをContext Selector、Knowledge Reducer、通常Read APIへ返さず、再開時にcreate-or-verifyする。
 
-`SecureIngestionManifest`は少なくとも、`ingestion_id`、`execution_id`、`receipt_id / digest`、`quarantine_id / ciphertext_digest`、Rule Version、Redacted Artifact Reference / Digest、Encrypted Raw Artifact Reference / Digest、Secret Reference / Metadata Digest、Redaction Metadata、作成時刻を含み、自身のCanonical Digestを持つ。全参照をread-back検証したTransactionだけが`INGESTED_DURABLE`へ進める。
+`SecureIngestionManifest`は少なくとも、`ingestion_id`、`execution_id`、`receipt_id / digest`、`quarantine_id / ciphertext_digest`、Rule Version、Redacted Artifact Reference / Digest、Encrypted Raw Artifact Reference / Digest、Secret Reference / Metadata Digest、Redaction Metadata、`ExecutionResultProjection` ID / Digest、作成時刻を含み、自身のCanonical Digestを持つ。ProjectionはProvider Status、Exit Code、Timeout / Cancellation、開始 / 終了時刻、安全なPreview Reference等の型付きControl Metadataを保持し、Raw Content、Secret Value、Provider一時Pathを含めない。全参照とProjectionをread-back検証したTransactionだけが`INGESTED_DURABLE`へ進める。
+
+Quarantine Sink / ReaderのConstructor、Factory、Repository Lookup、`for_execution()`相当は副作用を持たない。これらの処理からDeletion Intent再開、Key破棄、Ciphertext Unlinkを呼び出してはならない。Erasureは、Current Ingestion Stateを読み、Manifest、Projection、Manifest内の全Artifact / Secret Reference、Receipt、Authority、Deletion Intentを順にread-back認証した後にだけ、内部の明示的`erase_verified()`へ渡す。
 
 Quarantine Deletion IntentはManifest ID / Digest、Receipt、Quarantine Digest、Key MetadataへBindingする。再起動時の規則を次へ固定する。
 
 | Crash境界 | Recovery |
 |---|---|
 | Manifest Commit前 | 同じQuarantineから決定的Publicationを再開。Provider Actionは再実行しない |
-| Manifest Commit後・Deletion Intent前 | Manifestを検証し、Deletion Intent作成から再開 |
-| Deletion Intent後・Erasure前 | 同じIntentのKey破棄 / Ciphertext削除だけを再開 |
-| Erasure後・ExecutionResult確定前 | ManifestからExecutionResultを再構築。復号しない |
+| Manifest Commit後・Deletion Intent前 | Manifest、Projection、全参照Resourceを検証し、Deletion Intent作成から再開 |
+| Deletion Intent後・Erasure前 | Manifest、Projection、全参照Resource、Intentを検証してから同じIntentのKey破棄 / Ciphertext削除だけを再開 |
+| Erasure後・ExecutionResult確定前 | Manifest / ProjectionからExecutionResultを再構築。Sinkを作らず、復号、Adapter Collection、Provider照会を行わない |
 
-Retention失効、Key unavailable、Manifest不整合、Receipt不整合ではFail Closedし、平文Fallbackまたは通常Artifactへの昇格を行わない。
+Retention失効、Key unavailable、Manifest / Projection / Resource / Intent不整合、Receipt不整合ではFail Closedし、平文Fallback、追加削除または通常Artifactへの昇格を行わない。`INGESTED_DURABLE`以後に`collect_result()`を呼ぶ経路を禁止し、消去後の結果復元をProvider Availabilityへ依存させない。
 
 例:
 
@@ -4112,11 +4147,11 @@ Secret Storeは少なくとも以下を提供する。
 * 有効期限、失効、Rotation Metadata
 * Secret値を含まない安定したReference ID
 
-PlannerおよびAnalyzerへSecret値を渡さない。ExecutionPlanProposalの`arguments`には`credential_reference`等の参照だけを含め、Pre-dispatch成功後に永続化された未消費のDispatch ClaimへBindingされた`SecretInjectionBroker`だけが、実行直前にTrusted Adapter Channelへ値を注入する。解決されたSecretをApplication Callerへ返す汎用API、ExecutionPlan、ExecutionRequest、ExecutionResult、Exception、Prompt、Audit Logへ含めてはならない。
+PlannerおよびAnalyzerへSecret値を渡さない。ExecutionPlanProposalの`arguments`には`credential_reference`等の参照だけを含める。Pre-dispatch成功後に永続化された未消費のDispatch ClaimをExecutor内部Transactionが平文解放前にDurable消費し、実行直前にComposition Root固定のTrusted Adapter Dispatch Portへ値を注入する。Broker / Channel / CallbackをApplication Callerが構築する経路、解決されたSecretをApplication Callerへ返す汎用API、ExecutionPlan、ExecutionRequest、ExecutionResult、Exception、Prompt、Audit Logへ含めてはならない。
 
 Planner / Analyzer / Knowledge Reducerへ渡してよいのはSecret Reference ID、Credential Type、Associated Principal、Source Execution、Verification State等のMetadataだけとする。Knowledge ReducerはSecretDiscoveryReferenceをProvenance付きFindingへ変換し、Secret ValueをKnowledge Baseへ保存しない。
 
-Secret Valueの注入は、PolicyDecision Envelope内のexact DataAccessGrantに加え、Current Mission、Execution State `DISPATCH_CLAIMED`、Execution State Version、Dispatch Claim、ToolRef、Resolved Adapter、固定Adapter Channel、Operation、期限がすべて一致する場合だけ許可する。`AUTHORIZED`はSecret解決権限ではない。`BLOCKED`、Claim失効 / 消費済み、Mission停止、Epoch変更、Tool / Adapter不一致では拒否し、解決値をEnvironment、Command Line、通常IPC、Caller Callbackへ露出させない。
+Secret Valueの注入は、PolicyDecision Envelope内のexact DataAccessGrantに加え、Current Mission、Execution State `DISPATCH_CLAIMED`、Execution State Version、Dispatch Claim、完全なSecret Reference集合、ToolRef、Resolved Adapter、固定Adapter Dispatch Port、Operation、期限がすべて一致する場合だけ許可する。`AUTHORIZED`はSecret解決権限ではない。`BLOCKED`、Claim失効 / 消費済み、Mission停止、Epoch変更、Tool / Adapter / Secret集合不一致では拒否する。Claim Consumption Commitとread-back検証より前に復号せず、解決値をEnvironment、Command Line、通常IPC、Caller Callbackへ露出させない。
 
 Raw Tool OutputにSecretが含まれる可能性があるため、Secure Ingestionで分類・Secret Detection・Redactionを行う。Raw SecretをLLM Promptへ渡してはならない。
 
@@ -4193,7 +4228,11 @@ class GenerationAnchor(StrictImmutableBoundaryModel):
 
 RecoveryはExternal AnchorをSource of Truthとし、`generation + immutable_blob_id + state_digest`で正確なStateを再取得する。Anchor未更新のPrepared Blobは非権威として回収できる。Anchor更新済みでLocal Commit Markerが欠落している場合は、External BlobからMarkerを自動再構築する。Directory rename / replacement後のProcess Restartでも手動renameを要求してはならない。
 
-Production ProviderはAnchorが指すBlobを、置換可能なApplication作業Directoryとは独立したVault、OS-keystore-backed Store、または同等のTrusted Durable Storeから再取得できなければならない。Generation整数だけを外部保存しBlobをLocal Fileだけに置くProviderはDevelopment-onlyとし、Production起動を拒否する。Wrapped Key Stateは外部Store内でも暗号化された状態を維持し、Secret / Quarantine / Artifact / AuditのKey Domain分離を崩さない。
+Phase 0CはProtocolとIn-memory Test Doubleだけでなく、Production Compositionへ接続される`DurableAuthenticatedGenerationBackend`を実装する。このBackendはImmutable Content-addressed Blob StoreとNamespace-scoped Authenticated Anchor CASを単一のDurable Contractとして提供し、公開操作を`put_blob_if_absent`、`get_blob`、`compare_and_set_anchor`へ閉じる。Local-first Reference実装は、Audit / Wrapped Keyの置換可能なState Directoryとは別の明示設定されたControl-plane Rootに専用SQLite Databaseを置き、`synchronous=FULL`でEncrypted Immutable BlobをCommit・read-back検証した後、別のAtomic TransactionでAnchorをCAS更新する。CAS前Crashで残るBlobは非権威なOrphanであり、Anchorが未Commit Contentを指す状態を作らない。Anchor Authentication Keyは同じDatabaseまたはApplication Configへ保存せず、OS Key Storeまたは同等のOpaque `AnchorAuthenticator`から取得する。
+
+Audit Head StoreとWrapped Key ProviderのProduction Constructorはこの完全なBackendを必須Dependencyとする。Generation整数だけを外部保存するProvider、Local Slot Fileだけを正本にするProvider、In-memory Anchor / Blob Storeを受理するProduction OverloadまたはFallbackを実装しない。Development Test DoubleはMission / Caller入力から選択できない明示的Test Composition Rootだけで使用できる。
+
+Production BackendはAnchorが指すBlobを、置換可能なApplication作業Directoryとは独立したTrusted Durable Storeから再取得できなければならない。Backend Root自体の欠落、置換、Rollback ambiguity、認証失敗ではFail Closedし、Local Alternate Stateを使用しない。VaultまたはOS-keystore-backed Remote State Serviceは同じAtomic Contractの代替実装にできる。Wrapped Key Stateは外部Store内でも暗号化された状態を維持し、Secret / Quarantine / Artifact / AuditのKey Domain分離を崩さない。
 
 ---
 
@@ -4467,9 +4506,9 @@ Graph State / Mission State Mapping
 * ExecutionAdapterを交換してもExecutor Coreを変更しない
 * Executor Dispatch NodeにLangGraph Automatic Retryが適用されない
 * Pre-dispatch不一致は`AUTHORIZED -> BLOCKED`となりProvider APIを呼ばず、ExecutionResultも生成しない
-* `AUTHORIZED`だけではSecretを解決できず、Pre-dispatch成功と同一Transactionで作成した未消費Dispatch ClaimだけがTrusted Adapter ChannelへのJIT Secret Injectionを許可する
-* Dispatch Claim確定後のCrashではProvider Submitを自動再送せず、Reconciliationへ進む
-* Result Collection開始時刻、Tool Registry Digest、Tool固有`max_output_bytes`、Retention、Sink IDをDurable Authorityへ固定し、Execution作成時刻またはCaller設定から再計算しない
+* `AUTHORIZED`だけではSecretを解決できず、Pre-dispatch成功と同一Transactionで作成した未消費Dispatch Claimを平文解放前にDurable消費したExecutor-owned Transactionだけが固定Adapter Dispatch PortへのJIT Secret Injectionを許可する
+* Application CallerがSecret Broker、Channel Registry、Callbackを構築できず、Claim消費後のCrashではSecret InjectionとProvider Submitを自動再送せずReconciliationへ進む
+* Result Collection開始時刻、Tool Registry Digest、Tool固有`max_output_bytes`、Retention、Sink IDをExecutor所有のTrusted ClockからDurable Authorityへ固定し、Execution作成時刻、Caller Timestamp、Restart時刻から再計算しない
 * Grant / Snapshot PersistenceのRetryがDeterministic IDとIdempotent Upsertで重複Recordを作らない
 * 旧Authorization EpochのDecision / ApprovalをDispatchに使用できない
 * Mission Revision変更時にrun_idとthread_idが変わる
@@ -4509,14 +4548,16 @@ Mission-scoped Audit Sequence
 * Raw Contentを含まないReceipt / Metadata以外のAdapter Resultが通常Application DB、通常Audit Log、LLM Contextへ保存されない
 * Streaming途中またはReceipt取得直後のCrash後にQuarantineから取得 / Ingestionを再開し、External Actionを再実行しない
 * Caller生成Receipt、Quarantine Reference、Publication Object、Full-object compatibility loaderから平文を取得できず、Repository-bound `ingestion_id`だけがSecure Ingestionを開始できる
-* Secure Ingestion ManifestをDurable Commitし全参照をread-back検証する前にQuarantineを消去しない
-* Manifest Commit、Deletion Intent、Key破棄、Ciphertext削除、ExecutionResult確定の各Crash境界から、Provider再実行または手動File修復なしに再開できる
+* Quarantine Sink / Reader / Factory / Lookupは副作用を持たず、Secure Ingestion Manifest、ExecutionResultProjection、全参照Resource、Deletion Intentをread-back検証する前にQuarantineを消去しない
+* Manifest Commit、Deletion Intent、Key破棄、Ciphertext削除、ExecutionResult確定の各Crash境界から、Provider再実行、Adapter Result再収集、Quarantine再復号または手動File修復なしに再開できる
+* `INGESTED_DURABLE`以後はManifest-bound ExecutionResultProjectionだけからExecutionResultを再構築する
 * Secure Ingestion失敗がExternal Actionの自動再実行を引き起こさない
 * Secret ValueではなくSecretDiscoveryReferenceだけがKnowledge Flowへ入る
 * 未実装のSandbox Capabilityを利用可能として扱わない
 * Secret Store、Quarantine、Artifactで同一Key IDまたはKey Separation Tagを共用しない
 * Mission別Audit ChainのSequence重複を拒否し、独立して検証できる
-* Audit Head / Wrapped Key StateのExternal AnchorがGeneration、State Digest、Immutable Blob IDへBindingされ、Directory置換後の再起動でもAnchorから正確なCommitted Stateを回復する
+* Audit Head / Wrapped Key StateのProduction CompositionがDurable Authenticated Generation Backendを必須とし、External AnchorがGeneration、State Digest、Immutable Blob IDへBindingされ、Directory置換後の再起動でもAnchorから正確なCommitted Stateを回復する
+* ProductionでInteger-only、Local-slotまたはIn-memory Generation Providerを指定すると起動を拒否する
 
 ---
 
@@ -4760,7 +4801,7 @@ MVP完成条件を以下とする。
 * Result CollectionのRetentionがTrusted Collection開始時刻から固定され、Tool固有Output上限をCallerまたはGlobal設定で拡大できない
 * Provider Execution StateとResult Ingestion Stateを独立して永続化できる
 * Ingestion途中CrashからQuarantineを使って再開でき、External Actionを結果取得目的で再実行しない
-* Durable Secure Ingestion Manifest確定前にQuarantineを消去せず、消去後CrashではManifestからExecutionResultを再構築できる
+* Durable Secure Ingestion Manifest / ExecutionResultProjectionと全参照Resourceの検証前にQuarantineを消去せず、消去後CrashではAdapter / Providerへ再アクセスせずManifest / ProjectionからExecutionResultを再構築できる
 * AnalyzerがExecutionResultを構造化できる
 * Knowledge ReducerがProvenance付きでKnowledge Baseを更新する
 * AnalyzerのCandidateSessionObservationだけではSession Runtime Stateが変化しない
@@ -4891,7 +4932,8 @@ Unit / Integration Testに加えて、最低限以下のSecurity / Recovery Test
 * Secure Ingestion失敗時にProvider Execution Stateを推測変更せず、Actionを再実行しないこと
 * Full-object Ingestion factory、Caller生成Receipt / Quarantine Reference、Compatibility Loaderを直接呼び出しても平文を取得できないこと
 * Receipt永続化 / Ingestion Claim前、Manifest Commit前後、Deletion Intent前後、Key破棄 / Ciphertext削除前後、ExecutionResult確定前後のCrash Recovery
-* Quarantine消去後にDurable ManifestだけからExecutionResultを再構築できること
+* Quarantine Sink / Reader / Factory / Lookupの生成だけではDeletion Intent、Key破棄、Ciphertext削除が進まないこと
+* Quarantine消去後にDurable Manifest / ExecutionResultProjectionだけから、Adapter Collection、Provider照会、Quarantine復号なしでExecutionResultを再構築できること
 * Audit Eventの削除、並べ替え、内容変更、Previous Hash変更の検出
 * AdapterRawResultがAnalyzer、Planner、Knowledge Baseへ直接渡らないこと
 * Raw Tool Outputが通常Application DBと通常Audit Logへ保存されないこと
@@ -4901,7 +4943,10 @@ Unit / Integration Testに加えて、最低限以下のSecurity / Recovery Test
 * 同じPolicyDecisionから2件目のExecutionRecordを作成できないこと
 * Adapter送信前後のProcess Crashと自動再送防止
 * `AUTHORIZED`中、Pre-dispatch失敗後、期限切れ / 消費済みDispatch Claim、Tool / Adapter不一致からのSecret解決拒否
-* Dispatch Claim発行後・Secret Injection前後・Provider Submit前後のCrashでSecretまたは外部Actionを自動再送しないこと
+* Public Export / ConstructorからCaller所有Broker、Channel Registry、Callbackを組み立ててSecret配送できないこと
+* Dispatch Claim発行後、Consume Commit前後、Adapter Entry / Return前後、Provider Submit前後のCrashでSecretまたは外部Actionを自動再送しないこと
+* Claim Consumption失敗時にSecretを復号せず、Test AdapterがSecret Valueを保持しないこと
+* Callerが未来 / 過去の`now`を渡せず、Trusted ClockだけがCollection開始、Lease、Retentionを決定すること
 * Executor Dispatch、C2 Submit、MCP Side-effect Call、Local Side-effect ExecutionへLangGraph Automatic Retryが適用されないこと
 * TaskHandle受信前Crashに対する`reconcile()`
 * `reconcile()`の`UNSUPPORTED / UNKNOWN / 不確実なNOT_FOUND`から`OUTCOME_UNKNOWN`への遷移
@@ -4979,6 +5024,8 @@ Unit / Integration Testに加えて、最低限以下のSecurity / Recovery Test
 * Audit Head / Wrapped Key StateのPrepare前、Blob Durable Write後、External Anchor CAS前後、Local Marker更新前後のCrashから正確なGenerationを回復すること
 * State DirectoryをCAS境界で置換してProcessを再起動しても、External AnchorのDigest / Immutable Blob IDから自動回復し、手動renameを要求しないこと
 * External Anchorが進んだ一方で対応Blobが欠落・改ざんされている場合に旧Alternate StateへFallbackせずFail Closedすること
+* Durable Production Generation BackendがProcess Restart後もAnchor / Blobを回復し、Production ConstructorがInteger-only、Local-slot、In-memory Test Doubleを拒否すること
+* Dispatch / Secret Delivery、Ingestion / Erasure / Result Recovery、Collection Timing、Authenticated GenerationのStateful FamilyをProperty-basedまたはRule-based State Machineで検証すること
 
 ---
 
@@ -5175,3 +5222,7 @@ Generic Resume、旧base-refresh Status、Label変更は再開権限ではない
 | Durable Execution Authority | `AUTHORIZED`がPre-dispatch前のSecret解決やCaller再構築Sinkの権限として広すぎた | Pre-dispatch成功時の`DISPATCH_CLAIMED`、単回Dispatch Claim、Trusted Adapter ChannelへのJIT Secret Injection、Result Collection Authorityを追加 | Policy認可と今この瞬間のSecret / Side-effect / Collection権限を分離するため | Executor、Secret Store、Adapter、Execution / Tool Repository、RawResultSink | AUTHORIZED / BLOCKEDからのSecret拒否、Claim消費、Cross-tool上限、Collection開始Retention |
 | Durable Secure Ingestion | Full-object PublicationとMemory上のResultがQuarantine消去を先行できた | Repository-bound ingestion ID、Durable Manifest、Deletion Intent、`INGESTED_DURABLE -> DELETE_PENDING -> QUARANTINE_ERASED`を追加 | Caller権限mintingと消去後Result喪失を同じState Machineで防ぐため | Secure Ingestion、Quarantine、Artifact / Secret Store、Result Repository | Direct factory拒否、各Crash境界Resume、消去後Manifest復元 |
 | Authenticated Generation Commit | 外部AnchorがGeneration整数だけで、Directory置換後にCommitted Stateへ到達不能になり得た | Generation、State Digest、Immutable Blob ID、Previous Anchor DigestをCAS Bindingする共通Coordinatorを追加 | Audit HeadとWrapped Key Stateを手動Path修復なしに回復するため | Audit Head Store、Key Provider、Trusted Blob / Anchor Store | CAS前後Crash、Directory置換Restart、Blob欠落 / 改ざんFail Closed |
+| Executor-owned Secret Delivery | Public Broker / Channel RegistryをCallerが構築でき、Delivery後・Claim消費前Crashで再注入できた | Secret配送をExecutor内部の固定Adapter Dispatch Transactionへ閉じ、Claimを平文解放前にDurable消費・read-back検証する | Composition provenanceとAt-most-once Crash Semanticsを同じ境界で強制するため | Executor、Dispatch Claim Repository、Secret Store、Trusted Adapter Registry | Public構築拒否、Consume前後 / Adapter Return後Crash、再注入 / 再Submit 0件 |
+| Verified Erasure / Result Projection | Sink生成がDeletionを再開し、Quarantine消去後のResult復元がAdapter再収集へ依存した | 全LookupをSide-effect-freeにし、Manifest / Projection / Resource / Intent検証後だけ明示的Erasure、以後はProjection-only Result復元 | 未検証削除と消去済みOutputの再収集を同時に防ぐため | Secure Ingestion、Quarantine、Result Repository、Executor | Constructor非削除、全Crash境界、Post-erasure Adapter Call 0件 |
+| Trusted Collection Clock Ownership | Caller supplied `now`がCollection開始とRetentionを前後へ操作できた | Executor Composition RootのTrusted Clockだけから開始時刻とLeaseを一度生成し、Public Security APIからCaller時刻を除去 | Retention Extension / Premature Expiryを防ぐため | Executor、Result Collection Authority Repository、RawResultSink Factory | Future / Backdated Caller Clock無効、Restart安定性State Machine |
+| Durable Production Generation Backend | Digest / Blob CoordinatorがIn-memory Test DoubleだけでProductionにInteger-only Pathが残った | Durable Authenticated Blob / CAS Anchor BackendをProduction Constructor必須とし、Test / Legacy Provider選択をMissionから分離する | Process RestartとDirectory置換後もContent-bound Generationを実際の本番構成で回復するため | Audit Head Store、Wrapped Key Provider、Generation Backend、Composition Root | Durable Restart、Production Legacy拒否、CAS / Corruption State Machine |

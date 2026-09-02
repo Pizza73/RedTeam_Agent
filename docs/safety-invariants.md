@@ -34,9 +34,10 @@
 
 - Secret ValueはPlanner、Analyzer、Knowledge Reducer、Knowledge Base、Promptへ渡さない。
 - Planには`credential_reference`等の参照だけを含める。
-- SecretはPre-dispatch成功後の未消費Dispatch Claimを検証したBrokerだけが、固定されたTrusted Adapter Channelへ実行直前に注入する。
+- Secret配送はExecutor-owned Dispatch Transactionだけが行う。Application CallerがBroker、Channel Registry、Callbackを構築または注入できず、Composition Root固定のAdapter Dispatch Portだけを使用する。
+- Current Dispatch Claimを平文復号前にOCCでDurable消費してread-back検証する。Claim消費後のCrashまたは不明な結果ではSecret配送とProvider Submitを再実行しない。
 - `AUTHORIZED`、`BLOCKED`、失効 / 消費済みClaim、Mission / Epoch / Tool / Adapter不一致からSecretを解決しない。
-- Secret StoreはApplication Callerへ平文bytesを返す汎用Resolve、任意Callback、任意Environment / Command Line注入Interfaceを提供しない。
+- Secret StoreはApplication Callerへ平文bytesを返す汎用Resolve、公開Broker / Channel Constructor、任意Callback、任意Environment / Command Line注入Interfaceを提供しない。
 - 解決SecretをPlan、Result、Exception、Traceback、Audit Log、通常DBへ含めない。
 - Raw Tool Outputは非信頼入力であり、直接Promptへ連結しない。
 - Quarantine、Classification、Secret Detection、Redactionを経たArtifactだけをLLM可視にする。
@@ -53,14 +54,16 @@
 - Key unavailable/revoked/mismatch/unsupported algorithmはFail Closed。
 - Audit HeadとWrapped Key StateのExternal Generation AnchorはGenerationだけでなくState DigestとImmutable Blob IDへBindingする。
 - Anchorが指すCommitted BlobをTrusted Storeから回復できなければ、Local Alternate StateへFallbackせずFail Closedにする。ProductionはGeneration整数だけを外部保存するFile-only Providerを使用しない。
+- ProductionのAudit Head / Wrapped Key Constructorは、Immutable BlobとAuthenticated CAS Anchorを一体でDurableに提供するGeneration Backendを必須とする。Integer-only、Local-slot、In-memory Test DoubleをProductionで受理しない。
 
 ## Result collection and durable ingestion
 
-- Result Collection開始時にTrusted Clock、exact Tool Definition、Provider Task、Sink、Mission DeadlineへBindingしたDurable Authorityを作成する。
-- RetentionはCollection開始時刻から一度だけ計算して保存し、Execution作成時刻またはRestart時刻から再計算しない。
+- Result Collection開始時にExecutorがComposition Rootから注入されたTrusted Clockを1回読み、exact Tool Definition、Provider Task、Sink、Mission DeadlineへBindingしたDurable Authorityを作成する。Security-sensitive Collection APIはCaller supplied `now`を受け取らない。
+- RetentionはTrusted Collection開始時刻から一度だけ計算して保存し、Execution作成時刻、Caller / Provider TimestampまたはRestart時刻から再計算しない。
 - Tool固有`max_output_bytes`はTrusted Registryから解決し、CallerまたはGlobal設定で拡大しない。
-- Redacted Artifact、Secret Reference、Secure Ingestion ManifestをDurableに確定してからQuarantine Deletion Intentを作成する。
-- Manifest Commit、Deletion Intent、Key破棄、Ciphertext削除、ExecutionResult確定の各Crash境界を、Provider再実行、平文Fallback、手動File修復なしに回復する。
+- Quarantine Sink / Reader / Factory / Lookupは副作用を持たない。Redacted Artifact、Secret Reference、ExecutionResultProjection、Secure Ingestion ManifestをDurableに確定して全参照をread-back検証してからQuarantine Deletion Intentを作成または再開する。
+- `INGESTED_DURABLE`以後はManifest / ExecutionResultProjectionだけからExecutionResultを再構築し、Adapter Collection、Provider照会、Quarantine復号を再実行しない。
+- Manifest Commit、Deletion Intent、Key破棄、Ciphertext削除、ExecutionResult確定の各Crash境界を、Provider再実行、平文Fallback、追加の未検証消去、手動File修復なしに回復する。
 
 ## External effects and retry
 

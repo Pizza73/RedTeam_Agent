@@ -25,18 +25,16 @@ ACTIVE PR STATE: Resolve from trusted GitHub evidence; do not copy from this sna
   `9060c6c7ded3158072989035cab78c5f97946642`
 - Current Phase: Phase 0C (`phase-0c`, `ai-loop-blocked`)
 - Current implementation HEAD:
-  `39859abf240c05d932df515b84e4932918577688`
-- The second formal Phase 0C review retained six P1 findings across
-  `authorization-lifecycle`, `secret-plaintext-boundary`, `audit-recovery-durability`, and
-  `filesystem-concurrency-retention`:
-  `https://github.com/Pizza73/RedTeam_Agent/pull/3#pullrequestreview-5081290374`.
-- The trusted recurrence stop requires a coherent redesign before another local fix:
-  `https://github.com/Pizza73/RedTeam_Agent/pull/3#issuecomment-5498115527`.
-- An older local runner incorrectly reused post-refresh Resume state after that stop. The runner was
-  terminated, `ai-loop-blocked` restored, the implementation label removed, and the operator
-  correction recorded at:
-  `https://github.com/Pizza73/RedTeam_Agent/pull/3#issuecomment-5498152000`.
-- The approved coherent redesign is documented in
+  `4e86a7e4f5a6578133cd3579fbb5a004ab5c80c3`
+- The latest formal Phase 0C review retained six P1 findings across
+  `authorization-lifecycle`, `secret-plaintext-boundary`, `audit-recovery-durability`,
+  `filesystem-concurrency-retention`, and `integrity-cryptography-keys`:
+  `https://github.com/Pizza73/RedTeam_Agent/pull/3#pullrequestreview-5085287765`.
+- The trusted recurrence gate and design stop require a second coherent redesign before another
+  implementation request:
+  `https://github.com/Pizza73/RedTeam_Agent/pull/3#issuecomment-5503904111` and
+  `https://github.com/Pizza73/RedTeam_Agent/pull/3#issuecomment-5503904489`.
+- The human-approved second coherent-redesign direction is documented in
   `docs/review/phase-0c-coherent-redesign.md` and the corresponding Source-of-Truth changes on the
   current governance branch. This snapshot does not itself constitute a Design Approval marker.
 
@@ -62,16 +60,17 @@ base PASS, exact labels/request, and current default-branch evidence remain the 
 Do not restart the local runner or issue a generic Resume while the latest Phase 0C gate is the
 recurrence stop above. After this design governance change is human-reviewed and merged:
 
-1. implement and validate the dedicated `DESIGN_CHANGE_REQUIRED` / `DESIGN_APPROVED` control path,
-   latest-gate precedence, one-use base-refresh transition, and trigger-time revalidation in a
-   human-reviewed governance change;
-2. incorporate the resulting governance and approved design commit into PR #3 using only the
-   exact-HEAD base-refresh operation; that operation must keep the Phase 0C label and stop state;
+1. human-review and merge this second coherent redesign into the default branch;
+2. incorporate the resulting approved design commit into PR #3 using only the exact-HEAD
+   base-refresh operation; that operation must keep the Phase 0C label and stop state;
 3. wait for current-HEAD required checks, then issue the dedicated Design Approval bound to the
-   recurrence gate, full current HEAD, Phase 0C and incorporated design commit;
-4. resume once with `RESUME_AFTER_DESIGN_APPROVAL` and implement the Durable Execution Lifecycle,
-   Durable Secure Ingestion and Authenticated Generation Commit as one coherent redesign; and
-5. run the complete Phase 0C gate and one fresh exhaustive formal review.
+   latest recurrence gate, full current HEAD, Phase 0C and incorporated design commit;
+4. resume once with `RESUME_AFTER_DESIGN_APPROVAL` and implement Executor-owned
+   consume-before-release Secret delivery, trusted collection Clock ownership, side-effect-free
+   verified erasure, manifest/projection-only result recovery and the durable Production generation
+   backend as one coherent redesign; and
+5. run the complete Phase 0C gate, update all invariant-family state-machine evidence and request
+   one fresh exhaustive formal review.
 
 After Phase 5 PASS, the local orchestrator revalidates all configured Phase records, the latest
 Phase status, current-HEAD checks, stop labels and current `main` ancestry. It then submits one

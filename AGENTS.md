@@ -126,18 +126,24 @@ The final implementation report must include:
 - Security-sensitive records are verified on write and read.
 - Untrusted JSON duplicate keys and unknown fields are rejected at the actual boundary.
 - Secrets never enter Planner, Analyzer, Knowledge Base, normal DB/logs, exceptions, tracebacks, or prompts.
-- Only references are carried in plans. `AUTHORIZED` is not secret-resolution authority; only a
-  repository-backed, unconsumed post-pre-dispatch Dispatch Claim may inject a secret just in time
-  into the fixed trusted Adapter channel. No general plaintext-returning resolve API is allowed.
+- Only references are carried in plans. `AUTHORIZED` is not secret-resolution authority. Only the
+  Executor-owned, non-public dispatch transaction may durably consume and read-back verify the
+  repository-backed, unconsumed post-pre-dispatch Dispatch Claim before releasing plaintext once
+  into the composition-root-fixed trusted Adapter dispatch port. Callers cannot construct a
+  Broker, channel registry or callback, and no general plaintext-returning resolve API is allowed.
 - Raw tool output is classified, scanned, redacted, and only then made LLM-visible.
 - Caller-created receipts, quarantine references, publication objects, or compatibility loaders are
-  not ingestion authority. Durable ingestion manifest verification precedes quarantine erasure.
+  not ingestion authority. Quarantine constructors and lookups are side-effect free. Durable
+  manifest, result-projection, referenced-resource and deletion-intent verification precedes
+  explicit quarantine erasure; post-erasure recovery never recollects from an Adapter or Provider.
 - Secret Store, raw-result quarantine, and artifact encryption use separate key domains.
 - Encryption failure is fail-closed; there is no plaintext or cross-domain fallback.
-- Result collection retention starts at the trusted persisted collection-start time, uses the exact
-  trusted ToolDefinition output limit, and is stable across restart.
+- Result collection retention starts at the Executor-owned Clock's trusted persisted
+  collection-start time, uses the exact trusted ToolDefinition output limit, rejects caller
+  security timestamps, and is stable across restart.
 - Audit-head and wrapped-key generation anchors bind generation, state digest, and immutable blob
-  identity; missing committed blobs fail closed without local alternate fallback.
+  identity. Production requires a durable authenticated blob/anchor backend and rejects
+  integer-only, local-slot and in-memory fallbacks; missing committed blobs fail closed.
 - External side-effect dispatch is absent in Phase 0A and uses no automatic retry in later phases.
 - Final PR merge is unavailable to Codex and GitHub Actions. Only the trusted local orchestrator may
   issue one exact-HEAD merge after every configured Phase and final check passes; an uncertain merge
