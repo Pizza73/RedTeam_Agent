@@ -261,6 +261,10 @@ machine-readable phase record.
 - Native review remains pending: confirm the single runner-authored `@codex review` follows the
   current-head ready marker and contains `redteam-local-codex-trigger`. Manual review comments are
   not accepted as phase-gate evidence.
+- An audit-binding review finding must distinguish the implementation request's input HEAD from the
+  ready marker's output HEAD and compare the marker against canonical JSON digest, not raw file
+  bytes. CI already rejects a non-ancestor input, wrong request binding, wrong output HEAD, or wrong
+  canonical digest; do not rewrite valid audit evidence to satisfy the opposite interpretation.
 - `AI_LOOP=BLOCKED`: inspect the latest trusted bot marker and workflow run. Do not remove the stop
   latch, alter review evidence, or weaken CI to continue. A transient lifecycle projection mismatch
   should be reconciled by the trusted transition rather than treated as new authorization.
