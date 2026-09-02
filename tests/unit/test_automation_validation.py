@@ -409,6 +409,47 @@ process.stdout.write(helper.canonicalDigest(policy));
     assert node_digest == canonical_digest(policy)
 
 
+def test_loop_control_projection_policy_is_shared_and_block_safe() -> None:
+    helper_path = REPO_ROOT / "automation" / "loop_control_state.js"
+    workflow = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(
+        encoding="utf-8"
+    )
+    approval = (REPO_ROOT / "automation" / "approve_design_resume.js").read_text(
+        encoding="utf-8"
+    )
+
+    assert "loop_control_state.js" in workflow
+    assert "shouldPublishReviewReady" in workflow
+    assert "Blocked PR passed deterministic checks" in workflow
+    assert "loop_control_state" in approval
+    assert "assertDesignApprovalProjection" in approval
+
+    node = shutil.which("node")
+    assert node is not None
+    policy_test = """
+const control = require(process.argv[1]);
+const blocked = ['ai-loop', 'phase-0c', 'ai-loop-blocked'];
+if (control.shouldPublishReviewReady(blocked)) process.exit(1);
+control.assertDesignApprovalProjection(
+  [...blocked, 'ai-needs-review'], 'phase-0c', true
+);
+let rejected = false;
+try {
+  control.assertDesignApprovalProjection(
+    [...blocked, 'ai-needs-implementation'], 'phase-0c', true
+  );
+} catch (_) {
+  rejected = true;
+}
+if (!rejected) process.exit(1);
+"""
+    subprocess.run(  # noqa: S603 - fixed node executable and test-only source.
+        [node, "-e", policy_test, str(helper_path)],
+        cwd=REPO_ROOT,
+        check=True,
+    )
+
+
 def test_generic_resume_and_recovery_reject_design_stop() -> None:
     resume = (
         REPO_ROOT / ".github" / "workflows" / "resume-ai-loop.yml"

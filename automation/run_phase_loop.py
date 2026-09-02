@@ -394,11 +394,9 @@ def select_finding_key(review_result: dict[str, Any]) -> str:
     raise UntrustedEvidenceError("first review finding has no stable finding key")
 
 
-def select_evidence_action(
-    *, request_exists: bool, ready_exists: bool, labels: frozenset[str]
-) -> str:
-    implementation_pending = bool(labels.intersection({"ai-needs-implementation", "ai-needs-fix"}))
-    if request_exists and implementation_pending:
+def select_evidence_action(*, request_exists: bool, ready_exists: bool) -> str:
+    """Resolve work from trusted current-HEAD evidence, not UI projection labels."""
+    if request_exists:
         return "implementation"
     if ready_exists:
         return "review"
@@ -2445,6 +2443,13 @@ class PhaseLoop:
                 )
             return True
         if recurring_families:
+            check_state = self.check_state(state.head_sha)
+            if check_state == "pending":
+                return True
+            if check_state != "success":
+                raise LoopBlockedError(
+                    "design-approved resume requires successful refreshed current-head checks"
+                )
             self.log(
                 f"waiting for dedicated design approval in {state.phase} at "
                 f"{state.head_sha[:12]}"
@@ -3212,7 +3217,6 @@ class PhaseLoop:
             action = select_evidence_action(
                 request_exists=request is not None,
                 ready_exists=ready is not None,
-                labels=state.labels,
             )
 
             if action == "implementation" and request is not None:

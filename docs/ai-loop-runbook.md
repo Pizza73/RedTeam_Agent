@@ -26,7 +26,9 @@ repeats this sequence:
 
 The process stops on a failure limit, `BLOCKED`, a runtime limit, the Phase 4/5 Human Gates, or
 successful project merge. It never deploys. Closing it with Ctrl-C only pauses local polling;
-GitHub comments, labels and checks preserve the state for a later restart.
+trusted GitHub comments, statuses and checks preserve authority for a later restart. Lifecycle
+labels are a reconstructable operator projection; only the Phase label and conservative stop latch
+participate in routing/safety checks.
 
 ## One-time repository setup
 
@@ -167,6 +169,11 @@ Use `--dry-run` to validate local/GitHub prerequisites and report the next actio
 comment or dispatching a workflow. A normal restart is idempotent: the runner recognizes its own
 SHA-bound trigger markers and does not intentionally request the same work twice.
 
+The runner selects work from current-HEAD trusted evidence, not from transient lifecycle labels. A
+current implementation request wins over an older ready projection; otherwise a current ready
+record selects review. Delayed `ai-needs-*` projection updates therefore do not create a false stop
+or duplicate action.
+
 The runner may use GitHub's **Update a pull request branch** operation. This merges the current
 default branch into the long-lived PR branch only after the approver-restricted workflow records a
 SHA-bound `redteam/base-refresh/...` commit status. The status is attached to the old full HEAD,
@@ -224,7 +231,10 @@ machine-readable phase record.
   then run **Approve AI Loop Design Resume** with the latest blocking gate permalink, full current
   HEAD, full design commit SHA and repository design permalink. Restart the runner only after the
   trusted `redteam-design-approval` marker exists. The marker is single-use; do not remove the stop
-  label or post a generic Resume manually.
+  label or post a generic Resume manually. CI suppresses Review Ready publication while the stop
+  latch is present. If an older control run left only `ai-needs-review`, the approval workflow
+  treats it as a stale UI projection and removes it in the authorized label transition; fix/pass/
+  provider-gate projections remain conflicting and are rejected.
 - Before Phase 4 or Phase 5: approve `automation/provider-gates.json` in a separate,
   human-reviewed `governance-change` PR, merge it to `main`, run **Advance AI Loop Phase**, then
   restart the local command. The approved phase is automated, but the gate itself is not.
@@ -245,8 +255,9 @@ machine-readable phase record.
 - Native review remains pending: confirm the single runner-authored `@codex review` follows the
   current-head ready marker and contains `redteam-local-codex-trigger`. Manual review comments are
   not accepted as phase-gate evidence.
-- `AI_LOOP=BLOCKED`: inspect the latest trusted bot marker and workflow run. Do not bypass labels,
-  alter review evidence, or weaken CI to continue.
+- `AI_LOOP=BLOCKED`: inspect the latest trusted bot marker and workflow run. Do not remove the stop
+  latch, alter review evidence, or weaken CI to continue. A transient lifecycle projection mismatch
+  should be reconciled by the trusted transition rather than treated as new authorization.
 - `DESIGN_CHANGE_REQUIRED`: stop the runner. A base refresh may incorporate approved governance but
   cannot resume implementation. Confirm the latest recurrence gate, merged design commit, current
   PR HEAD/checks and single-use Design Approval marker before restarting.

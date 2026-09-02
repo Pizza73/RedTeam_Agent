@@ -49,20 +49,24 @@
   使用済みTransitionまたは後発Gateを越えたTransitionを再利用できない
 - Design Stop後の再開Recordは、停止Gate permalink、Current Phase、Current 40桁HEAD、Current default
   branchへ包含されたDesign commit、Design permalink、Policy Digestを完全Bindingし、1回だけ消費できる
-- Runnerはbase refresh、Label write、Workflow dispatchの各後、およびCodex Trigger直前に最新Gate、Current
-  HEAD、全managed / stop label、Transition消費状態を再取得し、Drift時は`ai-loop-blocked`を維持する
+- Runnerはbase refresh、Trusted Workflow dispatchの各後、およびCodex Trigger直前に最新Gate、Current
+  HEAD、Stop latch、Transition消費状態を再取得し、Authority Drift時は`ai-loop-blocked`を維持する。
+  Transient Lifecycle Labelの遅延・残存だけでは停止せず、Trusted Transitionで正規化する
 - Phase Cycle、同一exact Root Cause、CI Failureの自動Loop上限はすべて5回とし、設定値が5以外なら
   Fail Closedにする。Semantic Invariant Familyの再発上限は2回とし、設定値が2以外ならFail Closedにする
-- Required Check成功前にReview Gateを記録しない
+- Required Check成功前にReview Gateを記録しない。`ai-loop-blocked`中のCI成功ではReview Ready marker、
+  `ai-needs-review`、review pending statusを生成せず、Design Approval用のCheck結果だけを残す
 - 自動Phase遷移は`ai-review-passed` markerを解除するまでRunnerが待機し、next追加後にcurrentを削除する。
   各境界でfreshなopen PR、exact HEAD、marker、隣接Phaseを再検証し、無関係Labelを完全置換で消さない。
   marker欠落、非隣接/3件以上のPhase、HEAD/state driftはFail Closedにする
-- 同じRequest/Reviewを再処理せず、停止後にGitHub Evidenceから再開できる
+- RunnerはCurrent-HEAD Trusted RequestをTransient Labelなしでも実行対象として解決し、Requestを
+  Ready markerより優先する。同じRequest/Reviewを再処理せず、停止後にGitHub Evidenceから再開できる
 - Phase 4/5は`ai-human-gate`中に停止し、承認済みProvider Gate遷移後だけ再開する
 - OpenAI API Keyを要求せず、GitHub CredentialをCodex Promptまたは実行環境へ渡さない
 - Active PRのCurrent Phaseは、exact phase label、`github-actions[bot]`のCurrent-HEAD
   Implementation Request、Current HEADへ包含された隣接Prior-Phase PASSでのみ解決する。
-  複数の包含PASSはGit祖先関係で唯一の最大候補を要求し、コメント順や互いに比較不能な候補を拒否する
+  複数の包含PASSはGit祖先関係で唯一の最大候補を要求し、コメント順、Transient Lifecycle Label、
+  互いに比較不能な候補をAuthorityとして拒否する
 - 累積PRのCurrent Phaseを回復するときは、trusted current-Phase finding/gate、Phase Base、
   reviewed HEADからcurrent HEADへの祖先関係、両HEADの同一Git tree、Current-HEAD Checkを検証し、
   Current Phaseの完全Gateを実行してから同じPhaseのfresh reviewへ戻す。隣接Prior Phaseへは戻さない
@@ -87,6 +91,9 @@
   祖先となるPartial Orderで唯一の最大候補だけをReview Baseにし、最大候補が複数ならFail Closedにする
 - Base refreshは`expected_head_sha`とCurrent default-branch SHAへ固定し、Final merge APIを
   呼ばない
+- Design ApprovalはStop latch、Current Phase / HEAD、最新Blocking Gate、Required Check、Design commit
+  の包含を再検証する。Current HEADの旧`ai-needs-review`はAuthorityではないため許容して最終Label遷移で
+  除去するが、`ai-needs-fix`、`ai-review-passed`、`ai-human-gate`等の競合状態は拒否する
 - Final mergeはLocal Orchestratorだけが実行し、`phase-5`、`ai-project-complete`、
   `ai-review-passed`、全Phase PASS Chain、Current-HEAD Check、Trusted Phase Status、
   Current default-branch ancestryを再検証する
