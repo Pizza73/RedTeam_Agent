@@ -2,12 +2,13 @@
 
 ## Status
 
-- Design status: human-approved direction; governance implementation and exact-HEAD Design Approval remain pending
+- Design status: human-approved second coherent-redesign direction; governance merge and exact-HEAD Design Approval remain pending
 - Current implementation PR: #3 (`ai/redteam-agent-phase-loop`)
-- Blocked implementation HEAD: `39859abf240c05d932df515b84e4932918577688`
-- Formal review: <https://github.com/Pizza73/RedTeam_Agent/pull/3#pullrequestreview-5081290374>
-- Trusted recurrence stop: <https://github.com/Pizza73/RedTeam_Agent/pull/3#issuecomment-5498115527>
-- Operator correction after invalid old-Resume reuse: <https://github.com/Pizza73/RedTeam_Agent/pull/3#issuecomment-5498152000>
+- Blocked implementation HEAD: `4e86a7e4f5a6578133cd3579fbb5a004ab5c80c3`
+- Formal review: <https://github.com/Pizza73/RedTeam_Agent/pull/3#pullrequestreview-5085287765>
+- Trusted recurrence gate: <https://github.com/Pizza73/RedTeam_Agent/pull/3#issuecomment-5503904111>
+- Trusted design stop: <https://github.com/Pizza73/RedTeam_Agent/pull/3#issuecomment-5503904489>
+- Prior coherent-redesign review: <https://github.com/Pizza73/RedTeam_Agent/pull/3#pullrequestreview-5081290374>
 
 This document records the coherent redesign required after the following invariant families
 recurred in a second Phase 0C formal review:
@@ -16,10 +17,13 @@ recurred in a second Phase 0C formal review:
 - `secret-plaintext-boundary`
 - `audit-recovery-durability`
 
-The same review also retained a `filesystem-concurrency-retention` finding. The design closes all
-six retained P1 findings as one state-transition and durability redesign. It does not authorize a
-new implementation request by itself. Resume requires the dedicated current-HEAD Design Approval
-defined in `docs/ai-development-loop.md`.
+The latest review retained six P1 findings across those families plus
+`filesystem-concurrency-retention` and `integrity-cryptography-keys`. They show that the first
+coherent redesign did not yet fix construction provenance, consume-before-release ordering,
+side-effect-free recovery, result reconstruction, trusted-clock ownership, or a durable
+Production generation composition. This revision closes those gaps as one state-transition and
+durability redesign. It does not authorize a new implementation request by itself. Resume requires
+the dedicated current-HEAD Design Approval defined in `docs/ai-development-loop.md`.
 
 ## Problem statement
 
@@ -81,31 +85,58 @@ The immutable record binds:
 The Claim is not a bearer token. Services load the Current Claim through the Execution ID and
 revalidate all bindings. A caller-provided Claim object or copied Claim ID is insufficient.
 
-### Secret injection
+### Executor-owned Secret delivery transaction
 
 Plans, PolicyDecision, ExecutionRequest and Graph State carry Secret Reference metadata only.
-There is no general application API that returns plaintext bytes.
+There is no general application API that returns plaintext bytes, accepts a plaintext consumer, or
+constructs a Secret delivery channel.
 
-`SecretInjectionBroker` performs the following fixed transaction:
+Secret delivery is not a separately constructible service. The trusted Application composition
+root creates Executor with its fixed `TrustedAdapterRegistry`, Secret Store and Dispatch Claim
+Repository. Executor owns one private delivery transaction and invokes it only as part of the same
+non-retryable Adapter submit attempt. The package must not export a `SecretInjectionBroker`,
+`TrustedSecretChannelRegistry`, `SecretAdapterChannel`, callback protocol, or public injection
+method that an Application caller can assemble with caller-owned code. Runtime type checks or
+nominally private names are not construction provenance.
 
-1. load the Current unconsumed Dispatch Claim;
-2. load Current Mission / Execution / PolicyDecision / exact DataAccessGrant;
-3. load and verify Current Secret metadata and retention / revocation state;
-4. resolve the fixed trusted Adapter channel from the Tool / Adapter registry;
-5. decrypt and inject the value into that channel immediately before submit;
-6. destroy the temporary buffer and mark the Claim consumed regardless of submit result.
+The fixed transaction is ordered as follows:
 
-The caller cannot choose a callback, consumer, environment variable, command line, endpoint or
-alternate Adapter channel. `AUTHORIZED`, `BLOCKED`, `RUNNING`, terminal states, expired / consumed
-Claims and Mission / Epoch / Tool / Adapter mismatch all deny Secret injection.
+1. load and verify Current Mission, Execution, PolicyDecision, exact DataAccessGrant, Tool and
+   fixed Adapter from trusted repositories;
+2. load the Current unconsumed Dispatch Claim and the complete authorization-bound set of Secret
+   Reference IDs;
+3. in one OCC transaction, transition that exact Claim to consumed for the one Adapter dispatch;
+4. read back the consumed record and verify its digest, state version and consumption identity;
+5. only after durable consumption, load Current Secret metadata, verify retention / revocation,
+   decrypt into bounded mutable buffers and invoke the already-selected trusted Adapter dispatch
+   port exactly once;
+6. zero all temporary buffers on every return, cancellation and exception path; and
+7. persist a confirmed Task identity when available, otherwise enter Reconciliation without
+   replaying Secret delivery or Provider submit.
 
-Phase 0C uses a test double of the same channel interface. Phase 4 / 5 production Adapters must use
-the process-isolated channel required by the Sandbox policy. In-process trusted components remain
-part of the TCB; untrusted plugin code must not execute inside that TCB.
+Consumption failure occurs before decryption and releases no plaintext. A crash after consumption
+but before, during, or after Adapter entry is deliberately at-most-once: restart does not inject
+again and does not call submit again. It reconciles using the immutable execution identity and
+idempotency key; an unresolvable outcome becomes `OUTCOME_UNKNOWN`. This chooses safety over
+availability instead of claiming cross-process exactly-once delivery.
+
+The caller cannot choose a callback, consumer, environment variable, command line, endpoint,
+registry or alternate Adapter channel. `AUTHORIZED`, `BLOCKED`, `RUNNING`, terminal states,
+expired / consumed Claims and Mission / Epoch / Tool / Adapter / Secret-set mismatch all deny
+Secret delivery.
+
+Phase 0C uses an Executor-owned test Adapter that validates the supplied value inside the call and
+records only call count / non-secret control metadata; it must not retain or copy plaintext.
+Phase 4 / 5 production Adapters use the process-isolated channel required by the Sandbox policy.
+Untrusted plugin code must not execute inside the Executor / Adapter composition TCB.
 
 ## Decision 2: trusted result-collection authority
 
-Before `ExecutionAdapter.collect_result()` receives a sink, Executor persists one
+Executor receives one trusted `Clock` from the Application composition root. Security-sensitive
+collection and ingestion entry points do not accept a caller-supplied `now`; caller timestamps are
+observation metadata only and never authorization, lease or retention evidence.
+
+Before `ExecutionAdapter.collect_result()` receives a sink, Executor reads that Clock once and persists one
 `ResultCollectionAuthority` bound to:
 
 - execution ID and provider task ID;
@@ -134,9 +165,10 @@ The system hard cap may reduce, but never expand, the Tool-specific limit. A cal
 global max is not authoritative. If the Mission deadline has already passed, the Tool or exact
 Registry revision is missing, or the Provider task does not match, no new sink is issued.
 
-Restart reuses the stored collection start, retention, output limit, sink and cursor. It does not
-recalculate them from Execution creation time or restart time. Collection recovery may retrieve
-the same Provider task result but never resubmits the external action.
+The same trusted reading is used for authority creation and the initial collection lease. Restart
+reuses the stored collection start, retention, output limit, sink and cursor. It does not
+recalculate them from Execution creation time, restart time or a caller parameter. Collection
+recovery may retrieve the same Provider task result but never resubmits the external action.
 
 ## Decision 3: one repository-bound ingestion entry point
 
@@ -192,6 +224,9 @@ The immutable manifest binds:
 - every retained Encrypted Raw Artifact reference and digest;
 - every Secret Reference and metadata digest;
 - Redaction Metadata;
+- an immutable, plaintext-free `ExecutionResultProjection` containing every normalized Provider
+  control field required to build the final ExecutionResult;
+- the Result Projection digest and its binding to the exact Receipt and Provider task;
 - creation time; and
 - its own canonical digest.
 
@@ -203,29 +238,50 @@ Resource. After read-back verification, public Artifact / Secret metadata, the m
 `INGESTED_DURABLE` transition commit in one Application Database transaction. Context Selector,
 Knowledge Reducer and normal read APIs cannot observe partially prepared output.
 
+`ExecutionResultProjection` contains only typed control metadata and safe references: confirmed
+Provider status, exit code, started / finished timestamps, timeout / cancellation flags, redacted
+preview references and the exact Artifact / Redaction bindings. It contains no Raw bytes, Secret
+Value or Provider temporary path. Once `INGESTED_DURABLE` is reached, every path that invokes
+`collect_result()`, decrypts Quarantine, or queries the Provider for result reconstruction is
+rejected. Recovery builds the final result from the verified manifest and projection only.
+
 ### Erasure ordering
 
-1. prepare and verify output ciphertext / artifact bodies in an internal staging namespace;
-2. atomically publish output metadata, commit the SecureIngestionManifest and transition to
+Opening or reconstructing a Quarantine sink/reader is side-effect free. Constructors, factories,
+repository reads and `for_execution()`-style lookup methods must not resume a deletion intent,
+destroy a key or unlink ciphertext. Erasure is exposed only through an explicit internal
+`erase_verified(intent, manifest)` operation after all prerequisite read-back checks succeed.
+
+1. load and verify Execution, Receipt, Result Collection Authority and Quarantine metadata;
+2. prepare and verify output ciphertext / artifact bodies in an internal staging namespace;
+3. construct and verify the plaintext-free ExecutionResultProjection;
+4. atomically publish output metadata, commit the SecureIngestionManifest and transition to
    `INGESTED_DURABLE` in the Application Database;
-3. read-back verify the committed manifest and every referenced publication;
-4. commit a manifest-bound Quarantine Deletion Intent;
-5. transition to `DELETE_PENDING`;
-6. destroy the resource key and unlink ciphertext;
-7. transition to `QUARANTINE_ERASED`;
-8. construct / persist ExecutionResult from the manifest; and
-9. acknowledge `SUCCEEDED`.
+5. read-back verify the committed manifest, projection and every referenced Artifact / Secret;
+6. commit and read-back verify a manifest-bound Quarantine Deletion Intent;
+7. transition to `DELETE_PENDING`;
+8. call the explicit erasure operation, destroy the resource key and unlink ciphertext;
+9. transition to `QUARANTINE_ERASED`;
+10. construct / persist ExecutionResult from the manifest and projection without Adapter access;
+    and
+11. acknowledge `SUCCEEDED`.
+
+Recovery first loads the current ingestion state. For `INGESTED_DURABLE`, `DELETE_PENDING` or
+`QUARANTINE_ERASED`, it loads and authenticates the manifest, projection and every referenced
+durable resource before constructing any deletion-capable object. For `DELETE_PENDING`, it also
+loads and authenticates the exact deletion intent before calling erasure. Missing or corrupt
+evidence stops with no additional deletion.
 
 ### Crash matrix
 
 | Crash boundary | Required restart behavior |
 |---|---|
 | Before manifest commit | Re-run deterministic create-or-verify against the same Quarantine; never re-run Provider action |
-| After manifest commit, before deletion intent | Verify manifest and continue at deletion intent |
-| After deletion intent, before key destruction | Resume the same deletion intent |
+| After manifest commit, before deletion intent | Verify manifest, projection and every referenced resource, then continue at deletion intent |
+| After deletion intent, before key destruction | Verify manifest, projection, resources and intent, then resume the same deletion intent |
 | After key destruction, before ciphertext unlink | Verify cryptographic erasure and finish unlink / acknowledgement |
 | After ciphertext unlink, before `QUARANTINE_ERASED` | Reconcile absence against the durable intent and manifest |
-| After erasure, before ExecutionResult | Reconstruct from manifest without decryption or Provider retrieval |
+| After erasure, before ExecutionResult | Reconstruct from manifest / projection without sink construction, decryption, Adapter collection or Provider retrieval |
 | After ExecutionResult, before `SUCCEEDED` | Verify identical result digest and acknowledge only |
 
 ## Decision 5: content-bound authenticated generations
@@ -256,10 +312,27 @@ committed and can be collected. An advanced anchor with a missing local marker i
 the anchored blob. An advanced anchor whose blob is missing or invalid fails closed and never
 falls back to an older alternate file.
 
-Production may use a Vault, OS-keystore-backed state service or equivalent trusted durable store.
-An external integer combined with a blob that exists only beneath a replaceable local directory is
-development-only and rejected in Production. Wrapped Key State remains encrypted in the trusted
-blob store and uses its separate key domain.
+Phase 0C supplies and wires a durable Production composition rather than only protocols and
+in-memory test doubles. The local-first reference composition is a
+`DurableAuthenticatedGenerationBackend` stored in a separately configured control-plane root. Its
+closed API is `put_blob_if_absent`, `get_blob` and `compare_and_set_anchor`; callers cannot update
+rows or paths directly. The reference backend stores immutable encrypted blobs and namespace-scoped
+anchors in a dedicated SQLite database using `synchronous=FULL`: it commits and read-back verifies
+the blob before a later atomic anchor CAS transaction, so a crash can create only a non-authoritative
+orphan blob, never an anchor to absent content. Anchors are authenticated with an opaque key
+supplied by the configured OS key store or equivalent `AnchorAuthenticator`. The authentication
+key is not stored in the generation database or Application configuration.
+
+Audit Head and Wrapped Key constructors require this complete backend in Production. There is no
+Production overload or fallback that accepts only an integer GenerationStore, local slot files or
+in-memory anchor/blob objects. Development test doubles are accepted only by an explicit test
+composition root that cannot be selected by Mission or caller input.
+
+The backend root is independent of the replaceable Audit / Wrapped Key state directories. Loss,
+replacement, rollback ambiguity or authentication failure of the backend itself fails closed; it
+does not authorize local alternate state. A Vault or OS-keystore-backed remote state service can
+replace the local-first backend through the same atomic contract. Wrapped Key State remains
+encrypted in the trusted blob store and uses its separate key domain.
 
 ## Decision 6: Design Stop is a terminal authority event
 
@@ -291,6 +364,19 @@ removal does not authorize implementation.
 
 ## Finding coverage
 
+### Latest formal review (`4e86a7e4f5a6578133cd3579fbb5a004ab5c80c3`)
+
+| Formal-review issue | Design decision |
+|---|---|
+| [Caller can construct the exported Broker with a caller-owned channel](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3910452535) | Decision 1 removes separately constructible / exported delivery components and puts delivery inside the Executor-owned fixed Adapter transaction |
+| [Claim is consumed after plaintext delivery](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3910452541) | Decision 1 durably consumes and verifies the exact Claim before decrypting or releasing plaintext; every later crash is non-replayable |
+| [Sink construction erases Quarantine before manifest/resource verification](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3910452545) | Decision 4 makes all construction/read paths side-effect free and requires complete read-back verification before explicit erasure |
+| [Result finalization recollects after Quarantine erasure](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3910452550) | Decision 4 makes the manifest-bound ExecutionResultProjection sufficient and prohibits Adapter/Provider access after `INGESTED_DURABLE` |
+| [Collection start accepts caller `now`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3910452561) | Decision 2 makes Executor's composition-root Clock the only security time source and removes caller time from collection APIs |
+| [Authenticated generation exists only as in-memory test doubles](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3910452566) | Decision 5 requires and wires a durable Production backend; integer-only/local/in-memory alternatives are test-only and unavailable to Mission input |
+
+### Prior formal review
+
 | Formal-review issue | Design decision |
 |---|---|
 | Direct full-object publication minting releases plaintext | Decisions 3 and 4 remove the factory / raw-return path and require repository-bound ingestion |
@@ -302,33 +388,45 @@ removal does not authorize implementation.
 
 ## Required implementation sequence
 
-1. Implement the `DESIGN_CHANGE_REQUIRED` / Design Approval governance path and tests. Do not
-   restart the current loop before this is human-merged.
-2. Add schema / repository migrations for Dispatch Claim, Result Collection Authority,
-   SecureIngestionManifest and Quarantine Deletion Intent.
-3. Implement `DISPATCH_CLAIMED`, SecretInjectionBroker and submit reconciliation.
-4. Implement exact-Tool Result Collection Authority and stable retention.
-5. Remove full-object / legacy receipt ingestion and implement the repository-bound stream path.
-6. Implement durable ingestion / deletion reconciliation and manifest-based result recovery.
-7. Replace duplicate Audit / Key generation commit logic with the shared Coordinator and trusted
-   blob / anchor provider.
-8. Run the complete Phase 0C gate, update the invariant-family audit and request one exhaustive
+1. Merge this Source-of-Truth revision and issue a current-HEAD Design Approval. Do not restart the
+   current loop before both the design commit and approval are incorporated and validated.
+2. Replace exported Secret delivery components with the Executor-owned consume-before-release
+   transaction and remove every caller construction / callback path.
+3. Inject a composition-root trusted Clock into Executor and remove caller security timestamps
+   from collection / lease / retention decisions.
+4. Make all Quarantine construction and lookup side-effect free; implement explicit verified
+   erasure after manifest, projection, resource and intent read-back.
+5. Persist the plaintext-free ExecutionResultProjection with the manifest and prohibit result
+   collection or Provider access after `INGESTED_DURABLE`.
+6. Implement and wire the durable authenticated generation backend, removing Production
+   integer-only / local-slot fallback.
+7. Review every public entry point and sibling path in all affected invariant families; update the
+   invariant audit and add state-machine evidence.
+8. Run the complete Phase 0C gate and request one exhaustive
    fresh formal review.
 
 ## Required tests
 
+- No importable/public Broker, channel registry, callback protocol or plaintext-returning Secret
+  API can be used to construct a delivery path outside Executor.
 - Secret injection denial from `AUTHORIZED`, `BLOCKED`, stale Mission / Epoch, expired / consumed
-  Claim and mismatched Tool / Adapter.
-- Crash before / after Claim commit, Secret injection and Provider submit without automatic replay.
+  Claim and mismatched Tool / Adapter / Secret set.
+- Crash before / after Claim consumption, Adapter entry / return and Provider submit without
+  Secret delivery or submit replay; the Adapter test double retains no plaintext.
 - Cross-tool output limits and caller / global attempted expansion.
-- Long-running Provider collection with trusted start retention, Mission deadline cap and stable
-  restart values.
+- Caller future/backdated timestamps do not affect a long-running Provider collection; trusted
+  Clock start, Mission deadline cap and restart values remain stable.
 - Direct full-object factory, caller receipt / reference and compatibility-loader denial.
-- Positive, negative and failure-path tests at every ingestion / deletion crash boundary.
-- Recovery from durable manifest after Quarantine erasure.
+- Positive, negative and failure-path tests at every ingestion / deletion crash boundary, proving
+  no sink/factory construction can erase before complete durable verification.
+- Recovery from durable manifest / projection after Quarantine erasure with zero Adapter or
+  Provider collection calls.
 - Audit / Key generation property or state-machine tests for prepare, blob write, CAS, local marker,
   directory replacement and restart.
-- Missing / corrupt anchored blob fail-closed tests without alternate fallback.
+- Durable Production backend restart plus missing / corrupt anchored blob fail-closed tests without
+  alternate fallback; Production rejects test-double and integer-only configurations.
+- Rule-based state-machine tests cover Dispatch/Secret delivery, ingestion/erasure/result recovery,
+  collection timing and authenticated generation transitions in addition to example regressions.
 - Design Stop precedence, old refresh reuse denial, generic Resume denial, one-use Design Approval
   and final trigger-time drift tests.
 

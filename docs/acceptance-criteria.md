@@ -151,10 +151,13 @@ External Tool Dispatch = 0
 - `reconcile()`の不確実結果を`OUTCOME_UNKNOWN`へ遷移
 - Pre-dispatch不一致は`AUTHORIZED -> BLOCKED`、Provider Callなし、ExecutionResultなし
 - `AUTHORIZED`はSecret解決権限ではなく、Pre-dispatch成功と同一Transactionで作成した未消費の
-  Dispatch ClaimだけがTrusted Adapter ChannelへのJIT Secret Injectionを許可する
-- Dispatch Claim確定後のCrashまたはSubmit結果不明では自動再送せずReconciliationへ進む
-- Result Collection開始時にexact Tool Registry / Tool Definition、Provider Task、Trusted Clock、Sinkへ
-  BindingしたAuthorityを永続化し、Tool固有Output上限をCaller / Global設定で拡大しない
+  Dispatch Claimを平文解放前にDurable消費したExecutor-owned Transactionだけが、Composition Root
+  固定Adapter Dispatch PortへのJIT Secret Injectionを許可する
+- CallerがSecret Broker、Channel Registry、Callbackを構築できず、Claim消費後のCrashまたは
+  Submit結果不明ではSecret InjectionもProvider Submitも自動再送せずReconciliationへ進む
+- Result Collection開始時にExecutor所有のTrusted Clock、exact Tool Registry / Tool Definition、
+  Provider Task、SinkへBindingしたAuthorityを永続化し、Caller Timestampを受け取らず、Tool固有
+  Output上限をCaller / Global設定で拡大しない
 - Quarantine RetentionはCollection開始時刻からMission Deadline内で一度だけ確定し、Restart時に再計算しない
 - External Side Effect NodeにLangGraph Automatic Retryなし
 - Raw ResultをChunk Streamingし、全量Memory保持なし
@@ -169,10 +172,12 @@ External Tool Dispatch = 0
 - Raw OutputはQuarantine -> Classification -> Secret Detection -> Redactionを通る
 - Caller生成Receipt、Quarantine Reference、Publication Object、Full-object compatibility loaderから
   Quarantine平文を取得できず、Repository-bound `ingestion_id`だけがSecure Ingestionを開始できる
-- Artifact / Secret ReferenceとSecure Ingestion ManifestをDurableに確定しread-back検証する前に
-  Quarantine Deletion Intentを作成しない
+- Quarantine Sink / Reader / Factory / Lookupは副作用を持たず、Artifact / Secret Reference、
+  ExecutionResultProjection、Secure Ingestion ManifestをDurableに確定しread-back検証する前に
+  Quarantine Deletion Intentを作成または再開しない
 - Manifest Commit、Deletion Intent、Key破棄、Ciphertext削除、ExecutionResult確定の全Crash境界を
-  Provider再実行や手動File修復なしに回復する
+  Provider再実行、Adapter Result再収集、Quarantine再復号、手動File修復なしに回復する
+- `INGESTED_DURABLE`以後はManifest / ExecutionResultProjectionだけからExecutionResultを再構築する
 - Context BuilderがEncrypted Raw Artifact/Secret Resolveへアクセス不可
 - Artifact Path Traversal/Symlink Escapeを拒否
 - Artifact size/quota/integrity/classification/retention/auditを強制
@@ -184,6 +189,10 @@ External Tool Dispatch = 0
 - Audit Head / Wrapped Key StateのExternal AnchorがGeneration、State Digest、Immutable Blob IDへBindingされ、
   Directory置換後のRestartでも正確なCommitted Stateを回復する
 - Anchorが指すBlobの欠落 / 改ざん時は旧Local AlternateへFallbackせずFail Closedにする
+- Audit Head / Wrapped Key StateのProduction ConstructorがDurable Authenticated Generation Backendを
+  必須とし、Integer-only、Local-slot、In-memory Test Double構成を拒否する
+- Dispatch / Secret Delivery、Ingestion / Erasure / Result Recovery、Collection Timing、Authenticated
+  GenerationのStateful FamilyにProperty-basedまたはRule-based State Machine Evidenceがある
 
 ## Phase 1: Agent Loop
 
