@@ -250,7 +250,8 @@ jobs:
               if (!match) continue;
               try {
                 const record = JSON.parse(match[1].trim());
-                if (record.schema_version === '1.0' && typeof comment.html_url === 'string') {
+                if (['1.0', '1.1'].includes(record.schema_version) &&
+                    typeof comment.html_url === 'string') {
                   priorRecords.push({...record, _comment_url: comment.html_url});
                 }
               } catch (_) {}
@@ -866,7 +867,7 @@ jobs:
               return;
             }
             const record = {
-              schema_version: '1.0',
+              schema_version: designStop ? '1.1' : '1.0',
               phase,
               reviewed_sha: reviewedSha,
               base_sha: suppliedBaseSha,
@@ -882,6 +883,12 @@ jobs:
               required_checks: requiredChecks,
               loop_state: limitReached ? 'BLOCKED_LIMIT' : verdict,
             };
+            if (designStop) {
+              record.stop_reason = 'INVARIANT_FAMILY_RECURRENCE';
+              record.recurring_families = [...recurringFamilies].sort();
+              record.finding_references = currentFindings
+                .map((item) => item.html_url).sort();
+            }
             const marker = `<!-- redteam-phase-gate\n${JSON.stringify(record)}\n-->`;
             const familyReview = {
               schema_version: '1.0',
@@ -937,7 +944,7 @@ jobs:
                   owner, repo, issue_number: pull_number,
                   body: `AI loop stopped for design review: invariant family ${recurringFamilies.map(
                     (item) => `\`${item}\``
-                  ).join(', ')} recurred in a second formal review. A new local patch is not authorized; document and approve a coherent redesign before using the bounded Resume workflow.`,
+                  ).join(', ')} recurred in a second formal review. A new local patch and generic Resume are not authorized. Merge a coherent redesign, refresh this exact branch, and use the dedicated Approve AI Loop Design Resume workflow.`,
                 });
               }
               return;

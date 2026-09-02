@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from automation.run_phase_loop import INVARIANT_FAMILIES
+from automation.run_phase_loop import INVARIANT_FAMILIES, canonical_digest
 from scripts.ci.validate_automation import (
     AutomationValidationError,
     strict_json_load,
@@ -184,6 +184,9 @@ def test_phase_gate_uses_fail_closed_native_codex_evidence_chain() -> None:
         "invariant_family: invariantFamily(item.body)",
         "redteam-invariant-family-review",
         "recurringFamilies.length > 0",
+        "record.stop_reason = 'INVARIANT_FAMILY_RECURRENCE'",
+        "record.recurring_families = [...recurringFamilies].sort()",
+        "record.finding_references = currentFindings",
         "semantic invariant family recurred",
         "sameFindingCount + 1 >= 5",
         "AI_LOOP_MAX_ITERATIONS must be exactly 5",
@@ -316,6 +319,111 @@ def test_resume_workflow_can_comment_on_pr_without_merge_authority() -> None:
         "/pulls/{number}/merge",
     ):
         assert forbidden_operation not in workflow
+
+
+def test_design_resume_is_dedicated_single_use_and_fail_closed() -> None:
+    workflow = (
+        REPO_ROOT / ".github" / "workflows" / "approve-ai-loop-design-resume.yml"
+    ).read_text(encoding="utf-8")
+    helper_path = REPO_ROOT / "automation" / "approve_design_resume.js"
+    helper = helper_path.read_text(encoding="utf-8")
+    permissions = workflow.split("\npermissions:\n", maxsplit=1)[1].split(
+        "\njobs:\n", maxsplit=1
+    )[0]
+
+    assert permissions.strip().splitlines() == [
+        "checks: read",
+        "  contents: read",
+        "  issues: write",
+        "  pull-requests: write",
+        "  statuses: write",
+    ]
+    for required_control in (
+        "APPROVE_DESIGN_RESUME",
+        "blocked_gate_reference",
+        "design_commit_sha",
+        "design_reference",
+        "redteam-design-approval",
+        "RESUME_AFTER_DESIGN_APPROVAL",
+        "policy_digest",
+        "INVARIANT_FAMILY_RECURRENCE",
+        "Required current-HEAD check is not uniquely successful",
+        "Design approval consumption is missing or ambiguous",
+        "Approved design commit is not incorporated in main and current PR HEAD",
+        "Design Resume workflow code is not the current default-branch revision",
+        "issues.setLabels",
+    ):
+        assert required_control in workflow or required_control in helper
+    assert "contents: write" not in workflow
+    assert "secrets." not in workflow
+    for forbidden_operation in (
+        "github.rest.pulls.merge",
+        "mergePullRequest",
+        "/pulls/{number}/merge",
+        "updateBranch",
+    ):
+        assert forbidden_operation not in workflow
+        assert forbidden_operation not in helper
+
+    node = shutil.which("node")
+    assert node is not None
+    parser_test = """
+const helper = require(process.argv[1]);
+let rejected = false;
+try {
+  helper.strictJsonParse('{"outer":{"phase":"phase-0c","phase":"phase-1"}}');
+} catch (error) {
+  rejected = String(error).includes('duplicate JSON key');
+}
+if (!rejected) process.exit(1);
+"""
+    subprocess.run(  # noqa: S603 - fixed node executable and test-only source.
+        [node, "-e", parser_test, str(helper_path)],
+        cwd=REPO_ROOT,
+        check=True,
+    )
+    digest_test = """
+const fs = require('fs');
+const helper = require(process.argv[1]);
+const policy = helper.strictJsonParse(fs.readFileSync(process.argv[2], 'utf8'));
+process.stdout.write(helper.canonicalDigest(policy));
+"""
+    node_digest = subprocess.run(  # noqa: S603 - fixed node executable and test-only source.
+        [
+            node,
+            "-e",
+            digest_test,
+            str(helper_path),
+            str(REPO_ROOT / "automation" / "invariant-families.json"),
+        ],
+        cwd=REPO_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    policy = json.loads(
+        (REPO_ROOT / "automation" / "invariant-families.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert node_digest == canonical_digest(policy)
+
+
+def test_generic_resume_and_recovery_reject_design_stop() -> None:
+    resume = (
+        REPO_ROOT / ".github" / "workflows" / "resume-ai-loop.yml"
+    ).read_text(encoding="utf-8")
+    recovery = (
+        REPO_ROOT / ".github" / "workflows" / "revalidate-blocked-phase.yml"
+    ).read_text(encoding="utf-8")
+
+    assert "DESIGN_CHANGE_REQUIRED rejects generic Resume AI Loop" in resume
+    assert (
+        "DESIGN_CHANGE_REQUIRED cannot use Recover Blocked AI Loop Current Phase"
+        in recovery
+    )
+    assert "redteam-invariant-family-review" in resume
+    assert "redteam-invariant-family-review" in recovery
 
 
 def test_current_phase_recovery_is_identical_tree_and_fail_closed() -> None:

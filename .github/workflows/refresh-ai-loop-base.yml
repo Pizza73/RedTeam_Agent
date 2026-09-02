@@ -266,22 +266,28 @@ jobs:
               'review_reference', 'reviewer_login', 'recorded_by', 'finding_key',
               'required_checks', 'loop_state'
             ];
+            const designStopKeys = [
+              ...passKeys, 'stop_reason', 'recurring_families', 'finding_references'
+            ];
             const passingChecks = JSON.stringify([
               {name: 'tests (3.12)', status: 'PASS'},
               {name: 'tests (3.14)', status: 'PASS'},
               {name: 'quality', status: 'PASS'},
               {name: 'governance-integrity', status: 'PASS'},
             ]);
+            const baseAuthorization = exactKeys(authorization, passKeys) &&
+              authorization.schema_version === '1.0';
+            const designStopAuthorization = exactKeys(authorization, designStopKeys) &&
+              authorization.schema_version === '1.1';
             const commonAuthorizationValid =
-              exactKeys(authorization, passKeys) &&
-              authorization.schema_version === '1.0' &&
+              (baseAuthorization || designStopAuthorization) &&
               authorization.phase === previousPhase &&
               authorization.reviewed_sha === expectedHeadSha &&
               authorization.evidence_format === 'codex-native-v1' &&
               authorization.reviewer_login === process.env.AI_REVIEWER_LOGIN &&
               authorization.recorded_by === process.env.AI_GATE_APPROVER_LOGIN &&
               JSON.stringify(authorization.required_checks) === passingChecks;
-            const isPriorPass = commonAuthorizationValid &&
+            const isPriorPass = commonAuthorizationValid && baseAuthorization &&
               authorization.verdict === 'PASS' &&
               authorization.loop_state === 'PASS' && authorization.finding_key === null;
             const isBlockedCurrentPhase = commonAuthorizationValid &&
@@ -292,6 +298,23 @@ jobs:
               labels.some((name) =>
                 ['ai-loop-blocked', 'ai-needs-implementation'].includes(name)
               );
+            if (designStopAuthorization && (
+                authorization.stop_reason !== 'INVARIANT_FAMILY_RECURRENCE' ||
+                !Array.isArray(authorization.recurring_families) ||
+                authorization.recurring_families.length < 1 ||
+                authorization.recurring_families.length !==
+                  new Set(authorization.recurring_families).size ||
+                !authorization.recurring_families.every((item) =>
+                  /^[a-z][a-z0-9-]{2,63}$/.test(item)) ||
+                !Array.isArray(authorization.finding_references) ||
+                authorization.finding_references.length < 1 ||
+                authorization.finding_references.length !==
+                  new Set(authorization.finding_references).size ||
+                !authorization.finding_references.every((item) =>
+                  String(item).startsWith(`${expectedPrPrefix}#discussion_r`)))) {
+              core.setFailed('Design-stop gate recurrence evidence is malformed.');
+              return;
+            }
             if (!isPriorPass && !isBlockedCurrentPhase) {
               core.setFailed(
                 'Phase authorization is neither the exact prior PASS nor a bounded current gate.'
