@@ -226,6 +226,13 @@ transition. It must not remove `ai-loop-blocked`, issue a fix request, dispatch 
 trigger Codex. The runner records or derives one consumed transition identity bound to old HEAD,
 new HEAD, target base SHA, phase and blocking gate; another update cannot reuse it.
 
+If another human-reviewed governance change reaches `main` before Design Approval, the original
+Gate is not authority for an arbitrary newer HEAD. The runner and preparation workflow walk at
+most 32 refresh edges back to the Gate HEAD. Every edge must be a two-parent merge with the
+previous PR HEAD first, the exact previously authorized default-branch SHA second, and a matching
+`github-actions[bot]` base-refresh status on that previous HEAD. Only that complete chain permits
+one more expected-HEAD refresh; it never permits Resume or implementation by itself.
+
 The approver then invokes the separate `Approve AI Loop Design Resume` operation. The workflow
 revalidates the latest recurrence gate, unique adjacent phase base, current open PR, exact current
 HEAD, current default branch ancestry, successful required checks, exact Phase label, stop label,

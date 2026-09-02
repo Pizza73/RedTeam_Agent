@@ -47,8 +47,13 @@ If a blocked cumulative Phase 0B through Phase 3 HEAD predates required governan
 trusted current-Phase `BLOCKED_LIMIT` gate may authorize an exact-HEAD base refresh without changing
 the Phase label. The gate's adjacent base PASS, default-branch SHA, resulting ancestry, current-HEAD
 checks, and transition consumption must all be revalidated; a free-form branch update is not
-authority. A base refresh authorizes only one expected-HEAD branch update and never authorizes
-Resume. If the latest gate records invariant-family recurrence, it is `DESIGN_CHANGE_REQUIRED` and
+authority. While an invariant-family Design Stop remains active, a later governance advance may be
+incorporated only when every intermediate PR HEAD is a two-parent merge whose first parent is the
+previous PR HEAD, whose second parent is the exact previously authorized default-branch SHA, and
+whose first parent carries the matching trusted base-refresh status. The chain is bounded to 32
+edges and any missing, malformed, non-merge, or ambiguous edge is rejected. A base refresh
+authorizes only one expected-HEAD branch update and never authorizes Resume. If the latest gate
+records invariant-family recurrence, it is `DESIGN_CHANGE_REQUIRED` and
 dominates every earlier refresh / Resume record. Implementation may resume only from a single-use
 `DESIGN_APPROVED` record bound to that gate, the current Phase / full HEAD, and an approved design
 commit incorporated from the default branch.

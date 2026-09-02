@@ -226,6 +226,10 @@ machine-readable phase record.
   The refresh authorizes only that branch update; it must keep `ai-loop-blocked` and cannot trigger
   Resume or Codex. After current-HEAD CI succeeds, a recurrence stop still requires the dedicated
   **Approve AI Loop Design Resume** operation.
+- If `main` advances again while that Design Stop remains active, restart the runner from the new
+  clean `main`. It may reuse the same blocking Gate only after validating every intervening
+  base-refresh merge and trusted status, up to 32 edges. Do not manually merge, push, relabel, or
+  reuse a status when an edge is absent; the runner must report the chained refresh candidate.
 - For `DESIGN_CHANGE_REQUIRED`, first review and merge the coherent design as a governance PR.
   Refresh the blocked PR to incorporate that exact design commit, wait for current-HEAD checks,
   then run **Approve AI Loop Design Resume** with the latest blocking gate permalink, full current
@@ -267,6 +271,10 @@ machine-readable phase record.
 - `waiting for refreshed PR head`: GitHub accepted or is processing the exact-HEAD branch update.
   A changed HEAD causes the request to fail closed; restart from current clean `main` and inspect
   the PR evidence rather than forcing an update.
+- A stopped PR immediately reports `AI_LOOP=BLOCKED` after a later governance merge: verify that
+  each prior refresh output is a two-parent merge and that its first parent has the matching
+  `redteam/base-refresh/...` status. A missing chain edge requires governance repair, not a manual
+  branch update.
 - Automatic final merge blocked: inspect the Phase 0A→5 PASS chain, latest
   `redteam/phase-review`, four Check Runs, stop labels, current `main` ancestry, the exact-HEAD
   attempt comment and `refs/redteam-final-merge-attempts/pr-<PR>-<HEAD>`. Do not retry an uncertain

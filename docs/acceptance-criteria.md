@@ -91,6 +91,10 @@
   祖先となるPartial Orderで唯一の最大候補だけをReview Baseにし、最大候補が複数ならFail Closedにする
 - Base refreshは`expected_head_sha`とCurrent default-branch SHAへ固定し、Final merge APIを
   呼ばない
+- Design Stop後にDefault Branchが再度進んだ場合、Gate HEADからCurrent HEADまでの全Edgeについて、
+  2親Mergeの第1親がPrevious PR HEAD、第2親が当時の認可済みDefault SHAであり、第1親上のTrusted
+  Base Refresh Statusが同じGate / Phase / SHAをBindingすることを検証する。32段超過、通常Commit、
+  Status欠落、親またはGate不一致は再認可しない
 - Design ApprovalはStop latch、Current Phase / HEAD、最新Blocking Gate、Required Check、Design commit
   の包含を再検証する。Current HEADの旧`ai-needs-review`はAuthorityではないため許容して最終Label遷移で
   除去するが、`ai-needs-fix`、`ai-review-passed`、`ai-human-gate`等の競合状態は拒否する

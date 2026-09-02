@@ -450,6 +450,73 @@ if (!rejected) process.exit(1);
     )
 
 
+def test_blocked_base_refresh_chain_requires_status_for_every_merge_edge() -> None:
+    helper_path = REPO_ROOT / "automation" / "base_refresh_chain.js"
+    workflow = (
+        REPO_ROOT / ".github" / "workflows" / "refresh-ai-loop-base.yml"
+    ).read_text(encoding="utf-8")
+    assert "base_refresh_chain.js" in workflow
+    assert "verifyBlockedRefreshChain" in workflow
+    assert "ready.head_sha !== authorization.reviewed_sha" in workflow
+    assert "authorization.reviewed_sha === expectedHeadSha || designStopAuthorization" in workflow
+
+    node = shutil.which("node")
+    assert node is not None
+    policy_test = """
+const control = require(process.argv[1]);
+const gate = 'a'.repeat(40);
+const first = 'b'.repeat(40);
+const firstBase = 'c'.repeat(40);
+const current = 'd'.repeat(40);
+const currentBase = 'e'.repeat(40);
+const gateReference = 'https://github.com/example/repo/pull/3#issuecomment-gate';
+const status = (base) => ({
+  context: `redteam/base-refresh/phase-0c/phase-0b/${base}`,
+  state: 'success',
+  description: control.REFRESH_STATUS_DESCRIPTION,
+  target_url: gateReference,
+  creator: {login: 'github-actions[bot]'},
+});
+const commits = {
+  [current]: {sha: current, parents: [{sha: first}, {sha: currentBase}]},
+  [first]: {sha: first, parents: [{sha: gate}, {sha: firstBase}]},
+};
+const statuses = {[first]: [status(currentBase)], [gate]: [status(firstBase)]};
+const github = {
+  rest: {
+    git: {getCommit: async ({commit_sha}) => ({data: commits[commit_sha]})},
+    repos: {listCommitStatusesForRef: () => null},
+  },
+  paginate: async (_method, {ref}) => statuses[ref] || [],
+};
+(async () => {
+  const edges = await control.verifyBlockedRefreshChain({
+    github, owner: 'example', repo: 'repo', currentHeadSha: current,
+    gateHeadSha: gate, gateReference, sourcePhase: 'phase-0c',
+    revalidationPhase: 'phase-0b',
+  });
+  if (edges.length !== 2) process.exit(1);
+  delete statuses[first];
+  let rejected = false;
+  try {
+    await control.verifyBlockedRefreshChain({
+      github, owner: 'example', repo: 'repo', currentHeadSha: current,
+      gateHeadSha: gate, gateReference, sourcePhase: 'phase-0c',
+      revalidationPhase: 'phase-0b',
+    });
+  } catch (_) {
+    rejected = true;
+  }
+  if (!rejected) process.exit(1);
+})().catch(() => process.exit(1));
+"""
+    subprocess.run(  # noqa: S603 - fixed node executable and test-only source.
+        [node, "-e", policy_test, str(helper_path)],
+        cwd=REPO_ROOT,
+        check=True,
+    )
+
+
 def test_generic_resume_and_recovery_reject_design_stop() -> None:
     resume = (
         REPO_ROOT / ".github" / "workflows" / "resume-ai-loop.yml"

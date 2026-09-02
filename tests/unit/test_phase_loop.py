@@ -45,6 +45,8 @@ HEAD_SHA = "a" * 40
 BASE_SHA = "b" * 40
 DEFAULT_BRANCH_SHA = "d" * 40
 REFRESHED_HEAD_SHA = "e" * 40
+SECOND_DEFAULT_BRANCH_SHA = "f" * 40
+SECOND_REFRESHED_HEAD_SHA = "7" * 40
 ACTOR_LOGIN = "operator"
 REVIEWER_LOGIN = "chatgpt-codex-connector[bot]"
 READY_URL = "https://github.com/example/repo/pull/1#issuecomment-ready"
@@ -1123,11 +1125,12 @@ def base_refresh_status(
     from_phase: str = "phase-0b",
     revalidate_phase: str = "phase-0a",
     target_url: str = PHASE_RECORD_URL,
+    target_base_sha: str = DEFAULT_BRANCH_SHA,
 ) -> dict[str, object]:
     return {
         "context": (
             f"redteam/base-refresh/{from_phase}/{revalidate_phase}/"
-            f"{DEFAULT_BRANCH_SHA}"
+            f"{target_base_sha}"
         ),
         "state": state,
         "description": description,
@@ -1244,6 +1247,9 @@ class _BaseTransitionGitHub(_StatusGitHub):
         self.update_calls: list[tuple[int, str]] = []
         self.workflow_calls: list[tuple[str, str, dict[str, str]]] = []
         self.ancestors: set[tuple[str, str]] = set()
+        self.parents: dict[str, tuple[str, ...]] = {
+            REFRESHED_HEAD_SHA: (HEAD_SHA, DEFAULT_BRANCH_SHA),
+        }
 
     def set_pull_request_labels(
         self, number: int, labels: frozenset[str]
@@ -1260,10 +1266,14 @@ class _BaseTransitionGitHub(_StatusGitHub):
         self.workflow_calls.append((workflow, branch, inputs))
 
     def is_ancestor(self, ancestor_sha: str, descendant_sha: str) -> bool:
-        return (ancestor_sha, descendant_sha) in self.ancestors
+        return ancestor_sha == descendant_sha or (
+            ancestor_sha, descendant_sha
+        ) in self.ancestors
+
+    def commit_parents(self, sha: str) -> tuple[str, ...]:
+        return self.parents.get(sha, ())
 
     def compare(self, base_sha: str, head_sha: str) -> dict[str, object]:
-        assert (base_sha, head_sha) == (HEAD_SHA, DEFAULT_BRANCH_SHA)
         return {"ahead_by": 1}
 
 
@@ -1707,6 +1717,19 @@ def blocked_refresh_records() -> tuple[MarkerEvidence, MarkerEvidence]:
     return base_pass, gate
 
 
+def design_stop_refresh_records() -> tuple[MarkerEvidence, MarkerEvidence]:
+    base_pass, gate = blocked_refresh_records()
+    gate.payload.update(
+        {
+            "schema_version": "1.1",
+            "stop_reason": "INVARIANT_FAMILY_RECURRENCE",
+            "recurring_families": ["authorization-lifecycle"],
+            "finding_references": [f"{PULL_REQUEST_PREFIX}#discussion_r123"],
+        }
+    )
+    return base_pass, gate
+
+
 def blocked_phase_state() -> PullRequestState:
     state = phase_state(phase="phase-0b")
     return replace(
@@ -1765,6 +1788,115 @@ def test_blocked_current_phase_gate_accepts_identical_trusted_duplicates() -> No
         [base_pass, gate, duplicate],
         DEFAULT_BRANCH_SHA,
     ) == duplicate
+
+
+def test_refreshed_blocked_gate_authorizes_another_exact_base_refresh() -> None:
+    base_pass, gate = design_stop_refresh_records()
+    first_status = base_refresh_status(
+        from_phase="phase-0c",
+        revalidate_phase="phase-0b",
+        target_url=gate.url,
+    )
+    loop, github = blocked_refresh_loop({HEAD_SHA: [first_status]})
+    github.ancestors.add((HEAD_SHA, REFRESHED_HEAD_SHA))
+    state = replace(
+        blocked_phase_state(),
+        head_sha=REFRESHED_HEAD_SHA,
+        base_sha=DEFAULT_BRANCH_SHA,
+        labels=frozenset(
+            {"ai-loop", "ai-loop-blocked", "ai-needs-review", "phase-0b"}
+        ),
+    )
+
+    assert loop.blocked_base_refresh_candidate(
+        state, [base_pass, gate], SECOND_DEFAULT_BRANCH_SHA
+    ) == gate
+
+
+def test_only_a_design_stop_gate_can_authorize_a_later_refresh() -> None:
+    base_pass, gate = blocked_refresh_records()
+    first_status = base_refresh_status(
+        from_phase="phase-0c",
+        revalidate_phase="phase-0b",
+        target_url=gate.url,
+    )
+    loop, github = blocked_refresh_loop({HEAD_SHA: [first_status]})
+    github.ancestors.add((HEAD_SHA, REFRESHED_HEAD_SHA))
+    state = replace(blocked_phase_state(), head_sha=REFRESHED_HEAD_SHA)
+
+    assert (
+        loop.blocked_base_refresh_candidate(
+            state, [base_pass, gate], SECOND_DEFAULT_BRANCH_SHA
+        )
+        is None
+    )
+
+
+def test_blocked_refresh_chain_discovers_every_authorized_merge_edge() -> None:
+    base_pass, gate = design_stop_refresh_records()
+    first_status = base_refresh_status(
+        from_phase="phase-0c",
+        revalidate_phase="phase-0b",
+        target_url=gate.url,
+    )
+    second_status = base_refresh_status(
+        from_phase="phase-0c",
+        revalidate_phase="phase-0b",
+        target_url=gate.url,
+        target_base_sha=SECOND_DEFAULT_BRANCH_SHA,
+    )
+    loop, github = blocked_refresh_loop(
+        {HEAD_SHA: [first_status], REFRESHED_HEAD_SHA: [second_status]}
+    )
+    github.parents[SECOND_REFRESHED_HEAD_SHA] = (
+        REFRESHED_HEAD_SHA,
+        SECOND_DEFAULT_BRANCH_SHA,
+    )
+    github.ancestors.update(
+        {
+            (HEAD_SHA, REFRESHED_HEAD_SHA),
+            (HEAD_SHA, SECOND_REFRESHED_HEAD_SHA),
+            (REFRESHED_HEAD_SHA, SECOND_REFRESHED_HEAD_SHA),
+        }
+    )
+    state = replace(
+        blocked_phase_state(),
+        head_sha=SECOND_REFRESHED_HEAD_SHA,
+        base_sha=SECOND_DEFAULT_BRANCH_SHA,
+        labels=frozenset({"ai-loop", "ai-loop-blocked", "phase-0b"}),
+    )
+
+    evidence = loop.trusted_base_refresh_statuses(state, [base_pass, gate])
+
+    assert [record.payload["head_sha"] for record in evidence] == [
+        REFRESHED_HEAD_SHA,
+        HEAD_SHA,
+    ]
+
+
+def test_blocked_refresh_chain_rejects_a_merge_without_trusted_status() -> None:
+    base_pass, gate = design_stop_refresh_records()
+    loop, github = blocked_refresh_loop({})
+    github.ancestors.add((HEAD_SHA, REFRESHED_HEAD_SHA))
+    state = replace(blocked_phase_state(), head_sha=REFRESHED_HEAD_SHA)
+
+    with pytest.raises(UntrustedEvidenceError, match="lacks one trusted status"):
+        loop.blocked_base_refresh_candidate(
+            state, [base_pass, gate], SECOND_DEFAULT_BRANCH_SHA
+        )
+
+
+def test_blocked_refresh_chain_rejects_a_non_merge_commit() -> None:
+    base_pass, gate = design_stop_refresh_records()
+    loop, github = blocked_refresh_loop({})
+    github.parents[REFRESHED_HEAD_SHA] = (HEAD_SHA,)
+    github.ancestors.add((HEAD_SHA, REFRESHED_HEAD_SHA))
+    state = replace(blocked_phase_state(), head_sha=REFRESHED_HEAD_SHA)
+
+    with pytest.raises(UntrustedEvidenceError, match="non-refresh commit"):
+        loop.blocked_base_refresh_candidate(
+            state, [base_pass, gate], SECOND_DEFAULT_BRANCH_SHA
+        )
 
 
 def test_blocked_current_phase_gate_rejects_distinct_trusted_duplicates() -> None:

@@ -49,6 +49,7 @@ BASE_REFRESH_STATUS_PATTERN = re.compile(
     r"(phase-(?:0a|0b|0c|[1-5]))/"
     r"([0-9a-f]{40})$"
 )
+MAX_BLOCKED_REFRESH_CHAIN_DEPTH = 32
 FINDING_KEY_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9._-]{0,63}$")
 TOKEN_PATTERN = re.compile(r"(?:github_pat_|gh[opsu]_|sk-)[A-Za-z0-9_-]+")
 CODEX_NO_FINDINGS_PREFIX = "Codex Review: Didn't find any major issues."
@@ -1267,6 +1268,21 @@ class GitHubClient:
             result.extend(item for item in page if isinstance(item, dict))
         return result
 
+    def commit_parents(self, sha: str) -> tuple[str, ...]:
+        if not SHA_PATTERN.fullmatch(sha):
+            raise UntrustedEvidenceError("commit lookup requires a full commit SHA")
+        commit = self.api_object(f"repos/{self.repository}/git/commits/{sha}")
+        parents = commit.get("parents")
+        if commit.get("sha") != sha or not isinstance(parents, list):
+            raise UntrustedEvidenceError("GitHub commit ancestry response is malformed")
+        result: list[str] = []
+        for parent in parents:
+            parent_sha = parent.get("sha") if isinstance(parent, dict) else None
+            if not isinstance(parent_sha, str) or not SHA_PATTERN.fullmatch(parent_sha):
+                raise UntrustedEvidenceError("GitHub commit parent is malformed")
+            result.append(parent_sha)
+        return tuple(result)
+
     def default_branch_sha(self, branch: str) -> str:
         return self.command.run(
             ["api", f"repos/{self.repository}/commits/{branch}", "--jq", ".sha"]
@@ -1717,6 +1733,89 @@ class PhaseLoop:
             ),
         )
 
+    def trusted_blocked_refresh_chain(
+        self,
+        state: PullRequestState,
+        gate: MarkerEvidence,
+    ) -> list[MarkerEvidence]:
+        """Verify every merge from a blocked Gate HEAD to the current PR HEAD."""
+        gate_head = str(gate.payload.get("reviewed_sha", ""))
+        phase_index = PHASES.index(state.phase)
+        if (
+            phase_index < 1
+            or phase_index > 5
+            or not SHA_PATTERN.fullmatch(gate_head)
+            or not self.github.is_ancestor(gate_head, state.head_sha)
+        ):
+            raise UntrustedEvidenceError(
+                "blocked refresh chain is not descended from its Gate HEAD"
+            )
+        source_phase = PHASES[phase_index + 1]
+        cursor = state.head_sha
+        result: list[MarkerEvidence] = []
+        while cursor != gate_head:
+            if len(result) >= MAX_BLOCKED_REFRESH_CHAIN_DEPTH:
+                raise UntrustedEvidenceError(
+                    "blocked refresh chain exceeds its bounded depth"
+                )
+            parents = self.github.commit_parents(cursor)
+            if len(parents) != 2 or parents[0] == parents[1]:
+                raise UntrustedEvidenceError(
+                    "blocked refresh chain contains a non-refresh commit"
+                )
+            previous_head, incorporated_base = parents
+            statuses = base_refresh_evidence_from_statuses(
+                self.github.commit_statuses(previous_head), head_sha=previous_head
+            )
+            matches = [
+                record
+                for record in statuses
+                if record.payload.get("from_phase") == source_phase
+                and record.payload.get("revalidate_phase") == state.phase
+                and record.payload.get("target_base_sha") == incorporated_base
+                and record.payload.get("prior_pass_reference") == gate.url
+            ]
+            identities = {canonical_digest(record.payload) for record in matches}
+            if len(identities) != 1:
+                raise UntrustedEvidenceError(
+                    "blocked refresh chain lacks one trusted status for its merge edge"
+                )
+            result.append(matches[-1])
+            cursor = previous_head
+        return result
+
+    def incorporated_design_stop_gate(
+        self,
+        state: PullRequestState,
+        phase_records: list[MarkerEvidence],
+    ) -> MarkerEvidence | None:
+        candidates = [
+            record
+            for record in phase_records
+            if set(record.payload) == DESIGN_STOP_PHASE_GATE_RECORD_KEYS
+            and record.payload.get("schema_version") == "1.1"
+            and record.payload.get("phase") == state.phase
+            and record.payload.get("verdict") == "CHANGES_REQUESTED"
+            and record.payload.get("loop_state") == "BLOCKED_LIMIT"
+            and record.payload.get("stop_reason") == "INVARIANT_FAMILY_RECURRENCE"
+            and SHA_PATTERN.fullmatch(str(record.payload.get("reviewed_sha", "")))
+            and self.github.is_ancestor(
+                str(record.payload["reviewed_sha"]), state.head_sha
+            )
+        ]
+        identities = {
+            (record.url, canonical_digest(record.payload)) for record in candidates
+        }
+        if len(identities) > 1:
+            raise UntrustedEvidenceError(
+                "incorporated design-stop Gate is ambiguous"
+            )
+        if not candidates:
+            return None
+        gate = candidates[0]
+        self.validate_blocked_refresh_gate(gate, phase_records)
+        return gate
+
     def recurring_invariant_families(
         self,
         gate: MarkerEvidence,
@@ -1949,11 +2048,26 @@ class PhaseLoop:
             )
             and SHA_PATTERN.fullmatch(str(record.payload.get("reviewed_sha", "")))
         ]
+        inherited_gate = self.incorporated_design_stop_gate(state, phase_records)
+        inherited_records: list[MarkerEvidence] = []
+        if (
+            inherited_gate is not None
+            and inherited_gate.payload.get("verdict") == "CHANGES_REQUESTED"
+            and inherited_gate.payload.get("loop_state") == "BLOCKED_LIMIT"
+        ):
+            self.validate_blocked_refresh_gate(inherited_gate, phase_records)
+            inherited_records = self.trusted_blocked_refresh_chain(
+                state, inherited_gate
+            )
         candidate_heads = {state.head_sha}
         candidate_heads.update(
             str(record.payload["reviewed_sha"]) for record in authorization_records
         )
-        result: list[MarkerEvidence] = []
+        inherited_heads = {
+            str(record.payload["head_sha"]) for record in inherited_records
+        }
+        candidate_heads.difference_update(inherited_heads)
+        result: list[MarkerEvidence] = list(inherited_records)
         for head_sha in sorted(candidate_heads):
             evidence = base_refresh_evidence_from_statuses(
                 self.github.commit_statuses(head_sha), head_sha=head_sha
@@ -1973,6 +2087,16 @@ class PhaseLoop:
                     ),
                     None,
                 )
+                if (
+                    matching_record is None
+                    and inherited_gate is not None
+                    and inherited_gate.url == prior_reference
+                    and head_sha == state.head_sha
+                    and phase_index <= 5
+                    and item.payload.get("from_phase") == PHASES[phase_index + 1]
+                    and item.payload.get("revalidate_phase") == state.phase
+                ):
+                    matching_record = inherited_gate
                 if matching_record is None:
                     raise UntrustedEvidenceError(
                         "base-refresh status is not bound to trusted Phase evidence"
@@ -2321,7 +2445,7 @@ class PhaseLoop:
             )
         ):
             return None
-        candidates = [
+        direct_candidates = [
             record
             for record in phase_records
             if record.payload.get("phase") == state.phase
@@ -2329,15 +2453,21 @@ class PhaseLoop:
             and record.payload.get("verdict") == "CHANGES_REQUESTED"
             and record.payload.get("loop_state") == "BLOCKED_LIMIT"
         ]
-        if not candidates:
-            return None
-        identities = {canonical_digest(record.payload) for record in candidates}
-        if len(identities) != 1:
-            raise UntrustedEvidenceError(
-                "blocked current Phase has ambiguous current-head gate evidence"
-            )
-        record = candidates[-1]
-        self.validate_blocked_refresh_gate(record, phase_records)
+        if direct_candidates:
+            identities = {
+                canonical_digest(record.payload) for record in direct_candidates
+            }
+            if len(identities) != 1:
+                raise UntrustedEvidenceError(
+                    "blocked current Phase has ambiguous current-head gate evidence"
+                )
+            record = direct_candidates[-1]
+            self.validate_blocked_refresh_gate(record, phase_records)
+        else:
+            record = self.incorporated_design_stop_gate(state, phase_records)
+            if record is None:
+                return None
+        self.trusted_blocked_refresh_chain(state, record)
         comparison = self.github.compare(state.head_sha, default_branch_sha)
         ahead_by = comparison.get("ahead_by")
         if not isinstance(ahead_by, int) or ahead_by < 0:
@@ -2361,31 +2491,31 @@ class PhaseLoop:
         ):
             return False
         expected_source = PHASES[phase_index + 1]
-        blocked_gates = {
-            (record.url, str(record.payload.get("reviewed_sha", ""))): record
-            for record in phase_records
-            if record.payload.get("phase") == state.phase
-            and record.payload.get("verdict") == "CHANGES_REQUESTED"
-            and record.payload.get("loop_state") == "BLOCKED_LIMIT"
-        }
+        gate = self.incorporated_design_stop_gate(state, phase_records)
+        if gate is None:
+            gate = self.latest_incorporated_phase_gate(state, phase_records)
+        if (
+            gate is None
+            or gate.payload.get("verdict") != "CHANGES_REQUESTED"
+            or gate.payload.get("loop_state") != "BLOCKED_LIMIT"
+        ):
+            return False
+        self.validate_blocked_refresh_gate(gate, phase_records)
+        self.trusted_blocked_refresh_chain(state, gate)
         incorporated: list[MarkerEvidence] = []
         for record in refresh_records:
             payload = record.payload
             old_head = str(payload.get("head_sha", ""))
-            gate = blocked_gates.get(
-                (str(payload.get("prior_pass_reference", "")), old_head)
-            )
             if (
                 payload.get("from_phase") != expected_source
                 or payload.get("revalidate_phase") != state.phase
                 or payload.get("target_base_sha") != default_branch_sha
+                or payload.get("prior_pass_reference") != gate.url
                 or old_head == state.head_sha
-                or gate is None
                 or not self.github.is_ancestor(old_head, state.head_sha)
                 or not self.github.is_ancestor(default_branch_sha, state.head_sha)
             ):
                 continue
-            self.validate_blocked_refresh_gate(gate, phase_records)
             incorporated.append(record)
         maximal = [
             candidate
@@ -2407,13 +2537,11 @@ class PhaseLoop:
                 "incorporated blocked base-refresh evidence is ambiguous"
             )
         record = maximal[0]
-        gate = blocked_gates[
-            (
-                str(record.payload["prior_pass_reference"]),
-                str(record.payload["head_sha"]),
-            )
-        ]
-        latest_gate = self.latest_incorporated_phase_gate(state, phase_records)
+        latest_gate = (
+            gate
+            if set(gate.payload) == DESIGN_STOP_PHASE_GATE_RECORD_KEYS
+            else self.latest_incorporated_phase_gate(state, phase_records)
+        )
         if latest_gate is None or latest_gate.url != gate.url:
             raise UntrustedEvidenceError(
                 "post-refresh authorization does not reference the latest current-Phase gate"

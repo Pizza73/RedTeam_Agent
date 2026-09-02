@@ -51,10 +51,19 @@ jobs:
       SOURCE_PHASE: ${{ inputs.source_phase }}
       TARGET_BASE_SHA: ${{ inputs.target_base_sha }}
     steps:
+      - name: Check out trusted base-refresh implementation
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
       - name: Invalidate stale phase PASS and authorize exact base refresh
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
         with:
           script: |
+            const path = require('path');
+            const refreshChain = require(path.join(
+              process.env.GITHUB_WORKSPACE, 'automation', 'base_refresh_chain.js'
+            ));
             if (process.env.CONFIRMATION !== 'REFRESH_AI_LOOP_BASE') {
               core.setFailed('Confirmation text does not match.');
               return;
@@ -282,16 +291,17 @@ jobs:
             const commonAuthorizationValid =
               (baseAuthorization || designStopAuthorization) &&
               authorization.phase === previousPhase &&
-              authorization.reviewed_sha === expectedHeadSha &&
               authorization.evidence_format === 'codex-native-v1' &&
               authorization.reviewer_login === process.env.AI_REVIEWER_LOGIN &&
               authorization.recorded_by === process.env.AI_GATE_APPROVER_LOGIN &&
               JSON.stringify(authorization.required_checks) === passingChecks;
             const isPriorPass = commonAuthorizationValid && baseAuthorization &&
+              authorization.reviewed_sha === expectedHeadSha &&
               authorization.verdict === 'PASS' &&
               authorization.loop_state === 'PASS' && authorization.finding_key === null;
             const isBlockedCurrentPhase = commonAuthorizationValid &&
               currentPhase === previousPhase && sourceIndex > 1 && sourceIndex <= 6 &&
+              (authorization.reviewed_sha === expectedHeadSha || designStopAuthorization) &&
               authorization.verdict === 'CHANGES_REQUESTED' &&
               authorization.loop_state === 'BLOCKED_LIMIT' &&
               /^[A-Z0-9][A-Z0-9._-]{0,63}$/.test(authorization.finding_key) &&
@@ -326,6 +336,21 @@ jobs:
               if (!process.env.AI_REVIEWER_LOGIN ||
                   !/^[0-9a-f]{40}$/.test(authorization.base_sha)) {
                 core.setFailed('Blocked current-Phase authorization is incomplete.');
+                return;
+              }
+              try {
+                await refreshChain.verifyBlockedRefreshChain({
+                  github, owner, repo,
+                  currentHeadSha: expectedHeadSha,
+                  gateHeadSha: authorization.reviewed_sha,
+                  gateReference: priorPassReference,
+                  sourcePhase,
+                  revalidationPhase: currentPhase,
+                });
+              } catch (error) {
+                core.setFailed(
+                  error instanceof Error ? error.message : 'Blocked refresh chain validation failed.'
+                );
                 return;
               }
               const basePhase = plan.phases[sourceIndex - 2].id;
@@ -421,7 +446,7 @@ jobs:
                 !readyReference.startsWith(expectedPrPrefix) ||
                 !exactKeys(ready, ['schema_version', 'phase', 'head_sha']) ||
                 ready.schema_version !== '1.0' || ready.phase !== currentPhase ||
-                ready.head_sha !== expectedHeadSha
+                ready.head_sha !== authorization.reviewed_sha
               ) {
                 core.setFailed(
                   'Blocked current Phase lacks trusted exact-HEAD ready evidence.'

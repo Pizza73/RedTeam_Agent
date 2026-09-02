@@ -84,6 +84,7 @@
 - Design Stop後の再開は、停止Gate、Current 40桁HEAD、Phase、承認済みDesign revisionへBindingした単回`DESIGN_APPROVED` Evidenceだけを使用する。LabelやFree-text commentを権限にしない。
 - Transient Lifecycle LabelはOperator向けProjectionであり、Implementation / Review Actionを認可しない。RunnerはCurrent-HEAD Trusted Request / Ready EvidenceからActionを決定する。
 - `ai-loop-blocked`中のCIは決定論的Checkだけを確定し、Review Readyを生成しない。Stop latchはTrusted Resume / Design Approval / Phase transitionだけが除去できる。旧`ai-needs-review` ProjectionはAuthority再検証後のDesign Approval遷移だけが正規化できる。
+- Design Stop中の連続Base Refreshは、Gate HEADからCurrent HEADまでの各2親Mergeと各Previous HEAD上のTrusted Exact-SHA Statusを最大32段まで完全検証する。自由なMerge、通常Commit、欠落Edgeから権限を継承しない。
 - Phase 4/5の外部選択はHuman Gateを通す。
 - 最終mergeは、承認済みDefault Branch上のLocal OrchestratorだけがPhase 0A～5の
   SHA-bound PASS Chain、Current-HEAD CI/Status、Stop Label不在、Current Default Branch

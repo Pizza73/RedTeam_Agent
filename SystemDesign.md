@@ -5174,6 +5174,13 @@ Projectionを生成しない。既存のTransient Projectionが遅延または�
 Gate、Approval、Required Checkが不変ならTrusted TransitionがIdempotentに正規化する。Stop latchの欠落、
 Authority Recordの不一致、Head Drift、Phase Base不整合は従来どおりFail Closedとする。
 
+Design Stop中にDefault Branch上の承認済みGovernanceが複数回進んだ場合、Blocked Base Refreshの権限は
+自由に継承しない。Gate HEADからCurrent PR HEADまでの各Commitを最大32段のFirst-Parent Chainとして検証し、
+各段がPrevious PR HEADを第1親、当時認可されたExact Default-Branch SHAを第2親とする2親Mergeであり、
+第1親に`github-actions[bot]`の対応するSHA-bound Base Refresh Statusが存在する場合だけ、同じDesign Stop
+Gateから次の1回のExpected-HEAD Refreshを再認可できる。通常Commit、Status欠落、親順序不一致、曖昧な
+Gateまたは上限超過はFail Closedとし、このChainはResumeやImplementation Requestを認可しない。
+
 ---
 
 # 41. Revision Summary
