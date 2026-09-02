@@ -5,6 +5,7 @@ import base64
 import hashlib
 import json
 import os
+import sqlite3
 import stat
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
@@ -13,6 +14,8 @@ from threading import Event, Lock
 from typing import Any, Literal, Protocol, cast
 
 import pytest
+from hypothesis import HealthCheck, given, settings
+from hypothesis import strategies as st
 from pydantic import ValidationError
 
 from redteam_agent.canonical import (
@@ -26,6 +29,7 @@ from redteam_agent.data_security import (
     AuditContext,
     AuditReferencePayload,
     AuthenticatedGenerationCoordinator,
+    DurableAuthenticatedGenerationBackend,
     EncryptedRawResultQuarantine,
     EncryptedRawResultSinkFactory,
     EncryptedSecureResultIngester,
@@ -42,10 +46,8 @@ from redteam_agent.data_security import (
     RepositoryQuarantineStreamBindingResolver,
     SandboxPolicy,
     SandboxRequirement,
-    SecretInjectionBroker,
     SecretStore,
     SecureIngestor,
-    TrustedSecretChannelRegistry,
     WrappedFileEncryptionKeyProvider,
     ingestion_output_authority,
     require_sandbox_capabilities,
@@ -59,6 +61,7 @@ from redteam_agent.errors import (
     EncryptionIntegrityError,
     EncryptionKeyUnavailableError,
     EncryptionNonceReuseError,
+    ExecutionStateTransitionError,
     RawResultQuarantineError,
     RawResultStreamingError,
     SandboxCapabilityStaleError,
@@ -277,7 +280,7 @@ def _wrapped_keys(
     wrapping_key: bytes = b"wrapped-provider-root-key-material",
 ) -> WrappedFileEncryptionKeyProvider:
     first_creation = generation_store.current_generation() == 0
-    provider = WrappedFileEncryptionKeyProvider(
+    provider = WrappedFileEncryptionKeyProvider._for_test_with_legacy_generation_store(
         state_path=state_path,
         wrapping_key=wrapping_key,
         generation_store=generation_store,
@@ -310,7 +313,7 @@ def _audit_head_store(
     generation_store: _GenerationStore,
 ) -> KeyedFileAuditHeadStore:
     state_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    return KeyedFileAuditHeadStore(
+    return KeyedFileAuditHeadStore._for_test_with_legacy_generation_store(
         state_path=state_path,
         authenticator=KeyedAuditChainAuthenticator(keys),
         generation_store=generation_store,
@@ -424,21 +427,11 @@ def _ingest_stream_for_test(
     return asyncio.run(ingest())
 
 
-def _claim_execution_for_test(harness: Any, execution: Any, *, now: datetime) -> Any:
-    claims = DispatchClaimRepository(harness.database)
-    with harness.database.transaction(immediate=True):
-        claimed = harness.executions.transition_provider(
-            execution.execution_id,
-            expected_state_version=execution.state_version,
-            new_state="DISPATCH_CLAIMED",
-            dispatch_attempts=1,
-            now=now,
-        )
-        claims.add_current(harness.executor._dispatch_claim(claimed, now=now))
-    return claimed
-
-
-def test_dispatch_claim_survives_submit_crash_and_resume_never_replays() -> None:
+@settings(max_examples=8, deadline=None)
+@given(restart_attempts=st.integers(min_value=1, max_value=5))
+def test_dispatch_claim_survives_submit_crash_and_resume_never_replays(
+    restart_attempts: int,
+) -> None:
     harness = build_execution_harness()
     prepared = prepare_execution(harness)
 
@@ -462,261 +455,195 @@ def test_dispatch_claim_survives_submit_crash_and_resume_never_replays() -> None
         )
 
     claimed = harness.executions.get(prepared.execution_id)
-    claim = DispatchClaimRepository(harness.database).get_by_execution(
-        prepared.execution_id
-    )
+    claim = DispatchClaimRepository(harness.database).get_by_execution(prepared.execution_id)
     assert claimed is not None and claimed.provider_execution_state == "DISPATCH_CLAIMED"
     assert claim is not None and claim.execution_state_version == claimed.state_version
+    assert claim.consumed_at == harness.clock()
     assert crashing.submit_calls == 1
 
-    recovery_adapter = MockExecutionAdapter(
-        capabilities=harness.environment.adapter_snapshot.adapters[0],
-        now=FIXED_TIME + timedelta(minutes=4),
-        reconcile_status="NOT_FOUND",
-    )
-    restarted = executor_with_adapter(harness, recovery_adapter)
-    reconciled = asyncio.run(
-        restarted.resume_execution(
-            prepared.execution_id,
-            now=FIXED_TIME + timedelta(minutes=4),
+    recovery_adapters: list[MockExecutionAdapter] = []
+    reconciled = claimed
+    for offset in range(restart_attempts):
+        recovery_adapter = MockExecutionAdapter(
+            capabilities=harness.environment.adapter_snapshot.adapters[0],
+            now=FIXED_TIME + timedelta(minutes=4 + offset),
+            reconcile_status="NOT_FOUND",
         )
-    )
+        recovery_adapters.append(recovery_adapter)
+        restarted = executor_with_adapter(harness, recovery_adapter)
+        reconciled = asyncio.run(
+            restarted.resume_execution(
+                prepared.execution_id,
+                now=FIXED_TIME + timedelta(minutes=4 + offset),
+            )
+        )
     assert reconciled.provider_execution_state == "OUTCOME_UNKNOWN"
-    assert recovery_adapter.submit_calls == 0
-    assert recovery_adapter.reconcile_calls == 1
+    assert sum(adapter.submit_calls for adapter in recovery_adapters) == 0
+    assert sum(adapter.reconcile_calls for adapter in recovery_adapters) == 1
 
 
-def test_secret_plaintext_only_reaches_fixed_claim_channel_and_is_zeroed(
+@settings(
+    max_examples=6,
+    deadline=None,
+    suppress_health_check=(HealthCheck.function_scoped_fixture,),
+)
+@given(secret_value=st.binary(min_size=1, max_size=64))
+def test_secret_plaintext_only_reaches_executor_fixed_adapter_and_is_zeroed(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    secret_value: bytes,
 ) -> None:
-    harness = build_execution_harness()
-    prepared = prepare_execution(harness)
-    claim_time = FIXED_TIME + timedelta(minutes=2, seconds=30)
-    claimed = _claim_execution_for_test(harness, prepared, now=claim_time)
-    _, _, secrets, authorizer, _ = _stores(tmp_path)
-    authorizer.allow_ingestion_write(claimed.mission_id, claimed.execution_id)
-    secret_value = b"jit-channel-only-secret"
+    policy = DataAccessPolicy(
+        allowed=(
+            DataAccessRule(
+                resource_type="secret_reference",
+                resource_pattern="secret_*",
+                operations=frozenset({"write", "resolve"}),
+            ),
+        ),
+        prohibited=(),
+    )
+    harness = build_execution_harness(data_access_policy=policy)
+    source = prepare_execution(harness)
+    case_root = tmp_path / f"property-case-{len(tuple(tmp_path.iterdir()))}"
+    case_root.mkdir(mode=0o700)
+    _, _, secrets, authorizer, _ = _stores(case_root)
+    authorizer.allow_ingestion_write(source.mission_id, source.execution_id)
     reference = secrets.create(
-        mission_id=claimed.mission_id,
+        mission_id=source.mission_id,
         secret_value=secret_value,
         credential_type="token",
         associated_principal_ref=None,
-        source_execution_id=claimed.execution_id,
+        source_execution_id=source.execution_id,
         created_at=NOW,
     )
-    authorizer.set_grants(
-        claimed.mission_id,
-        (
-            DataAccessGrant(
-                resource_type="secret_reference",
-                resource=ResourceBinding(
-                    resource_id=reference.secret_reference_id,
-                    resource_version="1",
-                    resource_digest=sha256_digest(reference),
-                ),
-                operations=frozenset({"resolve"}),
-            ),
-        ),
+    secret_binding = ResourceBinding(
+        resource_id=reference.secret_reference_id,
+        resource_version="1",
+        resource_digest=sha256_digest(reference),
     )
+    harness.kernel.resources.add(
+        ContextResourceIndexRecord(
+            index_id="index-executor-secret-dispatch",
+            binding=secret_binding,
+            resource_type="secret_reference",
+            mission_id=source.mission_id,
+            target_references=(),
+            verification_state="confirmed",
+            observed_at=FIXED_TIME + timedelta(seconds=2),
+            classification="secret",
+            size_bytes=0,
+            summary_metadata=CanonicalJsonObject({"source": "executor-secret-dispatch-regression"}),
+        )
+    )
+    grant = DataAccessGrant(
+        resource_type="secret_reference",
+        resource=secret_binding,
+        operations=frozenset({"resolve"}),
+    )
+    prepared = prepare_additional_execution(
+        harness,
+        requested_data_access=(grant,),
+        objective="Use one authorized Secret in the isolated mock Adapter",
+        run_seed="phase-0c-secret-dispatch",
+    )
+    authorizer.set_grants(prepared.mission_id, (grant,))
 
-    class CapturingChannel:
-        def __init__(self) -> None:
-            self.received: bytes | None = None
-            self.borrowed: memoryview | None = None
+    class ValidatingSecretAdapter(MockExecutionAdapter):
+        validated = False
 
-        def inject(
+        async def submit_with_secrets(
             self,
-            *,
-            execution_id: str,
-            secret_reference_id: str,
-            value: memoryview,
-        ) -> None:
-            assert execution_id == claimed.execution_id
-            assert secret_reference_id == reference.secret_reference_id
-            self.received = bytes(value)
-            self.borrowed = value
+            request,
+            idempotency_key,
+            values,
+        ):
+            assert len(values) == 1
+            assert values[0].secret_reference_id == reference.secret_reference_id
+            assert bytes(values[0].value) == secret_value
+            self.validated = True
+            return await super().submit(request, idempotency_key)
 
-    channel = CapturingChannel()
-    broker = SecretInjectionBroker(
-        store=secrets,
-        claims=DispatchClaimRepository(harness.database),
-        channels=TrustedSecretChannelRegistry(
-            {claimed.resolved_adapter_id: channel}
-        ),
-        clock=lambda: claim_time,
+    adapter = ValidatingSecretAdapter(
+        capabilities=harness.environment.adapter_snapshot.adapters[0],
+        now=FIXED_TIME + timedelta(minutes=3),
     )
-    with pytest.raises(SecretAccessError, match="injection broker"):
+    captured_buffers: list[bytearray] = []
+    original_resolve = secrets._resolve_for_injection
+
+    def observe_consumed_claim(reference, *, claim, claims, now, token):
+        persisted = DispatchClaimRepository(harness.database).get_by_execution(
+            prepared.execution_id
+        )
+        assert persisted == claim and claim.consumed_at is not None
+        plaintext = original_resolve(
+            reference,
+            claim=claim,
+            claims=claims,
+            now=now,
+            token=token,
+        )
+        captured_buffers.append(plaintext)
+        return plaintext
+
+    monkeypatch.setattr(secrets, "_resolve_for_injection", observe_consumed_claim)
+    executor = executor_with_adapter(
+        harness,
+        adapter,
+        secret_store=secrets,
+    )
+    with pytest.raises(SecretAccessError, match="direct Secret plaintext"):
         secrets.resolve(
             reference,
-            execution_id=claimed.execution_id,
-            now=claim_time,
-        )
-    consumed = broker.inject(
-        execution_id=claimed.execution_id,
-        reference=reference,
-        now=claim_time + timedelta(days=1),
-    )
-    assert channel.received == secret_value
-    assert channel.borrowed is not None and bytes(channel.borrowed) == bytes(len(secret_value))
-    assert consumed.consumed_at == claim_time
-    with pytest.raises(SecretAccessError, match="Dispatch Claim"):
-        broker.inject(
-            execution_id=claimed.execution_id,
-            reference=reference,
-            now=claim_time,
+            execution_id=prepared.execution_id,
+            now=FIXED_TIME + timedelta(minutes=3),
         )
 
-    authorized_harness = build_execution_harness()
-    authorized = prepare_execution(authorized_harness)
-    authorized_broker = SecretInjectionBroker(
-        store=secrets,
-        claims=DispatchClaimRepository(authorized_harness.database),
-        channels=TrustedSecretChannelRegistry(
-            {authorized.resolved_adapter_id: channel}
-        ),
-        clock=lambda: claim_time,
-    )
-    with pytest.raises(SecretAccessError, match="Dispatch Claim"):
-        authorized_broker.inject(
-            execution_id=authorized.execution_id,
-            reference=reference,
-            now=claim_time,
-        )
-
-    expired_harness = build_execution_harness()
-    expired_prepared = prepare_execution(expired_harness)
-    expired_claimed = _claim_execution_for_test(
-        expired_harness,
-        expired_prepared,
-        now=claim_time,
-    )
-    expired_claims = DispatchClaimRepository(expired_harness.database)
-    expired_claim = expired_claims.get_by_execution(expired_claimed.execution_id)
-    assert expired_claim is not None
-    expired_broker = SecretInjectionBroker(
-        store=secrets,
-        claims=expired_claims,
-        channels=TrustedSecretChannelRegistry(
-            {expired_claimed.resolved_adapter_id: channel}
-        ),
-        clock=lambda: expired_claim.expires_at,
-    )
-    with pytest.raises(SecretAccessError, match="Dispatch Claim"):
-        expired_broker.inject(
-            execution_id=expired_claimed.execution_id,
-            reference=reference,
-            now=claim_time,
-        )
-    assert expired_claims.get_by_execution(expired_claimed.execution_id) == expired_claim
-
-    running_harness = build_execution_harness()
-    running_prepared = prepare_execution(running_harness)
-    running_claimed = _claim_execution_for_test(
-        running_harness,
-        running_prepared,
-        now=claim_time,
-    )
-    running_harness.executions.transition_provider(
-        running_claimed.execution_id,
-        expected_state_version=running_claimed.state_version,
-        new_state="RUNNING",
-        provider_task_id="provider-running-secret-denial",
-        now=claim_time + timedelta(seconds=1),
-    )
-    running_broker = SecretInjectionBroker(
-        store=secrets,
-        claims=DispatchClaimRepository(running_harness.database),
-        channels=TrustedSecretChannelRegistry(
-            {running_claimed.resolved_adapter_id: channel}
-        ),
-        clock=lambda: claim_time + timedelta(seconds=1),
-    )
-    with pytest.raises(SecretAccessError, match="Dispatch Claim"):
-        running_broker.inject(
-            execution_id=running_claimed.execution_id,
-            reference=reference,
-            now=claim_time,
-        )
-
-    mismatched_harness = build_execution_harness()
-    mismatched_prepared = prepare_execution(mismatched_harness)
-    mismatched_claimed = _claim_execution_for_test(
-        mismatched_harness,
-        mismatched_prepared,
-        now=claim_time,
-    )
-    mismatched_claims = DispatchClaimRepository(mismatched_harness.database)
-    mismatched_broker = SecretInjectionBroker(
-        store=secrets,
-        claims=mismatched_claims,
-        channels=TrustedSecretChannelRegistry({"different-adapter": channel}),
-        clock=lambda: claim_time,
-    )
-    with pytest.raises(SecretAccessError, match="adapter channel"):
-        mismatched_broker.inject(
-            execution_id=mismatched_claimed.execution_id,
-            reference=reference,
-            now=claim_time,
-        )
-    mismatched_claim = mismatched_claims.get_by_execution(
-        mismatched_claimed.execution_id
-    )
-    assert mismatched_claim is not None and mismatched_claim.consumed_at is None
-
-    failing_harness = build_execution_harness()
-    failing_prepared = prepare_execution(failing_harness)
-    failing_claimed = _claim_execution_for_test(
-        failing_harness,
-        failing_prepared,
-        now=claim_time,
-    )
-
-    class FailingChannel:
-        borrowed: memoryview | None = None
-
-        def inject(self, **kwargs: Any) -> None:
-            self.borrowed = cast(memoryview, kwargs["value"])
-            raise RuntimeError("adapter must not retain this value")
-
-    failing_channel = FailingChannel()
-    failing_claims = DispatchClaimRepository(failing_harness.database)
-    failing_broker = SecretInjectionBroker(
-        store=secrets,
-        claims=failing_claims,
-        channels=TrustedSecretChannelRegistry(
-            {failing_claimed.resolved_adapter_id: failing_channel}
-        ),
-        clock=lambda: claim_time,
-    )
-    with pytest.raises(SecretAccessError, match="failed closed") as failure:
-        failing_broker.inject(
-            execution_id=failing_claimed.execution_id,
-            reference=reference,
-            now=claim_time,
-        )
-    assert failure.value.__cause__ is None and failure.value.__context__ is None
-    assert failing_channel.borrowed is not None
-    assert bytes(failing_channel.borrowed) == bytes(len(secret_value))
-    failed_claim = failing_claims.get_by_execution(failing_claimed.execution_id)
-    assert failed_claim is not None and failed_claim.consumed_at == claim_time
-
-
-def test_result_collection_authority_uses_collection_time_and_exact_tool_cap() -> None:
-    harness = build_execution_harness()
-    prepared = prepare_execution(harness)
-    hard_cap = max(1, harness.environment.tool.max_output_bytes // 2)
-    harness.executor.quarantine_retention = timedelta(minutes=5)
-    harness.executor.system_hard_output_cap = hard_cap
     running = asyncio.run(
-        harness.executor.dispatch(
+        executor.dispatch(
             prepared.execution_id,
             now=FIXED_TIME + timedelta(minutes=3),
         )
     )
-    collection_time = FIXED_TIME + timedelta(minutes=10)
-    authority = harness.executor._ensure_collection_authority(
+
+    assert running.provider_execution_state == "RUNNING"
+    assert adapter.validated
+    assert captured_buffers and bytes(captured_buffers[0]) == bytes(len(secret_value))
+    consumed = DispatchClaimRepository(harness.database).get_by_execution(prepared.execution_id)
+    assert consumed is not None and consumed.consumed_at == harness.clock()
+
+
+@settings(max_examples=10, deadline=None)
+@given(
+    collection_offset=st.integers(min_value=5, max_value=15),
+    retention_minutes=st.integers(min_value=1, max_value=12),
+    cap_divisor=st.integers(min_value=2, max_value=8),
+)
+def test_result_collection_authority_uses_collection_time_and_exact_tool_cap(
+    collection_offset: int,
+    retention_minutes: int,
+    cap_divisor: int,
+) -> None:
+    harness = build_execution_harness()
+    prepared = prepare_execution(harness)
+    hard_cap = max(1, harness.environment.tool.max_output_bytes // cap_divisor)
+    collection_time = FIXED_TIME + timedelta(minutes=collection_offset)
+    executor = executor_with_adapter(
+        harness,
+        harness.adapter,
+        clock=lambda: collection_time,
+    )
+    executor.quarantine_retention = timedelta(minutes=retention_minutes)
+    executor.system_hard_output_cap = hard_cap
+    running = asyncio.run(
+        executor.dispatch(
+            prepared.execution_id,
+            now=FIXED_TIME + timedelta(minutes=3),
+        )
+    )
+    authority = executor._ensure_collection_authority(
         running,
-        now=collection_time,
+        collection_started_at=collection_time,
     )
     revision = MissionRevisionRepository(harness.database).get(
         running.mission_id,
@@ -725,18 +652,25 @@ def test_result_collection_authority_uses_collection_time_and_exact_tool_cap() -
     assert revision is not None
     assert authority.collection_started_at == collection_time
     assert authority.retention_until == min(
-        collection_time + timedelta(minutes=5),
+        collection_time + timedelta(minutes=retention_minutes),
         revision.valid_until,
     )
     assert authority.max_result_bytes == hard_cap
 
-    restarted = executor_with_adapter(harness, harness.adapter)
+    restarted = executor_with_adapter(
+        harness,
+        harness.adapter,
+        clock=lambda: collection_time + timedelta(seconds=30),
+    )
     restarted.quarantine_retention = timedelta(hours=12)
     restarted.system_hard_output_cap = harness.environment.tool.max_output_bytes
-    assert restarted._ensure_collection_authority(
-        running,
-        now=collection_time + timedelta(minutes=1),
-    ) == authority
+    assert (
+        restarted._ensure_collection_authority(
+            running,
+            collection_started_at=collection_time + timedelta(seconds=30),
+        )
+        == authority
+    )
     persisted = ResultCollectionAuthorityRepository(harness.database).get_by_execution(
         running.execution_id
     )
@@ -748,6 +682,110 @@ def test_result_collection_authority_uses_collection_time_and_exact_tool_cap() -
     ).resolve(running.execution_id)
     assert binding.max_result_bytes == hard_cap
     assert binding.retention_until == authority.retention_until
+
+
+@settings(max_examples=12, deadline=None)
+@given(
+    payloads=st.lists(
+        st.binary(min_size=0, max_size=128),
+        min_size=1,
+        max_size=8,
+    )
+)
+def test_authenticated_generation_transitions_preserve_latest_content(
+    payloads: list[bytes],
+) -> None:
+    anchors = InMemoryGenerationAnchorStore()
+    blobs = InMemoryImmutableGenerationBlobStore()
+    coordinator = AuthenticatedGenerationCoordinator(
+        namespace="phase0c-generation-property",
+        anchors=anchors,
+        blobs=blobs,
+    )
+    expected_digest: str | None = None
+    committed = None
+    for generation, payload in enumerate(payloads, start=1):
+        committed = coordinator.commit(
+            payload,
+            expected_anchor_digest=expected_digest,
+        )
+        expected_digest = committed.anchor_digest
+        assert committed.generation == generation
+        assert coordinator.recover() == (committed, payload)
+    assert committed is not None
+
+
+@settings(max_examples=12, deadline=None)
+@given(
+    attempted_states=st.lists(
+        st.sampled_from(
+            (
+                "PENDING",
+                "INGESTING",
+                "INGESTED_DURABLE",
+                "DELETE_PENDING",
+                "QUARANTINE_ERASED",
+                "SUCCEEDED",
+                "FAILED",
+                "QUARANTINED",
+            )
+        ),
+        min_size=1,
+        max_size=12,
+    )
+)
+def test_result_ingestion_repository_property_rejects_out_of_order_transitions(
+    attempted_states: list[str],
+) -> None:
+    harness = build_execution_harness()
+    prepared = prepare_execution(harness)
+    running = asyncio.run(
+        harness.executor.dispatch(
+            prepared.execution_id,
+            now=FIXED_TIME + timedelta(minutes=3),
+        )
+    )
+    asyncio.run(harness.executor.collect_result(running.execution_id))
+    current = harness.ingestions.get_by_execution(running.execution_id)
+    assert current is not None and current.status == "PENDING"
+    allowed = {
+        "PENDING": {"INGESTING"},
+        "INGESTING": {"INGESTED_DURABLE", "SUCCEEDED", "FAILED"},
+        "INGESTED_DURABLE": {"DELETE_PENDING", "SUCCEEDED"},
+        "DELETE_PENDING": {"QUARANTINE_ERASED"},
+        "QUARANTINE_ERASED": {"SUCCEEDED"},
+        "FAILED": {"INGESTING", "QUARANTINED"},
+        "SUCCEEDED": set(),
+        "QUARANTINED": set(),
+    }
+    for index, attempted in enumerate(attempted_states, start=1):
+        transition_time = FIXED_TIME + timedelta(minutes=5 + index)
+        kwargs: dict[str, object] = {}
+        if attempted == "INGESTING":
+            kwargs = {
+                "lease_id": f"property-lease-{index}",
+                "lease_expires_at": transition_time + timedelta(minutes=1),
+            }
+        elif attempted in {"FAILED", "QUARANTINED"}:
+            kwargs = {"failure_code": "PROPERTY_FAILURE"}
+        if attempted in allowed[current.status]:
+            current = harness.ingestions.transition(
+                current.ingestion_id,
+                expected_state_version=current.state_version,
+                status=attempted,  # type: ignore[arg-type]
+                now=transition_time,
+                **kwargs,  # type: ignore[arg-type]
+            )
+        else:
+            with pytest.raises(ExecutionStateTransitionError):
+                harness.ingestions.transition(
+                    current.ingestion_id,
+                    expected_state_version=current.state_version,
+                    status=attempted,  # type: ignore[arg-type]
+                    now=transition_time,
+                    **kwargs,  # type: ignore[arg-type]
+                )
+        assert harness.ingestions.get(current.ingestion_id) == current
 
 
 def test_authenticated_generation_recovery_is_content_bound_and_fail_closed() -> None:
@@ -776,15 +814,93 @@ def test_authenticated_generation_recovery_is_content_bound_and_fail_closed() ->
         coordinator.recover()
 
 
+def test_durable_authenticated_generation_backend_survives_restart_and_tamper(
+    tmp_path: Path,
+) -> None:
+    backend_path = tmp_path / "trusted-generation-control.sqlite3"
+    authentication_key = b"generation-anchor-authentication-key-v1"
+    backend = DurableAuthenticatedGenerationBackend(
+        database_path=backend_path,
+        authentication_key=authentication_key,
+    )
+    coordinator = AuthenticatedGenerationCoordinator(
+        namespace="audit-head-state",
+        anchors=backend,
+        blobs=backend,
+    )
+    marker = b"durable-generation-state"
+    committed = coordinator.commit(marker, expected_anchor_digest=None)
+    with sqlite3.connect(backend_path) as inspection:
+        ciphertext = inspection.execute(
+            "SELECT ciphertext FROM authenticated_generation_blobs WHERE blob_id = ?",
+            (committed.immutable_blob_id,),
+        ).fetchone()[0]
+    assert marker not in bytes(ciphertext)
+
+    restarted_backend = DurableAuthenticatedGenerationBackend(
+        database_path=backend_path,
+        authentication_key=authentication_key,
+    )
+    restarted = AuthenticatedGenerationCoordinator(
+        namespace="audit-head-state",
+        anchors=restarted_backend,
+        blobs=restarted_backend,
+    )
+    assert restarted.recover() == (committed, marker)
+
+    with sqlite3.connect(backend_path) as corruption:
+        corruption.execute(
+            "UPDATE authenticated_generation_blobs SET ciphertext = ? WHERE blob_id = ?",
+            (b"corrupt", committed.immutable_blob_id),
+        )
+    with pytest.raises(AuthenticatedGenerationError, match="authentication"):
+        restarted.recover()
+
+
+def test_production_state_constructors_reject_integer_only_generation_store(
+    tmp_path: Path,
+) -> None:
+    state_directory = tmp_path / "production-generation-rejection"
+    state_directory.mkdir(mode=0o700)
+    legacy = _GenerationStore()
+    with pytest.raises(TypeError, match="generation_store"):
+        WrappedFileEncryptionKeyProvider(
+            state_path=state_directory / "keys.json",
+            wrapping_key=b"production-wrapping-key-material-v1",
+            generation_store=legacy,  # type: ignore[call-arg]
+        )
+    with pytest.raises(TypeError, match="generation_store"):
+        KeyedFileAuditHeadStore(
+            state_path=state_directory / "audit.json",
+            authenticator=KeyedAuditChainAuthenticator(_keys()),
+            generation_store=legacy,  # type: ignore[call-arg]
+        )
+    in_memory_key_coordinator = AuthenticatedGenerationCoordinator(
+        namespace="wrapped-key-state",
+        anchors=InMemoryGenerationAnchorStore(),
+        blobs=InMemoryImmutableGenerationBlobStore(),
+    )
+    with pytest.raises(EncryptionKeyUnavailableError, match="complete generation backend"):
+        WrappedFileEncryptionKeyProvider(
+            state_path=state_directory / "in-memory-keys.json",
+            wrapping_key=b"production-wrapping-key-material-v1",
+            generation_coordinator=in_memory_key_coordinator,
+        )
+
+
 def test_key_and_audit_state_recover_from_external_blobs_after_path_replacement(
     tmp_path: Path,
 ) -> None:
-    key_anchors = InMemoryGenerationAnchorStore()
-    key_blobs = InMemoryImmutableGenerationBlobStore()
+    control_directory = tmp_path / "content-bound-control-plane"
+    control_directory.mkdir(mode=0o700)
+    generation_backend = DurableAuthenticatedGenerationBackend(
+        database_path=control_directory / "generations.sqlite3",
+        authentication_key=b"content-bound-generation-authentication-key",
+    )
     key_coordinator = AuthenticatedGenerationCoordinator(
         namespace="wrapped-key-state",
-        anchors=key_anchors,
-        blobs=key_blobs,
+        anchors=generation_backend,
+        blobs=generation_backend,
     )
     key_directory = tmp_path / "content-bound-key-state"
     key_directory.mkdir(mode=0o700)
@@ -813,12 +929,10 @@ def test_key_and_audit_state_recover_from_external_blobs_after_path_replacement(
     )
     assert recovered_keys.get_active_key_metadata("audit_signing") == metadata
 
-    audit_anchors = InMemoryGenerationAnchorStore()
-    audit_blobs = InMemoryImmutableGenerationBlobStore()
     audit_coordinator = AuthenticatedGenerationCoordinator(
         namespace="audit-head-state",
-        anchors=audit_anchors,
-        blobs=audit_blobs,
+        anchors=generation_backend,
+        blobs=generation_backend,
     )
     authenticator = KeyedAuditChainAuthenticator(recovered_keys)
     mission_id = "mission-content-bound-audit"
@@ -913,7 +1027,7 @@ def test_stream_binding_resolver_uses_current_repositories_and_rejects_callers(
     )
     executor._ensure_collection_authority(
         execution,
-        now=FIXED_TIME + timedelta(minutes=3),
+        collection_started_at=FIXED_TIME + timedelta(minutes=4),
     )
     resolver = RepositoryQuarantineStreamBindingResolver(
         database=harness.database,
@@ -1235,7 +1349,6 @@ def test_repository_authorizer_revalidates_decision_execution_and_current_policy
         executor.ingest_result(
             running.execution_id,
             ingester=DirectWriteProbe(),
-            now=written_at,
         )
     )
     artifact_ids = artifacts._store.resource_ids_with_prefix(
@@ -1306,9 +1419,7 @@ def test_repository_authorizer_revalidates_decision_execution_and_current_policy
             observed_at=FIXED_TIME + timedelta(minutes=2),
             classification="normal",
             size_bytes=reference.size_bytes,
-            summary_metadata=CanonicalJsonObject(
-                {"source": "repository-authorizer-regression"}
-            ),
+            summary_metadata=CanonicalJsonObject({"source": "repository-authorizer-regression"}),
         )
     )
     grant = DataAccessGrant(
@@ -1358,19 +1469,22 @@ def test_repository_authorizer_revalidates_decision_execution_and_current_policy
             operation="read",
             now=FIXED_TIME + timedelta(minutes=5),
         )
-    assert artifacts.read(
-        reference,
-        execution_id=prepared_reader.execution_id,
-        operation="read",
-        now=FIXED_TIME + timedelta(minutes=5),
-    ) == b"password=[REDACTED]"
-    with pytest.raises(SecretAccessError, match="injection broker"):
+    assert (
+        artifacts.read(
+            reference,
+            execution_id=prepared_reader.execution_id,
+            operation="read",
+            now=FIXED_TIME + timedelta(minutes=5),
+        )
+        == b"password=[REDACTED]"
+    )
+    with pytest.raises(SecretAccessError, match="direct Secret plaintext"):
         secrets.resolve(
             secret,
             execution_id=running.execution_id,
             now=FIXED_TIME + timedelta(minutes=5),
         )
-    with pytest.raises(SecretAccessError, match="injection broker"):
+    with pytest.raises(SecretAccessError, match="direct Secret plaintext"):
         secrets.resolve(
             secret,
             execution_id=prepared_reader.execution_id,
@@ -1384,7 +1498,7 @@ def test_repository_authorizer_revalidates_decision_execution_and_current_policy
         run_seed="phase-0c-repository-terminal-reader",
         approval_expires_at=FIXED_TIME + timedelta(minutes=6),
     )
-    with pytest.raises(SecretAccessError, match="injection broker"):
+    with pytest.raises(SecretAccessError, match="direct Secret plaintext"):
         secrets.resolve(
             secret,
             execution_id=terminal_reader.execution_id,
@@ -1407,9 +1521,7 @@ def test_repository_authorizer_revalidates_decision_execution_and_current_policy
             observed_at=FIXED_TIME + timedelta(minutes=5, seconds=1),
             classification="normal",
             size_bytes=reference.size_bytes,
-            summary_metadata=CanonicalJsonObject(
-                {"source": "stale-binding-regression"}
-            ),
+            summary_metadata=CanonicalJsonObject({"source": "stale-binding-regression"}),
         )
     )
     with pytest.raises(SecretAccessError, match="current exact resource grant"):
@@ -1435,12 +1547,10 @@ def test_repository_authorizer_revalidates_decision_execution_and_current_policy
             observed_at=FIXED_TIME + timedelta(minutes=5, seconds=2),
             classification="secret",
             size_bytes=0,
-            summary_metadata=CanonicalJsonObject(
-                {"source": "stale-secret-binding-regression"}
-            ),
+            summary_metadata=CanonicalJsonObject({"source": "stale-secret-binding-regression"}),
         )
     )
-    with pytest.raises(SecretAccessError, match="injection broker"):
+    with pytest.raises(SecretAccessError, match="direct Secret plaintext"):
         secrets.resolve(
             secret,
             execution_id=prepared_reader.execution_id,
@@ -1654,11 +1764,7 @@ def test_basic_authorization_is_redacted_complete_and_across_stream_chunks(
 
     async def ingest_basic_stream():
         sink = factory.for_execution(execution_id)
-        await sink.write_stdout(
-            b"Authorization: Basic "
-            + complete_secret
-            + b"\nAuthorization: Ba"
-        )
+        await sink.write_stdout(b"Authorization: Basic " + complete_secret + b"\nAuthorization: Ba")
         await sink.write_stdout(b"sic " + split_secret + b"\nstatus=ok")
         receipt = await sink.commit()
         return await SecureIngestor(
@@ -1689,8 +1795,7 @@ def test_basic_authorization_is_redacted_complete_and_across_stream_chunks(
         artifact, execution_id="execution-test-access", operation="read", now=NOW
     )
     assert visible == (
-        b"Authorization: Basic [REDACTED]\n"
-        b"Authorization: Basic [REDACTED]\nstatus=ok"
+        b"Authorization: Basic [REDACTED]\nAuthorization: Basic [REDACTED]\nstatus=ok"
     )
     for value in (complete_secret, split_secret):
         assert value not in visible
@@ -1765,9 +1870,7 @@ def test_unsupported_authorization_schemes_are_redacted_complete_and_split(
             secrets=secrets,
         ).ingest_stream(sink, receipt, now=NOW)
         assert result.redaction_metadata.redaction_count == 1
-        assert result.detected_secrets[0].credential_type == (
-            credential_type or case
-        )
+        assert result.detected_secrets[0].credential_type == (credential_type or case)
         assert secret.decode() not in result.model_dump_json()
         artifact = result.redacted_artifacts[0]
         authorizer.set_grants(
@@ -1875,10 +1978,7 @@ def test_standalone_private_key_blocks_are_redacted_complete_and_split(
     tmp_path: Path,
 ) -> None:
     quarantine, artifacts, secrets, authorizer, _ = _stores(tmp_path)
-    complete_block = (
-        b"-----BEGIN PRIVATE KEY-----\ncomplete-material\n"
-        b"-----END PRIVATE KEY-----"
-    )
+    complete_block = b"-----BEGIN PRIVATE KEY-----\ncomplete-material\n-----END PRIVATE KEY-----"
     authorizer.allow_ingestion_write("mission-pem", "execution-pem-complete")
     complete = _ingest_stream_for_test(
         quarantine=quarantine,
@@ -1893,8 +1993,7 @@ def test_standalone_private_key_blocks_are_redacted_complete_and_split(
     assert complete_block.decode() not in complete.model_dump_json()
 
     split_block = (
-        b"-----BEGIN OPENSSH PRIVATE KEY-----\nsplit-material\n"
-        b"-----END OPENSSH PRIVATE KEY-----"
+        b"-----BEGIN OPENSSH PRIVATE KEY-----\nsplit-material\n-----END OPENSSH PRIVATE KEY-----"
     )
     mission_id = "mission-pem-split"
     execution_id = "execution-pem-split"
@@ -1916,9 +2015,7 @@ def test_standalone_private_key_blocks_are_redacted_complete_and_split(
 
     async def ingest_split_key():
         await sink.write_stdout(b"-----BEGIN OPENSSH PRI")
-        await sink.write_stdout(
-            b"VATE KEY-----\nsplit-material\n-----END OPENSSH PRIVATE"
-        )
+        await sink.write_stdout(b"VATE KEY-----\nsplit-material\n-----END OPENSSH PRIVATE")
         await sink.write_stdout(b" KEY-----")
         receipt = await sink.commit()
         return await SecureIngestor(
@@ -1976,8 +2073,7 @@ def test_standalone_private_key_blocks_are_redacted_complete_and_split(
                 b"VATE KEY-----\nsplit-material\n-----END DSA PRIVATE",
                 b" KEY-----",
             ),
-            b"-----BEGIN DSA PRIVATE KEY-----\nsplit-material\n"
-            b"-----END DSA PRIVATE KEY-----",
+            b"-----BEGIN DSA PRIVATE KEY-----\nsplit-material\n-----END DSA PRIVATE KEY-----",
         ),
     ),
 )
@@ -2035,12 +2131,15 @@ def test_additional_private_key_pem_labels_are_redacted_complete_and_split(
             ),
         ),
     )
-    assert artifacts.read(
-        artifact,
-        execution_id="execution-test-access",
-        operation="read",
-        now=NOW,
-    ) == b"[REDACTED]"
+    assert (
+        artifacts.read(
+            artifact,
+            execution_id="execution-test-access",
+            operation="read",
+            now=NOW,
+        )
+        == b"[REDACTED]"
+    )
 
 
 def test_encrypted_raw_artifact_cannot_be_used_as_context_read(
@@ -2072,6 +2171,7 @@ def test_secure_ingestion_replacement_exception_drops_secret_bearing_traceback(
     quarantine, artifacts, secrets, authorizer, _ = _stores(tmp_path)
     authorizer.allow_ingestion_write("mission-traceback", "execution-traceback")
     raw = b"traceback-private-result"
+
     def fail_artifact_write(**kwargs) -> None:
         del kwargs
         raise ArtifactSecurityError("simulated publication failure")
@@ -2231,9 +2331,7 @@ def test_release_audit_failures_drop_decrypted_traceback_locals(
     assert quarantine_error.value.__context__ is None
     traceback = quarantine_error.value.__traceback__
     while traceback is not None:
-        if traceback.tb_frame.f_code.co_filename.endswith(
-            "data_security/ingestion.py"
-        ):
+        if traceback.tb_frame.f_code.co_filename.endswith("data_security/ingestion.py"):
             assert quarantine_raw not in traceback.tb_frame.f_locals.values()
         traceback = traceback.tb_next
 
@@ -2298,6 +2396,7 @@ def test_quarantine_delete_recovers_after_post_audit_crash(
         mission_quota_bytes=16 * 1024,
         clock=lambda: NOW,
     )
+    restarted.reconcile()
     assert not restarted._store.has_resource(
         mission_id=reference.mission_id,
         resource_id=reference.quarantine_id,
@@ -2307,10 +2406,13 @@ def test_quarantine_delete_recovers_after_post_audit_crash(
         prefix="quarantinedeletion_",
     )
     assert keys.resource_key_destroyed(envelope.payload.metadata)
-    assert sum(
-        event.event_type == "raw_result_quarantine.delete"
-        for event in audit_log.events_for(reference.mission_id)
-    ) == 1
+    assert (
+        sum(
+            event.event_type == "raw_result_quarantine.delete"
+            for event in audit_log.events_for(reference.mission_id)
+        )
+        == 1
+    )
 
 
 def test_oauth_fields_are_redacted_across_stream_chunks(tmp_path: Path) -> None:
@@ -2368,19 +2470,14 @@ def test_oauth_fields_are_redacted_across_stream_chunks(tmp_path: Path) -> None:
         await sink.write_stdout(b'ential":"cross-value","password')
         await sink.write_stdout(b'Hash":"hash-value","client')
         await sink.write_stdout(b'Secret":"client-value","refresh_')
+        await sink.write_stdout(b'token":"refresh-value","oauthToken":"oauth-value","sshPrivate')
         await sink.write_stdout(
-            b'token":"refresh-value","oauthToken":"oauth-value","sshPrivate'
-        )
-        await sink.write_stdout(
-            b'Key":"ssh-value","api\\u005fkey":"escaped-api-value",'
-            b'"client\\u00'
+            b'Key":"ssh-value","api\\u005fkey":"escaped-api-value","client\\u00'
         )
         await sink.write_stdout(b'5fsecret":"escaped-client-value"} ')
         await sink.write_stdout(b"passwordHash=unquoted-hash token")
         await sink.write_stdout(b"Value: unquoted-token")
-        await sink.write_stdout(
-            b" machine complete.example login user password complete-netrc "
-        )
+        await sink.write_stdout(b" machine complete.example login user password complete-netrc ")
         await sink.write_stdout(b"machine split.example login user pass")
         await sink.write_stdout(b"word split-netrc")
         await sink.write_stdout(b" X<password>complete-xml</password> <client")
@@ -2566,9 +2663,7 @@ def test_raw_chunk_failures_leave_no_secret_in_streaming_traceback(
     traceback = error.__traceback__
     checked_streaming_frame = False
     while traceback is not None:
-        if traceback.tb_frame.f_code.co_filename.endswith(
-            "data_security/streaming.py"
-        ):
+        if traceback.tb_frame.f_code.co_filename.endswith("data_security/streaming.py"):
             checked_streaming_frame = True
             assert "chunk" not in traceback.tb_frame.f_locals
             assert raw_chunk not in traceback.tb_frame.f_locals.values()
@@ -2625,9 +2720,7 @@ def test_terminal_storage_and_key_failures_are_typed_for_recovery(
         asyncio.run(storage_sink.commit())
     assert storage_sink.recovery_metadata(updated_at=NOW).state == "RECOVERY_REQUIRED"
     monkeypatch.setattr(storage_sink._store, "write", original_write)
-    assert asyncio.run(storage_sink.commit()).stdout_bytes == len(
-        b"durable-before-terminal"
-    )
+    assert asyncio.run(storage_sink.commit()).stdout_bytes == len(b"durable-before-terminal")
 
     key_factory = factory("execution-terminal-key")
     key_sink = key_factory.for_execution("execution-terminal-key")
@@ -2644,9 +2737,7 @@ def test_terminal_storage_and_key_failures_are_typed_for_recovery(
         asyncio.run(key_sink.commit())
     assert key_sink.recovery_metadata(updated_at=NOW).state == "RECOVERY_REQUIRED"
     monkeypatch.setattr(keys, "seal_for_resource", original_seal)
-    assert asyncio.run(key_sink.commit()).stdout_bytes == len(
-        b"durable-before-key-failure"
-    )
+    assert asyncio.run(key_sink.commit()).stdout_bytes == len(b"durable-before-key-failure")
 
 
 def test_encrypted_store_fsyncs_parent_before_acknowledging_write(
@@ -2699,14 +2790,17 @@ def test_encrypted_store_fsyncs_parent_before_acknowledging_write(
     assert directory_sync_attempts == 7
     with pytest.raises(ArtifactSecurityError, match="trusted ingestion"):
         quarantine.resume(reference, now=NOW)
-    assert _quarantined_content_for_test(
-        quarantine,
-        reference,
-        now=NOW,
-    ) == b"encrypted-result"
-    assert tuple(
-        event.event_type for event in audit_log.events_for("mission-durable")
-    ) == ("raw_result_quarantine.commit",)
+    assert (
+        _quarantined_content_for_test(
+            quarantine,
+            reference,
+            now=NOW,
+        )
+        == b"encrypted-result"
+    )
+    assert tuple(event.event_type for event in audit_log.events_for("mission-durable")) == (
+        "raw_result_quarantine.commit",
+    )
 
 
 def test_encrypted_store_write_is_anchored_during_mission_directory_swap(
@@ -2769,11 +2863,14 @@ def test_encrypted_store_write_is_anchored_during_mission_directory_swap(
         created_at=NOW,
         retention_until=NOW + timedelta(hours=1),
     )
-    assert _quarantined_content_for_test(
-        quarantine,
-        reference,
-        now=NOW,
-    ) == b"anchored-content"
+    assert (
+        _quarantined_content_for_test(
+            quarantine,
+            reference,
+            now=NOW,
+        )
+        == b"anchored-content"
+    )
 
 
 def test_encrypted_erasure_is_anchored_during_mission_directory_swap(
@@ -2887,11 +2984,7 @@ def test_encrypted_store_fsyncs_store_root_for_first_mission_write(
         )
     assert directory_sync_attempts == 1
     assert audit_log.events_for("mission-first-write") == ()
-    assert not list(
-        (tmp_path / "first-mission-quarantine" / "mission-first-write").glob(
-            "*.json"
-        )
-    )
+    assert not list((tmp_path / "first-mission-quarantine" / "mission-first-write").glob("*.json"))
 
     reference = quarantine.commit(
         mission_id="mission-first-write",
@@ -2902,14 +2995,17 @@ def test_encrypted_store_fsyncs_store_root_for_first_mission_write(
         retention_until=NOW + timedelta(hours=1),
     )
     assert directory_sync_attempts == 5
-    assert _quarantined_content_for_test(
-        quarantine,
-        reference,
-        now=NOW,
-    ) == b"first-encrypted-result"
-    assert tuple(
-        event.event_type for event in audit_log.events_for("mission-first-write")
-    ) == ("raw_result_quarantine.commit",)
+    assert (
+        _quarantined_content_for_test(
+            quarantine,
+            reference,
+            now=NOW,
+        )
+        == b"first-encrypted-result"
+    )
+    assert tuple(event.event_type for event in audit_log.events_for("mission-first-write")) == (
+        "raw_result_quarantine.commit",
+    )
 
 
 def test_encrypted_store_fsyncs_new_nested_root_before_acknowledging_write(
@@ -2962,14 +3058,17 @@ def test_encrypted_store_fsyncs_new_nested_root_before_acknowledging_write(
         retention_until=NOW + timedelta(hours=1),
     )
     assert directory_sync_attempts == 8
-    assert _quarantined_content_for_test(
-        quarantine,
-        reference,
-        now=NOW,
-    ) == b"new-store-encrypted-result"
-    assert tuple(
-        event.event_type for event in audit_log.events_for("mission-new-store")
-    ) == ("raw_result_quarantine.commit",)
+    assert (
+        _quarantined_content_for_test(
+            quarantine,
+            reference,
+            now=NOW,
+        )
+        == b"new-store-encrypted-result"
+    )
+    assert tuple(event.event_type for event in audit_log.events_for("mission-new-store")) == (
+        "raw_result_quarantine.commit",
+    )
 
 
 def test_encrypted_store_rejects_intermediate_symlink_in_configured_root(
@@ -3034,13 +3133,16 @@ def test_secret_resolution_requires_trusted_exact_mission_grant(tmp_path: Path) 
         created_at=NOW + timedelta(seconds=1),
     )
     assert repeated_metadata == metadata
-    assert len(
-        [
-            event
-            for event in audit_log.events_for("mission-a")
-            if event.event_type == "secret_reference.create"
-        ]
-    ) == 1
+    assert (
+        len(
+            [
+                event
+                for event in audit_log.events_for("mission-a")
+                if event.event_type == "secret_reference.create"
+            ]
+        )
+        == 1
+    )
     with pytest.raises(SecretAccessError):
         secrets.resolve(metadata, execution_id="execution-test-access", now=NOW)
 
@@ -3092,7 +3194,7 @@ def test_secret_resolution_requires_trusted_exact_mission_grant(tmp_path: Path) 
             ),
         ),
     )
-    with pytest.raises(SecretAccessError, match="injection broker"):
+    with pytest.raises(SecretAccessError, match="direct Secret plaintext"):
         secrets.resolve(metadata, execution_id="execution-test-access", now=NOW)
     assert audit_log.events_for("mission-a")[-1].event_type == "secret_reference.create"
     authorizer.set_grants(
@@ -3122,9 +3224,7 @@ def test_secret_resolution_requires_trusted_exact_mission_grant(tmp_path: Path) 
             execution_id="execution-test-access",
             now=NOW + timedelta(seconds=2),
         )
-    assert b"private-value" not in b"".join(
-        path.read_bytes() for path in tmp_path.rglob("*.json")
-    )
+    assert b"private-value" not in b"".join(path.read_bytes() for path in tmp_path.rglob("*.json"))
 
 
 def test_secret_reference_and_public_binding_do_not_expose_guess_verifiers(
@@ -3194,11 +3294,14 @@ def test_quarantine_verifiers_do_not_expose_low_entropy_plaintext_digests(
         retention_until=NOW + timedelta(hours=1),
     )
     assert reference.sha256 != plaintext_digest
-    assert _quarantined_content_for_test(
-        quarantine,
-        reference,
-        now=NOW,
-    ) == low_entropy
+    assert (
+        _quarantined_content_for_test(
+            quarantine,
+            reference,
+            now=NOW,
+        )
+        == low_entropy
+    )
 
     binding = QuarantineStreamBinding(
         mission_id="mission-keyed-stream",
@@ -3294,11 +3397,14 @@ def test_quarantine_verifiers_remain_bound_across_domain_key_rotation(
         material=b"\x09" * 32,
         created_at=NOW + timedelta(minutes=1),
     )
-    assert _quarantined_content_for_test(
-        quarantine,
-        reference,
-        now=NOW,
-    ) == b"pre-rotation"
+    assert (
+        _quarantined_content_for_test(
+            quarantine,
+            reference,
+            now=NOW,
+        )
+        == b"pre-rotation"
+    )
     assert (
         quarantine.commit(
             mission_id="mission-rotation",
@@ -3366,11 +3472,14 @@ def test_quarantine_verifiers_remain_bound_across_domain_key_rotation(
         created_at=NOW,
         retention_until=NOW + timedelta(hours=1),
     )
-    assert _quarantined_content_for_test(
-        quarantine,
-        race_reference,
-        now=NOW,
-    ) == b"rotation-race"
+    assert (
+        _quarantined_content_for_test(
+            quarantine,
+            race_reference,
+            now=NOW,
+        )
+        == b"rotation-race"
+    )
 
 
 def test_aborted_stream_erasure_resumes_after_interruption(
@@ -3420,9 +3529,7 @@ def test_aborted_stream_erasure_resumes_after_interruption(
         )
 
     asyncio.run(write_chunks())
-    chunk_metadata = tuple(
-        envelope.payload.metadata for _, envelope in sink._chunks
-    )
+    chunk_metadata = tuple(envelope.payload.metadata for _, envelope in sink._chunks)
     artifact_metadata = tuple(
         envelope.payload.metadata for _, envelope in sink._artifact_terminals.values()
     )
@@ -3443,32 +3550,21 @@ def test_aborted_stream_erasure_resumes_after_interruption(
     terminal_metadata = sink._terminal_envelope.payload.metadata
     monkeypatch.setattr(sink._store, "erase_resource", original_erase)
 
+    factory.reconcile_retention("execution-aborted")
     recovered = factory.for_execution("execution-aborted")
     assert recovered.recovery_metadata(updated_at=NOW).state == "ABORTED"
-    assert not list(
-        (tmp_path / "aborted-quarantine").rglob("streamchunk_*.json")
-    )
-    assert not list(
-        (tmp_path / "aborted-quarantine").rglob("streamartifact_*.json")
-    )
-    assert not list(
-        (tmp_path / "aborted-quarantine").rglob("streamterminal_*.json")
-    )
-    assert not list(
-        (tmp_path / "aborted-quarantine").rglob("streamdeletion_*.json")
-    )
+    assert not list((tmp_path / "aborted-quarantine").rglob("streamchunk_*.json"))
+    assert not list((tmp_path / "aborted-quarantine").rglob("streamartifact_*.json"))
+    assert not list((tmp_path / "aborted-quarantine").rglob("streamterminal_*.json"))
+    assert not list((tmp_path / "aborted-quarantine").rglob("streamdeletion_*.json"))
     assert all(
         keys.resource_key_destroyed(metadata)
         for metadata in (*chunk_metadata, *artifact_metadata, terminal_metadata)
     )
     recovered_again = factory.for_execution("execution-aborted")
     assert recovered_again.recovery_metadata(updated_at=NOW).state == "ABORTED"
-    assert not list(
-        (tmp_path / "aborted-quarantine").rglob("streamdeletion_*.json")
-    )
-    event_types = tuple(
-        event.event_type for event in audit_log.events_for("mission-aborted")
-    )
+    assert not list((tmp_path / "aborted-quarantine").rglob("streamdeletion_*.json"))
+    event_types = tuple(event.event_type for event in audit_log.events_for("mission-aborted"))
     assert event_types.count("raw_result_quarantine.abort") == 1
     assert event_types.count("raw_result_quarantine.delete") == 1
 
@@ -3487,9 +3583,7 @@ def test_wrapped_key_provider_recovers_committed_stream_after_restart(
         wrapping_key=wrapping_key,
         generation_store=generation_store,
     )
-    first_audit_log = MissionAuditLog(
-        authenticator=KeyedAuditChainAuthenticator(first_keys)
-    )
+    first_audit_log = MissionAuditLog(authenticator=KeyedAuditChainAuthenticator(first_keys))
     first_quarantine = EncryptedRawResultQuarantine(
         root=quarantine_root,
         keys=first_keys,
@@ -3521,18 +3615,12 @@ def test_wrapped_key_provider_recovers_committed_stream_after_restart(
         return await sink.commit()
 
     receipt = asyncio.run(commit_before_restart())
-    persisted_slots = tuple(
-        path.read_bytes() for path in first_keys._state_paths if path.exists()
-    )
+    persisted_slots = tuple(path.read_bytes() for path in first_keys._state_paths if path.exists())
     assert len(persisted_slots) == 2
-    assert all(
-        stat.S_IMODE(path.stat().st_mode) == 0o600
-        for path in first_keys._state_paths
-    )
+    assert all(stat.S_IMODE(path.stat().st_mode) == 0o600 for path in first_keys._state_paths)
     for index in range(1, 5):
         assert all(
-            base64.b64encode(bytes([index]) * 32) not in persisted
-            for persisted in persisted_slots
+            base64.b64encode(bytes([index]) * 32) not in persisted for persisted in persisted_slots
         )
 
     restarted_keys = _wrapped_keys(
@@ -3544,9 +3632,7 @@ def test_wrapped_key_provider_recovers_committed_stream_after_restart(
         root=quarantine_root,
         keys=restarted_keys,
         audit=MissionAuditRecorder(
-            audit_log=MissionAuditLog(
-                authenticator=KeyedAuditChainAuthenticator(restarted_keys)
-            ),
+            audit_log=MissionAuditLog(authenticator=KeyedAuditChainAuthenticator(restarted_keys)),
             contexts=_AuditContexts(),
         ),
         max_item_bytes=1024,
@@ -3573,7 +3659,7 @@ def test_wrapped_key_provider_recovers_committed_stream_after_restart(
 
     assert asyncio.run(recover_after_restart()) == b"restart-safe-secret-result"
     with pytest.raises(EncryptionKeyUnavailableError, match="authentication failed"):
-        WrappedFileEncryptionKeyProvider(
+        WrappedFileEncryptionKeyProvider._for_test_with_legacy_generation_store(
             state_path=key_state_path,
             wrapping_key=b"different-external-keystore-key-material",
             generation_store=generation_store,
@@ -3600,8 +3686,7 @@ def test_wrapped_key_provider_recovers_committed_stream_after_restart(
         created_at=NOW,
     )
     assert (
-        restarted_keys.open("artifact_store", second_resource, aad)
-        == b"second-concurrent-resource"
+        restarted_keys.open("artifact_store", second_resource, aad) == b"second-concurrent-resource"
     )
     pre_destruction_generation = generation_store.current_generation()
     pre_destruction_state = concurrent_keys._state_path_for_generation(
@@ -3611,11 +3696,11 @@ def test_wrapped_key_provider_recovers_committed_stream_after_restart(
     with pytest.raises(EncryptionKeyUnavailableError, match="unavailable"):
         restarted_keys.open("artifact_store", first_resource, aad)
 
-    concurrent_keys._state_path_for_generation(
-        generation_store.current_generation()
-    ).write_bytes(pre_destruction_state)
+    concurrent_keys._state_path_for_generation(generation_store.current_generation()).write_bytes(
+        pre_destruction_state
+    )
     with pytest.raises(EncryptionKeyUnavailableError, match="rollback"):
-        WrappedFileEncryptionKeyProvider(
+        WrappedFileEncryptionKeyProvider._for_test_with_legacy_generation_store(
             state_path=key_state_path,
             wrapping_key=wrapping_key,
             generation_store=generation_store,
@@ -3630,7 +3715,7 @@ def test_wrapped_key_state_recovers_both_generation_commit_boundaries(
     key_state_path = key_state_directory / "provider.json"
     wrapping_key = b"recoverable-os-keystore-root-key-material"
     generation_store = _FaultingGenerationStore()
-    provider = WrappedFileEncryptionKeyProvider(
+    provider = WrappedFileEncryptionKeyProvider._for_test_with_legacy_generation_store(
         state_path=key_state_path,
         wrapping_key=wrapping_key,
         generation_store=generation_store,
@@ -3657,10 +3742,12 @@ def test_wrapped_key_state_recovers_both_generation_commit_boundaries(
         )
     assert generation_store.current_generation() == 1
     generation_store.failure = None
-    recovered_before_anchor = WrappedFileEncryptionKeyProvider(
-        state_path=key_state_path,
-        wrapping_key=wrapping_key,
-        generation_store=generation_store,
+    recovered_before_anchor = (
+        WrappedFileEncryptionKeyProvider._for_test_with_legacy_generation_store(
+            state_path=key_state_path,
+            wrapping_key=wrapping_key,
+            generation_store=generation_store,
+        )
     )
     assert (
         recovered_before_anchor.get_active_key_metadata("artifact_store").key_id
@@ -3690,21 +3777,18 @@ def test_wrapped_key_state_recovers_both_generation_commit_boundaries(
         )
     assert generation_store.current_generation() == 3
     generation_store.failure = None
-    recovered_after_anchor = WrappedFileEncryptionKeyProvider(
-        state_path=key_state_path,
-        wrapping_key=wrapping_key,
-        generation_store=generation_store,
+    recovered_after_anchor = (
+        WrappedFileEncryptionKeyProvider._for_test_with_legacy_generation_store(
+            state_path=key_state_path,
+            wrapping_key=wrapping_key,
+            generation_store=generation_store,
+        )
     )
     assert (
-        recovered_after_anchor.get_active_key_metadata(
-            "raw_result_quarantine"
-        ).key_id
+        recovered_after_anchor.get_active_key_metadata("raw_result_quarantine").key_id
         == "quarantine-key-v1"
     )
-    assert (
-        recovered_after_anchor.get_active_key_metadata("secret_store").key_id
-        == "secret-key-v1"
-    )
+    assert recovered_after_anchor.get_active_key_metadata("secret_store").key_id == "secret-key-v1"
 
 
 def test_wrapped_key_providers_share_lock_during_parent_directory_swap(
@@ -3840,13 +3924,9 @@ def test_wrapped_key_providers_share_lock_during_parent_directory_swap(
         state_path,
         generation_store=generation_store,
     )
+    assert restarted.open("artifact_store", first_payload, first_aad) == b"first-parent-swap-state"
     assert (
-        restarted.open("artifact_store", first_payload, first_aad)
-        == b"first-parent-swap-state"
-    )
-    assert (
-        restarted.open("artifact_store", second_payload, second_aad)
-        == b"second-parent-swap-state"
+        restarted.open("artifact_store", second_payload, second_aad) == b"second-parent-swap-state"
     )
 
 
@@ -3953,14 +4033,10 @@ def test_expired_committed_and_abandoned_streams_are_erased_after_restart(
         await abandoned.write_stdout(b"abandoned-expired-secret")
 
     asyncio.run(populate())
-    committed_metadata = tuple(
-        envelope.payload.metadata for _, envelope in committed._chunks
-    )
+    committed_metadata = tuple(envelope.payload.metadata for _, envelope in committed._chunks)
     assert committed._terminal_envelope is not None
     committed_terminal_metadata = committed._terminal_envelope.payload.metadata
-    abandoned_metadata = tuple(
-        envelope.payload.metadata for _, envelope in abandoned._chunks
-    )
+    abandoned_metadata = tuple(envelope.payload.metadata for _, envelope in abandoned._chunks)
     current_time[0] = NOW + timedelta(minutes=6)
     original_erase = quarantine._store.erase_resource
     erase_count = 0
@@ -3977,16 +4053,14 @@ def test_expired_committed_and_abandoned_streams_are_erased_after_restart(
         "erase_resource",
         interrupt_first_expiry_erasure,
     )
-    with pytest.raises(RawResultQuarantineError, match="reconstruction"):
-        committed_factory.for_execution("execution-expired-committed")
+    with pytest.raises(RawResultQuarantineError, match="reconciliation"):
+        committed_factory.reconcile_retention("execution-expired-committed")
     monkeypatch.setattr(quarantine._store, "erase_resource", original_erase)
 
-    recovered_committed = committed_factory.for_execution(
-        "execution-expired-committed"
-    )
-    recovered_abandoned = abandoned_factory.for_execution(
-        "execution-expired-abandoned"
-    )
+    committed_factory.reconcile_retention("execution-expired-committed")
+    abandoned_factory.reconcile_retention("execution-expired-abandoned")
+    recovered_committed = committed_factory.for_execution("execution-expired-committed")
+    recovered_abandoned = abandoned_factory.for_execution("execution-expired-abandoned")
     assert recovered_committed._deleted
     assert recovered_abandoned._deleted
     with pytest.raises(RawResultQuarantineError, match="deleted quarantine"):
@@ -4000,23 +4074,17 @@ def test_expired_committed_and_abandoned_streams_are_erased_after_restart(
         )
     )
     assert not list((tmp_path / "expired-streams").rglob("streamchunk_*.json"))
-    assert not list(
-        (tmp_path / "expired-streams").rglob("streamterminal_*.json")
-    )
+    assert not list((tmp_path / "expired-streams").rglob("streamterminal_*.json"))
     for execution_id in (
         "execution-expired-committed",
         "execution-expired-abandoned",
     ):
         mission_id = f"mission-{execution_id}"
-        event_types = tuple(
-            event.event_type for event in audit_log.events_for(mission_id)
-        )
+        event_types = tuple(event.event_type for event in audit_log.events_for(mission_id))
         assert event_types.count("raw_result_quarantine.delete") == 1
         recovered_again = factory_for(execution_id).for_execution(execution_id)
         assert recovered_again._deleted
-    assert not list(
-        (tmp_path / "expired-streams").rglob("streamdeletion_*.json")
-    )
+    assert not list((tmp_path / "expired-streams").rglob("streamdeletion_*.json"))
 
 
 def test_secret_revocation_reconciles_interrupted_erasure(
@@ -4086,11 +4154,14 @@ def test_secret_revocation_reconciles_interrupted_erasure(
         ),
     )
     monkeypatch.setattr(secrets._store, "delete", original_delete)
-    assert secrets.revoke(
-        metadata,
-        execution_id="execution-test-access",
-        now=NOW + timedelta(seconds=2),
-    ) == revoked
+    assert (
+        secrets.revoke(
+            metadata,
+            execution_id="execution-test-access",
+            now=NOW + timedelta(seconds=2),
+        )
+        == revoked
+    )
     assert not secrets._store.has_resource(
         mission_id=metadata.mission_id,
         resource_id=metadata.secret_reference_id,
@@ -4103,9 +4174,7 @@ def test_artifact_create_audit_is_reconciled_after_write_crash(tmp_path: Path) -
     authorizer = _ExactEnvelopeAuthorizer()
     authorizer.allow_ingestion_write("mission-audit", "execution-audit")
     audit_log = MissionAuditLog()
-    durable_audit = MissionAuditRecorder(
-        audit_log=audit_log, contexts=_AuditContexts()
-    )
+    durable_audit = MissionAuditRecorder(audit_log=audit_log, contexts=_AuditContexts())
 
     class FailFirstArtifactCreateAudit:
         def __init__(self) -> None:
@@ -4161,9 +4230,9 @@ def test_artifact_create_audit_is_reconciled_after_write_crash(tmp_path: Path) -
         created_at=NOW + timedelta(seconds=1),
     )
     assert reference.created_at == NOW
-    assert tuple(
-        event.event_type for event in audit_log.events_for("mission-audit")
-    ) == ("artifact.create",)
+    assert tuple(event.event_type for event in audit_log.events_for("mission-audit")) == (
+        "artifact.create",
+    )
 
 
 def test_key_domain_nonce_aad_tamper_and_revocation_fail_closed() -> None:
@@ -4304,9 +4373,7 @@ def test_storage_rejects_traversal_symlink_quota_retention_and_corruption(
         )
 
     stream_audit_log = MissionAuditLog()
-    stream_audit = MissionAuditRecorder(
-        audit_log=stream_audit_log, contexts=_AuditContexts()
-    )
+    stream_audit = MissionAuditRecorder(audit_log=stream_audit_log, contexts=_AuditContexts())
     stream_quarantine = EncryptedRawResultQuarantine(
         root=tmp_path / "stream-quarantine",
         keys=keys,
@@ -4400,12 +4467,8 @@ def test_storage_rejects_traversal_symlink_quota_retention_and_corruption(
                 now=NOW,
             )
         with pytest.raises(SecureIngestionError):
-            await ingestor.ingest_stream(
-                final_sink, receipt, now=NOW, retain_encrypted_raw=True
-            )
-        encrypted_snapshot_path = next(
-            (tmp_path / "stream-quarantine").rglob("streamchunk_*.json")
-        )
+            await ingestor.ingest_stream(final_sink, receipt, now=NOW, retain_encrypted_raw=True)
+        encrypted_snapshot_path = next((tmp_path / "stream-quarantine").rglob("streamchunk_*.json"))
         encrypted_snapshot = encrypted_snapshot_path.read_bytes()
         summary = await ingestor.ingest_stream(final_sink, receipt, now=NOW)
         assert summary.ingestion_id.startswith("secureingestion_")
@@ -4420,8 +4483,7 @@ def test_storage_rejects_traversal_symlink_quota_retention_and_corruption(
         artifact_chunks = [
             envelope
             for envelope in artifact_envelopes
-            if envelope.binding.to_dict().get("record_type")
-            == "artifact_stream_chunk"
+            if envelope.binding.to_dict().get("record_type") == "artifact_stream_chunk"
         ]
         assert len(artifact_chunks) > 1
         assert all(envelope.plaintext_size <= 4 * 1024 for envelope in artifact_chunks)
@@ -4448,16 +4510,17 @@ def test_storage_rejects_traversal_symlink_quota_retention_and_corruption(
         )
         assert raw_secret not in visible
         assert b'"api_key":"[REDACTED]"' in visible
-        assert len(
-            [
-                event
-                for event in stream_audit_log.events_for("mission-stream")
-                if event.event_type == "secret_reference.create"
-            ]
-        ) == 1
-        assert any(
-            (tmp_path / "stream-quarantine").rglob("streamchunk_*.json")
+        assert (
+            len(
+                [
+                    event
+                    for event in stream_audit_log.events_for("mission-stream")
+                    if event.event_type == "secret_reference.create"
+                ]
+            )
+            == 1
         )
+        assert any((tmp_path / "stream-quarantine").rglob("streamchunk_*.json"))
         recovered_summary = await ingestor.ingest_stream(
             final_sink,
             receipt,
@@ -4470,13 +4533,16 @@ def test_storage_rejects_traversal_symlink_quota_retention_and_corruption(
         assert encrypted_snapshot_path.exists()
 
     asyncio.run(stream_with_restart())
-    assert len(
-        [
-            event
-            for event in stream_audit_log.events_for("mission-stream")
-            if event.event_type == "raw_result_quarantine.write_chunk"
-        ]
-    ) == 64
+    assert (
+        len(
+            [
+                event
+                for event in stream_audit_log.events_for("mission-stream")
+                if event.event_type == "raw_result_quarantine.write_chunk"
+            ]
+        )
+        == 64
+    )
 
     artifact_quarantine = EncryptedRawResultQuarantine(
         root=tmp_path / "artifact-stream-quarantine",
@@ -4536,21 +4602,16 @@ def test_storage_rejects_traversal_symlink_quota_retention_and_corruption(
 
     asyncio.run(resume_inside_artifact())
     artifact_events = stream_audit_log.events_for("mission-artifact")
-    assert len(
-        [event for event in artifact_events if event.event_type.endswith("write_chunk")]
-    ) == 2
-    assert len(
-        [
-            event
-            for event in artifact_events
-            if event.event_type.endswith("commit_artifact")
-        ]
-    ) == 1
+    assert (
+        len([event for event in artifact_events if event.event_type.endswith("write_chunk")]) == 2
+    )
+    assert (
+        len([event for event in artifact_events if event.event_type.endswith("commit_artifact")])
+        == 1
+    )
 
     audit_crash_log = MissionAuditLog()
-    durable_audit = MissionAuditRecorder(
-        audit_log=audit_crash_log, contexts=_AuditContexts()
-    )
+    durable_audit = MissionAuditRecorder(audit_log=audit_crash_log, contexts=_AuditContexts())
 
     class FailCommitAudit:
         def __init__(self) -> None:
@@ -4616,15 +4677,23 @@ def test_storage_rejects_traversal_symlink_quota_retention_and_corruption(
         clock=lambda: NOW,
     )
     recovered_sink = recovered_factory.for_execution("execution-audit-crash")
+    assert not [
+        event
+        for event in audit_crash_log.events_for("mission-audit-crash")
+        if event.event_type.endswith(".commit")
+    ]
     recovered_receipt = asyncio.run(recovered_sink.commit())
     assert recovered_receipt.stdout_bytes == len(b"auditable")
-    assert len(
-        [
-            event
-            for event in audit_crash_log.events_for("mission-audit-crash")
-            if event.event_type.endswith(".commit")
-        ]
-    ) == 1
+    assert (
+        len(
+            [
+                event
+                for event in audit_crash_log.events_for("mission-audit-crash")
+                if event.event_type.endswith(".commit")
+            ]
+        )
+        == 1
+    )
 
     delete_quarantine = EncryptedRawResultQuarantine(
         root=tmp_path / "delete-crash-quarantine",
@@ -4668,9 +4737,7 @@ def test_storage_rejects_traversal_symlink_quota_retention_and_corruption(
             raise ArtifactSecurityError("simulated crash during streamed erasure")
 
     monkeypatch.setattr(delete_sink._store, "erase_resource", interrupt_erasure)
-    stream_authorizer.allow_ingestion_write(
-        "mission-delete-crash", "execution-delete-crash"
-    )
+    stream_authorizer.allow_ingestion_write("mission-delete-crash", "execution-delete-crash")
     delete_ingestor = SecureIngestor(
         quarantine=delete_quarantine,
         artifacts=stream_artifacts,
@@ -4693,19 +4760,18 @@ def test_storage_rejects_traversal_symlink_quota_retention_and_corruption(
     recovered_delete = recovered_delete_sink._durable_ingestion_result(delete_receipt)
     assert recovered_delete is not None
     assert recovered_delete.ingestion_id.startswith("secureingestion_")
-    assert any(
-        (tmp_path / "delete-crash-quarantine").rglob("streamchunk_*.json")
+    assert any((tmp_path / "delete-crash-quarantine").rglob("streamchunk_*.json"))
+    assert (
+        len(
+            [
+                event
+                for event in stream_audit_log.events_for("mission-delete-crash")
+                if event.event_type.endswith(".delete")
+            ]
+        )
+        == 0
     )
-    assert len(
-        [
-            event
-            for event in stream_audit_log.events_for("mission-delete-crash")
-            if event.event_type.endswith(".delete")
-        ]
-    ) == 0
-    assert all(
-        raw_secret not in path.read_bytes() for path in tmp_path.rglob("*.json")
-    )
+    assert all(raw_secret not in path.read_bytes() for path in tmp_path.rglob("*.json"))
 
 
 def test_executor_resumes_deleted_ingestion_without_recollecting_raw_chunks(
@@ -4769,6 +4835,7 @@ def test_executor_resumes_deleted_ingestion_without_recollecting_raw_chunks(
         harness,
         adapter,
         sink_factory=sink_factory,  # type: ignore[arg-type]
+        clock=lambda: current_time[0],
     )
     running = asyncio.run(
         harness.executor.dispatch(
@@ -4798,13 +4865,12 @@ def test_executor_resumes_deleted_ingestion_without_recollecting_raw_chunks(
                         database=harness.database,
                         clock=lambda: current_time[0],
                     ),
-                    now=current_time[0],
                 )
             )
 
     reconstructed = sink_factory.for_execution(running.execution_id)
-    assert reconstructed.committed
-    assert reconstructed._deleted
+    assert not reconstructed.committed
+    assert not reconstructed._deleted
     assert harness.results.get_by_execution(running.execution_id) is None
     assert adapter.collect_calls == 1
     durable_ingestion = harness.ingestions.get_by_execution(running.execution_id)
@@ -4816,9 +4882,9 @@ def test_executor_resumes_deleted_ingestion_without_recollecting_raw_chunks(
     manifest = SecureIngestionManifestRepository(harness.database).get_by_ingestion(
         durable_ingestion.ingestion_id
     )
-    deletion_intent = QuarantineDeletionIntentRepository(
-        harness.database
-    ).get_by_ingestion(durable_ingestion.ingestion_id)
+    deletion_intent = QuarantineDeletionIntentRepository(harness.database).get_by_ingestion(
+        durable_ingestion.ingestion_id
+    )
     assert manifest is not None
     assert manifest.receipt_id == durable_ingestion.receipt_id
     assert manifest.resources
@@ -4839,9 +4905,7 @@ def test_executor_resumes_deleted_ingestion_without_recollecting_raw_chunks(
         original_erase(mission_id=mission_id, resource_id=resource_id)
         if acknowledgment_exists and not interrupted_ack:
             interrupted_ack = True
-            raise ArtifactSecurityError(
-                "simulated crash during persisted-result acknowledgment"
-            )
+            raise ArtifactSecurityError("simulated crash during persisted-result acknowledgment")
 
     with monkeypatch.context() as crash:
         crash.setattr(
@@ -4859,7 +4923,6 @@ def test_executor_resumes_deleted_ingestion_without_recollecting_raw_chunks(
                         database=harness.database,
                         clock=lambda: current_time[0],
                     ),
-                    now=current_time[0],
                 )
             )
     assert interrupted_ack
@@ -4879,7 +4942,6 @@ def test_executor_resumes_deleted_ingestion_without_recollecting_raw_chunks(
                 database=harness.database,
                 clock=lambda: current_time[0],
             ),
-            now=current_time[0],
         )
     )
     assert recovered.execution_id == running.execution_id
@@ -4890,10 +4952,8 @@ def test_executor_resumes_deleted_ingestion_without_recollecting_raw_chunks(
     assert final_execution.result_ingestion_state == "SUCCEEDED"
     assert final_ingestion is not None and final_ingestion.status == "SUCCEEDED"
     assert adapter.submit_calls == 1
-    assert adapter.collect_calls == 2
-    quarantine_directory = (
-        quarantine._store._root / prepared.mission_id
-    )
+    assert adapter.collect_calls == 1
+    quarantine_directory = quarantine._store._root / prepared.mission_id
     assert not list(quarantine_directory.glob("*.json"))
 
     repeated = asyncio.run(
@@ -4905,11 +4965,10 @@ def test_executor_resumes_deleted_ingestion_without_recollecting_raw_chunks(
                 database=harness.database,
                 clock=lambda: current_time[0] + timedelta(seconds=1),
             ),
-            now=current_time[0] + timedelta(seconds=1),
         )
     )
     assert repeated == recovered
-    assert adapter.collect_calls == 2
+    assert adapter.collect_calls == 1
     assert not list(quarantine_directory.glob("*.json"))
 
 
@@ -4972,7 +5031,7 @@ def test_expired_non_stream_quarantine_is_erased_and_resumed_after_restart(
             interrupt_after_target_erasure,
         )
         with pytest.raises(ArtifactSecurityError, match="cleanup interruption"):
-            EncryptedRawResultQuarantine(
+            interrupted_quarantine = EncryptedRawResultQuarantine(
                 root=root,
                 keys=keys,
                 audit=audit,
@@ -4980,6 +5039,7 @@ def test_expired_non_stream_quarantine_is_erased_and_resumed_after_restart(
                 mission_quota_bytes=4096,
                 clock=lambda: current_time[0],
             )
+            interrupted_quarantine.reconcile()
 
     pending = quarantine._store.envelopes_for(reference.mission_id)
     assert len(pending) == 1
@@ -4994,6 +5054,7 @@ def test_expired_non_stream_quarantine_is_erased_and_resumed_after_restart(
         mission_quota_bytes=4096,
         clock=lambda: current_time[0],
     )
+    restarted.reconcile()
     assert not restarted._store.resource_ids_with_prefix(
         mission_id=reference.mission_id,
         prefix="quarantine_",
@@ -5063,11 +5124,7 @@ def test_expired_quarantine_existence_check_uses_anchored_mission_directory(
         follow_symlinks: bool = True,
     ) -> os.stat_result:
         nonlocal swapped
-        path_name = (
-            ""
-            if isinstance(path, int)
-            else Path(os.fsdecode(os.fspath(path))).name
-        )
+        path_name = "" if isinstance(path, int) else Path(os.fsdecode(os.fspath(path))).name
         if not swapped and path_name == target_name:
             mission_root.rename(detached_root)
             mission_root.mkdir(mode=0o700)
@@ -5098,13 +5155,16 @@ def test_expired_quarantine_existence_check_uses_anchored_mission_directory(
         resource_id=reference.quarantine_id,
     )
     assert keys.resource_key_destroyed(target_envelope.payload.metadata)
-    assert len(
-        [
-            event
-            for event in audit_log.events_for(reference.mission_id)
-            if event.event_type == "raw_result_quarantine.delete"
-        ]
-    ) == 1
+    assert (
+        len(
+            [
+                event
+                for event in audit_log.events_for(reference.mission_id)
+                if event.event_type == "raw_result_quarantine.delete"
+            ]
+        )
+        == 1
+    )
 
 
 def test_quarantine_restart_enumeration_uses_anchored_mission_directory(
@@ -5181,6 +5241,7 @@ def test_quarantine_restart_enumeration_uses_anchored_mission_directory(
         mission_quota_bytes=4096,
         clock=lambda: current_time[0],
     )
+    restarted.reconcile()
 
     assert swap_count == 2
     assert not restarted._store.has_resource(
@@ -5324,12 +5385,15 @@ def test_artifact_quota_is_serialized_across_store_instances(
             ),
         ),
     )
-    assert first_store.read(
-        first_reference,
-        execution_id="execution-test-access",
-        operation="read",
-        now=NOW,
-    ) == b"first!"
+    assert (
+        first_store.read(
+            first_reference,
+            execution_id="execution-test-access",
+            operation="read",
+            now=NOW,
+        )
+        == b"first!"
+    )
 
 
 def test_artifact_quota_scan_stays_on_anchored_mission_directory(
@@ -5628,12 +5692,14 @@ def test_identical_streamed_artifacts_keep_cross_execution_provenance(
             for reference in (first, second)
         ),
     )
-    assert artifacts.read(
-        first, execution_id="execution-test-access", operation="read", now=NOW
-    ) == b""
-    assert artifacts.read(
-        second, execution_id="execution-test-access", operation="read", now=NOW
-    ) == b""
+    assert (
+        artifacts.read(first, execution_id="execution-test-access", operation="read", now=NOW)
+        == b""
+    )
+    assert (
+        artifacts.read(second, execution_id="execution-test-access", operation="read", now=NOW)
+        == b""
+    )
 
 
 @pytest.mark.parametrize("read_mode", ("read", "read_bound"))
@@ -5673,9 +5739,7 @@ def test_artifact_reads_reject_concurrent_mission_directory_swap(
     retained_root = artifacts._store._root / f"{mission_id}-retained"
     replacement_root = tmp_path / f"outside-{read_mode}"
     replacement_root.mkdir()
-    (replacement_root / f"{reference.artifact_id}.json").write_bytes(
-        b"x" * (1024 * 1024)
-    )
+    (replacement_root / f"{reference.artifact_id}.json").write_bytes(b"x" * (1024 * 1024))
     original_open = os.open
     swapped = False
 
@@ -5687,11 +5751,7 @@ def test_artifact_reads_reject_concurrent_mission_directory_swap(
         dir_fd: int | None = None,
     ) -> int:
         nonlocal swapped
-        if (
-            not swapped
-            and path == f"{reference.artifact_id}.json"
-            and dir_fd is not None
-        ):
+        if not swapped and path == f"{reference.artifact_id}.json" and dir_fd is not None:
             mission_root.rename(retained_root)
             mission_root.symlink_to(replacement_root, target_is_directory=True)
             swapped = True
@@ -5883,13 +5943,16 @@ def test_artifact_expiry_is_audited_and_resumes_cryptographic_erasure(
         restarted._store._keys.resource_key_destroyed(envelope.payload.metadata)
         for envelope in target_envelopes.values()
     )
-    assert len(
-        [
-            event
-            for event in audit_log.events_for(reference.mission_id)
-            if event.event_type == "artifact.delete"
-        ]
-    ) == 1
+    assert (
+        len(
+            [
+                event
+                for event in audit_log.events_for(reference.mission_id)
+                if event.event_type == "artifact.delete"
+            ]
+        )
+        == 1
+    )
 
 
 def test_artifact_expiry_sweeps_without_caller_reference_after_restart(
@@ -5949,20 +6012,26 @@ def test_artifact_expiry_sweeps_without_caller_reference_after_restart(
         resource_id=reference.artifact_id,
     )
     assert keys.resource_key_destroyed(envelope.payload.metadata)
-    assert len(
-        [
-            event
-            for event in audit_log.events_for(mission_id)
-            if event.event_type == "artifact.create"
-        ]
-    ) == 1
-    assert len(
-        [
-            event
-            for event in audit_log.events_for(mission_id)
-            if event.event_type == "artifact.delete"
-        ]
-    ) == 1
+    assert (
+        len(
+            [
+                event
+                for event in audit_log.events_for(mission_id)
+                if event.event_type == "artifact.create"
+            ]
+        )
+        == 1
+    )
+    assert (
+        len(
+            [
+                event
+                for event in audit_log.events_for(mission_id)
+                if event.event_type == "artifact.delete"
+            ]
+        )
+        == 1
+    )
 
 
 def test_completed_stream_cleanup_reconciles_create_audit_after_restart(
@@ -6031,9 +6100,7 @@ def test_completed_stream_cleanup_reconciles_create_audit_after_restart(
         prefix="artifactcleanup_",
     )
     assert not [
-        event
-        for event in audit_log.events_for(mission_id)
-        if event.event_type == "artifact.create"
+        event for event in audit_log.events_for(mission_id) if event.event_type == "artifact.create"
     ]
 
     restarted = ArtifactStore(
@@ -6049,13 +6116,16 @@ def test_completed_stream_cleanup_reconciles_create_audit_after_restart(
         mission_id=mission_id,
         prefix="artifactcleanup_",
     )
-    assert len(
-        [
-            event
-            for event in audit_log.events_for(mission_id)
-            if event.event_type == "artifact.create"
-        ]
-    ) == 1
+    assert (
+        len(
+            [
+                event
+                for event in audit_log.events_for(mission_id)
+                if event.event_type == "artifact.create"
+            ]
+        )
+        == 1
+    )
     authorizer.set_grants(
         mission_id,
         (
@@ -6075,9 +6145,7 @@ def test_completed_stream_cleanup_reconciles_create_audit_after_restart(
         execution_id="execution-test-access",
         operation="read",
         now=NOW,
-    ) == (
-        b"manifest-is-durable-before-create-audit"
-    )
+    ) == (b"manifest-is-durable-before-create-audit")
 
 
 def test_partial_artifact_stream_cleanup_resumes_after_restart(
@@ -6122,16 +6190,10 @@ def test_partial_artifact_stream_cleanup_resumes_after_restart(
             )
         )
     pending_envelopes = artifacts._store.envelopes_for("mission-partial")
-    pending_metadata = tuple(
-        envelope.payload.metadata for envelope in pending_envelopes
-    )
+    pending_metadata = tuple(envelope.payload.metadata for envelope in pending_envelopes)
+    assert any(envelope.resource_id.startswith("artifactchunk_") for envelope in pending_envelopes)
     assert any(
-        envelope.resource_id.startswith("artifactchunk_")
-        for envelope in pending_envelopes
-    )
-    assert any(
-        envelope.resource_id.startswith("artifactcleanup_")
-        for envelope in pending_envelopes
+        envelope.resource_id.startswith("artifactcleanup_") for envelope in pending_envelopes
     )
 
     mission_root = artifact_root / "mission-partial"
@@ -6225,13 +6287,9 @@ def test_conflicting_artifact_stream_attempts_are_serialized_before_cleanup(
             "source_execution_id": execution_id,
             "created_at": NOW,
         }
-        failing_task = asyncio.create_task(
-            artifacts.put_stream(chunks=failing_chunks(), **common)
-        )
+        failing_task = asyncio.create_task(artifacts.put_stream(chunks=failing_chunks(), **common))
         await first_started.wait()
-        winning_task = asyncio.create_task(
-            artifacts.put_stream(chunks=winning_chunks(), **common)
-        )
+        winning_task = asyncio.create_task(artifacts.put_stream(chunks=winning_chunks(), **common))
         await asyncio.sleep(0.03)
         assert not winning_task.done()
         release_failure.set()
@@ -6276,9 +6334,7 @@ def test_conflicting_artifact_stream_attempts_are_serialized_before_cleanup(
         execution_id="execution-test-access",
         operation="read",
         now=NOW,
-    ) == (
-        b"B" * 4096 + b"winning-tail"
-    )
+    ) == (b"B" * 4096 + b"winning-tail")
     assert not artifacts._store.resource_ids_with_prefix(
         mission_id=mission_id,
         prefix="artifactcleanup_",
@@ -6399,12 +6455,9 @@ def test_sqlite_audit_chain_persists_events_and_trusted_head(tmp_path: Path) -> 
         assert restarted.verify("mission-durable") == (first, second, third)
 
     with Database(database_path) as database:
+        database.connection.execute("DELETE FROM audit_logs WHERE event_id = ?", (third.event_id,))
         database.connection.execute(
-            "DELETE FROM audit_logs WHERE event_id = ?", (third.event_id,)
-        )
-        database.connection.execute(
-            "UPDATE audit_log_heads SET sequence_number = ?, event_hash = ? "
-            "WHERE mission_id = ?",
+            "UPDATE audit_log_heads SET sequence_number = ?, event_hash = ? WHERE mission_id = ?",
             (second.sequence_number, second.event_hash, "mission-durable"),
         )
         with pytest.raises(AuditIntegrityError, match="head"):
@@ -6565,8 +6618,7 @@ def test_sqlite_audit_recovers_prepared_appends_across_commit_boundaries(
             (prepared_third.event_id,),
         )
         database.connection.execute(
-            "UPDATE audit_log_heads SET sequence_number = ?, event_hash = ? "
-            "WHERE mission_id = ?",
+            "UPDATE audit_log_heads SET sequence_number = ?, event_hash = ? WHERE mission_id = ?",
             (
                 prepared_second.sequence_number,
                 prepared_second.event_hash,
@@ -6722,9 +6774,7 @@ def test_keyed_sqlite_audit_rejects_recomputed_forged_chain(tmp_path: Path) -> N
         for sequence, row in enumerate(rows, start=1):
             forged = json.loads(str(row["payload_json"]))
             if sequence == 1:
-                forged["canonical_payload"]["metadata_digest"] = (
-                    "sha256:" + "f" * 64
-                )
+                forged["canonical_payload"]["metadata_digest"] = "sha256:" + "f" * 64
             forged["previous_event_hash"] = previous_hash
             digest_payload = {
                 field: forged[field]
@@ -6746,8 +6796,7 @@ def test_keyed_sqlite_audit_rejects_recomputed_forged_chain(tmp_path: Path) -> N
             forged_hash = sha256_digest(digest_payload)
             forged["event_hash"] = forged_hash
             database.connection.execute(
-                "UPDATE audit_logs SET event_hash = ?, payload_json = ? "
-                "WHERE event_id = ?",
+                "UPDATE audit_logs SET event_hash = ?, payload_json = ? WHERE event_id = ?",
                 (
                     forged_hash,
                     json.dumps(forged, sort_keys=True, separators=(",", ":")),
@@ -6756,8 +6805,7 @@ def test_keyed_sqlite_audit_rejects_recomputed_forged_chain(tmp_path: Path) -> N
             )
             previous_hash = forged_hash
         database.connection.execute(
-            "UPDATE audit_log_heads SET sequence_number = ?, event_hash = ? "
-            "WHERE mission_id = ?",
+            "UPDATE audit_log_heads SET sequence_number = ?, event_hash = ? WHERE mission_id = ?",
             (len(rows), previous_hash, "mission-forged"),
         )
 
@@ -6933,9 +6981,7 @@ def test_audit_chain_and_sandbox_capabilities_fail_closed(tmp_path: Path) -> Non
 def test_yaml_block_scalar_credentials_fail_closed_complete_and_split(
     tmp_path: Path,
 ) -> None:
-    quarantine, artifacts, secrets, authorizer, _ = _stores(
-        tmp_path / "yaml-block-scalars"
-    )
+    quarantine, artifacts, secrets, authorizer, _ = _stores(tmp_path / "yaml-block-scalars")
     complete_mission = "mission-yaml-block-complete"
     complete_execution = "execution-yaml-block-complete"
     complete_secret = b"complete-yaml-private-value"
@@ -6955,9 +7001,7 @@ def test_yaml_block_scalar_credentials_fail_closed_complete_and_split(
             secrets=secrets,
         ).ingest(complete_reference, now=NOW)
     assert complete_secret.decode() not in str(complete_failure.value)
-    assert not list(
-        (artifacts._store._root / complete_mission).glob("artifact*.json")
-    )
+    assert not list((artifacts._store._root / complete_mission).glob("artifact*.json"))
     assert not list((secrets._store._root / complete_mission).glob("secret*.json"))
 
     split_mission = "mission-yaml-block-split"
@@ -7041,9 +7085,7 @@ def test_artifact_quota_charges_durable_envelope_bytes(
             source_execution_id="execution-durable-second",
             created_at=NOW,
         )
-    assert sum(path.stat().st_size for path in mission_root.glob("*.json")) == (
-        durable_usage
-    )
+    assert sum(path.stat().st_size for path in mission_root.glob("*.json")) == (durable_usage)
 
 
 def test_full_quota_artifact_expiry_recovers_without_caller_capacity(
@@ -7106,13 +7148,16 @@ def test_full_quota_artifact_expiry_recovers_without_caller_capacity(
         resource_id=restarted._deletion_intent_id(reference.artifact_id),
     )
     assert keys.resource_key_destroyed(envelope.payload.metadata)
-    assert len(
-        [
-            event
-            for event in audit_log.events_for(mission_id)
-            if event.event_type == "artifact.delete"
-        ]
-    ) == 1
+    assert (
+        len(
+            [
+                event
+                for event in audit_log.events_for(mission_id)
+                if event.event_type == "artifact.delete"
+            ]
+        )
+        == 1
+    )
 
 
 def test_completed_expiry_removes_intent_and_allows_safe_recreation(
@@ -7163,9 +7208,7 @@ def test_completed_expiry_removes_intent_and_allows_safe_recreation(
         ),
     )
     current_time[0] = first_retention
-    artifacts.expire(
-        first, execution_id="execution-test-access", now=first_retention
-    )
+    artifacts.expire(first, execution_id="execution-test-access", now=first_retention)
     artifacts.expire(
         first,
         execution_id="execution-test-access",
@@ -7212,13 +7255,9 @@ def test_completed_expiry_removes_intent_and_allows_safe_recreation(
         resource_id=intent_id,
     )
     with pytest.raises(DigestIntegrityError):
-        restarted.expire(
-            first, execution_id="execution-test-access", now=second_retention
-        )
+        restarted.expire(first, execution_id="execution-test-access", now=second_retention)
     restart_time[0] = second_retention
-    restarted.expire(
-        second, execution_id="execution-test-access", now=second_retention
-    )
+    restarted.expire(second, execution_id="execution-test-access", now=second_retention)
     restarted.expire(
         second,
         execution_id="execution-test-access",
@@ -7232,20 +7271,26 @@ def test_completed_expiry_removes_intent_and_allows_safe_recreation(
         mission_id=mission_id,
         resource_id=intent_id,
     )
-    assert len(
-        [
-            event
-            for event in audit_log.events_for(mission_id)
-            if event.event_type == "artifact.create"
-        ]
-    ) == 2
-    assert len(
-        [
-            event
-            for event in audit_log.events_for(mission_id)
-            if event.event_type == "artifact.delete"
-        ]
-    ) == 2
+    assert (
+        len(
+            [
+                event
+                for event in audit_log.events_for(mission_id)
+                if event.event_type == "artifact.create"
+            ]
+        )
+        == 2
+    )
+    assert (
+        len(
+            [
+                event
+                for event in audit_log.events_for(mission_id)
+                if event.event_type == "artifact.delete"
+            ]
+        )
+        == 2
+    )
 
 
 def test_wrapped_key_state_limit_is_enforced_before_generation_commit(
@@ -7279,15 +7324,12 @@ def test_wrapped_key_state_limit_is_enforced_before_generation_commit(
 
     assert generation_store.current_generation() == committed_generation
     assert committed_path.read_bytes() == committed_state
-    restarted = WrappedFileEncryptionKeyProvider(
+    restarted = WrappedFileEncryptionKeyProvider._for_test_with_legacy_generation_store(
         state_path=state_path,
         wrapping_key=b"wrapped-provider-root-key-material",
         generation_store=generation_store,
     )
-    assert (
-        restarted.get_active_key_metadata("artifact_store").key_id
-        == "artifact_store-key-v1"
-    )
+    assert restarted.get_active_key_metadata("artifact_store").key_id == "artifact_store-key-v1"
 
 
 @pytest.mark.parametrize("interruption", ("before_link", "after_link"))
@@ -7391,9 +7433,7 @@ def test_resource_creation_reconciles_wrapped_keys_across_envelope_link_crashes(
             )
     else:
         assert len(restarted_keys._records) == baseline_record_count + 1
-        assert not restarted_keys.resource_key_destroyed(
-            captured_metadata[0]
-        )
+        assert not restarted_keys.resource_key_destroyed(captured_metadata[0])
     recovered = restarted.put(
         mission_id=mission_id,
         content=content,
@@ -7404,13 +7444,9 @@ def test_resource_creation_reconciles_wrapped_keys_across_envelope_link_crashes(
         created_at=NOW,
     )
     if interruption == "before_link":
-        assert recovered.encryption_metadata_id != restarted_keys.metadata_id(
-            captured_metadata[0]
-        )
+        assert recovered.encryption_metadata_id != restarted_keys.metadata_id(captured_metadata[0])
     else:
-        assert recovered.encryption_metadata_id == restarted_keys.metadata_id(
-            captured_metadata[0]
-        )
+        assert recovered.encryption_metadata_id == restarted_keys.metadata_id(captured_metadata[0])
 
 
 def test_atomic_envelope_failures_do_not_accumulate_wrapped_key_records(
@@ -7462,11 +7498,7 @@ def test_atomic_envelope_failures_do_not_accumulate_wrapped_key_records(
                 created_at=NOW,
             )
         assert len(keys._records) == baseline_record_count
-        assert not list(
-            (artifacts._store._root / mission_id).glob(
-                ".resource-creation-*.intent"
-            )
-        )
+        assert not list((artifacts._store._root / mission_id).glob(".resource-creation-*.intent"))
 
 
 @pytest.mark.parametrize("interruption", ("partial_write", "before_fsync"))
@@ -7678,7 +7710,7 @@ def test_creation_audit_pending_intent_recovers_each_public_store(
         )
         expected_event = "secret_reference.create"
     else:
-        EncryptedRawResultQuarantine(
+        restarted_quarantine = EncryptedRawResultQuarantine(
             root=root,
             keys=keys,
             audit=audit,
@@ -7686,12 +7718,11 @@ def test_creation_audit_pending_intent_recovers_each_public_store(
             mission_quota_bytes=16 * 1024,
             clock=lambda: NOW,
         )
+        restarted_quarantine.reconcile()
         expected_event = "raw_result_quarantine.commit"
 
     assert not list(mission_root.glob(".resource-creation-*.intent"))
-    assert [
-        event.event_type for event in audit_log.events_for(mission_id)
-    ] == [expected_event]
+    assert [event.event_type for event in audit_log.events_for(mission_id)] == [expected_event]
 
 
 def test_audit_pending_creation_intents_are_charged_to_mission_quota(
@@ -7754,14 +7785,15 @@ def test_audit_pending_creation_intents_are_charged_to_mission_quota(
 
     assert audit_failures >= 1
     assert quota_denied
-    assert len(list(mission_root.glob(".resource-creation-*.intent"))) == (
-        audit_failures
+    assert len(list(mission_root.glob(".resource-creation-*.intent"))) == (audit_failures)
+    assert (
+        sum(
+            entry.stat(follow_symlinks=False).st_size
+            for entry in mission_root.iterdir()
+            if entry.is_file()
+        )
+        <= quota_bytes
     )
-    assert sum(
-        entry.stat(follow_symlinks=False).st_size
-        for entry in mission_root.iterdir()
-        if entry.is_file()
-    ) <= quota_bytes
 
 
 def test_secret_retention_uses_trusted_clock_for_reads_and_erasure(
@@ -7815,7 +7847,7 @@ def test_secret_retention_uses_trusted_clock_for_reads_and_erasure(
         ),
     )
 
-    with pytest.raises(SecretAccessError, match="injection broker"):
+    with pytest.raises(SecretAccessError, match="direct Secret plaintext"):
         secrets.resolve(
             reference,
             execution_id="execution-test-access",
@@ -7922,13 +7954,16 @@ def test_expired_secret_erasure_resumes_after_restart(
         mission_quota_bytes=16 * 1024,
         clock=lambda: current_time[0],
     )
-    assert len(
-        [
-            event
-            for event in audit_log.events_for(mission_id)
-            if event.event_type == "secret_reference.delete"
-        ]
-    ) == 1
+    assert (
+        len(
+            [
+                event
+                for event in audit_log.events_for(mission_id)
+                if event.event_type == "secret_reference.delete"
+            ]
+        )
+        == 1
+    )
 
 
 @pytest.mark.parametrize("store_type", ("artifact", "secret", "quarantine"))
@@ -8143,12 +8178,15 @@ def test_long_ordinary_tokens_do_not_exhaust_uri_stream_lookahead(
                 ),
             ),
         )
-        assert artifacts.read(
-            artifact,
-            execution_id="execution-test-access",
-            operation="read",
-            now=NOW,
-        ) == ordinary_token
+        assert (
+            artifacts.read(
+                artifact,
+                execution_id="execution-test-access",
+                operation="read",
+                now=NOW,
+            )
+            == ordinary_token
+        )
 
     asyncio.run(ingest("complete", (ordinary_token,)))
     asyncio.run(
@@ -8162,9 +8200,7 @@ def test_long_ordinary_tokens_do_not_exhaust_uri_stream_lookahead(
 def test_connection_uri_credentials_are_redacted_complete_and_split(
     tmp_path: Path,
 ) -> None:
-    quarantine, artifacts, secrets, authorizer, _ = _stores(
-        tmp_path / "credential-uri"
-    )
+    quarantine, artifacts, secrets, authorizer, _ = _stores(tmp_path / "credential-uri")
     complete_mission = "mission-uri-complete"
     complete_execution = "execution-uri-complete"
     complete_secret = b"complete-uri-password"
@@ -8175,11 +8211,7 @@ def test_connection_uri_credentials_are_redacted_complete_and_split(
         secrets=secrets,
         mission_id=complete_mission,
         execution_id=complete_execution,
-        chunks=(
-            b"dsn=ssh://alice:"
-            + complete_secret
-            + b"@database.local/app status=ok",
-        ),
+        chunks=(b"dsn=ssh://alice:" + complete_secret + b"@database.local/app status=ok",),
     )
     assert complete.redaction_metadata.redaction_count == 1
     assert complete.detected_secrets[0].credential_type == "uri_password"
@@ -8292,8 +8324,7 @@ def test_full_quota_quarantine_cleanup_survives_restart(
         retention_until=NOW + timedelta(minutes=5),
     )
     non_stream_usage = sum(
-        path.stat().st_size
-        for path in (non_stream_root / non_stream_mission).glob("*.json")
+        path.stat().st_size for path in (non_stream_root / non_stream_mission).glob("*.json")
     )
     non_stream._store._mission_quota_bytes = non_stream_usage
     non_stream_time[0] = NOW + timedelta(minutes=5)
@@ -8341,11 +8372,11 @@ def test_full_quota_quarantine_cleanup_survives_restart(
 
     asyncio.run(populate_stream())
     stream_usage = sum(
-        path.stat().st_size
-        for path in (stream_root / stream_mission).glob("*.json")
+        path.stat().st_size for path in (stream_root / stream_mission).glob("*.json")
     )
     stream._store._mission_quota_bytes = stream_usage
     current_time[0] = NOW + timedelta(minutes=5)
+    stream_factory.reconcile_retention(stream_execution)
     expired = stream_factory.for_execution(stream_execution)
     assert expired._deleted
     assert not list((stream_root / stream_mission).glob("streamchunk_*.json"))

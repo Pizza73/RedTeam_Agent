@@ -77,9 +77,7 @@ class QuarantineStreamBindingResolver(Protocol):
 class RepositoryQuarantineStreamBindingResolver:
     """Reconstruct stream bindings only from current trusted repositories."""
 
-    _allowed_mission_states = frozenset(
-        {"RUNNING", "PAUSED", "FINALIZING", "WAITING_HUMAN_REVIEW"}
-    )
+    _allowed_mission_states = frozenset({"RUNNING", "PAUSED", "FINALIZING", "WAITING_HUMAN_REVIEW"})
 
     def __init__(
         self,
@@ -89,13 +87,9 @@ class RepositoryQuarantineStreamBindingResolver:
         max_result_bytes: int,
     ) -> None:
         if type(database) is not Database:
-            raise RawResultQuarantineError(
-                "stream binding resolver requires the trusted database"
-            )
+            raise RawResultQuarantineError("stream binding resolver requires the trusted database")
         if retention <= timedelta(0) or max_result_bytes <= 0:
-            raise RawResultQuarantineError(
-                "stream binding policy is invalid"
-            )
+            raise RawResultQuarantineError("stream binding policy is invalid")
         self._executions = ExecutionRepository(database)
         self._mission_revisions = MissionRevisionRepository(database)
         self._mission_states = MissionStateRepository(database)
@@ -112,20 +106,20 @@ class RepositoryQuarantineStreamBindingResolver:
             "DISPATCH_CLAIMED",
             "BLOCKED",
         }:
-            raise RawResultQuarantineError(
-                "execution cannot issue a raw-result stream binding"
-            )
+            raise RawResultQuarantineError("execution cannot issue a raw-result stream binding")
         state = self._mission_states.get(execution.mission_id)
         revision = self._mission_revisions.latest(execution.mission_id)
-        if state is None or revision is None or not (
-            state.mission_id == execution.mission_id == revision.mission_id
-            and revision.mission_revision == execution.mission_revision
-            and state.authorization_epoch == execution.authorization_epoch
-            and state.state in self._allowed_mission_states
-        ):
-            raise RawResultQuarantineError(
-                "execution mission binding is stale"
+        if (
+            state is None
+            or revision is None
+            or not (
+                state.mission_id == execution.mission_id == revision.mission_id
+                and revision.mission_revision == execution.mission_revision
+                and state.authorization_epoch == execution.authorization_epoch
+                and state.state in self._allowed_mission_states
             )
+        ):
+            raise RawResultQuarantineError("execution mission binding is stale")
         authority = self._authorities.get_by_execution(execution_id)
         if authority is None or not (
             authority.execution_id == execution.execution_id
@@ -135,13 +129,10 @@ class RepositoryQuarantineStreamBindingResolver:
             and authority.authorization_epoch == execution.authorization_epoch
             and authority.tool_ref == execution.tool_ref
             and authority.retention_until <= revision.valid_until
-            and authority.retention_until
-            <= authority.collection_started_at + self._retention
+            and authority.retention_until <= authority.collection_started_at + self._retention
             and authority.max_result_bytes <= self._max_result_bytes
         ):
-            raise RawResultQuarantineError(
-                "result collection authority is unavailable or stale"
-            )
+            raise RawResultQuarantineError("result collection authority is unavailable or stale")
         quarantine_id = stable_id(
             "quarantine",
             {
@@ -167,9 +158,7 @@ class RepositoryQuarantineStreamBindingResolver:
                 and recovery.quarantine_id == quarantine_id
                 and recovery.state != "ABORTED"
             ):
-                raise RawResultQuarantineError(
-                    "raw-result recovery binding is invalid"
-                )
+                raise RawResultQuarantineError("raw-result recovery binding is invalid")
             resume_mode = "from_cursor"
             resume_cursor = recovery.last_chunk_sequence + 1
         return QuarantineStreamBinding(
@@ -261,9 +250,7 @@ class EncryptedRawResultSink:
         self._store = quarantine._store
         self._audit = quarantine._audit
         self.binding = binding
-        self._binding_digest = digest_model(
-            binding, exclude={"resume_mode", "resume_cursor"}
-        )
+        self._binding_digest = digest_model(binding, exclude={"resume_mode", "resume_cursor"})
         self.execution_id = binding.execution_id
         self.sink_id = stable_id(
             "sink",
@@ -275,12 +262,11 @@ class EncryptedRawResultSink:
         )
         self._clock = clock
         self._chunks: list[tuple[_ChunkBinding, _StoredEnvelope]] = []
-        self._artifact_terminals: dict[
-            int, tuple[_ArtifactTerminalBinding, _StoredEnvelope]
-        ] = {}
+        self._artifact_terminals: dict[int, tuple[_ArtifactTerminalBinding, _StoredEnvelope]] = {}
         self._receipt: RawResultReceipt | None = None
         self._ingestion_result: SecureIngestionResult | None = None
         self._ingestion_binding: _IngestionResultBinding | None = None
+        self._ingestion_envelope: _StoredEnvelope | None = None
         self._terminal_envelope: _StoredEnvelope | None = None
         self._aborted = False
         self._recovery_required = False
@@ -292,47 +278,31 @@ class EncryptedRawResultSink:
             mission_id=self.binding.mission_id,
             resource_id=self._ingestion_ack_resource_id(),
         ):
-            self._resume_ingestion_ack()
+            self._input_sequence = 0
             return
         if self._store.has_resource(
             mission_id=self.binding.mission_id,
             resource_id=self._deletion_resource_id(),
         ):
             self._load_ingestion_result()
-            self._resume_deletion()
+            self._input_sequence = 0
             return
         self._load_durable_state()
         self._load_ingestion_result()
         if self._completed_terminal_deletion():
+            self._input_sequence = 0
             return
         if self._aborted:
-            self._delete_aborted(now=self._clock())
+            self._input_sequence = len(self._chunks)
             return
         if self._clock() >= self.binding.retention_until:
-            if self._receipt is not None and self._ingestion_result is not None:
-                self._delete_committed(now=self._clock())
-            else:
-                self._delete_expired(now=self._clock())
+            self._input_sequence = len(self._chunks)
             return
-        if (
-            binding.resume_mode == "from_cursor"
-            and binding.resume_cursor != len(self._chunks)
-        ):
+        if binding.resume_mode == "from_cursor" and binding.resume_cursor != len(self._chunks):
             raise RawResultQuarantineError(
                 "verified resume cursor differs from durable chunk sequence"
             )
-        if self._chunks and self._receipt is None and not self._aborted:
-            self._audit.record(
-                mission_id=self.binding.mission_id,
-                resource_type="raw_result_quarantine",
-                resource_id=self.quarantine_id,
-                operation="resume",
-                metadata_digest=self._aggregate_digest(),
-                occurred_at=self._clock(),
-            )
-        self._input_sequence = (
-            0 if binding.resume_mode == "from_start" else len(self._chunks)
-        )
+        self._input_sequence = 0 if binding.resume_mode == "from_start" else len(self._chunks)
 
     @property
     def bytes_received(self) -> int:
@@ -365,11 +335,10 @@ class EncryptedRawResultSink:
         metadata: RawArtifactMetadata,
         chunks: AsyncIterator[bytes],
     ) -> None:
+        self._reconcile_durable_audits()
         metadata_digest = digest_model(metadata)
         existing = [
-            item
-            for item, _ in self._chunks
-            if item.artifact_sequence == metadata.artifact_sequence
+            item for item, _ in self._chunks if item.artifact_sequence == metadata.artifact_sequence
         ]
         terminal = self._artifact_terminals.get(metadata.artifact_sequence)
         replaying_same = bool(existing) and (
@@ -382,9 +351,7 @@ class EncryptedRawResultSink:
             and terminal is None
             and self._chunks[-1][0].artifact_sequence == metadata.artifact_sequence
         )
-        if not existing and metadata.artifact_sequence != len(
-            self._artifact_terminals
-        ):
+        if not existing and metadata.artifact_sequence != len(self._artifact_terminals):
             raise RawResultStreamingError("artifact sequence is not monotonic")
         if existing and not (replaying_same or continuing_open):
             raise RawResultStreamingError("artifact sequence was reused")
@@ -422,11 +389,10 @@ class EncryptedRawResultSink:
             raise
         except Exception as failure:
             failure.__traceback__ = None
-        raise RawResultQuarantineError(
-            "raw-result terminal persistence failed closed"
-        ) from None
+        raise RawResultQuarantineError("raw-result terminal persistence failed closed") from None
 
     def _commit_terminal(self) -> RawResultReceipt:
+        self._reconcile_durable_audits()
         if self._receipt is not None:
             return self._receipt
         if self._deleted:
@@ -510,11 +476,10 @@ class EncryptedRawResultSink:
             raise
         except Exception as failure:
             failure.__traceback__ = None
-        raise RawResultQuarantineError(
-            "raw-result terminal persistence failed closed"
-        ) from None
+        raise RawResultQuarantineError("raw-result terminal persistence failed closed") from None
 
     def _abort_terminal(self) -> None:
+        self._reconcile_durable_audits()
         if self._deleted:
             raise RawResultQuarantineError("deleted quarantine cannot be aborted")
         if self._receipt is not None:
@@ -590,17 +555,14 @@ class EncryptedRawResultSink:
             updated_at=updated_at,
         )
         return provisional.model_copy(
-            update={
-                "recovery_digest": digest_model(
-                    provisional, exclude={"recovery_digest"}
-                )
-            }
+            update={"recovery_digest": digest_model(provisional, exclude={"recovery_digest"})}
         )
 
     def _iter_committed_chunks(
         self, receipt: RawResultReceipt, *, now: datetime
     ) -> AsyncIterator[bytes]:
         async def iterate() -> AsyncIterator[bytes]:
+            self._reconcile_durable_audits()
             if self._deleted or self._receipt is None or receipt != self._receipt:
                 raise RawResultQuarantineError("raw-result stream is not committed")
             self._audit.record(
@@ -629,9 +591,8 @@ class EncryptedRawResultSink:
 
         return iterate()
 
-    def _durable_ingestion_result(
-        self, receipt: RawResultReceipt
-    ) -> SecureIngestionResult | None:
+    def _durable_ingestion_result(self, receipt: RawResultReceipt) -> SecureIngestionResult | None:
+        self._reconcile_durable_audits()
         if self._ingestion_result is None or self._ingestion_binding is None:
             return None
         if not (
@@ -641,9 +602,7 @@ class EncryptedRawResultSink:
             and receipt.quarantine_id == self.quarantine_id
             and receipt.sink_id == self.sink_id
         ):
-            raise RawResultQuarantineError(
-                "durable ingestion result is bound to another receipt"
-            )
+            raise RawResultQuarantineError("durable ingestion result is bound to another receipt")
         return self._ingestion_result
 
     def _commit_ingestion_result(
@@ -653,10 +612,9 @@ class EncryptedRawResultSink:
         *,
         now: datetime,
     ) -> None:
+        self._reconcile_durable_audits()
         if self._receipt is None or receipt != self._receipt or self._deleted:
-            raise RawResultQuarantineError(
-                "ingestion result requires a live committed quarantine"
-            )
+            raise RawResultQuarantineError("ingestion result requires a live committed quarantine")
         binding = _IngestionResultBinding(
             record_type="stream_ingestion_result",
             mission_revision=self.binding.mission_revision,
@@ -687,6 +645,11 @@ class EncryptedRawResultSink:
         )
         self._ingestion_binding = binding
         self._ingestion_result = result
+        self._ingestion_envelope = next(
+            item
+            for item in self._store.envelopes_for(self.binding.mission_id)
+            if item.resource_id == self._ingestion_result_resource_id()
+        )
 
     def _load_ingestion_result(self) -> None:
         resource_id = self._ingestion_result_resource_id()
@@ -703,13 +666,9 @@ class EncryptedRawResultSink:
         try:
             canonical_loads(raw)
             result = SecureIngestionResult.model_validate_json(raw, strict=True)
-            binding = _IngestionResultBinding.model_validate(
-                envelope.binding.to_dict()
-            )
+            binding = _IngestionResultBinding.model_validate(envelope.binding.to_dict())
         except (TypeError, ValueError) as exc:
-            raise RawResultQuarantineError(
-                "durable ingestion result is invalid"
-            ) from exc
+            raise RawResultQuarantineError("durable ingestion result is invalid") from exc
         expected_digest = sha256_digest(
             {
                 "ingestion_id": result.ingestion_id,
@@ -725,27 +684,24 @@ class EncryptedRawResultSink:
             and binding.execution_id == self.execution_id
             and binding.sink_id == self.sink_id
             and binding.ingestion_id == result.ingestion_id
-            and binding.ingestion_digest
-            == result.ingestion_digest
-            == expected_digest
+            and binding.ingestion_digest == result.ingestion_digest == expected_digest
         ):
-            raise RawResultQuarantineError(
-                "durable ingestion result binding is invalid"
-            )
-        self._audit.record(
-            mission_id=self.binding.mission_id,
-            resource_type="raw_result_quarantine",
-            resource_id=self.quarantine_id,
-            operation="commit",
-            operation_id=self._audit_operation_id("commit", "ingestion-result"),
-            metadata_digest=result.ingestion_digest,
-            occurred_at=envelope.created_at,
-        )
+            raise RawResultQuarantineError("durable ingestion result binding is invalid")
         self._ingestion_binding = binding
         self._ingestion_result = result
+        self._ingestion_envelope = envelope
 
     def _delete_committed(self, *, now: datetime) -> None:
+        self._reconcile_durable_audits()
         if self._deleted:
+            return
+        if self._store.has_resource(
+            mission_id=self.binding.mission_id,
+            resource_id=self._deletion_resource_id(),
+        ):
+            if self._ingestion_result is None:
+                self._load_ingestion_result()
+            self._resume_deletion()
             return
         if (
             self._receipt is None
@@ -753,15 +709,7 @@ class EncryptedRawResultSink:
             or self._ingestion_result is None
         ):
             raise RawResultQuarantineError("raw-result stream is not committed")
-        if self._store.has_resource(
-            mission_id=self.binding.mission_id,
-            resource_id=self._deletion_resource_id(),
-        ):
-            self._resume_deletion()
-            return
-        terminal = _TerminalBinding.model_validate(
-            self._terminal_envelope.binding.to_dict()
-        )
+        terminal = _TerminalBinding.model_validate(self._terminal_envelope.binding.to_dict())
         intent = _StreamDeletionBinding(
             record_type="stream_delete_intent",
             mission_revision=self.binding.mission_revision,
@@ -793,15 +741,14 @@ class EncryptedRawResultSink:
     ) -> None:
         """Reclaim replay metadata only after the Executor persisted its result."""
 
+        self._reconcile_durable_audits()
         if not (
             receipt.execution_id == self.execution_id
             and receipt.quarantine_id == self.quarantine_id
             and receipt.sink_id == self.sink_id
             and result.execution_id == self.execution_id
         ):
-            raise RawResultQuarantineError(
-                "execution-result acknowledgment binding is invalid"
-            )
+            raise RawResultQuarantineError("execution-result acknowledgment binding is invalid")
         if self._store.has_resource(
             mission_id=self.binding.mission_id,
             resource_id=self._ingestion_ack_resource_id(),
@@ -820,9 +767,7 @@ class EncryptedRawResultSink:
                 operation_id=self._audit_operation_id("delete", "intent"),
                 metadata_digest=receipt.receipt_digest,
             ):
-                raise RawResultQuarantineError(
-                    "execution-result acknowledgment is unavailable"
-                )
+                raise RawResultQuarantineError("execution-result acknowledgment is unavailable")
             self._deleted = True
             return
         if not self._deleted:
@@ -832,19 +777,13 @@ class EncryptedRawResultSink:
             or self._ingestion_result is None
             or self._terminal_envelope is None
         ):
-            raise RawResultQuarantineError(
-                "execution-result acknowledgment source is unavailable"
-            )
+            raise RawResultQuarantineError("execution-result acknowledgment source is unavailable")
         if not (
             self._receipt == receipt
             and self._ingestion_result.ingestion_id == result.secure_ingestion_id
         ):
-            raise RawResultQuarantineError(
-                "execution-result acknowledgment binding is invalid"
-            )
-        terminal = _TerminalBinding.model_validate(
-            self._terminal_envelope.binding.to_dict()
-        )
+            raise RawResultQuarantineError("execution-result acknowledgment binding is invalid")
+        terminal = _TerminalBinding.model_validate(self._terminal_envelope.binding.to_dict())
         intent_raw, _ = self._store.read_bound(
             mission_id=self.binding.mission_id,
             resource_id=self._deletion_resource_id(),
@@ -917,24 +856,19 @@ class EncryptedRawResultSink:
         artifact_sequence: int | None = None,
         artifact_metadata_digest: str | None = None,
     ) -> None:
+        self._reconcile_durable_audits()
         if self._deleted or self._receipt is not None or self._aborted:
             raise RawResultStreamingError("raw-result sink is no longer writable")
         if not isinstance(chunk, bytes):
             raise RawResultStreamingError("raw-result chunks must be bytes")
         self.max_observed_chunk_bytes = max(self.max_observed_chunk_bytes, len(chunk))
         sequence = self._input_sequence
-        durable_envelope = (
-            self._chunks[sequence][1] if sequence < len(self._chunks) else None
-        )
+        durable_envelope = self._chunks[sequence][1] if sequence < len(self._chunks) else None
         digest = self._store._content_digest(
             chunk,
-            metadata=(
-                None if durable_envelope is None else durable_envelope.payload.metadata
-            ),
+            metadata=(None if durable_envelope is None else durable_envelope.payload.metadata),
         )
-        ciphertext_offset = sum(
-            envelope.plaintext_size for _, envelope in self._chunks[:sequence]
-        )
+        ciphertext_offset = sum(envelope.plaintext_size for _, envelope in self._chunks[:sequence])
         expected = _ChunkBinding(
             record_type="stream_chunk",
             mission_revision=self.binding.mission_revision,
@@ -1099,24 +1033,18 @@ class EncryptedRawResultSink:
         offset = 0
         for item, envelope in self._chunks:
             if not (
-                item.plaintext_size == envelope.plaintext_size
-                and item.ciphertext_offset == offset
+                item.plaintext_size == envelope.plaintext_size and item.ciphertext_offset == offset
             ):
                 raise RawResultQuarantineError("durable stream chunk offset is invalid")
             offset += envelope.plaintext_size
         for sequence, (artifact, _) in self._artifact_terminals.items():
-            chunks = [
-                item
-                for item, _ in self._chunks
-                if item.artifact_sequence == sequence
-            ]
+            chunks = [item for item, _ in self._chunks if item.artifact_sequence == sequence]
             if not (
                 chunks
                 and artifact.mission_revision == self.binding.mission_revision
                 and artifact.stream_binding_digest == self._binding_digest
                 and all(
-                    item.artifact_metadata_digest
-                    == artifact.artifact_metadata_digest
+                    item.artifact_metadata_digest == artifact.artifact_metadata_digest
                     for item in chunks
                 )
                 and artifact.first_chunk_sequence == chunks[0].sequence_number
@@ -1124,10 +1052,7 @@ class EncryptedRawResultSink:
                 and artifact.chunk_count == len(chunks)
                 and artifact.chunk_bindings_digest == sha256_digest(tuple(chunks))
             ):
-                raise RawResultQuarantineError(
-                    "durable artifact completion binding is invalid"
-                )
-        self._reconcile_nonterminal_audits()
+                raise RawResultQuarantineError("durable artifact completion binding is invalid")
         if self.bytes_received > self.binding.max_result_bytes or len(terminals) > 1:
             raise RawResultQuarantineError("durable stream state conflicts with policy")
         if not terminals:
@@ -1141,15 +1066,6 @@ class EncryptedRawResultSink:
         ):
             raise RawResultQuarantineError("durable stream terminal binding is invalid")
         if terminal.record_type == "stream_abort":
-            self._audit.record(
-                mission_id=self.binding.mission_id,
-                resource_type="raw_result_quarantine",
-                resource_id=self.quarantine_id,
-                operation="abort",
-                operation_id=self._audit_operation_id("abort", "terminal"),
-                metadata_digest=terminal.aggregate_digest,
-                occurred_at=envelope.created_at,
-            )
             self._aborted = True
             self._terminal_envelope = envelope
             return
@@ -1178,15 +1094,6 @@ class EncryptedRawResultSink:
             == self._receipt_counts()
         ):
             raise RawResultQuarantineError("durable stream receipt binding is invalid")
-        self._audit.record(
-            mission_id=self.binding.mission_id,
-            resource_type="raw_result_quarantine",
-            resource_id=self.quarantine_id,
-            operation="commit",
-            operation_id=self._audit_operation_id("commit", "terminal"),
-            metadata_digest=receipt.receipt_digest,
-            occurred_at=envelope.created_at,
-        )
         self._receipt = receipt
         self._terminal_envelope = envelope
 
@@ -1207,9 +1114,7 @@ class EncryptedRawResultSink:
                         "encryption_metadata_id": envelope.encryption_metadata_id,
                         "payload": envelope.payload,
                     }
-                    for _, (binding, envelope) in sorted(
-                        self._artifact_terminals.items()
-                    )
+                    for _, (binding, envelope) in sorted(self._artifact_terminals.items())
                 ),
             }
         )
@@ -1240,6 +1145,47 @@ class EncryptedRawResultSink:
                 occurred_at=envelope.created_at,
             )
 
+    def _reconcile_durable_audits(self) -> None:
+        """Explicitly flush verified stream audit outboxes before an operation."""
+
+        self._reconcile_nonterminal_audits()
+        if self._terminal_envelope is not None:
+            terminal = _TerminalBinding.model_validate(
+                self._terminal_envelope.binding.to_dict()
+            )
+            if terminal.record_type == "stream_abort" and self._aborted:
+                operation: Literal["abort", "commit"] = "abort"
+                metadata_digest = terminal.aggregate_digest
+            elif terminal.record_type == "stream_commit" and self._receipt is not None:
+                operation = "commit"
+                metadata_digest = self._receipt.receipt_digest
+            else:
+                raise RawResultQuarantineError(
+                    "durable stream terminal audit binding is invalid"
+                )
+            self._audit.record(
+                mission_id=self.binding.mission_id,
+                resource_type="raw_result_quarantine",
+                resource_id=self.quarantine_id,
+                operation=operation,
+                operation_id=self._audit_operation_id(operation, "terminal"),
+                metadata_digest=metadata_digest,
+                occurred_at=self._terminal_envelope.created_at,
+            )
+        if (
+            self._ingestion_result is not None
+            and self._ingestion_binding is not None
+            and self._ingestion_envelope is not None
+        ):
+            self._audit.record(
+                mission_id=self.binding.mission_id,
+                resource_type="raw_result_quarantine",
+                resource_id=self.quarantine_id,
+                operation="commit",
+                operation_id=self._audit_operation_id("commit", "ingestion-result"),
+                metadata_digest=self._ingestion_result.ingestion_digest,
+                occurred_at=self._ingestion_envelope.created_at,
+            )
     def _terminal_resource_id(self, state: Literal["commit", "abort"]) -> str:
         return stable_id(
             "streamterminal",
@@ -1336,9 +1282,7 @@ class EncryptedRawResultSink:
             is not None
         )
         if len(completed) > 1:
-            raise AuditIntegrityError(
-                "terminal stream deletion completion is ambiguous"
-            )
+            raise AuditIntegrityError("terminal stream deletion completion is ambiguous")
         if not completed:
             return False
         self._aborted = completed[0] == "abort-intent"
@@ -1346,6 +1290,7 @@ class EncryptedRawResultSink:
         return True
 
     def _resume_deletion(self) -> None:
+        self._reconcile_durable_audits()
         raw, envelope = self._store.read_bound(
             mission_id=self.binding.mission_id,
             resource_id=self._deletion_resource_id(),
@@ -1361,9 +1306,7 @@ class EncryptedRawResultSink:
             self._resume_expiry_deletion(value, envelope=envelope)
             return
         if self._ingestion_result is None or self._ingestion_binding is None:
-            raise RawResultQuarantineError(
-                "deletion intent lacks a durable ingestion result"
-            )
+            raise RawResultQuarantineError("deletion intent lacks a durable ingestion result")
         try:
             intent = _StreamDeletionBinding.model_validate_json(
                 canonicalize(value),
@@ -1378,9 +1321,7 @@ class EncryptedRawResultSink:
         )
         try:
             canonical_loads(terminal_raw)
-            terminal = _TerminalBinding.model_validate(
-                terminal_envelope.binding.to_dict()
-            )
+            terminal = _TerminalBinding.model_validate(terminal_envelope.binding.to_dict())
             receipt = RawResultReceipt.model_validate_json(
                 terminal_raw,
                 strict=True,
@@ -1392,14 +1333,12 @@ class EncryptedRawResultSink:
             and intent.stream_binding_digest == self._binding_digest
             and intent.execution_id == self.execution_id
             and intent.sink_id == self.sink_id
-            and intent.artifact_sequences
-            == tuple(sorted(set(intent.artifact_sequences)))
+            and intent.artifact_sequences == tuple(sorted(set(intent.artifact_sequences)))
             and all(sequence >= 0 for sequence in intent.artifact_sequences)
             and terminal.record_type == "stream_commit"
             and terminal.chunk_count == intent.chunk_count
             and intent.bytes_received <= self.binding.max_result_bytes
-            and receipt.stdout_bytes + receipt.stderr_bytes
-            <= intent.bytes_received
+            and receipt.stdout_bytes + receipt.stderr_bytes <= intent.bytes_received
             and receipt.artifact_count <= intent.chunk_count
             and terminal.aggregate_digest == intent.aggregate_digest
             and terminal.receipt_digest == intent.receipt_digest
@@ -1408,11 +1347,9 @@ class EncryptedRawResultSink:
             and receipt.sink_id == self.sink_id
             and receipt.ciphertext_digest == terminal.aggregate_digest
             and receipt.receipt_digest == terminal.receipt_digest
-            and digest_model(receipt, exclude={"receipt_digest"})
-            == receipt.receipt_digest
+            and digest_model(receipt, exclude={"receipt_digest"}) == receipt.receipt_digest
             and self._ingestion_binding.receipt_id == receipt.receipt_id
-            and self._ingestion_binding.receipt_digest
-            == receipt.receipt_digest
+            and self._ingestion_binding.receipt_digest == receipt.receipt_digest
             and intent.ingestion_id == self._ingestion_result.ingestion_id
             and intent.ingestion_digest == self._ingestion_result.ingestion_digest
         ):
@@ -1421,6 +1358,7 @@ class EncryptedRawResultSink:
         self._terminal_envelope = terminal_envelope
         self._deleted_bytes_received = intent.bytes_received
         self._deleted_chunk_count = intent.chunk_count
+        self._reconcile_durable_audits()
         self._audit.record(
             mission_id=self.binding.mission_id,
             resource_type="raw_result_quarantine",
@@ -1444,18 +1382,14 @@ class EncryptedRawResultSink:
             now=None,
         )
         if raw:
-            raise RawResultQuarantineError(
-                "execution-result acknowledgment content is invalid"
-            )
+            raise RawResultQuarantineError("execution-result acknowledgment content is invalid")
         try:
             acknowledgment = _StreamIngestionAckBinding.model_validate_json(
                 canonicalize(envelope.binding.to_dict()),
                 strict=True,
             )
         except (TypeError, ValueError) as exc:
-            raise RawResultQuarantineError(
-                "execution-result acknowledgment is invalid"
-            ) from exc
+            raise RawResultQuarantineError("execution-result acknowledgment is invalid") from exc
         if not (
             acknowledgment.mission_revision == self.binding.mission_revision
             and acknowledgment.stream_binding_digest == self._binding_digest
@@ -1463,14 +1397,9 @@ class EncryptedRawResultSink:
             and acknowledgment.sink_id == self.sink_id
             and acknowledgment.artifact_sequences
             == tuple(sorted(set(acknowledgment.artifact_sequences)))
-            and all(
-                sequence >= 0
-                for sequence in acknowledgment.artifact_sequences
-            )
+            and all(sequence >= 0 for sequence in acknowledgment.artifact_sequences)
         ):
-            raise RawResultQuarantineError(
-                "execution-result acknowledgment binding is invalid"
-            )
+            raise RawResultQuarantineError("execution-result acknowledgment binding is invalid")
         deletion_resource_id = self._deletion_resource_id()
         if self._store.has_resource(
             mission_id=self.binding.mission_id,
@@ -1492,21 +1421,17 @@ class EncryptedRawResultSink:
                 raise RawResultQuarantineError("deletion intent is invalid") from exc
             if not (
                 deletion.mission_revision == acknowledgment.mission_revision
-                and deletion.stream_binding_digest
-                == acknowledgment.stream_binding_digest
+                and deletion.stream_binding_digest == acknowledgment.stream_binding_digest
                 and deletion.execution_id == acknowledgment.execution_id
                 and deletion.sink_id == acknowledgment.sink_id
                 and deletion.chunk_count == acknowledgment.chunk_count
-                and deletion.artifact_sequences
-                == acknowledgment.artifact_sequences
+                and deletion.artifact_sequences == acknowledgment.artifact_sequences
                 and deletion.aggregate_digest == acknowledgment.aggregate_digest
                 and deletion.receipt_digest == acknowledgment.receipt_digest
                 and deletion.ingestion_id == acknowledgment.ingestion_id
                 and deletion.ingestion_digest == acknowledgment.ingestion_digest
             ):
-                raise RawResultQuarantineError(
-                    "execution-result acknowledgment binding is invalid"
-                )
+                raise RawResultQuarantineError("execution-result acknowledgment binding is invalid")
         if not self._audit.operation_recorded(
             mission_id=self.binding.mission_id,
             resource_type="raw_result_quarantine",
@@ -1526,9 +1451,7 @@ class EncryptedRawResultSink:
         for artifact_sequence in acknowledgment.artifact_sequences:
             self._store.erase_resource(
                 mission_id=self.binding.mission_id,
-                resource_id=self._artifact_terminal_resource_id(
-                    artifact_sequence
-                ),
+                resource_id=self._artifact_terminal_resource_id(artifact_sequence),
             )
         for resource_id in (
             self._terminal_resource_id("commit"),
@@ -1548,10 +1471,12 @@ class EncryptedRawResultSink:
         self._receipt = None
         self._ingestion_result = None
         self._ingestion_binding = None
+        self._ingestion_envelope = None
         self._terminal_envelope = None
         self._deleted = True
 
     def _delete_expired(self, *, now: datetime) -> None:
+        self._reconcile_durable_audits()
         if self._deleted:
             return
         if now < self.binding.retention_until:
@@ -1568,15 +1493,11 @@ class EncryptedRawResultSink:
             stream_binding_digest=self._binding_digest,
             execution_id=self.execution_id,
             sink_id=self.sink_id,
-            terminal_state=(
-                "committed" if self._receipt is not None else "abandoned"
-            ),
+            terminal_state=("committed" if self._receipt is not None else "abandoned"),
             chunk_count=len(self._chunks),
             artifact_sequences=tuple(sorted(self._artifact_terminals)),
             aggregate_digest=self._aggregate_digest(),
-            receipt_digest=(
-                None if self._receipt is None else self._receipt.receipt_digest
-            ),
+            receipt_digest=(None if self._receipt is None else self._receipt.receipt_digest),
         )
         self._store.write_quarantine_cleanup_intent(
             mission_id=self.binding.mission_id,
@@ -1604,15 +1525,11 @@ class EncryptedRawResultSink:
             and intent.stream_binding_digest == self._binding_digest
             and intent.execution_id == self.execution_id
             and intent.sink_id == self.sink_id
-            and intent.artifact_sequences
-            == tuple(sorted(set(intent.artifact_sequences)))
+            and intent.artifact_sequences == tuple(sorted(set(intent.artifact_sequences)))
             and all(sequence >= 0 for sequence in intent.artifact_sequences)
             and (
                 (intent.terminal_state == "committed" and intent.receipt_digest)
-                or (
-                    intent.terminal_state == "abandoned"
-                    and intent.receipt_digest is None
-                )
+                or (intent.terminal_state == "abandoned" and intent.receipt_digest is None)
             )
         ):
             raise RawResultQuarantineError("expiry deletion intent binding is invalid")
@@ -1627,13 +1544,9 @@ class EncryptedRawResultSink:
                 now=None,
             )
             try:
-                terminal = _TerminalBinding.model_validate(
-                    terminal_envelope.binding.to_dict()
-                )
+                terminal = _TerminalBinding.model_validate(terminal_envelope.binding.to_dict())
             except ValueError as exc:
-                raise RawResultQuarantineError(
-                    "expiry deletion terminal is invalid"
-                ) from exc
+                raise RawResultQuarantineError("expiry deletion terminal is invalid") from exc
             if not (
                 intent.terminal_state == "committed"
                 and terminal.record_type == "stream_commit"
@@ -1641,9 +1554,7 @@ class EncryptedRawResultSink:
                 and terminal.aggregate_digest == intent.aggregate_digest
                 and terminal.receipt_digest == intent.receipt_digest
             ):
-                raise RawResultQuarantineError(
-                    "expiry deletion terminal binding is invalid"
-                )
+                raise RawResultQuarantineError("expiry deletion terminal binding is invalid")
         self._audit.record(
             mission_id=self.binding.mission_id,
             resource_type="raw_result_quarantine",
@@ -1678,6 +1589,7 @@ class EncryptedRawResultSink:
         self._deleted = True
 
     def _delete_aborted(self, *, now: datetime) -> None:
+        self._reconcile_durable_audits()
         if self._deleted:
             return
         if not self._aborted or self._terminal_envelope is None:
@@ -1688,9 +1600,7 @@ class EncryptedRawResultSink:
         ):
             self._resume_deletion()
             return
-        terminal = _TerminalBinding.model_validate(
-            self._terminal_envelope.binding.to_dict()
-        )
+        terminal = _TerminalBinding.model_validate(self._terminal_envelope.binding.to_dict())
         intent = _StreamAbortDeletionBinding(
             record_type="stream_abort_delete_intent",
             mission_revision=self.binding.mission_revision,
@@ -1734,20 +1644,15 @@ class EncryptedRawResultSink:
                 now=None,
             )
             try:
-                terminal = _TerminalBinding.model_validate(
-                    terminal_envelope.binding.to_dict()
-                )
+                terminal = _TerminalBinding.model_validate(terminal_envelope.binding.to_dict())
             except ValueError as exc:
-                raise RawResultQuarantineError(
-                    "abort deletion terminal is invalid"
-                ) from exc
+                raise RawResultQuarantineError("abort deletion terminal is invalid") from exc
         if not (
             intent.mission_revision == self.binding.mission_revision
             and intent.stream_binding_digest == self._binding_digest
             and intent.execution_id == self.execution_id
             and intent.sink_id == self.sink_id
-            and intent.artifact_sequences
-            == tuple(sorted(set(intent.artifact_sequences)))
+            and intent.artifact_sequences == tuple(sorted(set(intent.artifact_sequences)))
             and all(sequence >= 0 for sequence in intent.artifact_sequences)
             and (
                 terminal is None
@@ -1831,9 +1736,7 @@ class EncryptedRawResultSinkFactory:
         try:
             binding = self._bindings.resolve(execution_id)
             if binding.execution_id != execution_id:
-                raise RawResultQuarantineError(
-                    "stream binding resolver returned another execution"
-                )
+                raise RawResultQuarantineError("stream binding resolver returned another execution")
             return EncryptedRawResultSink(
                 quarantine=self._quarantine,
                 binding=binding,
@@ -1851,6 +1754,35 @@ class EncryptedRawResultSinkFactory:
             raise RawResultQuarantineError(
                 "encrypted raw-result sink reconstruction failed"
             ) from None
+
+    def reconcile_retention(self, execution_id: str) -> None:
+        """Explicitly apply verified abort/expiry cleanup outside lookup paths."""
+
+        try:
+            sink = self.for_execution(execution_id)
+            now = self._clock()
+            if sink._store.has_resource(
+                mission_id=sink.binding.mission_id,
+                resource_id=sink._deletion_resource_id(),
+            ):
+                sink._resume_deletion()
+            elif sink._aborted:
+                sink._delete_aborted(now=now)
+            elif now >= sink.binding.retention_until:
+                if sink._receipt is not None and sink._ingestion_result is not None:
+                    sink._delete_committed(now=now)
+                else:
+                    sink._delete_expired(now=now)
+        except (
+            ArtifactSecurityError,
+            AuditIntegrityError,
+            DigestIntegrityError,
+            EncryptionIntegrityError,
+            EncryptionKeyUnavailableError,
+            RawResultQuarantineError,
+            RawResultStreamingError,
+        ):
+            raise RawResultQuarantineError("raw-result retention reconciliation failed") from None
 
     def recovery_metadata_for_failure(
         self,

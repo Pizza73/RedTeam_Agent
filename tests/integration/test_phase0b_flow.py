@@ -14,9 +14,7 @@ from tests.phase0b_helpers import (
 )
 
 
-def _restart_executor(
-    harness: ExecutionHarness, adapter: MockExecutionAdapter, *, now
-) -> Executor:
+def _restart_executor(harness: ExecutionHarness, adapter: MockExecutionAdapter, *, now) -> Executor:
     from redteam_agent.executor import MockRawResultSinkFactory
 
     restarted_factory = MockRawResultSinkFactory(
@@ -24,7 +22,12 @@ def _restart_executor(
         max_bytes=harness.environment.tool.max_output_bytes,
         store=harness.sink_factory.store,
     )
-    return executor_with_adapter(harness, adapter, sink_factory=restarted_factory)
+    return executor_with_adapter(
+        harness,
+        adapter,
+        sink_factory=restarted_factory,
+        clock=lambda: now,
+    )
 
 
 def test_mock_execution_streams_to_quarantine_and_application_normalizes_result() -> None:
@@ -47,15 +50,8 @@ def test_mock_execution_streams_to_quarantine_and_application_normalizes_result(
     assert running.provider_execution_state == "RUNNING"
     assert running.dispatch_attempts == 1
 
-    restarted_executor = _restart_executor(
-        harness, adapter, now=FIXED_TIME + timedelta(minutes=5)
-    )
-    metadata = asyncio.run(
-        restarted_executor.collect_result(
-            running.execution_id,
-            now=FIXED_TIME + timedelta(minutes=4),
-        )
-    )
+    restarted_executor = _restart_executor(harness, adapter, now=FIXED_TIME + timedelta(minutes=5))
+    metadata = asyncio.run(restarted_executor.collect_result(running.execution_id))
     assert not hasattr(metadata, "stdout")
     ingester = MockSecureResultIngester(
         summary=SecureIngestionSummary(
@@ -66,10 +62,9 @@ def test_mock_execution_streams_to_quarantine_and_application_normalizes_result(
         )
     )
     result = asyncio.run(
-        harness.executor.ingest_result(
+        restarted_executor.ingest_result(
             running.execution_id,
             ingester=ingester,
-            now=FIXED_TIME + timedelta(minutes=5),
         )
     )
     current = harness.executions.get(running.execution_id)
@@ -80,10 +75,9 @@ def test_mock_execution_streams_to_quarantine_and_application_normalizes_result(
     assert result.stdout_preview == "[REDACTED]"
     assert adapter.submit_calls == 1
     retried = asyncio.run(
-        harness.executor.ingest_result(
+        restarted_executor.ingest_result(
             running.execution_id,
             ingester=ingester,
-            now=FIXED_TIME + timedelta(minutes=6),
         )
     )
     assert retried == result
@@ -122,26 +116,14 @@ def test_stream_collection_resumes_without_resubmitting_action() -> None:
     from redteam_agent.errors import RawResultStreamingError
 
     try:
-        asyncio.run(
-            harness.executor.collect_result(
-                running.execution_id,
-                now=FIXED_TIME + timedelta(minutes=4),
-            )
-        )
+        asyncio.run(harness.executor.collect_result(running.execution_id))
     except RawResultStreamingError:
         pass
     else:
         raise AssertionError("mock interruption must fail closed")
 
-    restarted_executor = _restart_executor(
-        harness, adapter, now=FIXED_TIME + timedelta(minutes=5)
-    )
-    metadata = asyncio.run(
-        restarted_executor.collect_result(
-            running.execution_id,
-            now=FIXED_TIME + timedelta(minutes=5),
-        )
-    )
+    restarted_executor = _restart_executor(harness, adapter, now=FIXED_TIME + timedelta(minutes=5))
+    metadata = asyncio.run(restarted_executor.collect_result(running.execution_id))
     assert metadata.receipt.stdout_bytes == 11
     assert adapter.submit_calls == 1
     assert adapter.collect_calls == 2
@@ -162,12 +144,7 @@ def test_failed_ingestion_resumes_without_external_action_resubmit() -> None:
             now=FIXED_TIME + timedelta(minutes=3),
         )
     )
-    asyncio.run(
-        harness.executor.collect_result(
-            running.execution_id,
-            now=FIXED_TIME + timedelta(minutes=4),
-        )
-    )
+    asyncio.run(harness.executor.collect_result(running.execution_id))
     failing = MockSecureResultIngester(
         summary=SecureIngestionSummary(secure_ingestion_id="secure-retry"),
         fail=True,
@@ -178,8 +155,7 @@ def test_failed_ingestion_resumes_without_external_action_resubmit() -> None:
         asyncio.run(
             harness.executor.ingest_result(
                 running.execution_id,
-                    ingester=failing,
-                now=FIXED_TIME + timedelta(minutes=5),
+                ingester=failing,
             )
         )
     except ResultIngestionError:
@@ -198,7 +174,6 @@ def test_failed_ingestion_resumes_without_external_action_resubmit() -> None:
         harness.executor.resume_result_ingestion(
             running.execution_id,
             ingester=failing,
-            now=FIXED_TIME + timedelta(minutes=6),
         )
     )
     assert result.secure_ingestion_id == "secure-retry"

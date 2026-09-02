@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Literal, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
 
 from redteam_agent.authorization_runtime import AuthorizationRuntimeContextResolver
 from redteam_agent.canonical import digest_model, sha256_digest, stable_id
@@ -21,6 +22,7 @@ from redteam_agent.errors import (
     RawResultStreamingError,
     ResultIngestionError,
     ResultIngestionLeaseError,
+    SecretAccessError,
     TrustedDependencyUnavailableError,
 )
 from redteam_agent.models.execution import (
@@ -29,6 +31,7 @@ from redteam_agent.models.execution import (
     ExecutionRecord,
     ExecutionRequest,
     ExecutionResult,
+    ExecutionResultProjection,
     ExecutionRetryPolicy,
     PreDispatchBlockReason,
     ProviderExecutionState,
@@ -51,19 +54,24 @@ from redteam_agent.repositories.execution import (
     RawResultRecoveryRepository,
     ResultCollectionAuthorityRepository,
     ResultIngestionRepository,
+    SecureIngestionManifestRepository,
     dispatch_claim_digest,
     execution_record_digest,
+    execution_result_projection_digest,
     ingestion_record_digest,
     result_collection_authority_digest,
 )
 from redteam_agent.repositories.plans import PlanRepository
 from redteam_agent.repositories.policy import PolicyDecisionRepository
 
-from .adapter import ExecutionAdapter, TrustedExecutionAdapterRegistry
+from .adapter import AdapterSecretValue, ExecutionAdapter, TrustedExecutionAdapterRegistry
 from .authorization_gate import authorize_execution
 from .finalization import FinalizationCoordinator
 from .ingestion import MockSecureResultIngester, SecureResultIngester
 from .raw_results import RawResultSink, RawResultSinkFactory
+
+if TYPE_CHECKING:
+    from redteam_agent.data_security.stores import SecretStore
 
 
 @dataclass(frozen=True)
@@ -153,19 +161,21 @@ class Executor:
         adapter_registry: TrustedExecutionAdapterRegistry,
         capability_probe: PreDispatchCapabilityProbe,
         finalization_requester: FinalizationCoordinator,
+        clock: Callable[[], datetime],
+        secret_store: SecretStore | None = None,
         quarantine_retention: timedelta = timedelta(hours=24),
         system_hard_output_cap: int = 16 * 1024 * 1024,
     ) -> None:
-        if capability_probe is None or not isinstance(
-            finalization_requester, FinalizationCoordinator
+        if (
+            capability_probe is None
+            or not callable(clock)
+            or not isinstance(finalization_requester, FinalizationCoordinator)
         ):
             raise TrustedDependencyUnavailableError(
                 "live capability and finalization dependencies are mandatory"
             )
         if quarantine_retention <= timedelta(0) or system_hard_output_cap <= 0:
-            raise TrustedDependencyUnavailableError(
-                "result collection policy is invalid"
-            )
+            raise TrustedDependencyUnavailableError("result collection policy is invalid")
         self.runtime_resolver = runtime_resolver
         self.plans = plans
         self.decisions = decisions
@@ -178,13 +188,21 @@ class Executor:
         self.ingestions = ingestions
         self.results = results
         self.sink_factory = sink_factory
-        self.adapter_registry = adapter_registry
+        self._adapter_registry = adapter_registry
         self.capability_probe = capability_probe
         self.finalization_requester = finalization_requester
+        self._clock = clock
+        if secret_store is not None:
+            from redteam_agent.data_security.stores import SecretStore
+
+            if type(secret_store) is not SecretStore:
+                raise TrustedDependencyUnavailableError(
+                    "trusted Secret Store dependency is invalid"
+                )
+        self._secret_store = secret_store
         self.dispatch_claims = DispatchClaimRepository(executions.database)
-        self.collection_authorities = ResultCollectionAuthorityRepository(
-            executions.database
-        )
+        self.collection_authorities = ResultCollectionAuthorityRepository(executions.database)
+        self.ingestion_manifests = SecureIngestionManifestRepository(executions.database)
         self.quarantine_retention = quarantine_retention
         self.system_hard_output_cap = system_hard_output_cap
         self.retry_policy = ExecutionRetryPolicy()
@@ -328,9 +346,22 @@ class Executor:
             )
             self.dispatch_claims.add_current(self._dispatch_claim(claimed, now=now))
         request = self._execution_request(claimed)
+        consumed = self._consume_dispatch_claim(claimed)
+        secret_buffers: tuple[bytearray, ...] = ()
         try:
-            handle = await adapter.submit(request, claimed.idempotency_key)
-        except AdapterDispatchUncertainError:
+            secret_buffers, secret_values = self._borrow_dispatch_secrets(
+                claimed,
+                consumed,
+            )
+            if secret_values:
+                handle = await adapter.submit_with_secrets(
+                    request,
+                    claimed.idempotency_key,
+                    secret_values,
+                )
+            else:
+                handle = await adapter.submit(request, claimed.idempotency_key)
+        except (AdapterDispatchUncertainError, AdapterOperationError, SecretAccessError):
             reconciling = self.executions.transition_provider(
                 claimed.execution_id,
                 expected_state_version=claimed.state_version,
@@ -338,6 +369,9 @@ class Executor:
                 now=now,
             )
             return await self._reconcile(reconciling, adapter=adapter, now=now)
+        finally:
+            for secret_buffer in secret_buffers:
+                secret_buffer[:] = b"\x00" * len(secret_buffer)
         if handle.execution_id != claimed.execution_id:
             return self.executions.transition_provider(
                 claimed.execution_id,
@@ -473,37 +507,43 @@ class Executor:
     async def collect_result(
         self,
         execution_id: str,
-        *,
-        now: datetime,
     ) -> AdapterRawResult:
+        collection_time = self._trusted_time()
         record = self._require_execution(execution_id)
         adapter = self._resolve_adapter(record)
-        if record.provider_execution_state not in {
-            "RUNNING",
-            "SUCCEEDED",
-            "FAILED",
-            "CANCELLED",
-        } or record.provider_task_id is None:
+        if (
+            record.provider_execution_state
+            not in {
+                "RUNNING",
+                "SUCCEEDED",
+                "FAILED",
+                "CANCELLED",
+            }
+            or record.provider_task_id is None
+        ):
             raise ExecutionStateTransitionError("execution has no confirmed provider result task")
-        self._ensure_collection_authority(record, now=now)
+        self._ensure_collection_authority(
+            record,
+            collection_started_at=collection_time,
+        )
         collection_lease_id = stable_id(
             "lease",
             {
                 "schema_version": "result-collection-lease-v1",
                 "execution_id": record.execution_id,
-                "requested_at": now,
+                "requested_at": collection_time,
             },
         )
         self.executions.acquire_result_collection_claim(
             record.execution_id,
             lease_id=collection_lease_id,
-            lease_expires_at=now + timedelta(minutes=1),
-            now=now,
+            lease_expires_at=collection_time + timedelta(minutes=1),
+            now=collection_time,
         )
         try:
             sink = self.sink_factory.for_execution(record.execution_id)
         except (RawResultQuarantineError, RawResultStreamingError):
-            self._record_sink_construction_failure(record, now=now)
+            self._record_sink_construction_failure(record, now=collection_time)
             self.executions.release_result_collection_claim(
                 record.execution_id,
                 lease_id=collection_lease_id,
@@ -517,7 +557,7 @@ class Executor:
             RawResultQuarantineError,
             RawResultStreamingError,
         ) as exc:
-            self._record_raw_result_failure(record, sink=sink, now=now)
+            self._record_raw_result_failure(record, sink=sink, now=collection_time)
             if isinstance(exc, (RawResultQuarantineError, RawResultStreamingError)):
                 raise
             raise RawResultStreamingError("provider result streaming did not complete") from exc
@@ -526,7 +566,7 @@ class Executor:
             and metadata.provider_task_id == record.provider_task_id
             and metadata.receipt == bound_receipt
         ):
-            self._record_raw_result_failure(record, sink=sink, now=now)
+            self._record_raw_result_failure(record, sink=sink, now=collection_time)
             raise RawResultStreamingError("adapter result metadata binding mismatch")
         current = self._require_execution(execution_id)
         if current.provider_execution_state not in {
@@ -535,32 +575,33 @@ class Executor:
             "FAILED",
             "CANCELLED",
         }:
-            self._record_raw_result_failure(record, sink=sink, now=now)
-            raise RawResultStreamingError(
-                "execution state changed during result collection"
-            )
+            self._record_raw_result_failure(record, sink=sink, now=collection_time)
+            raise RawResultStreamingError("execution state changed during result collection")
         if (
             current.provider_execution_state in {"SUCCEEDED", "FAILED", "CANCELLED"}
             and metadata.provider_status != current.provider_execution_state
         ):
-            self._record_raw_result_failure(record, sink=sink, now=now)
+            self._record_raw_result_failure(record, sink=sink, now=collection_time)
             raise RawResultStreamingError(
                 "adapter result status conflicts with confirmed provider state"
             )
-        adapter_metadata_digest = sha256_digest(
-            metadata.model_dump(mode="python", exclude={"receipt"})
-        )
+        result_projection = self._result_projection(metadata)
+        adapter_metadata_digest = result_projection.projection_digest
         ingestion = self.ingestions.get_by_execution(record.execution_id)
-        if (
-            ingestion is not None
-            and ingestion.adapter_metadata_digest != adapter_metadata_digest
+        if ingestion is not None and (
+            ingestion.adapter_metadata_digest != adapter_metadata_digest
+            or ingestion.result_projection != result_projection
         ):
-            self._record_raw_result_failure(record, sink=sink, now=now)
+            self._record_raw_result_failure(
+                record,
+                sink=sink,
+                now=collection_time,
+            )
             raise RawResultStreamingError(
                 "adapter result metadata changed across collection attempts"
             )
         self.receipts.add(metadata.receipt)
-        self.recovery.set_current(sink.recovery_metadata(updated_at=now))
+        self.recovery.set_current(sink.recovery_metadata(updated_at=collection_time))
         if ingestion is None:
             provisional = ResultIngestionRecord(
                 ingestion_id=stable_id(
@@ -578,8 +619,9 @@ class Executor:
                 receipt_id=metadata.receipt.receipt_id,
                 quarantine_id=metadata.receipt.quarantine_id,
                 adapter_metadata_digest=adapter_metadata_digest,
-                created_at=now,
-                updated_at=now,
+                result_projection=result_projection,
+                created_at=collection_time,
+                updated_at=collection_time,
             )
             ingestion = provisional.model_copy(
                 update={"ingestion_digest": ingestion_record_digest(provisional)}
@@ -595,7 +637,7 @@ class Executor:
                 expected_state_version=current.state_version,
                 new_state=metadata.provider_status,
                 provider_task_id=metadata.provider_task_id,
-                now=now,
+                now=collection_time,
             )
         if current.result_ingestion_state == "NOT_AVAILABLE":
             self.executions.transition_ingestion(
@@ -603,7 +645,7 @@ class Executor:
                 expected_state_version=current.state_version,
                 new_state="PENDING",
                 quarantine_id=metadata.receipt.quarantine_id,
-                now=now,
+                now=collection_time,
             )
         return metadata
 
@@ -616,9 +658,7 @@ class Executor:
     ) -> None:
         sink.mark_recovery_required()
         self.recovery.set_current(sink.recovery_metadata(updated_at=now))
-        self.finalization_requester.pause_for_raw_result_failure(
-            record.mission_id, now=now
-        )
+        self.finalization_requester.pause_for_raw_result_failure(record.mission_id, now=now)
 
     def _record_sink_construction_failure(
         self,
@@ -660,8 +700,8 @@ class Executor:
         execution_id: str,
         *,
         ingester: SecureResultIngester,
-        now: datetime,
     ) -> ExecutionResult:
+        now = self._trusted_time()
         record = self._require_execution(execution_id)
         ingestion = self.ingestions.get_by_execution(execution_id)
         existing = self.results.get_by_execution(execution_id)
@@ -699,8 +739,7 @@ class Executor:
                     now=now,
                 )
             if record.result_ingestion_state == "QUARANTINE_ERASED" or (
-                isolated_test_double
-                and record.result_ingestion_state == "INGESTING"
+                isolated_test_double and record.result_ingestion_state == "INGESTING"
             ):
                 self.executions.transition_ingestion(
                     record.execution_id,
@@ -709,7 +748,31 @@ class Executor:
                     now=now,
                 )
             return existing
-        adapter_result = await self.collect_result(execution_id, now=now)
+        durable_states = {
+            "INGESTED_DURABLE",
+            "DELETE_PENDING",
+            "QUARANTINE_ERASED",
+        }
+        if ingestion is not None and ingestion.status in durable_states:
+            receipt = self.receipts.get_by_execution(execution_id)
+            manifest = self.ingestion_manifests.get_by_ingestion(ingestion.ingestion_id)
+            if (
+                receipt is None
+                or manifest is None
+                or not (
+                    ingestion.result_projection is not None
+                    and manifest.result_projection == ingestion.result_projection
+                )
+            ):
+                raise ExecutionStateTransitionError(
+                    "durable ingestion lacks its verified result projection"
+                )
+            adapter_result = self._adapter_result_from_projection(
+                manifest.result_projection,
+                receipt,
+            )
+        else:
+            adapter_result = await self.collect_result(execution_id)
         record = self._require_execution(execution_id)
         ingestion = self.ingestions.get_by_execution(execution_id)
         if ingestion is None:
@@ -814,9 +877,7 @@ class Executor:
             and record.result_ingestion_state == "INGESTING"
         )
         if not durable_erasure_complete and not isolated_test_double:
-            raise ExecutionStateTransitionError(
-                "secure ingestion did not durably erase quarantine"
-            )
+            raise ExecutionStateTransitionError("secure ingestion did not durably erase quarantine")
         assert current_active is not None
         active = current_active
         result = self._normalize_result(record, adapter_result, summary)
@@ -842,12 +903,10 @@ class Executor:
         execution_id: str,
         *,
         ingester: SecureResultIngester,
-        now: datetime,
     ) -> ExecutionResult:
         return await self.ingest_result(
             execution_id,
             ingester=ingester,
-            now=now,
         )
 
     def quarantine_failed_ingestion(
@@ -890,9 +949,7 @@ class Executor:
             and runtime.mission.authorization_epoch == record.authorization_epoch
             and decision.authorization_digest == record.authorization_digest
         ):
-            raise ExecutionAuthorizationError(
-                "dispatch claim source authorization is unavailable"
-            )
+            raise ExecutionAuthorizationError("dispatch claim source authorization is unavailable")
         expires_at = min(decision.expires_at, runtime.mission.valid_until)
         identity = {
             "schema_version": "dispatch-claim-v1",
@@ -918,52 +975,146 @@ class Executor:
             issued_at=now,
             expires_at=expires_at,
         )
-        return provisional.model_copy(
-            update={"claim_digest": dispatch_claim_digest(provisional)}
+        return provisional.model_copy(update={"claim_digest": dispatch_claim_digest(provisional)})
+
+    def _consume_dispatch_claim(self, record: ExecutionRecord) -> DispatchClaim:
+        consumption_time = self._trusted_time()
+        try:
+            consumed = self.dispatch_claims.consume(
+                record.execution_id,
+                now=consumption_time,
+            )
+            persisted = self.dispatch_claims.get_by_execution(record.execution_id)
+        except Exception as failure:
+            failure.__traceback__ = None
+            raise SecretAccessError("Dispatch Claim consumption failed closed") from None
+        if persisted is None or not (
+            persisted == consumed
+            and consumed.execution_id == record.execution_id
+            and consumed.execution_state_version == record.state_version
+            and consumed.authorization_digest == record.authorization_digest
+            and consumed.tool_ref == record.tool_ref
+            and consumed.adapter_id == record.resolved_adapter_id
+            and consumed.idempotency_key == record.idempotency_key
+            and consumed.consumed_at == consumption_time
+            and consumed.claim_digest == dispatch_claim_digest(consumed)
+        ):
+            raise SecretAccessError("Dispatch Claim consumption read-back failed closed")
+        return consumed
+
+    def _borrow_dispatch_secrets(
+        self,
+        record: ExecutionRecord,
+        claim: DispatchClaim,
+    ) -> tuple[tuple[bytearray, ...], tuple[AdapterSecretValue, ...]]:
+        decision = self.decisions.get(record.policy_decision_id)
+        if decision is None or not (
+            claim.consumed_at is not None
+            and claim.execution_id == record.execution_id
+            and claim.policy_decision_id == decision.decision_id
+            and claim.authorization_digest
+            == record.authorization_digest
+            == decision.authorization_digest
+            and claim.tool_ref == record.tool_ref == decision.tool_ref
+            and claim.adapter_id == record.resolved_adapter_id
+        ):
+            raise SecretAccessError("consumed Dispatch Claim authorization binding is invalid")
+        grants = tuple(
+            sorted(
+                (
+                    grant
+                    for grant in decision.authorized_data_access
+                    if grant.resource_type == "secret_reference" and "resolve" in grant.operations
+                ),
+                key=lambda grant: grant.resource.resource_id,
+            )
         )
+        resource_ids = tuple(grant.resource.resource_id for grant in grants)
+        if len(resource_ids) != len(set(resource_ids)):
+            raise SecretAccessError("authorized Secret reference set is ambiguous")
+        if not grants:
+            return (), ()
+        if self._secret_store is None:
+            raise SecretAccessError("trusted Secret Store is unavailable")
+
+        from redteam_agent.data_security.stores import _SECRET_INJECTION_TOKEN
+
+        buffers: list[bytearray] = []
+        values: list[AdapterSecretValue] = []
+        try:
+            for grant in grants:
+                reference, version = self._secret_store._reference_for_dispatch(
+                    mission_id=record.mission_id,
+                    secret_reference_id=grant.resource.resource_id,
+                    token=_SECRET_INJECTION_TOKEN,
+                )
+                if not (
+                    grant.resource.resource_version == str(version)
+                    and grant.resource.resource_digest == sha256_digest(reference)
+                ):
+                    raise SecretAccessError("authorized Secret reference binding changed")
+                plaintext = self._secret_store._resolve_for_injection(
+                    reference,
+                    claim=claim,
+                    claims=self.dispatch_claims,
+                    now=claim.consumed_at,
+                    token=_SECRET_INJECTION_TOKEN,
+                )
+                buffers.append(plaintext)
+                values.append(
+                    AdapterSecretValue(
+                        secret_reference_id=reference.secret_reference_id,
+                        value=memoryview(plaintext),
+                    )
+                )
+        except Exception as failure:
+            for plaintext in buffers:
+                plaintext[:] = b"\x00" * len(plaintext)
+            failure.__traceback__ = None
+            if isinstance(failure, SecretAccessError):
+                raise SecretAccessError("Secret dispatch was denied") from None
+            raise SecretAccessError("Secret dispatch failed closed") from None
+        return tuple(buffers), tuple(values)
 
     def _ensure_collection_authority(
         self,
         record: ExecutionRecord,
         *,
-        now: datetime,
+        collection_started_at: datetime,
     ) -> ResultCollectionAuthority:
         existing = self.collection_authorities.get_by_execution(record.execution_id)
         if existing is not None:
-            if existing.retention_until <= now:
-                raise RawResultQuarantineError(
-                    "result collection authority retention has expired"
-                )
+            if existing.retention_until <= collection_started_at:
+                raise RawResultQuarantineError("result collection authority retention has expired")
             return existing
         if record.provider_task_id is None:
-            raise RawResultQuarantineError(
-                "result collection requires a confirmed provider task"
-            )
+            raise RawResultQuarantineError("result collection requires a confirmed provider task")
         try:
             claim = self.dispatch_claims.get_by_execution(record.execution_id)
             revision = self.runtime_resolver.revisions.get(
                 record.mission_id,
                 record.mission_revision,
             )
-            registry = self.runtime_resolver.registries.get(
-                record.tool_ref.registry_revision
-            )
+            registry = self.runtime_resolver.registries.get(record.tool_ref.registry_revision)
         except Exception as exc:
             raise RawResultQuarantineError(
                 "result collection authority source is unavailable"
             ) from exc
-        if claim is None or revision is None or registry is None or not (
-            claim.execution_id == record.execution_id
-            and claim.mission_id == record.mission_id
-            and claim.mission_revision == record.mission_revision
-            and claim.authorization_epoch == record.authorization_epoch
-            and claim.authorization_digest == record.authorization_digest
-            and claim.tool_ref == record.tool_ref
-            and claim.adapter_id == record.resolved_adapter_id
-        ):
-            raise RawResultQuarantineError(
-                "result collection dispatch authority is unavailable"
+        if (
+            claim is None
+            or revision is None
+            or registry is None
+            or not (
+                claim.execution_id == record.execution_id
+                and claim.mission_id == record.mission_id
+                and claim.mission_revision == record.mission_revision
+                and claim.authorization_epoch == record.authorization_epoch
+                and claim.authorization_digest == record.authorization_digest
+                and claim.tool_ref == record.tool_ref
+                and claim.adapter_id == record.resolved_adapter_id
             )
+        ):
+            raise RawResultQuarantineError("result collection dispatch authority is unavailable")
         tool = next(
             (item for item in registry.tools if item.tool_ref == record.tool_ref),
             None,
@@ -973,17 +1124,13 @@ class Executor:
             and registry.registry_revision == record.tool_ref.registry_revision
             and revision.mission_revision == record.mission_revision
         ):
-            raise RawResultQuarantineError(
-                "result collection exact tool binding is unavailable"
-            )
+            raise RawResultQuarantineError("result collection exact tool binding is unavailable")
         retention_until = min(
-            now + self.quarantine_retention,
+            collection_started_at + self.quarantine_retention,
             revision.valid_until,
         )
-        if retention_until <= now:
-            raise RawResultQuarantineError(
-                "result collection retention is unavailable"
-            )
+        if retention_until <= collection_started_at:
+            raise RawResultQuarantineError("result collection retention is unavailable")
         sink_id = stable_id(
             "sink",
             {
@@ -1013,13 +1160,11 @@ class Executor:
                 self.system_hard_output_cap,
             ),
             system_hard_output_cap=self.system_hard_output_cap,
-            collection_started_at=now,
+            collection_started_at=collection_started_at,
             retention_until=retention_until,
         )
         authority = provisional.model_copy(
-            update={
-                "authority_digest": result_collection_authority_digest(provisional)
-            }
+            update={"authority_digest": result_collection_authority_digest(provisional)}
         )
         with self.executions.database.transaction(immediate=True):
             return self.collection_authorities.add(authority)
@@ -1082,10 +1227,7 @@ class Executor:
             return "ADAPTER_CAPABILITY_MISMATCH"
         if record.sandbox_capabilities_digest != runtime.sandbox_snapshot.snapshot_digest:
             return "SANDBOX_CAPABILITY_MISMATCH"
-        if (
-            record.remote_mcp_trust_policy_digest
-            != runtime.remote_trust_snapshot.snapshot_digest
-        ):
+        if record.remote_mcp_trust_policy_digest != runtime.remote_trust_snapshot.snapshot_digest:
             return "REMOTE_MCP_TRUST_MISMATCH"
         if (
             await self.capability_probe.session_security_context_digest()
@@ -1095,16 +1237,12 @@ class Executor:
         if not (await self.capability_probe.session_freshness()).is_fresh_at(now):
             return "SESSION_STALE"
         if (
-            await self.capability_probe.sandbox_capabilities_digest(
-                record.resolved_adapter_id
-            )
+            await self.capability_probe.sandbox_capabilities_digest(record.resolved_adapter_id)
             != record.sandbox_capabilities_digest
         ):
             return "SANDBOX_CAPABILITY_MISMATCH"
         if (
-            await self.capability_probe.remote_mcp_trust_policy_digest(
-                record.resolved_adapter_id
-            )
+            await self.capability_probe.remote_mcp_trust_policy_digest(record.resolved_adapter_id)
             != record.remote_mcp_trust_policy_digest
         ):
             return "REMOTE_MCP_TRUST_MISMATCH"
@@ -1224,6 +1362,68 @@ class Executor:
             update={"result_digest": digest_model(provisional, exclude={"result_digest"})}
         )
 
+    def _result_projection(
+        self,
+        adapter_result: AdapterRawResult,
+    ) -> ExecutionResultProjection:
+        identity = {
+            "schema_version": "execution-result-projection-v1",
+            "execution_id": adapter_result.execution_id,
+            "provider_task_id": adapter_result.provider_task_id,
+            "receipt_id": adapter_result.receipt.receipt_id,
+        }
+        provisional = ExecutionResultProjection(
+            projection_id=stable_id("resultprojection", identity),
+            projection_digest="pending",
+            execution_id=adapter_result.execution_id,
+            provider_task_id=adapter_result.provider_task_id,
+            receipt_id=adapter_result.receipt.receipt_id,
+            provider_status=adapter_result.provider_status,
+            exit_code=adapter_result.exit_code,
+            started_at=adapter_result.started_at,
+            finished_at=adapter_result.finished_at,
+            timed_out=False,
+        )
+        return provisional.model_copy(
+            update={"projection_digest": execution_result_projection_digest(provisional)}
+        )
+
+    @staticmethod
+    def _adapter_result_from_projection(
+        projection: ExecutionResultProjection,
+        receipt: object,
+    ) -> AdapterRawResult:
+        from redteam_agent.models.execution import RawResultReceipt
+
+        if not isinstance(receipt, RawResultReceipt) or not (
+            projection.execution_id == receipt.execution_id
+            and projection.receipt_id == receipt.receipt_id
+            and projection.projection_digest == execution_result_projection_digest(projection)
+        ):
+            raise ExecutionStateTransitionError("durable result projection binding is invalid")
+        return AdapterRawResult(
+            execution_id=projection.execution_id,
+            provider_task_id=projection.provider_task_id,
+            provider_status=projection.provider_status,
+            receipt=receipt,
+            exit_code=projection.exit_code,
+            started_at=projection.started_at,
+            finished_at=projection.finished_at,
+        )
+
+    def _trusted_time(self) -> datetime:
+        try:
+            now = self._clock()
+        except Exception as exc:
+            raise TrustedDependencyUnavailableError(
+                "Executor trusted clock is unavailable"
+            ) from exc
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise TrustedDependencyUnavailableError(
+                "Executor trusted clock returned a naive timestamp"
+            )
+        return now
+
     def _require_execution(self, execution_id: str) -> ExecutionRecord:
         record = self.executions.get(execution_id)
         if record is None:
@@ -1234,7 +1434,7 @@ class Executor:
         decision = self.decisions.get(record.policy_decision_id)
         if decision is None or decision.resolved_adapter_id != record.resolved_adapter_id:
             raise AdapterResolutionError("execution adapter authorization is unavailable")
-        return self.adapter_registry.resolve(
+        return self._adapter_registry.resolve(
             decision.resolved_adapter,
             decision.resolved_adapter_id,
         )

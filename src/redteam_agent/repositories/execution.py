@@ -18,6 +18,7 @@ from redteam_agent.models.execution import (
     DispatchClaim,
     ExecutionRecord,
     ExecutionResult,
+    ExecutionResultProjection,
     PreDispatchBlockReason,
     ProviderExecutionState,
     QuarantineDeletionIntent,
@@ -54,6 +55,10 @@ def dispatch_claim_digest(claim: DispatchClaim) -> str:
 
 def result_collection_authority_digest(authority: ResultCollectionAuthority) -> str:
     return digest_model(authority, exclude={"authority_digest"})
+
+
+def execution_result_projection_digest(projection: ExecutionResultProjection) -> str:
+    return digest_model(projection, exclude={"projection_digest"})
 
 
 def secure_ingestion_manifest_digest(manifest: SecureIngestionManifest) -> str:
@@ -93,8 +98,7 @@ class DispatchClaimRepository(ImmutableJsonRepository[DispatchClaim]):
             and execution.idempotency_key == model.idempotency_key
             and execution.state_version >= model.execution_state_version
             and execution.dispatch_attempts == 1
-            and execution.provider_execution_state
-            not in {"PLANNED", "AUTHORIZED", "BLOCKED"}
+            and execution.provider_execution_state not in {"PLANNED", "AUTHORIZED", "BLOCKED"}
         ):
             raise DigestIntegrityError("dispatch claim execution binding mismatch")
 
@@ -154,15 +158,19 @@ class DispatchClaimRepository(ImmutableJsonRepository[DispatchClaim]):
     ) -> DispatchClaim:
         claim = self.get_by_execution(execution_id)
         execution = ExecutionRepository(self.database).get(execution_id)
-        if claim is None or execution is None or not (
-            claim.execution_id == execution_id
-            and claim.consumed_at is None
-            and claim.issued_at <= now < claim.expires_at
-            and execution.provider_execution_state == "DISPATCH_CLAIMED"
-            and execution.state_version == claim.execution_state_version
-            and execution.authorization_digest == claim.authorization_digest
-            and execution.tool_ref == claim.tool_ref
-            and execution.resolved_adapter_id == claim.adapter_id
+        if (
+            claim is None
+            or execution is None
+            or not (
+                claim.execution_id == execution_id
+                and claim.consumed_at is None
+                and claim.issued_at <= now < claim.expires_at
+                and execution.provider_execution_state == "DISPATCH_CLAIMED"
+                and execution.state_version == claim.execution_state_version
+                and execution.authorization_digest == claim.authorization_digest
+                and execution.tool_ref == claim.tool_ref
+                and execution.resolved_adapter_id == claim.adapter_id
+            )
         ):
             raise ExecutionStateTransitionError(
                 "dispatch claim is unavailable for Secret injection"
@@ -189,9 +197,7 @@ class DispatchClaimRepository(ImmutableJsonRepository[DispatchClaim]):
         return updated
 
 
-class ResultCollectionAuthorityRepository(
-    ImmutableJsonRepository[ResultCollectionAuthority]
-):
+class ResultCollectionAuthorityRepository(ImmutableJsonRepository[ResultCollectionAuthority]):
     table = "result_collection_authorities"
     id_column = "authority_id"
     model_type = ResultCollectionAuthority
@@ -207,37 +213,40 @@ class ResultCollectionAuthorityRepository(
         if model.authority_id != stable_id("collectionauthority", identity):
             raise DigestIntegrityError("result collection authority ID mismatch")
         execution = ExecutionRepository(self.database).get(model.execution_id)
-        registry = ToolRegistryRepository(self.database).get(
-            model.tool_ref.registry_revision
+        registry = ToolRegistryRepository(self.database).get(model.tool_ref.registry_revision)
+        tool = (
+            None
+            if registry is None
+            else next((item for item in registry.tools if item.tool_ref == model.tool_ref), None)
         )
-        tool = None if registry is None else next(
-            (item for item in registry.tools if item.tool_ref == model.tool_ref), None
-        )
-        if execution is None or registry is None or tool is None or not (
-            execution.provider_task_id == model.provider_task_id
-            and execution.mission_id == model.mission_id
-            and execution.mission_revision == model.mission_revision
-            and execution.authorization_epoch == model.authorization_epoch
-            and execution.tool_ref == model.tool_ref
-            and execution.provider_execution_state
-            in {"RUNNING", "SUCCEEDED", "FAILED", "CANCELLED"}
-            and registry.registry_digest == model.registry_digest
-            and model.sink_id
-            == stable_id(
-                "sink",
-                {
-                    "schema_version": "encrypted-stream-v1",
-                    "execution_id": model.execution_id,
-                },
+        if (
+            execution is None
+            or registry is None
+            or tool is None
+            or not (
+                execution.provider_task_id == model.provider_task_id
+                and execution.mission_id == model.mission_id
+                and execution.mission_revision == model.mission_revision
+                and execution.authorization_epoch == model.authorization_epoch
+                and execution.tool_ref == model.tool_ref
+                and execution.provider_execution_state
+                in {"RUNNING", "SUCCEEDED", "FAILED", "CANCELLED"}
+                and registry.registry_digest == model.registry_digest
+                and model.sink_id
+                == stable_id(
+                    "sink",
+                    {
+                        "schema_version": "encrypted-stream-v1",
+                        "execution_id": model.execution_id,
+                    },
+                )
+                and model.max_result_bytes
+                == min(tool.max_output_bytes, model.system_hard_output_cap)
             )
-            and model.max_result_bytes
-            == min(tool.max_output_bytes, model.system_hard_output_cap)
         ):
             raise DigestIntegrityError("result collection authority binding mismatch")
 
-    def verify_row_binding(
-        self, identifier: str | int, model: ResultCollectionAuthority
-    ) -> None:
+    def verify_row_binding(self, identifier: str | int, model: ResultCollectionAuthority) -> None:
         row = self.database.connection.execute(
             "SELECT authority_digest, execution_id, provider_task_id "
             "FROM result_collection_authorities WHERE authority_id = ?",
@@ -277,9 +286,7 @@ class ResultCollectionAuthorityRepository(
         return None if row is None else self.get(str(row["authority_id"]))
 
 
-class SecureIngestionManifestRepository(
-    ImmutableJsonRepository[SecureIngestionManifest]
-):
+class SecureIngestionManifestRepository(ImmutableJsonRepository[SecureIngestionManifest]):
     table = "secure_ingestion_manifests"
     id_column = "manifest_id"
     model_type = SecureIngestionManifest
@@ -298,27 +305,38 @@ class SecureIngestionManifestRepository(
             raise DigestIntegrityError("secure ingestion manifest ID mismatch")
         ingestion = ResultIngestionRepository(self.database).get(model.ingestion_id)
         receipt = RawResultReceiptRepository(self.database).get(model.receipt_id)
-        if ingestion is None or receipt is None or not (
-            ingestion.execution_id == model.execution_id == receipt.execution_id
-            and ingestion.receipt_id == model.receipt_id
-            and ingestion.quarantine_id == model.quarantine_id == receipt.quarantine_id
-            and receipt.receipt_digest == model.receipt_digest
-            and receipt.ciphertext_digest == model.quarantine_digest
-            and tuple(model.resources)
-            == tuple(
-                sorted(
-                    model.resources,
-                    key=lambda item: (item.resource_type, item.resource_id),
+        authority = ResultCollectionAuthorityRepository(self.database).get_by_execution(
+            model.execution_id
+        )
+        if (
+            ingestion is None
+            or receipt is None
+            or authority is None
+            or not (
+                ingestion.execution_id == model.execution_id == receipt.execution_id
+                and ingestion.receipt_id == model.receipt_id
+                and ingestion.quarantine_id == model.quarantine_id == receipt.quarantine_id
+                and receipt.receipt_digest == model.receipt_digest
+                and receipt.ciphertext_digest == model.quarantine_digest
+                and model.result_projection == ingestion.result_projection
+                and model.result_projection.receipt_id == receipt.receipt_id
+                and model.result_projection.provider_task_id == authority.provider_task_id
+                and model.result_projection.projection_digest
+                == execution_result_projection_digest(model.result_projection)
+                and tuple(model.resources)
+                == tuple(
+                    sorted(
+                        model.resources,
+                        key=lambda item: (item.resource_type, item.resource_id),
+                    )
                 )
+                and len({(item.resource_type, item.resource_id) for item in model.resources})
+                == len(model.resources)
             )
-            and len({(item.resource_type, item.resource_id) for item in model.resources})
-            == len(model.resources)
         ):
             raise DigestIntegrityError("secure ingestion manifest binding mismatch")
 
-    def verify_row_binding(
-        self, identifier: str | int, model: SecureIngestionManifest
-    ) -> None:
+    def verify_row_binding(self, identifier: str | int, model: SecureIngestionManifest) -> None:
         row = self.database.connection.execute(
             "SELECT manifest_digest, ingestion_id, execution_id "
             "FROM secure_ingestion_manifests WHERE manifest_id = ?",
@@ -358,9 +376,7 @@ class SecureIngestionManifestRepository(
         return None if row is None else self.get(str(row["manifest_id"]))
 
 
-class QuarantineDeletionIntentRepository(
-    ImmutableJsonRepository[QuarantineDeletionIntent]
-):
+class QuarantineDeletionIntentRepository(ImmutableJsonRepository[QuarantineDeletionIntent]):
     table = "quarantine_deletion_intents"
     id_column = "intent_id"
     model_type = QuarantineDeletionIntent
@@ -385,9 +401,7 @@ class QuarantineDeletionIntentRepository(
         ):
             raise DigestIntegrityError("quarantine deletion intent binding mismatch")
 
-    def verify_row_binding(
-        self, identifier: str | int, model: QuarantineDeletionIntent
-    ) -> None:
+    def verify_row_binding(self, identifier: str | int, model: QuarantineDeletionIntent) -> None:
         row = self.database.connection.execute(
             "SELECT intent_digest, ingestion_id, quarantine_id "
             "FROM quarantine_deletion_intents WHERE intent_id = ?",
@@ -484,9 +498,7 @@ class ExecutionRepository(ImmutableJsonRepository[ExecutionRecord]):
     _allowed_provider_transitions: dict[str, frozenset[str]] = {
         "PLANNED": frozenset({"AUTHORIZED"}),
         "AUTHORIZED": frozenset({"BLOCKED", "DISPATCH_CLAIMED"}),
-        "DISPATCH_CLAIMED": frozenset(
-            {"RUNNING", "RECONCILING", "OUTCOME_UNKNOWN"}
-        ),
+        "DISPATCH_CLAIMED": frozenset({"RUNNING", "RECONCILING", "OUTCOME_UNKNOWN"}),
         "DISPATCHED": frozenset(
             {
                 "RUNNING",
@@ -568,9 +580,7 @@ class ExecutionRepository(ImmutableJsonRepository[ExecutionRecord]):
             decision.decision != "DENY"
             and decision.plan_id == plan.plan_id == model.plan_id
             and decision.mission_id == plan.mission_id == model.mission_id
-            and decision.mission_revision
-            == plan.mission_revision
-            == model.mission_revision
+            and decision.mission_revision == plan.mission_revision == model.mission_revision
             and decision.authorization_epoch
             == plan.authorization_epoch
             == model.authorization_epoch
@@ -600,16 +610,19 @@ class ExecutionRepository(ImmutableJsonRepository[ExecutionRecord]):
             raise DigestIntegrityError("approval-required execution lacks approval evidence")
         request = ApprovalRequestRepository(self.database).get(model.approval_request_id)
         approval = ApprovalRecordRepository(self.database).get(model.approval_record_id)
-        if request is None or approval is None or not (
-            request.policy_decision_id == decision.decision_id
-            and request.authorization_digest == decision.authorization_digest
-            and approval.policy_decision_id == decision.decision_id
-            and approval.authorization_digest == decision.authorization_digest
-            and approval.approval_request_id == request.approval_request_id
-            and approval.approval_request_digest == request.request_digest
-            and approval.approval_presentation_digest
-            == request.approval_presentation_digest
-            and approval.decision == "APPROVED"
+        if (
+            request is None
+            or approval is None
+            or not (
+                request.policy_decision_id == decision.decision_id
+                and request.authorization_digest == decision.authorization_digest
+                and approval.policy_decision_id == decision.decision_id
+                and approval.authorization_digest == decision.authorization_digest
+                and approval.approval_request_id == request.approval_request_id
+                and approval.approval_request_digest == request.request_digest
+                and approval.approval_presentation_digest == request.approval_presentation_digest
+                and approval.decision == "APPROVED"
+            )
         ):
             raise DigestIntegrityError("execution approval evidence binding mismatch")
 
@@ -758,22 +771,16 @@ class ExecutionRepository(ImmutableJsonRepository[ExecutionRecord]):
                 "provider_execution_state": new_state,
                 "pre_dispatch_block_reason": block_reason,
                 "provider_task_id": (
-                    current.provider_task_id
-                    if provider_task_id is None
-                    else provider_task_id
+                    current.provider_task_id if provider_task_id is None else provider_task_id
                 ),
                 "dispatch_attempts": (
-                    current.dispatch_attempts
-                    if dispatch_attempts is None
-                    else dispatch_attempts
+                    current.dispatch_attempts if dispatch_attempts is None else dispatch_attempts
                 ),
                 "updated_at": now,
                 "record_digest": "pending",
             }
         )
-        updated = updated.model_copy(
-            update={"record_digest": execution_record_digest(updated)}
-        )
+        updated = updated.model_copy(update={"record_digest": execution_record_digest(updated)})
         self._occ_update(current, updated)
         return updated
 
@@ -804,17 +811,13 @@ class ExecutionRepository(ImmutableJsonRepository[ExecutionRecord]):
                 "state_version": current.state_version + 1,
                 "result_ingestion_state": new_state,
                 "raw_result_quarantine_id": (
-                    current.raw_result_quarantine_id
-                    if quarantine_id is None
-                    else quarantine_id
+                    current.raw_result_quarantine_id if quarantine_id is None else quarantine_id
                 ),
                 "updated_at": now,
                 "record_digest": "pending",
             }
         )
-        updated = updated.model_copy(
-            update={"record_digest": execution_record_digest(updated)}
-        )
+        updated = updated.model_copy(update={"record_digest": execution_record_digest(updated)})
         self._occ_update(current, updated)
         return updated
 
@@ -942,9 +945,7 @@ class RawResultRecoveryRepository(ImmutableJsonRepository[RawResultRecoveryMetad
         }:
             raise DigestIntegrityError("raw-result recovery has no dispatched execution")
 
-    def verify_row_binding(
-        self, identifier: str | int, model: RawResultRecoveryMetadata
-    ) -> None:
+    def verify_row_binding(self, identifier: str | int, model: RawResultRecoveryMetadata) -> None:
         row = self.database.connection.execute(
             "SELECT recovery_digest, execution_id, quarantine_id, state "
             "FROM raw_result_recovery_metadata WHERE recovery_id = ?",
@@ -991,9 +992,7 @@ class RawResultRecoveryRepository(ImmutableJsonRepository[RawResultRecoveryMetad
                 return existing
             allowed = {
                 "OPEN": frozenset({"OPEN", "COMMITTED", "RECOVERY_REQUIRED", "ABORTED"}),
-                "RECOVERY_REQUIRED": frozenset(
-                    {"RECOVERY_REQUIRED", "COMMITTED", "ABORTED"}
-                ),
+                "RECOVERY_REQUIRED": frozenset({"RECOVERY_REQUIRED", "COMMITTED", "ABORTED"}),
                 "COMMITTED": frozenset(),
                 "ABORTED": frozenset(),
             }
@@ -1005,9 +1004,7 @@ class RawResultRecoveryRepository(ImmutableJsonRepository[RawResultRecoveryMetad
                 and metadata.last_chunk_sequence >= existing.last_chunk_sequence
                 and metadata.state in allowed[existing.state]
             ):
-                raise ExecutionStateTransitionError(
-                    "raw-result recovery transition is invalid"
-                )
+                raise ExecutionStateTransitionError("raw-result recovery transition is invalid")
             cursor = self.database.connection.execute(
                 "UPDATE raw_result_recovery_metadata SET recovery_digest = ?, state = ?, "
                 "payload_json = ? WHERE recovery_id = ? AND recovery_digest = ?",
@@ -1057,9 +1054,19 @@ class ResultIngestionRepository(ImmutableJsonRepository[ResultIngestionRecord]):
             "SELECT execution_id FROM execution_records WHERE execution_id = ?",
             (model.execution_id,),
         ).fetchone()
-        if receipt is None or execution_row is None or not (
-            receipt.execution_id == model.execution_id
-            and receipt.quarantine_id == model.quarantine_id
+        if (
+            receipt is None
+            or execution_row is None
+            or not (
+                receipt.execution_id == model.execution_id
+                and receipt.quarantine_id == model.quarantine_id
+                and model.result_projection is not None
+                and model.result_projection.receipt_id == receipt.receipt_id
+                and model.result_projection.execution_id == model.execution_id
+                and model.result_projection.projection_digest
+                == execution_result_projection_digest(model.result_projection)
+                and model.adapter_metadata_digest == model.result_projection.projection_digest
+            )
         ):
             raise DigestIntegrityError("result-ingestion receipt binding mismatch")
 
@@ -1135,9 +1142,7 @@ class ResultIngestionRepository(ImmutableJsonRepository[ResultIngestionRecord]):
                 "ingestion_digest": "pending",
             }
         )
-        updated = updated.model_copy(
-            update={"ingestion_digest": ingestion_record_digest(updated)}
-        )
+        updated = updated.model_copy(update={"ingestion_digest": ingestion_record_digest(updated)})
         cursor = self.database.connection.execute(
             "UPDATE result_ingestions SET ingestion_digest = ?, state_version = ?, status = ?, "
             "payload_json = ? WHERE ingestion_id = ? AND state_version = ? "
@@ -1185,9 +1190,7 @@ class ResultIngestionRepository(ImmutableJsonRepository[ResultIngestionRecord]):
                 "ingestion_digest": "pending",
             }
         )
-        updated = updated.model_copy(
-            update={"ingestion_digest": ingestion_record_digest(updated)}
-        )
+        updated = updated.model_copy(update={"ingestion_digest": ingestion_record_digest(updated)})
         cursor = self.database.connection.execute(
             "UPDATE result_ingestions SET ingestion_digest = ?, state_version = ?, "
             "payload_json = ? WHERE ingestion_id = ? AND state_version = ? "
@@ -1213,9 +1216,7 @@ class ExecutionResultRepository(ImmutableJsonRepository[ExecutionResult]):
 
     def verify_integrity(self, model: ExecutionResult) -> None:
         verify_model_digest(model, model.result_digest, exclude={"result_digest"})
-        ingestion = ResultIngestionRepository(self.database).get_by_execution(
-            model.execution_id
-        )
+        ingestion = ResultIngestionRepository(self.database).get_by_execution(model.execution_id)
         if (
             ingestion is None
             or ingestion.receipt_id is None
@@ -1242,13 +1243,17 @@ class ExecutionResultRepository(ImmutableJsonRepository[ExecutionResult]):
             raise DigestIntegrityError("execution result provider state mismatch")
         decision = PolicyDecisionRepository(self.database).get(model.policy_decision_id)
         plan = None if decision is None else PlanRepository(self.database).get(decision.plan_id)
-        if decision is None or plan is None or not (
-            execution.provider_task_id == model.provider_task_id
-            and execution.resolved_adapter_id == model.adapter_id
-            and execution.policy_decision_id == model.policy_decision_id
-            and decision.tool_ref == model.tool_ref
-            and decision.normalized_targets == model.normalized_targets
-            and plan.proposal.session_id == model.session_id
+        if (
+            decision is None
+            or plan is None
+            or not (
+                execution.provider_task_id == model.provider_task_id
+                and execution.resolved_adapter_id == model.adapter_id
+                and execution.policy_decision_id == model.policy_decision_id
+                and decision.tool_ref == model.tool_ref
+                and decision.normalized_targets == model.normalized_targets
+                and plan.proposal.session_id == model.session_id
+            )
         ):
             raise DigestIntegrityError("execution result authorization binding mismatch")
 

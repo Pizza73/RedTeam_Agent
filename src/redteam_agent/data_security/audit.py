@@ -167,18 +167,12 @@ class _AuditPreparedAppend(StrictImmutableBoundaryModel):
 
     @model_validator(mode="after")
     def event_follows_previous_head(self) -> _AuditPreparedAppend:
-        previous_absent = (
-            self.previous_sequence_number is None
-            and self.previous_event_hash is None
-        )
+        previous_absent = self.previous_sequence_number is None and self.previous_event_hash is None
         previous_present = (
-            self.previous_sequence_number is not None
-            and self.previous_event_hash is not None
+            self.previous_sequence_number is not None and self.previous_event_hash is not None
         )
         expected_sequence = (
-            1
-            if self.previous_sequence_number is None
-            else self.previous_sequence_number + 1
+            1 if self.previous_sequence_number is None else self.previous_sequence_number + 1
         )
         if not (
             (previous_absent or previous_present)
@@ -217,18 +211,42 @@ class KeyedFileAuditHeadStore:
     """Authenticated audit heads anchored by an external monotonic generation."""
 
     _MAX_STATE_BYTES = 16 * 1024 * 1024
+    _TEST_COMPOSITION_TOKEN = object()
+
+    @classmethod
+    def _for_test_with_legacy_generation_store(
+        cls,
+        *,
+        state_path: Path,
+        authenticator: AuditChainAuthenticator,
+        generation_store: AuditHeadGenerationStore,
+    ) -> KeyedFileAuditHeadStore:
+        return cls(
+            state_path=state_path,
+            authenticator=authenticator,
+            _test_generation_store=generation_store,
+            _test_composition_token=cls._TEST_COMPOSITION_TOKEN,
+        )
 
     def __init__(
         self,
         *,
         state_path: Path,
         authenticator: AuditChainAuthenticator,
-        generation_store: AuditHeadGenerationStore | None = None,
         generation_coordinator: AuthenticatedGenerationCoordinator | None = None,
+        _test_generation_store: AuditHeadGenerationStore | None = None,
+        _test_composition_token: object | None = None,
     ) -> None:
-        if (generation_store is None) == (generation_coordinator is None):
+        if (
+            (_test_generation_store is None) == (generation_coordinator is None)
+            or (
+                _test_generation_store is not None
+                and _test_composition_token is not self._TEST_COMPOSITION_TOKEN
+            )
+            or (generation_coordinator is not None and not generation_coordinator.production_ready)
+        ):
             raise AuditIntegrityError(
-                "exactly one audit-head generation authority is required"
+                "production audit-head requires a complete generation backend"
             )
         if (
             generation_coordinator is not None
@@ -241,17 +259,13 @@ class KeyedFileAuditHeadStore:
         try:
             parent_metadata = os.lstat(absolute_path.parent)
         except OSError as exc:
-            raise AuditIntegrityError(
-                "audit-head state directory is unavailable"
-            ) from exc
+            raise AuditIntegrityError("audit-head state directory is unavailable") from exc
         if (
             stat.S_ISLNK(parent_metadata.st_mode)
             or not stat.S_ISDIR(parent_metadata.st_mode)
             or stat.S_IMODE(parent_metadata.st_mode) & 0o077
         ):
-            raise AuditIntegrityError(
-                "audit-head state directory permissions are invalid"
-            )
+            raise AuditIntegrityError("audit-head state directory permissions are invalid")
         self._state_path = absolute_path
         self._state_paths = (
             absolute_path,
@@ -260,7 +274,7 @@ class KeyedFileAuditHeadStore:
         self._parent_identity = (parent_metadata.st_dev, parent_metadata.st_ino)
         self._lock_path = absolute_path.parent / f".{absolute_path.name}.lock"
         self._authenticator = authenticator
-        self._generation_store = generation_store
+        self._generation_store = _test_generation_store
         self._generation_coordinator = generation_coordinator
         self._lock = RLock()
 
@@ -276,9 +290,7 @@ class KeyedFileAuditHeadStore:
         if not mission_id:
             raise AuditIntegrityError("audit-head mission binding is invalid")
         with self._lock, self._locked_state_file() as directory_descriptor:
-            _, prepared = self._load_state(
-                directory_descriptor=directory_descriptor
-            )
+            _, prepared = self._load_state(directory_descriptor=directory_descriptor)
             item = prepared.get(mission_id)
             return None if item is None else item.event
 
@@ -399,9 +411,7 @@ class KeyedFileAuditHeadStore:
         dict[str, _AuditPreparedAppend],
     ]:
         generation = (
-            self._external_generation()
-            if expected_generation is None
-            else expected_generation
+            self._external_generation() if expected_generation is None else expected_generation
         )
         if generation == 0:
             return {}, {}
@@ -418,9 +428,7 @@ class KeyedFileAuditHeadStore:
                     "content-bound audit-head generation is unavailable"
                 ) from exc
             if anchor.generation != generation:
-                raise AuditIntegrityError(
-                    "content-bound audit-head generation mismatch"
-                )
+                raise AuditIntegrityError("content-bound audit-head generation mismatch")
         try:
             duplicate_free = canonical_loads(raw)
             state = _AuditHeadState.model_validate_json(
@@ -445,9 +453,7 @@ class KeyedFileAuditHeadStore:
             expected_digest,
             state.state_digest,
         ):
-            raise AuditIntegrityError(
-                "audit-head rollback, generation, or authentication failed"
-            )
+            raise AuditIntegrityError("audit-head rollback, generation, or authentication failed")
         return (
             {item.mission_id: item for item in state.heads},
             {item.mission_id: item for item in state.prepared},
@@ -496,9 +502,7 @@ class KeyedFileAuditHeadStore:
                 committed = self._generation_coordinator.commit(
                     encoded,
                     expected_anchor_digest=(
-                        None
-                        if current_anchor is None
-                        else current_anchor.anchor_digest
+                        None if current_anchor is None else current_anchor.anchor_digest
                     ),
                 )
             except Exception as exc:
@@ -506,9 +510,7 @@ class KeyedFileAuditHeadStore:
                     "content-bound audit-head generation is unavailable"
                 ) from exc
             if committed.generation != next_generation:
-                raise AuditIntegrityError(
-                    "content-bound audit-head generation mismatch"
-                )
+                raise AuditIntegrityError("content-bound audit-head generation mismatch")
             self._load_state(
                 directory_descriptor=directory_descriptor,
                 expected_generation=next_generation,
@@ -526,13 +528,9 @@ class KeyedFileAuditHeadStore:
                 new=next_generation,
             )
         except Exception as exc:
-            raise AuditIntegrityError(
-                "external audit-head generation is unavailable"
-            ) from exc
+            raise AuditIntegrityError("external audit-head generation is unavailable") from exc
         if not advanced:
-            raise AuditIntegrityError(
-                "external audit-head generation update conflicted"
-            )
+            raise AuditIntegrityError("external audit-head generation update conflicted")
         self._reconcile_committed_state_reachability(next_generation)
 
     def _reconcile_committed_state_reachability(self, generation: int) -> None:
@@ -549,28 +547,21 @@ class KeyedFileAuditHeadStore:
                 directory_flags,
             )
         except OSError as exc:
-            raise AuditIntegrityError(
-                "committed audit-head directory is unavailable"
-            ) from exc
+            raise AuditIntegrityError("committed audit-head directory is unavailable") from exc
         try:
             directory_metadata = os.fstat(directory_descriptor)
             if (
                 not stat.S_ISDIR(directory_metadata.st_mode)
-                or (directory_metadata.st_dev, directory_metadata.st_ino)
-                != self._parent_identity
+                or (directory_metadata.st_dev, directory_metadata.st_ino) != self._parent_identity
             ):
-                raise AuditIntegrityError(
-                    "audit-head state directory identity changed"
-                )
+                raise AuditIntegrityError("audit-head state directory identity changed")
             self._load_state(
                 directory_descriptor=directory_descriptor,
                 expected_generation=generation,
             )
             self._verify_parent_identity()
             if self._external_generation() != generation:
-                raise AuditIntegrityError(
-                    "committed audit-head generation is unavailable"
-                )
+                raise AuditIntegrityError("committed audit-head generation is unavailable")
         finally:
             os.close(directory_descriptor)
 
@@ -587,9 +578,7 @@ class KeyedFileAuditHeadStore:
             "schema_version": "audit-head-state-v2",
             "generation": generation,
             "heads": tuple(item.model_dump(mode="python") for item in heads),
-            "prepared": tuple(
-                item.model_dump(mode="python") for item in prepared
-            ),
+            "prepared": tuple(item.model_dump(mode="python") for item in prepared),
             "signing_key_id": signing_key_id,
             "signing_key_version": signing_key_version,
         }
@@ -607,9 +596,7 @@ class KeyedFileAuditHeadStore:
         try:
             generation = self._generation_store.current_generation()
         except Exception as exc:
-            raise AuditIntegrityError(
-                "external audit-head generation is unavailable"
-            ) from exc
+            raise AuditIntegrityError("external audit-head generation is unavailable") from exc
         if (
             not isinstance(generation, int)
             or isinstance(generation, bool)
@@ -646,9 +633,7 @@ class KeyedFileAuditHeadStore:
                     or (directory_metadata.st_dev, directory_metadata.st_ino)
                     != self._parent_identity
                 ):
-                    raise AuditIntegrityError(
-                        "audit-head state directory identity changed"
-                    )
+                    raise AuditIntegrityError("audit-head state directory identity changed")
                 lock_flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC
                 if hasattr(os, "O_NOFOLLOW"):
                     lock_flags |= os.O_NOFOLLOW
@@ -807,9 +792,7 @@ class KeyedFileAuditHeadStore:
         try:
             metadata = os.stat(self._state_path.parent, follow_symlinks=False)
         except OSError as exc:
-            raise AuditIntegrityError(
-                "audit-head state directory is unavailable"
-            ) from exc
+            raise AuditIntegrityError("audit-head state directory is unavailable") from exc
         if (
             not stat.S_ISDIR(metadata.st_mode)
             or (metadata.st_dev, metadata.st_ino) != self._parent_identity
@@ -942,9 +925,7 @@ class MissionAuditRecorder:
             resource_id=resource_id,
             operation=operation,
             operation_id=(
-                "auditop_" + secrets.token_hex(16)
-                if operation_id is None
-                else operation_id
+                "auditop_" + secrets.token_hex(16) if operation_id is None else operation_id
             ),
             metadata_digest=metadata_digest,
         )
@@ -968,14 +949,17 @@ class MissionAuditRecorder:
     ) -> bool:
         """Verify an exact idempotent operation against the trusted audit chain."""
 
-        return self._verified_operation(
-            mission_id=mission_id,
-            resource_type=resource_type,
-            resource_id=resource_id,
-            operation=operation,
-            operation_id=operation_id,
-            metadata_digest=metadata_digest,
-        ) is not None
+        return (
+            self._verified_operation(
+                mission_id=mission_id,
+                resource_type=resource_type,
+                resource_id=resource_id,
+                operation=operation,
+                operation_id=operation_id,
+                metadata_digest=metadata_digest,
+            )
+            is not None
+        )
 
     def operation_metadata_digest(
         self,
@@ -999,9 +983,7 @@ class MissionAuditRecorder:
         if event is None:
             return None
         try:
-            payload = AuditReferencePayload.model_validate(
-                event.canonical_payload.to_dict()
-            )
+            payload = AuditReferencePayload.model_validate(event.canonical_payload.to_dict())
         except ValueError as exc:
             raise AuditIntegrityError("audit operation binding failed") from exc
         return payload.metadata_digest
@@ -1026,9 +1008,7 @@ class MissionAuditRecorder:
         if len(matches) != 1:
             raise AuditIntegrityError("audit operation binding failed")
         try:
-            payload = AuditReferencePayload.model_validate(
-                matches[0].canonical_payload.to_dict()
-            )
+            payload = AuditReferencePayload.model_validate(matches[0].canonical_payload.to_dict())
         except ValueError as exc:
             raise AuditIntegrityError("audit operation binding failed") from exc
         if not (
@@ -1037,10 +1017,7 @@ class MissionAuditRecorder:
             and payload.resource_id == resource_id
             and payload.operation == operation
             and payload.operation_id == operation_id
-            and (
-                metadata_digest is None
-                or payload.metadata_digest == metadata_digest
-            )
+            and (metadata_digest is None or payload.metadata_digest == metadata_digest)
         ):
             raise AuditIntegrityError("audit operation binding failed")
         return matches[0]
@@ -1061,9 +1038,7 @@ class MissionAuditLog:
                 "durable audit log requires an external authenticator and head store"
             )
         if database is None and head_store is not None:
-            raise AuditIntegrityError(
-                "in-memory audit log cannot use a durable head store"
-            )
+            raise AuditIntegrityError("in-memory audit log cannot use a durable head store")
         self._database = database
         self._repository = None if database is None else AuditLogRepository(database)
         self._authenticator = authenticator
@@ -1118,9 +1093,7 @@ class MissionAuditLog:
                     canonical_payload=canonical_payload,
                     occurred_at=occurred_at,
                 ):
-                    raise AuditSequenceConflictError(
-                        "derived audit event identifier conflicted"
-                    )
+                    raise AuditSequenceConflictError("derived audit event identifier conflicted")
                 return existing
             mission_events = self._events.setdefault(mission_id, [])
             sequence = len(mission_events) + 1
@@ -1261,10 +1234,7 @@ class MissionAuditLog:
                 head = self._repository.head(mission_id)
                 sequence = 1 if head is None else int(head["sequence_number"]) + 1
                 previous_hash = None if head is None else str(head["event_hash"])
-                if (
-                    expected_sequence_number is not None
-                    and expected_sequence_number != sequence
-                ):
+                if expected_sequence_number is not None and expected_sequence_number != sequence:
                     raise AuditSequenceConflictError("audit sequence allocation conflict")
                 if head is None and self._repository.has_event(mission_id):
                     raise AuditIntegrityError("audit chain has no trusted head")
@@ -1301,9 +1271,7 @@ class MissionAuditLog:
                     canonical_payload=canonical_payload,
                     occurred_at=occurred_at,
                 )
-                event_json = canonicalize(event.model_dump(mode="python")).decode(
-                    "utf-8"
-                )
+                event_json = canonicalize(event.model_dump(mode="python")).decode("utf-8")
                 expected_head = (
                     None
                     if head is None
@@ -1314,9 +1282,7 @@ class MissionAuditLog:
                     expected=expected_head,
                     event=event,
                 ):
-                    raise AuditSequenceConflictError(
-                        "external audit append preparation conflicted"
-                    )
+                    raise AuditSequenceConflictError("external audit append preparation conflicted")
                 self._repository.insert_event(
                     event_id=event.event_id,
                     mission_id=event.mission_id,
@@ -1346,9 +1312,7 @@ class MissionAuditLog:
                 event.sequence_number,
                 event.event_hash,
             ):
-                raise AuditSequenceConflictError(
-                    "external audit append commit conflicted"
-                )
+                raise AuditSequenceConflictError("external audit append commit conflicted")
             self.verify(mission_id)
             return event
         except (AuditIntegrityError, AuditSequenceConflictError):
@@ -1374,39 +1338,27 @@ class MissionAuditLog:
             raise AuditIntegrityError("prepared audit append was not recovered")
         row = self._repository.head(mission_id)
         database_head = (
-            None
-            if row is None
-            else (int(row["sequence_number"]), str(row["event_hash"]))
+            None if row is None else (int(row["sequence_number"]), str(row["event_hash"]))
         )
         candidate_head = (
-            None
-            if not candidates
-            else (candidates[-1].sequence_number, candidates[-1].event_hash)
+            None if not candidates else (candidates[-1].sequence_number, candidates[-1].event_hash)
         )
         if database_head != candidate_head:
             raise AuditIntegrityError("database audit head differs from event chain")
         external_head = self._head_store.head(mission_id)
-        if external_head is not None and not KeyedFileAuditHeadStore._valid_head(
-            external_head
-        ):
+        if external_head is not None and not KeyedFileAuditHeadStore._valid_head(external_head):
             raise AuditIntegrityError("external audit head is invalid")
         if external_head != candidate_head:
             raise AuditIntegrityError("mission audit chain head failed")
 
     def _recover_prepared_append(self, mission_id: str) -> None:
-        if (
-            self._database is None
-            or self._repository is None
-            or self._head_store is None
-        ):
+        if self._database is None or self._repository is None or self._head_store is None:
             raise AuditIntegrityError("durable audit dependencies are unavailable")
         prepared = self._head_store.prepared_append(mission_id)
         if prepared is None:
             return
         if self._database.connection.in_transaction:
-            raise AuditIntegrityError(
-                "prepared audit append recovery requires its own transaction"
-            )
+            raise AuditIntegrityError("prepared audit append recovery requires its own transaction")
         external_head = self._head_store.head(mission_id)
         expected_head = (
             None
@@ -1421,9 +1373,7 @@ class MissionAuditLog:
             self._verify_event_chain(mission_id, candidates)
             row = self._repository.head(mission_id)
             database_head = (
-                None
-                if row is None
-                else (int(row["sequence_number"]), str(row["event_hash"]))
+                None if row is None else (int(row["sequence_number"]), str(row["event_hash"]))
             )
             candidate_head = (
                 None
@@ -1431,18 +1381,12 @@ class MissionAuditLog:
                 else (candidates[-1].sequence_number, candidates[-1].event_hash)
             )
             if database_head != candidate_head:
-                raise AuditIntegrityError(
-                    "database audit head differs from event chain"
-                )
+                raise AuditIntegrityError("database audit head differs from event chain")
             if candidate_head == new_head:
                 if candidates[-1] != prepared:
-                    raise AuditIntegrityError(
-                        "prepared audit append differs from database suffix"
-                    )
+                    raise AuditIntegrityError("prepared audit append differs from database suffix")
             elif candidate_head == expected_head:
-                event_json = canonicalize(
-                    prepared.model_dump(mode="python")
-                ).decode("utf-8")
+                event_json = canonicalize(prepared.model_dump(mode="python")).decode("utf-8")
                 self._repository.insert_event(
                     event_id=prepared.event_id,
                     mission_id=prepared.mission_id,
@@ -1463,20 +1407,17 @@ class MissionAuditLog:
                     sequence_number=prepared.sequence_number,
                     event_hash=prepared.event_hash,
                 ):
-                    raise AuditSequenceConflictError(
-                        "prepared audit head recovery conflicted"
-                    )
+                    raise AuditSequenceConflictError("prepared audit head recovery conflicted")
             else:
-                raise AuditIntegrityError(
-                    "database chain conflicts with prepared audit append"
-                )
-        if not self._head_store.commit_append(
-            mission_id,
-            event=prepared,
-        ) and self._head_store.head(mission_id) != new_head:
-            raise AuditSequenceConflictError(
-                "prepared audit append commit conflicted"
+                raise AuditIntegrityError("database chain conflicts with prepared audit append")
+        if (
+            not self._head_store.commit_append(
+                mission_id,
+                event=prepared,
             )
+            and self._head_store.head(mission_id) != new_head
+        ):
+            raise AuditSequenceConflictError("prepared audit append commit conflicted")
 
     def _verify_event_chain(
         self,

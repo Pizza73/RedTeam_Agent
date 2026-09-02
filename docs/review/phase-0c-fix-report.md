@@ -474,6 +474,152 @@ PHASE_GATE=phase-0c PASS
 - A fresh independent Phase 0C review remains required on the resulting 40-character PR HEAD; this
   local PASS is not an independent Phase Gate PASS.
 
+## Thirty-second design-approved durable lifecycle correction
+
+Current phase: `phase-0c`.
+
+Input native-review SHA: `4e86a7e4f5a6578133cd3579fbb5a004ab5c80c3`.
+
+Design-approved implementation input SHA: `fa4b120a5f276d05f1c86f7619ac2b522a7981d4`.
+
+Phase base: `5cda9a5f8792ee33c3e153d8e791499f5619d82e`.
+
+Trusted Design Approval:
+[`issuecomment-5508736032`](https://github.com/Pizza73/RedTeam_Agent/pull/3#issuecomment-5508736032).
+
+Trusted implementation request:
+[`issuecomment-5508736487`](https://github.com/Pizza73/RedTeam_Agent/pull/3#issuecomment-5508736487).
+
+### Findings addressed
+
+All six retained P1 findings from the recurring-family Design Stop were repaired as one durable
+Executor, ingestion, and generation lifecycle:
+
+- [`discussion_r3910452535`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3910452535)
+  (`secret-plaintext-boundary`): removed the exported `SecretInjectionBroker`, caller-created
+  channel registry, and callback protocol. Secret delivery now exists only inside the
+  composition-root-created Executor and enters its already-selected Adapter through the fixed
+  `submit_with_secrets` dispatch port. The public Secret Store resolve path remains unavailable.
+- [`discussion_r3910452541`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3910452541)
+  (`authorization-lifecycle`): Executor durably consumes and read-back verifies the exact current
+  Dispatch Claim before it decrypts a Secret or calls the Adapter. A crash after consumption is
+  deliberately at-most-once; restart reconciles and cannot replay plaintext delivery or submit.
+- [`discussion_r3910452545`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3910452545)
+  (`audit-recovery-durability`): Quarantine sink and Quarantine constructors no longer perform
+  recovery writes. Ingestion loads and verifies the manifest, result projection, every referenced
+  Artifact and Secret, and the deletion intent before explicitly resuming erasure.
+- [`discussion_r3910452550`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3910452550)
+  (`audit-recovery-durability`): the immutable ingestion manifest now carries a verified
+  `ExecutionResultProjection`. After durable ingestion or erasure, Executor reconstructs the final
+  result from repository evidence and never calls `collect_result()` again.
+- [`discussion_r3910452561`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3910452561)
+  (`filesystem-concurrency-retention`): Executor owns an injected trusted Clock. Collection and
+  ingestion APIs no longer accept caller security timestamps; the same trusted reading establishes
+  collection start, retention, and the initial lease, which restart reuses unchanged.
+- [`discussion_r3910452566`](https://github.com/Pizza73/RedTeam_Agent/pull/3#discussion_r3910452566)
+  (`integrity-cryptography-keys`): added a durable SQLite-backed authenticated anchor and encrypted
+  immutable-blob provider. It verifies private path identity, HMAC bindings, content digests,
+  generation transitions, and atomic CAS across restart. Production key/audit constructors reject
+  integer-only and in-memory fallbacks. SQL is confined to the storage layer.
+
+### Resulting working-tree diff
+
+The correction changes 19 repository paths: 13 implementation paths, four test paths, this report,
+and the Phase 0C invariant audit. It deletes the obsolete Secret broker module and adds the storage
+record boundary for durable generations.
+
+Implementation paths:
+
+- `src/redteam_agent/data_security/__init__.py`
+- `src/redteam_agent/data_security/audit.py`
+- `src/redteam_agent/data_security/generations.py`
+- `src/redteam_agent/data_security/ingestion.py`
+- `src/redteam_agent/data_security/keys.py`
+- `src/redteam_agent/data_security/secret_injection.py` (deleted)
+- `src/redteam_agent/data_security/stores.py`
+- `src/redteam_agent/data_security/streaming.py`
+- `src/redteam_agent/executor/adapter.py`
+- `src/redteam_agent/executor/service.py`
+- `src/redteam_agent/models/execution.py`
+- `src/redteam_agent/repositories/execution.py`
+- `src/redteam_agent/storage/generation_records.py` (added)
+
+Test and report paths:
+
+- `tests/integration/test_phase0b_flow.py`
+- `tests/phase0b_helpers.py`
+- `tests/security/test_phase0b_execution_safety.py`
+- `tests/security/test_phase0c_data_security.py`
+- `docs/review/phase-0c-invariant-audit.json`
+- `docs/review/phase-0c-fix-report.md`
+
+### Regression evidence
+
+The regressions cover fixed-Adapter Secret delivery and buffer zeroing, consume-before-decrypt
+ordering, submit-crash reconciliation without replay, manifest/resource verification before
+erasure, no provider recollection after erasure, trusted Clock ownership, durable generation
+restart/recovery/tamper denial, production fallback rejection, and the SQL layer boundary.
+Hypothesis properties exercise repeated Claim recovery, variable Secret values, collection times,
+output caps, ingestion transition order, and generation sequences. Existing Phase 0B compatibility,
+positive, negative, and failure-path cases remain enabled.
+No test was deleted, skipped, weakened, or marked as an expected failure.
+
+Focused validation command:
+
+```text
+./.venv/bin/ruff check src/redteam_agent tests && \
+  ./.venv/bin/mypy src/redteam_agent && \
+  PYTHONPATH=. ./.venv/bin/pytest -q \
+    tests/integration/test_phase0b_flow.py \
+    tests/security/test_phase0b_execution_safety.py \
+    tests/security/test_phase0c_data_security.py -x
+```
+
+Result: ruff passed, mypy passed for 81 source files, and `134 passed`.
+
+Invariant-audit result:
+
+```text
+INVARIANT_AUDIT=PASS:80d9bb45579d079e6c2b0440d934e04aeb9622187a8f4ff41704fb3962972fbd
+```
+
+Required phase-gate command:
+
+```text
+PATH=/home/kali/Red_Agent/.venv/bin:$PATH \
+  bash scripts/ci/run_phase_gate.sh phase-0c
+```
+
+The first run exposed one pre-existing architecture constraint in the new backend: SQL had been
+placed in `data_security` instead of `storage`. The backend was split at that boundary and the
+complete gate was rerun successfully:
+
+```text
+AUTOMATION_VALIDATION=PASS
+INVARIANT_AUDIT=PASS
+ruff: All checks passed
+mypy: Success: no issues found in 81 source files
+unit: 228 passed
+integration: 7 passed
+security: 240 passed
+full/coverage run: 475 passed
+skipped=0, errors=0, failures=0
+coverage: 80% total (branch coverage enabled)
+pip check: No broken requirements found
+PHASE_GATE=phase-0c PASS
+```
+
+### Remaining findings and constraints
+
+- No retained P0/P1 finding is knowingly left unresolved; the resulting 40-character PR HEAD still
+  requires a fresh independent Codex review.
+- The durable generation backend is a local authenticated SQLite composition. Integration with an
+  OS keystore, vault, or remote durable control plane can replace the storage adapter without
+  weakening the content-bound protocol.
+- External Provider, C2, MCP side effects, local attack execution, credential collection, and
+  external-target actions remain absent.
+- No protected governance file was changed, and no merge was attempted.
+
 ## Thirty-first design-approved coherent redesign cycle
 
 Current phase: **Phase 0C — Data Security Foundation**.

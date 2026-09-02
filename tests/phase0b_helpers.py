@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from typing import TYPE_CHECKING
 
 from redteam_agent.executor import (
     ExecutionAdapter,
@@ -42,6 +43,9 @@ from redteam_agent.storage import Database
 
 from .helpers import KernelEnvironment, PersistedKernel, build_environment, persist_environment
 
+if TYPE_CHECKING:
+    from redteam_agent.data_security import SecretStore
+
 
 @dataclass
 class ExecutionHarness:
@@ -60,6 +64,7 @@ class ExecutionHarness:
     capability_probe: PreDispatchCapabilityProbe
     finalization: FinalizationCoordinator
     adapter_registry: TrustedExecutionAdapterRegistry
+    clock: Callable[[], datetime]
 
 
 def build_execution_harness(
@@ -120,6 +125,10 @@ def build_execution_harness(
             ),
         )
     )
+
+    def clock() -> datetime:
+        return FIXED_TIME + timedelta(minutes=4)
+
     executor = Executor(
         runtime_resolver=kernel.runtime_resolver,
         plans=kernel.plans,
@@ -136,6 +145,7 @@ def build_execution_harness(
         adapter_registry=adapter_registry,
         capability_probe=capability_probe,
         finalization_requester=finalization,
+        clock=clock,
     )
     return ExecutionHarness(
         database=database,
@@ -153,6 +163,7 @@ def build_execution_harness(
         capability_probe=capability_probe,
         finalization=finalization,
         adapter_registry=adapter_registry,
+        clock=clock,
     )
 
 
@@ -162,6 +173,8 @@ def executor_with_adapter(
     *,
     sink_factory: MockRawResultSinkFactory | None = None,
     capability_probe: PreDispatchCapabilityProbe | None = None,
+    clock: Callable[[], datetime] | None = None,
+    secret_store: SecretStore | None = None,
 ) -> Executor:
     capabilities = harness.environment.adapter_snapshot.adapters[0]
     return Executor(
@@ -188,6 +201,8 @@ def executor_with_adapter(
         ),
         capability_probe=capability_probe or harness.capability_probe,
         finalization_requester=harness.finalization,
+        clock=clock or harness.clock,
+        secret_store=secret_store,
     )
 
 
@@ -213,9 +228,7 @@ def prepare_additional_execution(
 ):
     """Prepare another independently authorized action before a safety pause."""
 
-    proposal = harness.environment.proposal.model_copy(
-        update={"objective": objective}
-    )
+    proposal = harness.environment.proposal.model_copy(update={"objective": objective})
     PlanProposalRepository(harness.database).add(proposal)
     plan = create_execution_plan(
         mission=harness.environment.mission,

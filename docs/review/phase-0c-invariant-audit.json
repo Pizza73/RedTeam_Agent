@@ -2,8 +2,8 @@
   "schema_version": "1.0",
   "phase": "phase-0c",
   "request": {
-    "head_sha": "edd6ed62db38d53f3bda6ebb59327b5f32175178",
-    "reference": "https://github.com/Pizza73/RedTeam_Agent/pull/3#issuecomment-5503202054",
+    "head_sha": "fa4b120a5f276d05f1c86f7619ac2b522a7981d4",
+    "reference": "https://github.com/Pizza73/RedTeam_Agent/pull/3#issuecomment-5508736487",
     "action": "IMPLEMENT_PHASE"
   },
   "families": [
@@ -13,30 +13,31 @@
       "entry_points": [
         "src/redteam_agent/executor/service.py",
         "src/redteam_agent/repositories/execution.py",
-        "src/redteam_agent/data_security/streaming.py",
-        "src/redteam_agent/data_security/authorization.py"
+        "src/redteam_agent/executor/adapter.py",
+        "src/redteam_agent/data_security/stores.py"
       ],
       "sibling_paths": [
-        "src/redteam_agent/data_security/secret_injection.py",
         "src/redteam_agent/data_security/ingestion.py",
+        "src/redteam_agent/data_security/streaming.py",
         "src/redteam_agent/repositories/mission.py"
       ],
       "invariant_evidence": [
-        "Pre-dispatch success atomically transitions AUTHORIZED to DISPATCH_CLAIMED and persists the exact Decision, Mission, Tool, Adapter, approval and idempotency binding before the one allowed submit attempt.",
-        "Restart from DISPATCH_CLAIMED performs reconciliation only, while Secret injection and result collection require their distinct current repository-backed authorities."
+        "Executor durably consumes and read-back verifies the exact repository-backed Dispatch Claim before Secret decryption or entry into the already-selected Adapter dispatch port.",
+        "A crash after Claim consumption is at-most-once: restart from DISPATCH_CLAIMED performs reconciliation only and cannot release Secret plaintext or replay Adapter submission."
       ],
       "tests": [
         "tests/security/test_phase0c_data_security.py",
         "tests/security/test_gate_review_regressions.py"
       ],
-      "test_modes": ["positive", "negative", "failure", "state-machine"]
+      "test_modes": ["positive", "negative", "failure", "property"]
     },
     {
       "id": "secret-plaintext-boundary",
       "status": "affected",
       "entry_points": [
+        "src/redteam_agent/executor/service.py",
+        "src/redteam_agent/executor/adapter.py",
         "src/redteam_agent/data_security/stores.py",
-        "src/redteam_agent/data_security/secret_injection.py",
         "src/redteam_agent/data_security/ingestion.py"
       ],
       "sibling_paths": [
@@ -45,8 +46,8 @@
         "src/redteam_agent/repositories/execution.py"
       ],
       "invariant_evidence": [
-        "SecretStore has no plaintext-returning application resolve path; the broker loads a current unconsumed Dispatch Claim, selects only the fixed Adapter channel, zeroes its temporary bytearray and durably consumes the Claim.",
-        "Caller Receipt, QuarantineReference, legacy loader and full-object publication paths are denied; only repository-bound ingestion_id execution may open committed chunks inside the redaction pipeline."
+        "The package exports no Broker, callback, or caller-constructible Secret channel; only Executor's private composition-root-fixed dispatch transaction can reach SecretStore's internal resolver and fixed Adapter port.",
+        "The transaction derives the complete Secret set from trusted Decision and Grant repositories after Claim consumption, releases each value once into bounded mutable buffers, and zeroes every buffer on success or failure."
       ],
       "tests": ["tests/security/test_phase0c_data_security.py"],
       "test_modes": ["positive", "negative", "failure"]
@@ -57,18 +58,19 @@
       "entry_points": [
         "src/redteam_agent/data_security/stores.py",
         "src/redteam_agent/data_security/keys.py",
-        "src/redteam_agent/data_security/generations.py"
+        "src/redteam_agent/data_security/generations.py",
+        "src/redteam_agent/storage/generation_records.py"
       ],
       "sibling_paths": [
         "src/redteam_agent/data_security/streaming.py",
         "src/redteam_agent/data_security/audit.py"
       ],
       "invariant_evidence": [
-        "Audit Head and Wrapped Key State can use the shared content-bound generation coordinator with separate namespaces, immutable blob IDs, complete anchor CAS and exact read-back verification.",
-        "Missing or corrupt committed blobs fail closed, while key and audit state recover from the external blob after replacement of the non-authoritative local path."
+        "The durable SQLite generation backend atomically persists HMAC-authenticated anchors and encrypted immutable blobs with generation, state-digest, prior-anchor, namespace, and path-identity bindings.",
+        "Production Audit Head and Wrapped Key constructors accept only one shared durable anchor/blob backend; integer-only and in-memory fallbacks are rejected, while restart and tamper tests fail closed."
       ],
       "tests": ["tests/security/test_phase0c_data_security.py"],
-      "test_modes": ["positive", "negative", "failure", "state-machine"]
+      "test_modes": ["positive", "negative", "failure", "property"]
     },
     {
       "id": "audit-recovery-durability",
@@ -82,11 +84,11 @@
         "src/redteam_agent/repositories/execution.py"
       ],
       "invariant_evidence": [
-        "The repository-bound coordinator read-back verifies SecureIngestionManifest before creating its manifest-bound QuarantineDeletionIntent and advances INGESTED_DURABLE, DELETE_PENDING and QUARANTINE_ERASED through paired OCC transitions.",
-        "Restart reuses immutable manifest and deletion evidence, resumes key destruction/unlink idempotently, and persists ExecutionResult before the final SUCCEEDED acknowledgement without replaying provider submit."
+        "Recovery loads and read-back verifies the SecureIngestionManifest, result projection, every referenced Artifact and Secret, and the deletion intent before it constructs a sink or explicitly resumes Quarantine erasure.",
+        "After durable ingestion or erasure, Executor rebuilds ExecutionResult from the verified projection and manifest without calling Adapter collection again; Quarantine constructors and lookups perform no recovery writes."
       ],
       "tests": ["tests/security/test_phase0c_data_security.py"],
-      "test_modes": ["positive", "negative", "failure", "state-machine"]
+      "test_modes": ["positive", "negative", "failure", "property"]
     },
     {
       "id": "filesystem-concurrency-retention",
@@ -100,11 +102,11 @@
         "src/redteam_agent/data_security/ingestion.py"
       ],
       "invariant_evidence": [
-        "Executor persists collection_started_at and retention_until once at result collection, caps retention at the exact Mission deadline, and restart reuses the same authority.",
+        "Executor owns an injected trusted Clock and exposes no caller timestamp on collection or ingestion; one Clock reading persists collection_started_at, retention_until, and the collection lease for restart reuse.",
         "The authority binds the exact ToolRef, Registry digest, Provider task and deterministic sink, and max_result_bytes is the minimum of that ToolDefinition limit and the system hard cap."
       ],
       "tests": ["tests/security/test_phase0c_data_security.py"],
-      "test_modes": ["positive", "negative", "failure", "state-machine"]
+      "test_modes": ["positive", "negative", "failure", "property"]
     },
     {
       "id": "untrusted-output-parsing",
@@ -151,5 +153,5 @@
     "tests/security/test_gate_review_regressions.py",
     "tests/integration/test_phase0b_flow.py"
   ],
-  "notes": "This audit is rebound to the dedicated current-HEAD design-approved implementation request. It covers the six retained P1 findings as one durable lifecycle redesign: post-validation Dispatch Claim, fixed-channel JIT Secret injection, exact result collection authority, ingestion_id-only secure ingestion, manifest-before-erasure recovery states, and shared digest/blob-bound generation coordination. No external provider or target action is introduced."
+  "notes": "This audit is rebound to the current-HEAD Design Approval implementation request. It covers all six retained P1 findings as one durable lifecycle correction: Executor-owned consume-before-decrypt Secret delivery, manifest-and-resource verification before explicit erasure, projection-only post-erasure result recovery, trusted Clock ownership, and a durable production generation backend. No external provider or target action is introduced."
 }

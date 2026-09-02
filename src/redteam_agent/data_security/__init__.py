@@ -22,6 +22,7 @@ from .generations import (
     AuthenticatedGenerationAnchor,
     AuthenticatedGenerationAnchorStore,
     AuthenticatedGenerationCoordinator,
+    DurableAuthenticatedGenerationBackend,
     ImmutableGenerationBlobStore,
     InMemoryGenerationAnchorStore,
     InMemoryImmutableGenerationBlobStore,
@@ -46,11 +47,6 @@ from .models import (
     SecureIngestionResult,
 )
 from .sandbox import SandboxPolicy, SandboxRequirement, require_sandbox_capabilities
-from .secret_injection import (
-    SecretAdapterChannel,
-    SecretInjectionBroker,
-    TrustedSecretChannelRegistry,
-)
 from .stores import (
     ArtifactStore,
     EncryptedRawResultQuarantine,
@@ -79,6 +75,7 @@ __all__ = [
     "AuditReferencePayload",
     "DataAccessAuthorizer",
     "DataStoreAuditRecorder",
+    "DurableAuthenticatedGenerationBackend",
     "EncryptedPayload",
     "EncryptedRawResultQuarantine",
     "EncryptedRawResultSink",
@@ -107,9 +104,6 @@ __all__ = [
     "SecretDiscoveryReference",
     "SecretReferenceMetadata",
     "SecretStore",
-    "SecretAdapterChannel",
-    "SecretInjectionBroker",
-    "TrustedSecretChannelRegistry",
     "SecureIngestionResult",
     "SecureIngestor",
     "WrappedFileEncryptionKeyProvider",

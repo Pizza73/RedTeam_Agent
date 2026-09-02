@@ -82,13 +82,9 @@ _CREDENTIAL_KEY_COMPONENTS = (
 _SECRET_TERMINATORS = frozenset(b" \t\n\r\v\f,;}]" + bytes((34, 39)))
 _SECRET_WHITESPACE = frozenset(b" \t\n\r\v\f")
 _QUOTE_BYTES = frozenset(b"\"'")
-_ASCII_WORD_BYTES = frozenset(
-    b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
-)
+_ASCII_WORD_BYTES = frozenset(b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_")
 _AUTHORIZATION_SCHEME_BYTES = _ASCII_WORD_BYTES | frozenset(b"!#$%&'*+-.^`|~")
-_URI_SCHEME_START_BYTES = frozenset(
-    b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
-)
+_URI_SCHEME_START_BYTES = frozenset(b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
 _URI_SCHEME_BYTES = _URI_SCHEME_START_BYTES | frozenset(b"0123456789+.-")
 _MAX_URI_SCHEME_BYTES = 256
 _STRUCTURED_KEY_BYTES = _ASCII_WORD_BYTES | frozenset(b"-")
@@ -131,8 +127,10 @@ class _StreamingSecretRedactor:
         while index < len(data):
             previous = data[index - 1] if index else self._previous_byte
             candidate = None
-            if data[index] == ord("<") or data[index] in _QUOTE_BYTES or (
-                previous is None or previous not in _ASCII_WORD_BYTES
+            if (
+                data[index] == ord("<")
+                or data[index] in _QUOTE_BYTES
+                or (previous is None or previous not in _ASCII_WORD_BYTES)
             ):
                 candidate = self._candidate(data, index, final=final)
             if candidate == "incomplete":
@@ -218,9 +216,7 @@ class _StreamingSecretRedactor:
                 if data[cursor] == 92:
                     if cursor + 1 == len(data):
                         if final:
-                            raise SecretDetectionError(
-                                "secret detection failed closed"
-                            )
+                            raise SecretDetectionError("secret detection failed closed")
                         return "incomplete"
                     cursor += 2
                     continue
@@ -231,12 +227,9 @@ class _StreamingSecretRedactor:
                 data[keyword_start:cursor],
                 quote=key_quote,
             )
-            normalized_key = structured_key.lower().replace(b"_", b"").replace(
-                b"-", b""
-            )
+            normalized_key = structured_key.lower().replace(b"_", b"").replace(b"-", b"")
             if structured_key.lower() in _SECRET_KEYWORDS or any(
-                component in normalized_key
-                for component in _CREDENTIAL_KEY_COMPONENTS
+                component in normalized_key for component in _CREDENTIAL_KEY_COMPONENTS
             ):
                 keyword = structured_key
         else:
@@ -248,12 +241,9 @@ class _StreamingSecretRedactor:
             if cursor == len(data):
                 return None if final else "incomplete"
             structured_key = data[keyword_start:cursor]
-            normalized_key = structured_key.lower().replace(b"_", b"").replace(
-                b"-", b""
-            )
+            normalized_key = structured_key.lower().replace(b"_", b"").replace(b"-", b"")
             if structured_key.lower() in _SECRET_KEYWORDS or any(
-                component in normalized_key
-                for component in _CREDENTIAL_KEY_COMPONENTS
+                component in normalized_key for component in _CREDENTIAL_KEY_COMPONENTS
             ):
                 keyword = structured_key
         if keyword is None:
@@ -347,10 +337,7 @@ class _StreamingSecretRedactor:
             if final:
                 tag = candidate.split(maxsplit=1)[0].split(b":")[-1]
                 normalized = tag.lower().replace(b"_", b"").replace(b"-", b"")
-                if any(
-                    component in normalized
-                    for component in _CREDENTIAL_KEY_COMPONENTS
-                ):
+                if any(component in normalized for component in _CREDENTIAL_KEY_COMPONENTS):
                     raise SecretDetectionError("secret detection failed closed")
                 return None
             return "incomplete"
@@ -502,9 +489,7 @@ class _StreamingSecretRedactor:
             return None if final else "incomplete"
         delimiter = b"://"
         available_delimiter = data[scheme_end : scheme_end + len(delimiter)]
-        if delimiter.startswith(available_delimiter) and len(available_delimiter) < len(
-            delimiter
-        ):
+        if delimiter.startswith(available_delimiter) and len(available_delimiter) < len(delimiter):
             return None if final else "incomplete"
         if available_delimiter != delimiter:
             return None
@@ -555,9 +540,7 @@ class _StreamingSecretRedactor:
                 if data[cursor] == 92:
                     if cursor + 1 == len(data):
                         if final:
-                            raise SecretDetectionError(
-                                "secret detection failed closed"
-                            )
+                            raise SecretDetectionError("secret detection failed closed")
                         return "incomplete"
                     cursor += 2
                     continue
@@ -618,9 +601,7 @@ class _StreamingSecretRedactor:
                 if data[cursor] == 92:
                     if cursor + 1 == len(data):
                         if final:
-                            raise SecretDetectionError(
-                                "secret detection failed closed"
-                            )
+                            raise SecretDetectionError("secret detection failed closed")
                         return "incomplete"
                     cursor += 2
                     continue
@@ -640,9 +621,7 @@ class _StreamingSecretRedactor:
             raise SecretDetectionError("secret detection failed closed")
         match_end = (
             cursor + 1
-            if value_quote is not None
-            and cursor < len(data)
-            and data[cursor] == value_quote
+            if value_quote is not None and cursor < len(data) and data[cursor] == value_quote
             else cursor
         )
         return (
@@ -667,18 +646,12 @@ class _StreamingSecretRedactor:
         keyword_start = index + 1 if wrapper_quote is not None else index
         available = data[keyword_start:].lower()
         matching_schemes = tuple(
-            scheme
-            for scheme in _SUPPORTED_AUTHORIZATION_SCHEMES
-            if scheme.startswith(available)
+            scheme for scheme in _SUPPORTED_AUTHORIZATION_SCHEMES if scheme.startswith(available)
         )
         if matching_schemes and all(len(available) < len(item) for item in matching_schemes):
             return None if final else "incomplete"
         scheme = next(
-            (
-                item
-                for item in _SUPPORTED_AUTHORIZATION_SCHEMES
-                if available[: len(item)] == item
-            ),
+            (item for item in _SUPPORTED_AUTHORIZATION_SCHEMES if available[: len(item)] == item),
             None,
         )
         if scheme is None:
@@ -736,9 +709,7 @@ def _trusted_publication_types() -> tuple[Any, Any, Any, Any, Any, Any]:
             now: datetime,
         ) -> None:
             if token is not construction_token:
-                raise SecureIngestionError(
-                    "detected-secret publication is not trusted"
-                )
+                raise SecureIngestionError("detected-secret publication is not trusted")
             self._receipt = receipt
             self._mission_id = mission_id
             self._secret_value = secret_value
@@ -751,9 +722,7 @@ def _trusted_publication_types() -> tuple[Any, Any, Any, Any, Any, Any]:
             self,
         ) -> tuple[RawResultReceipt, str, bytes, str, str | None, datetime]:
             if self._consumed:
-                raise SecureIngestionError(
-                    "detected-secret publication was already consumed"
-                )
+                raise SecureIngestionError("detected-secret publication was already consumed")
             self._consumed = True
             return (
                 self._receipt,
@@ -784,9 +753,7 @@ def _trusted_publication_types() -> tuple[Any, Any, Any, Any, Any, Any]:
             now: datetime,
         ) -> None:
             if token is not construction_token or type(sink) is not EncryptedRawResultSink:
-                raise SecureIngestionError(
-                    "redacted-artifact publication is not trusted"
-                )
+                raise SecureIngestionError("redacted-artifact publication is not trusted")
             self._sink = sink
             self._receipt = receipt
             self._secrets = secrets
@@ -809,16 +776,12 @@ def _trusted_publication_types() -> tuple[Any, Any, Any, Any, Any, Any]:
 
         def _detected_secrets(self) -> tuple[SecretDiscoveryReference, ...]:
             if not self._consumed:
-                raise SecureIngestionError(
-                    "redacted-artifact publication is incomplete"
-                )
+                raise SecureIngestionError("redacted-artifact publication is incomplete")
             return tuple(self._detections)
 
         async def _chunks(self) -> AsyncIterator[bytes]:
             if self._consumed:
-                raise SecureIngestionError(
-                    "redacted-artifact publication was already consumed"
-                )
+                raise SecureIngestionError("redacted-artifact publication was already consumed")
             self._consumed = True
 
             def replace(keyword: bytes, secret_value: bytes) -> bytes:
@@ -882,9 +845,7 @@ def _trusted_publication_types() -> tuple[Any, Any, Any, Any, Any, Any]:
             now: datetime,
         ) -> None:
             if token is not construction_token:
-                raise SecureIngestionError(
-                    "object-artifact publication is not trusted"
-                )
+                raise SecureIngestionError("object-artifact publication is not trusted")
             self._receipt = receipt
             self._mission_id = mission_id
             self._content = content
@@ -906,9 +867,7 @@ def _trusted_publication_types() -> tuple[Any, Any, Any, Any, Any, Any]:
             datetime,
         ]:
             if self._consumed:
-                raise SecureIngestionError(
-                    "object-artifact publication was already consumed"
-                )
+                raise SecureIngestionError("object-artifact publication was already consumed")
             self._consumed = True
             return (
                 self._receipt,
@@ -950,9 +909,7 @@ def _trusted_publication_types() -> tuple[Any, Any, Any, Any, Any, Any]:
                 or receipt.quarantine_id != reference.quarantine_id
                 or receipt.ciphertext_digest != reference.sha256
             ):
-                raise SecureIngestionError(
-                    "full-object ingestion publication is not trusted"
-                )
+                raise SecureIngestionError("full-object ingestion publication is not trusted")
             self._quarantine = quarantine
             self._reference = reference
             self._receipt = receipt
@@ -970,9 +927,7 @@ def _trusted_publication_types() -> tuple[Any, Any, Any, Any, Any, Any]:
 
         def _load(self) -> None:
             if self._loaded:
-                raise SecureIngestionError(
-                    "full-object ingestion publication was already loaded"
-                )
+                raise SecureIngestionError("full-object ingestion publication was already loaded")
             raw = self._quarantine._resume_for_ingestion(self)
 
             def replace(keyword: bytes, secret_value: bytes) -> bytes:
@@ -1013,9 +968,7 @@ def _trusted_publication_types() -> tuple[Any, Any, Any, Any, Any, Any]:
             derived_from_artifact_id: str | None,
         ) -> IngestedObjectArtifactPublication:
             if not self._loaded or self._raw is None or self._redacted is None:
-                raise SecureIngestionError(
-                    "full-object ingestion publication is incomplete"
-                )
+                raise SecureIngestionError("full-object ingestion publication is incomplete")
             if variant == "redacted":
                 content = self._redacted
                 classification: Literal["normal", "sensitive", "secret"] = (
@@ -1037,9 +990,7 @@ def _trusted_publication_types() -> tuple[Any, Any, Any, Any, Any, Any]:
 
         def _detected_secrets(self) -> tuple[SecretDiscoveryReference, ...]:
             if not self._loaded:
-                raise SecureIngestionError(
-                    "full-object ingestion publication is incomplete"
-                )
+                raise SecureIngestionError("full-object ingestion publication is incomplete")
             return tuple(self._detections)
 
     def create_redacted_artifact_publication(
@@ -1106,6 +1057,77 @@ class SecureIngestor:
         self._secrets = secrets
         self._rule_version = rule_version
 
+    def verify_manifest_resources(
+        self,
+        manifest: SecureIngestionManifest,
+        *,
+        mission_id: str,
+    ) -> None:
+        """Read-back verify every durable output without releasing its plaintext."""
+
+        for resource in manifest.resources:
+            try:
+                if resource.resource_type in {
+                    "redacted_artifact",
+                    "encrypted_raw_artifact",
+                }:
+                    artifact_reference = self._artifacts._stored_reference(
+                        mission_id=mission_id,
+                        artifact_id=resource.resource_id,
+                        now=None,
+                    )
+                    expected_type = (
+                        "redacted"
+                        if resource.resource_type == "redacted_artifact"
+                        else "encrypted_raw"
+                    )
+                    if artifact_reference.variant != expected_type:
+                        raise SecureIngestionError("durable ingestion artifact variant changed")
+                    actual_digest = sha256_digest(artifact_reference)
+                else:
+                    envelope = self._secrets._store.verified_envelope(
+                        mission_id=mission_id,
+                        resource_id=resource.resource_id,
+                        now=None,
+                    )
+                    secret_reference, _ = self._secrets._metadata_from_detected_envelope(envelope)
+                    actual_digest = sha256_digest(secret_reference)
+                if actual_digest != resource.resource_digest:
+                    raise SecureIngestionError("durable ingestion resource digest changed")
+            except SecureIngestionError:
+                raise
+            except Exception as exc:
+                raise SecureIngestionError("durable ingestion resource is unavailable") from exc
+
+    def secret_reference_digest(
+        self,
+        reference: SecretDiscoveryReference,
+        *,
+        mission_id: str,
+    ) -> str:
+        """Bind a manifest entry to the durable public Secret metadata."""
+
+        try:
+            envelope = self._secrets._store.verified_envelope(
+                mission_id=mission_id,
+                resource_id=reference.secret_reference_id,
+                now=None,
+            )
+            authoritative, source_execution_id = self._secrets._metadata_from_detected_envelope(
+                envelope
+            )
+        except Exception as exc:
+            raise SecureIngestionError("durable Secret reference is unavailable") from exc
+        if not (
+            authoritative.secret_reference_id == reference.secret_reference_id
+            and authoritative.credential_type == reference.credential_type
+            and authoritative.associated_principal_ref == reference.associated_principal_ref
+            and authoritative.verification_state == reference.verification_state
+            and source_execution_id == reference.source_execution_id
+        ):
+            raise SecureIngestionError("durable Secret reference binding changed")
+        return sha256_digest(authoritative)
+
     def ingest(
         self,
         reference: QuarantineReference,
@@ -1115,9 +1137,7 @@ class SecureIngestor:
         retain_encrypted_raw: bool = False,
     ) -> SecureIngestionResult:
         del reference, receipt, now, retain_encrypted_raw
-        raise SecureIngestionError(
-            "application ingestion requires a repository-bound ingestion_id"
-        )
+        raise SecureIngestionError("application ingestion requires a repository-bound ingestion_id")
 
     def _ingest_quarantined(
         self,
@@ -1136,9 +1156,7 @@ class SecureIngestor:
     @staticmethod
     def _legacy_receipt(reference: QuarantineReference) -> RawResultReceipt:
         del reference
-        raise SecureIngestionError(
-            "legacy full-object receipt construction is unavailable"
-        )
+        raise SecureIngestionError("legacy full-object receipt construction is unavailable")
 
     async def ingest_stream(
         self,
@@ -1170,9 +1188,7 @@ class SecureIngestor:
         retain_encrypted_raw: bool,
     ) -> SecureIngestionResult:
         if retain_encrypted_raw:
-            raise SecureIngestionError(
-                "chunked encrypted-raw retention is not configured"
-            )
+            raise SecureIngestionError("chunked encrypted-raw retention is not configured")
         durable_result = sink._durable_ingestion_result(receipt)
         if durable_result is not None:
             return durable_result
@@ -1182,9 +1198,7 @@ class SecureIngestor:
             secrets=self._secrets,
             now=now,
         )
-        redacted_reference = await self._artifacts._publish_redacted_stream(
-            publication
-        )
+        redacted_reference = await self._artifacts._publish_redacted_stream(publication)
         detections = list(publication._detected_secrets())
         result = self._result(
             quarantine_id=receipt.quarantine_id,
@@ -1305,9 +1319,7 @@ class EncryptedSecureResultIngester:
         retain_encrypted_raw: bool = False,
     ) -> None:
         if type(database) is not Database:
-            raise SecureIngestionError(
-                "secure ingestion requires the trusted application database"
-            )
+            raise SecureIngestionError("secure ingestion requires the trusted application database")
         self._ingestor = ingestor
         self._sinks = sinks
         self._executions = ExecutionRepository(database)
@@ -1334,27 +1346,15 @@ class EncryptedSecureResultIngester:
             if ingestion is None or ingestion.receipt_id is None
             else self._receipts.get(ingestion.receipt_id)
         )
-        execution = (
-            None
-            if ingestion is None
-            else self._executions.get(ingestion.execution_id)
-        )
+        execution = None if ingestion is None else self._executions.get(ingestion.execution_id)
         authority = (
             None
             if ingestion is None
-            else self._collection_authorities.get_by_execution(
-                ingestion.execution_id
-            )
+            else self._collection_authorities.get_by_execution(ingestion.execution_id)
         )
-        state = (
-            None
-            if execution is None
-            else self._mission_states.get(execution.mission_id)
-        )
+        state = None if execution is None else self._mission_states.get(execution.mission_id)
         revision = (
-            None
-            if execution is None
-            else self._mission_revisions.latest(execution.mission_id)
+            None if execution is None else self._mission_revisions.latest(execution.mission_id)
         )
         now = self._clock()
         if (
@@ -1379,113 +1379,206 @@ class EncryptedSecureResultIngester:
                 and execution.mission_id == state.mission_id == revision.mission_id
                 and execution.mission_revision == revision.mission_revision
                 and execution.authorization_epoch == state.authorization_epoch
-                and state.state
-                in {"RUNNING", "PAUSED", "FINALIZING", "WAITING_HUMAN_REVIEW"}
+                and state.state in {"RUNNING", "PAUSED", "FINALIZING", "WAITING_HUMAN_REVIEW"}
                 and authority.execution_id == execution.execution_id
                 and authority.provider_task_id == execution.provider_task_id
                 and authority.tool_ref == execution.tool_ref
                 and authority.sink_id == receipt.sink_id
                 and authority.retention_until <= revision.valid_until
-                and (
-                    ingestion.status != "INGESTING"
-                    or now < authority.retention_until
-                )
+                and (ingestion.status != "INGESTING" or now < authority.retention_until)
             )
         ):
-            raise SecureIngestionError(
-                "repository-bound active ingestion is required"
+            raise SecureIngestionError("repository-bound active ingestion is required")
+        manifest = self._manifests.get_by_ingestion(ingestion.ingestion_id)
+        if ingestion.status == "INGESTING" and manifest is not None:
+            self._verify_manifest(manifest, ingestion=ingestion, receipt=receipt)
+            self._ingestor.verify_manifest_resources(
+                manifest,
+                mission_id=execution.mission_id,
             )
-        sink = self._sinks.for_execution(receipt.execution_id)
-        result = await self._ingestor.ingest_stream(
-            sink,
-            receipt,
-            now=now,
-            retain_encrypted_raw=self._retain_encrypted_raw,
-        )
-        resources = tuple(
-            sorted(
-                (
-                    *(
-                        DurableIngestionResource(
-                            resource_type="redacted_artifact",
-                            resource_id=artifact.artifact_id,
-                            resource_digest=sha256_digest(artifact),
-                        )
-                        for artifact in result.redacted_artifacts
-                    ),
-                    *(
-                        DurableIngestionResource(
-                            resource_type="encrypted_raw_artifact",
-                            resource_id=artifact.artifact_id,
-                            resource_digest=sha256_digest(artifact),
-                        )
-                        for artifact in result.encrypted_raw_artifacts
-                    ),
-                    *(
-                        DurableIngestionResource(
-                            resource_type="secret_reference",
-                            resource_id=secret.secret_reference_id,
-                            resource_digest=sha256_digest(secret),
-                        )
-                        for secret in result.detected_secrets
-                    ),
-                ),
-                key=lambda item: (item.resource_type, item.resource_id),
+            ingestion = self._advance_ingestion_state(
+                ingestion,
+                expected_status="INGESTING",
+                new_status="INGESTED_DURABLE",
+                now=now,
             )
-        )
-        identity = {
-            "schema_version": "secure-ingestion-manifest-v1",
-            "ingestion_id": ingestion.ingestion_id,
-            "secure_ingestion_id": result.ingestion_id,
-            "receipt_digest": receipt.receipt_digest,
-            "quarantine_digest": receipt.ciphertext_digest,
-            "rule_version": result.redaction_metadata.rule_version,
-        }
-        existing_manifest = self._manifests.get_by_ingestion(ingestion.ingestion_id)
-        provisional = SecureIngestionManifest(
-            manifest_id=stable_id("ingestionmanifest", identity),
-            manifest_digest="pending",
-            ingestion_id=ingestion.ingestion_id,
-            secure_ingestion_id=result.ingestion_id,
-            execution_id=receipt.execution_id,
-            receipt_id=receipt.receipt_id,
-            receipt_digest=receipt.receipt_digest,
-            quarantine_id=receipt.quarantine_id,
-            quarantine_digest=receipt.ciphertext_digest,
-            rule_version=result.redaction_metadata.rule_version,
-            resources=resources,
-            redaction_metadata_digest=sha256_digest(result.redaction_metadata),
-            created_at=(
-                now if existing_manifest is None else existing_manifest.created_at
-            ),
-        )
-        manifest = provisional.model_copy(
-            update={"manifest_digest": secure_ingestion_manifest_digest(provisional)}
-        )
-        if existing_manifest is None:
-            self._manifests.add(manifest)
-        elif existing_manifest != manifest:
-            raise SecureIngestionError("secure ingestion manifest changed on recovery")
+        elif ingestion.status == "INGESTING":
+            if ingestion.result_projection is None:
+                raise SecureIngestionError("active ingestion lacks its durable result projection")
+            sink = self._sinks.for_execution(receipt.execution_id)
+            result = await self._ingestor.ingest_stream(
+                sink,
+                receipt,
+                now=now,
+                retain_encrypted_raw=self._retain_encrypted_raw,
+            )
+            resources = tuple(
+                sorted(
+                    (
+                        *(
+                            DurableIngestionResource(
+                                resource_type="redacted_artifact",
+                                resource_id=artifact.artifact_id,
+                                resource_digest=sha256_digest(artifact),
+                            )
+                            for artifact in result.redacted_artifacts
+                        ),
+                        *(
+                            DurableIngestionResource(
+                                resource_type="encrypted_raw_artifact",
+                                resource_id=artifact.artifact_id,
+                                resource_digest=sha256_digest(artifact),
+                            )
+                            for artifact in result.encrypted_raw_artifacts
+                        ),
+                        *(
+                            DurableIngestionResource(
+                                resource_type="secret_reference",
+                                resource_id=secret.secret_reference_id,
+                                resource_digest=self._ingestor.secret_reference_digest(
+                                    secret,
+                                    mission_id=execution.mission_id,
+                                ),
+                            )
+                            for secret in result.detected_secrets
+                        ),
+                    ),
+                    key=lambda item: (item.resource_type, item.resource_id),
+                )
+            )
+            identity = {
+                "schema_version": "secure-ingestion-manifest-v1",
+                "ingestion_id": ingestion.ingestion_id,
+                "secure_ingestion_id": result.ingestion_id,
+                "receipt_digest": receipt.receipt_digest,
+                "quarantine_digest": receipt.ciphertext_digest,
+                "rule_version": result.redaction_metadata.rule_version,
+            }
+            provisional = SecureIngestionManifest(
+                manifest_id=stable_id("ingestionmanifest", identity),
+                manifest_digest="pending",
+                ingestion_id=ingestion.ingestion_id,
+                secure_ingestion_id=result.ingestion_id,
+                execution_id=receipt.execution_id,
+                receipt_id=receipt.receipt_id,
+                receipt_digest=receipt.receipt_digest,
+                quarantine_id=receipt.quarantine_id,
+                quarantine_digest=receipt.ciphertext_digest,
+                rule_version=result.redaction_metadata.rule_version,
+                resources=resources,
+                redaction_metadata_digest=sha256_digest(result.redaction_metadata),
+                result_projection=ingestion.result_projection,
+                created_at=now,
+            )
+            candidate = provisional.model_copy(
+                update={"manifest_digest": secure_ingestion_manifest_digest(provisional)}
+            )
+            self._manifests.add(candidate)
+            manifest = candidate
+            if self._manifests.get(manifest.manifest_id) != manifest:
+                raise SecureIngestionError("secure ingestion manifest read-back failed")
+            self._verify_manifest(manifest, ingestion=ingestion, receipt=receipt)
+            self._ingestor.verify_manifest_resources(
+                manifest,
+                mission_id=execution.mission_id,
+            )
+            ingestion = self._advance_ingestion_state(
+                ingestion,
+                expected_status="INGESTING",
+                new_status="INGESTED_DURABLE",
+                now=now,
+            )
         else:
-            manifest = existing_manifest
-        if self._manifests.get(manifest.manifest_id) != manifest:
-            raise SecureIngestionError("secure ingestion manifest read-back failed")
-        ingestion = self._advance_ingestion_state(
-            ingestion,
-            expected_status="INGESTING",
-            new_status="INGESTED_DURABLE",
-            now=now,
-        )
+            if manifest is None:
+                raise SecureIngestionError("durable ingestion manifest is unavailable")
+            self._verify_manifest(manifest, ingestion=ingestion, receipt=receipt)
+            self._ingestor.verify_manifest_resources(
+                manifest,
+                mission_id=execution.mission_id,
+            )
+
+        if manifest is None:
+            raise SecureIngestionError("durable ingestion manifest is unavailable")
+
+        if ingestion.status == "INGESTED_DURABLE":
+            intent = self._create_or_verify_deletion_intent(
+                ingestion=ingestion,
+                manifest=manifest,
+                receipt=receipt,
+                now=now,
+            )
+            if self._deletion_intents.get(intent.intent_id) != intent:
+                raise SecureIngestionError("quarantine deletion intent read-back failed")
+            ingestion = self._advance_ingestion_state(
+                ingestion,
+                expected_status="INGESTED_DURABLE",
+                new_status="DELETE_PENDING",
+                now=now,
+            )
+
+        if ingestion.status == "DELETE_PENDING":
+            current_intent = self._deletion_intents.get_by_ingestion(ingestion.ingestion_id)
+            if current_intent is None or not (
+                current_intent.manifest_id == manifest.manifest_id
+                and current_intent.manifest_digest == manifest.manifest_digest
+                and current_intent.receipt_id == receipt.receipt_id
+                and current_intent.quarantine_id == receipt.quarantine_id
+            ):
+                raise SecureIngestionError("verified quarantine deletion intent is unavailable")
+            self._verify_manifest(manifest, ingestion=ingestion, receipt=receipt)
+            self._ingestor.verify_manifest_resources(
+                manifest,
+                mission_id=execution.mission_id,
+            )
+            sink = self._sinks.for_execution(receipt.execution_id)
+            sink._delete_committed(now=now)
+            ingestion = self._advance_ingestion_state(
+                ingestion,
+                expected_status="DELETE_PENDING",
+                new_status="QUARANTINE_ERASED",
+                now=now,
+            )
+
+        if ingestion.status != "QUARANTINE_ERASED":
+            raise SecureIngestionError("secure ingestion did not reach verified quarantine erasure")
+        return self._summary_from_manifest(manifest)
+
+    @staticmethod
+    def _verify_manifest(
+        manifest: SecureIngestionManifest,
+        *,
+        ingestion: ResultIngestionRecord,
+        receipt: RawResultReceipt,
+    ) -> None:
+        projection = ingestion.result_projection
+        if projection is None or not (
+            manifest.ingestion_id == ingestion.ingestion_id
+            and manifest.execution_id == ingestion.execution_id == receipt.execution_id
+            and manifest.receipt_id == ingestion.receipt_id == receipt.receipt_id
+            and manifest.receipt_digest == receipt.receipt_digest
+            and manifest.quarantine_id == ingestion.quarantine_id == receipt.quarantine_id
+            and manifest.quarantine_digest == receipt.ciphertext_digest
+            and manifest.result_projection == projection
+            and projection.receipt_id == receipt.receipt_id
+        ):
+            raise SecureIngestionError("durable ingestion manifest binding failed")
+
+    def _create_or_verify_deletion_intent(
+        self,
+        *,
+        ingestion: ResultIngestionRecord,
+        manifest: SecureIngestionManifest,
+        receipt: RawResultReceipt,
+        now: datetime,
+    ) -> QuarantineDeletionIntent:
         intent_identity = {
             "schema_version": "quarantine-deletion-intent-v1",
             "ingestion_id": ingestion.ingestion_id,
             "manifest_digest": manifest.manifest_digest,
             "quarantine_id": receipt.quarantine_id,
         }
-        existing_intent = self._deletion_intents.get_by_ingestion(
-            ingestion.ingestion_id
-        )
-        provisional_intent = QuarantineDeletionIntent(
+        existing = self._deletion_intents.get_by_ingestion(ingestion.ingestion_id)
+        provisional = QuarantineDeletionIntent(
             intent_id=stable_id("quarantinedeletion", intent_identity),
             intent_digest="pending",
             ingestion_id=ingestion.ingestion_id,
@@ -1494,42 +1587,28 @@ class EncryptedSecureResultIngester:
             manifest_digest=manifest.manifest_digest,
             receipt_id=receipt.receipt_id,
             quarantine_id=receipt.quarantine_id,
-            created_at=now if existing_intent is None else existing_intent.created_at,
+            created_at=now if existing is None else existing.created_at,
         )
-        intent = provisional_intent.model_copy(
-            update={
-                "intent_digest": quarantine_deletion_intent_digest(
-                    provisional_intent
-                )
-            }
+        candidate = provisional.model_copy(
+            update={"intent_digest": quarantine_deletion_intent_digest(provisional)}
         )
-        if existing_intent is None:
-            self._deletion_intents.add(intent)
-        elif existing_intent != intent:
-            raise SecureIngestionError(
-                "quarantine deletion intent changed on recovery"
-            )
-        else:
-            intent = existing_intent
-        if self._deletion_intents.get(intent.intent_id) != intent:
-            raise SecureIngestionError("quarantine deletion intent read-back failed")
-        ingestion = self._advance_ingestion_state(
-            ingestion,
-            expected_status="INGESTED_DURABLE",
-            new_status="DELETE_PENDING",
-            now=now,
-        )
-        sink._delete_committed(now=now)
-        self._advance_ingestion_state(
-            ingestion,
-            expected_status="DELETE_PENDING",
-            new_status="QUARANTINE_ERASED",
-            now=now,
-        )
+        if existing is None:
+            self._deletion_intents.add(candidate)
+            return candidate
+        if existing != candidate:
+            raise SecureIngestionError("quarantine deletion intent changed on recovery")
+        return existing
+
+    @staticmethod
+    def _summary_from_manifest(
+        manifest: SecureIngestionManifest,
+    ) -> SecureIngestionSummary:
         return SecureIngestionSummary(
-            secure_ingestion_id=result.ingestion_id,
+            secure_ingestion_id=manifest.secure_ingestion_id,
             redacted_artifact_references=tuple(
-                artifact.artifact_id for artifact in result.redacted_artifacts
+                item.resource_id
+                for item in manifest.resources
+                if item.resource_type == "redacted_artifact"
             ),
         )
 
@@ -1545,9 +1624,7 @@ class EncryptedSecureResultIngester:
             return ingestion
         execution = self._executions.get(ingestion.execution_id)
         if execution is None or execution.result_ingestion_state != expected_status:
-            raise SecureIngestionError(
-                "execution and ingestion durability states do not match"
-            )
+            raise SecureIngestionError("execution and ingestion durability states do not match")
         with self._executions.database.transaction(immediate=True):
             advanced = self._ingestions.transition(
                 ingestion.ingestion_id,
@@ -1575,19 +1652,28 @@ class EncryptedSecureResultIngester:
             else self._receipts.get(ingestion.receipt_id)
         )
         manifest = (
-            None
-            if ingestion is None
-            else self._manifests.get_by_ingestion(ingestion.ingestion_id)
+            None if ingestion is None else self._manifests.get_by_ingestion(ingestion.ingestion_id)
         )
-        if ingestion is None or receipt is None or manifest is None or not (
-            ingestion.ingestion_id == ingestion_id
-            and manifest.secure_ingestion_id == result.secure_ingestion_id
-            and manifest.receipt_id == receipt.receipt_id
-            and manifest.execution_id == result.execution_id
-        ):
-            raise SecureIngestionError(
-                "execution result lacks its durable ingestion manifest"
+        execution = None if ingestion is None else self._executions.get(ingestion.execution_id)
+        if (
+            ingestion is None
+            or receipt is None
+            or manifest is None
+            or execution is None
+            or not (
+                ingestion.ingestion_id == ingestion_id
+                and manifest.secure_ingestion_id == result.secure_ingestion_id
+                and manifest.receipt_id == receipt.receipt_id
+                and manifest.execution_id == result.execution_id
+                and manifest.result_projection == ingestion.result_projection
             )
+        ):
+            raise SecureIngestionError("execution result lacks its durable ingestion manifest")
+        self._verify_manifest(manifest, ingestion=ingestion, receipt=receipt)
+        self._ingestor.verify_manifest_resources(
+            manifest,
+            mission_id=execution.mission_id,
+        )
         sink = self._sinks.for_execution(receipt.execution_id)
         sink._acknowledge_persisted(
             receipt,

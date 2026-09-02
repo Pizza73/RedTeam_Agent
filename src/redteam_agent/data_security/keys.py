@@ -334,8 +334,7 @@ class InMemoryEncryptionKeyProvider:
                     continue
                 if not (
                     existing.metadata.rotation_state == "active"
-                    and existing.parent_key
-                    == (parent.key_id, parent.key_version)
+                    and existing.parent_key == (parent.key_id, parent.key_version)
                 ):
                     raise EncryptionKeyUnavailableError("resource key is unavailable")
                 metadata = existing.metadata
@@ -350,9 +349,7 @@ class InMemoryEncryptionKeyProvider:
         generation: int,
     ) -> tuple[str, str]:
         if generation < 1:
-            raise EncryptionKeyUnavailableError(
-                "resource key generation is invalid"
-            )
+            raise EncryptionKeyUnavailableError("resource key generation is invalid")
         if generation == 1:
             return (
                 stable_id(
@@ -435,9 +432,7 @@ class InMemoryEncryptionKeyProvider:
                     and record.metadata.key_domain == domain
                     and record.metadata.key_separation_tag == separation_tag
                 ):
-                    raise EncryptionKeyUnavailableError(
-                        "resource key binding is invalid"
-                    )
+                    raise EncryptionKeyUnavailableError("resource key binding is invalid")
                 matches.append((identity, record))
             discarded_identities = {identity for identity, _ in matches}
             for identity, record in matches:
@@ -451,14 +446,10 @@ class InMemoryEncryptionKeyProvider:
                     self._material_fingerprints.discard(fingerprint)
                 self._records.pop(identity)
                 self._key_ids.discard(record.metadata.key_id)
-                self._separation_tags.discard(
-                    record.metadata.key_separation_tag
-                )
+                self._separation_tags.discard(record.metadata.key_separation_tag)
             if discarded_identities:
                 self._used_nonces = {
-                    item
-                    for item in self._used_nonces
-                    if item[:3] not in discarded_identities
+                    item for item in self._used_nonces if item[:3] not in discarded_identities
                 }
 
     def resource_key_destroyed(self, metadata: EncryptionMetadata) -> bool:
@@ -509,16 +500,12 @@ class InMemoryEncryptionKeyProvider:
             aad_digest=sha256_digest(aad),
         )
 
-    def open(
-        self, domain: KeyDomain, payload: EncryptedPayload, aad: dict[str, object]
-    ) -> bytes:
+    def open(self, domain: KeyDomain, payload: EncryptedPayload, aad: dict[str, object]) -> bytes:
         nonce, ciphertext = self._verified_ciphertext(domain, payload, aad)
         record = self._record_for(payload.metadata, operation="decrypt")
         return self._xor_stream(record.material, nonce, ciphertext)
 
-    def verify(
-        self, domain: KeyDomain, payload: EncryptedPayload, aad: dict[str, object]
-    ) -> None:
+    def verify(self, domain: KeyDomain, payload: EncryptedPayload, aad: dict[str, object]) -> None:
         self._verified_ciphertext(domain, payload, aad)
 
     def _verified_ciphertext(
@@ -596,9 +583,7 @@ class InMemoryEncryptionKeyProvider:
         self, metadata: EncryptionMetadata, *, operation: Literal["encrypt", "decrypt"]
     ) -> _KeyRecord:
         with self._lock:
-            record = self._records.get(
-                (metadata.key_domain, metadata.key_id, metadata.key_version)
-            )
+            record = self._records.get((metadata.key_domain, metadata.key_id, metadata.key_version))
             allowed = {"active"} if operation == "encrypt" else {"active", "decrypt_only"}
             if record is None or record.metadata.rotation_state not in allowed:
                 raise EncryptionKeyUnavailableError("required key version is unavailable")
@@ -623,9 +608,7 @@ class InMemoryEncryptionKeyProvider:
         return record.material
 
     @staticmethod
-    def _xor_stream(
-        material: bytes | bytearray | None, nonce: bytes, value: bytes
-    ) -> bytes:
+    def _xor_stream(material: bytes | bytearray | None, nonce: bytes, value: bytes) -> bytes:
         if material is None:
             raise EncryptionKeyUnavailableError("key material is destroyed")
         output = bytearray(len(value))
@@ -661,26 +644,49 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
     written to the application database, configuration, or filesystem.
     """
 
+    _TEST_COMPOSITION_TOKEN = object()
+
+    @classmethod
+    def _for_test_with_legacy_generation_store(
+        cls,
+        *,
+        state_path: Path,
+        wrapping_key: bytes,
+        generation_store: KeyStateGenerationStore,
+    ) -> WrappedFileEncryptionKeyProvider:
+        return cls(
+            state_path=state_path,
+            wrapping_key=wrapping_key,
+            _test_generation_store=generation_store,
+            _test_composition_token=cls._TEST_COMPOSITION_TOKEN,
+        )
+
     def __init__(
         self,
         *,
         state_path: Path,
         wrapping_key: bytes,
-        generation_store: KeyStateGenerationStore | None = None,
         generation_coordinator: AuthenticatedGenerationCoordinator | None = None,
+        _test_generation_store: KeyStateGenerationStore | None = None,
+        _test_composition_token: object | None = None,
     ) -> None:
         super().__init__()
-        if (generation_store is None) == (generation_coordinator is None):
+        if (
+            (_test_generation_store is None) == (generation_coordinator is None)
+            or (
+                _test_generation_store is not None
+                and _test_composition_token is not self._TEST_COMPOSITION_TOKEN
+            )
+            or (generation_coordinator is not None and not generation_coordinator.production_ready)
+        ):
             raise EncryptionKeyUnavailableError(
-                "exactly one key-state generation authority is required"
+                "production key state requires a complete generation backend"
             )
         if (
             generation_coordinator is not None
             and generation_coordinator.namespace != "wrapped-key-state"
         ):
-            raise EncryptionKeyUnavailableError(
-                "key-state generation namespace is invalid"
-            )
+            raise EncryptionKeyUnavailableError("key-state generation namespace is invalid")
         if len(wrapping_key) < 32:
             raise EncryptionKeyUnavailableError(
                 "key-state wrapping material does not meet provider policy"
@@ -692,17 +698,13 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
         try:
             parent_metadata = os.lstat(parent)
         except OSError as exc:
-            raise EncryptionKeyUnavailableError(
-                "key-state directory is unavailable"
-            ) from exc
+            raise EncryptionKeyUnavailableError("key-state directory is unavailable") from exc
         if (
             stat.S_ISLNK(parent_metadata.st_mode)
             or not stat.S_ISDIR(parent_metadata.st_mode)
             or stat.S_IMODE(parent_metadata.st_mode) & 0o077
         ):
-            raise EncryptionKeyUnavailableError(
-                "key-state directory permissions are invalid"
-            )
+            raise EncryptionKeyUnavailableError("key-state directory permissions are invalid")
         self._state_path = absolute_path
         self._state_paths = (
             absolute_path,
@@ -713,7 +715,7 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
             parent_metadata.st_ino,
         )
         self._wrapping_key = bytes(wrapping_key)
-        self._generation_store = generation_store
+        self._generation_store = _test_generation_store
         self._generation_coordinator = generation_coordinator
         self._generation = 0
         self._state_lock_path = parent / f".{absolute_path.name}.lock"
@@ -721,9 +723,7 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
         self._updating = False
         with self._state_lock, self._locked_state_file() as directory_descriptor:
             if self._external_generation() > 0:
-                self._load_persisted_state(
-                    directory_descriptor=directory_descriptor
-                )
+                self._load_persisted_state(directory_descriptor=directory_descriptor)
 
     def register_key(
         self,
@@ -864,9 +864,7 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
     def _update_state(self) -> Iterator[None]:
         with self._state_lock, self._locked_state_file() as directory_descriptor:
             if self._external_generation() > 0:
-                self._load_persisted_state(
-                    directory_descriptor=directory_descriptor
-                )
+                self._load_persisted_state(directory_descriptor=directory_descriptor)
             snapshot = self._snapshot()
             generation = self._generation
             self._updating = True
@@ -890,11 +888,11 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
             with self._locked_state_file() as directory_descriptor:
                 if self._external_generation() == 0:
                     raise EncryptionKeyUnavailableError("key-state file is unavailable")
-                self._load_persisted_state(
-                    directory_descriptor=directory_descriptor
-                )
+                self._load_persisted_state(directory_descriptor=directory_descriptor)
 
-    def _snapshot(self) -> tuple[
+    def _snapshot(
+        self,
+    ) -> tuple[
         dict[tuple[KeyDomain, str, int], _KeyRecord],
         dict[KeyDomain, tuple[str, int]],
         set[str],
@@ -906,11 +904,7 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
             records = {
                 identity: _KeyRecord(
                     metadata=record.metadata,
-                    material=(
-                        None
-                        if record.material is None
-                        else bytearray(record.material)
-                    ),
+                    material=(None if record.material is None else bytearray(record.material)),
                     resource_key=record.resource_key,
                     parent_key=record.parent_key,
                 )
@@ -952,9 +946,7 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
                 _PersistedKeyRecord(
                     metadata=record.metadata,
                     material=(
-                        None
-                        if record.material is None
-                        else self._encode(bytes(record.material))
+                        None if record.material is None else self._encode(bytes(record.material))
                     ),
                     resource_key=record.resource_key,
                     parent_key=record.parent_key,
@@ -1026,24 +1018,18 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
             ).model_dump(mode="python")
         )
         if len(wrapped) > _MAX_WRAPPED_STATE_BYTES:
-            raise EncryptionKeyUnavailableError(
-                "key-state file exceeds provider limit"
-            )
+            raise EncryptionKeyUnavailableError("key-state file exceeds provider limit")
         if self._generation_coordinator is not None:
             current_anchor = self._generation_coordinator.current_anchor()
             if (0 if current_anchor is None else current_anchor.generation) != (
                 expected_generation
             ):
-                raise EncryptionKeyUnavailableError(
-                    "external key-state generation changed"
-                )
+                raise EncryptionKeyUnavailableError("external key-state generation changed")
             try:
                 committed = self._generation_coordinator.commit(
                     wrapped,
                     expected_anchor_digest=(
-                        None
-                        if current_anchor is None
-                        else current_anchor.anchor_digest
+                        None if current_anchor is None else current_anchor.anchor_digest
                     ),
                 )
             except Exception as exc:
@@ -1051,13 +1037,9 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
                     "content-bound key-state generation is unavailable"
                 ) from exc
             if committed.generation != generation:
-                raise EncryptionKeyUnavailableError(
-                    "content-bound key-state generation mismatch"
-                )
+                raise EncryptionKeyUnavailableError("content-bound key-state generation mismatch")
             self._generation = generation
-            self._load_persisted_state(
-                directory_descriptor=directory_descriptor
-            )
+            self._load_persisted_state(directory_descriptor=directory_descriptor)
             return
         target_path = self._state_path_for_generation(generation)
         self._write_wrapped_state_locked(
@@ -1076,9 +1058,7 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
                 "external key-state generation is unavailable"
             ) from exc
         if not advanced:
-            raise EncryptionKeyUnavailableError(
-                "external key-state generation update conflicted"
-            )
+            raise EncryptionKeyUnavailableError("external key-state generation update conflicted")
         self._generation = generation
         self._reconcile_committed_state_reachability(generation)
 
@@ -1101,14 +1081,10 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
             ) from exc
         try:
             self._validate_state_directory_descriptor(directory_descriptor)
-            self._load_persisted_state(
-                directory_descriptor=directory_descriptor
-            )
+            self._load_persisted_state(directory_descriptor=directory_descriptor)
             self._verify_state_parent_identity()
             if self._generation != generation:
-                raise EncryptionKeyUnavailableError(
-                    "committed key-state generation is unavailable"
-                )
+                raise EncryptionKeyUnavailableError("committed key-state generation is unavailable")
         finally:
             os.close(directory_descriptor)
 
@@ -1129,9 +1105,7 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
                     "content-bound key-state generation is unavailable"
                 ) from exc
             if anchor.generation != external_generation:
-                raise EncryptionKeyUnavailableError(
-                    "content-bound key-state generation mismatch"
-                )
+                raise EncryptionKeyUnavailableError("content-bound key-state generation mismatch")
         try:
             duplicate_free = canonical_loads(raw)
             wrapped = _WrappedKeyState.model_validate_json(
@@ -1207,9 +1181,7 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
             or generation < 0
             or generation >= 2**128
         ):
-            raise EncryptionKeyUnavailableError(
-                "external key-state generation is invalid"
-            )
+            raise EncryptionKeyUnavailableError("external key-state generation is invalid")
         return generation
 
     def _restore_loaded_state(self, state: _PersistedKeyState) -> None:
@@ -1227,9 +1199,7 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
                     else bytearray(self._decode(persisted.material))
                 )
             except ValueError as exc:
-                raise EncryptionKeyUnavailableError(
-                    "persisted key material is invalid"
-                ) from exc
+                raise EncryptionKeyUnavailableError("persisted key material is invalid") from exc
             if (
                 identity in records
                 or metadata.key_id in key_ids
@@ -1237,9 +1207,7 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
                 or (material is not None and len(material) < 32)
                 or (metadata.rotation_state == "destroyed") != (material is None)
             ):
-                raise EncryptionKeyUnavailableError(
-                    "persisted key metadata is inconsistent"
-                )
+                raise EncryptionKeyUnavailableError("persisted key metadata is inconsistent")
             records[identity] = _KeyRecord(
                 metadata=metadata,
                 material=material,
@@ -1258,9 +1226,7 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
                     metadata.key_version,
                 )
         try:
-            fingerprints = {
-                self._decode(value) for value in state.material_fingerprints
-            }
+            fingerprints = {self._decode(value) for value in state.material_fingerprints}
             used_nonces = {
                 (
                     item.domain,
@@ -1271,9 +1237,7 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
                 for item in state.used_nonces
             }
         except ValueError as exc:
-            raise EncryptionKeyUnavailableError(
-                "persisted key-state metadata is invalid"
-            ) from exc
+            raise EncryptionKeyUnavailableError("persisted key-state metadata is invalid") from exc
         live_fingerprints = {
             hmac.digest(b"redteam-key-equality-v1", record.material, "sha256")
             for record in records.values()
@@ -1283,22 +1247,20 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
             len(fingerprints) != len(state.material_fingerprints)
             or len(used_nonces) != len(state.used_nonces)
             or not live_fingerprints.issubset(fingerprints)
-            or any(
-                len(item[3]) != 24 or item[:3] not in records for item in used_nonces
-            )
+            or any(len(item[3]) != 24 or item[:3] not in records for item in used_nonces)
         ):
-            raise EncryptionKeyUnavailableError(
-                "persisted key-state metadata is inconsistent"
-            )
+            raise EncryptionKeyUnavailableError("persisted key-state metadata is inconsistent")
         for record in records.values():
-            if record.parent_key is not None and (
-                record.metadata.key_domain,
-                record.parent_key[0],
-                record.parent_key[1],
-            ) not in records:
-                raise EncryptionKeyUnavailableError(
-                    "persisted resource-key parent is unavailable"
+            if (
+                record.parent_key is not None
+                and (
+                    record.metadata.key_domain,
+                    record.parent_key[0],
+                    record.parent_key[1],
                 )
+                not in records
+            ):
+                raise EncryptionKeyUnavailableError("persisted resource-key parent is unavailable")
         with self._lock:
             self._records = records
             self._active = active
@@ -1324,9 +1286,7 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
                 dir_fd=directory_descriptor,
             )
         except OSError as exc:
-            raise EncryptionKeyUnavailableError(
-                "key-state file is unavailable"
-            ) from exc
+            raise EncryptionKeyUnavailableError("key-state file is unavailable") from exc
         try:
             metadata = os.fstat(descriptor)
             if (
@@ -1334,9 +1294,7 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
                 or metadata.st_nlink != 1
                 or stat.S_IMODE(metadata.st_mode) & 0o077
             ):
-                raise EncryptionKeyUnavailableError(
-                    "key-state file permissions are invalid"
-                )
+                raise EncryptionKeyUnavailableError("key-state file permissions are invalid")
             chunks: list[bytes] = []
             total_size = 0
             while True:
@@ -1346,9 +1304,7 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
                 chunks.append(chunk)
                 total_size += len(chunk)
                 if total_size > _MAX_WRAPPED_STATE_BYTES:
-                    raise EncryptionKeyUnavailableError(
-                        "key-state file exceeds provider limit"
-                    )
+                    raise EncryptionKeyUnavailableError("key-state file exceeds provider limit")
             self._verify_state_parent_identity()
             return b"".join(chunks)
         finally:
@@ -1381,9 +1337,7 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
                     dir_fd=directory_descriptor,
                 )
             except OSError as exc:
-                raise EncryptionKeyUnavailableError(
-                    "key-state lock is unavailable"
-                ) from exc
+                raise EncryptionKeyUnavailableError("key-state lock is unavailable") from exc
             try:
                 lock_metadata = os.fstat(lock_descriptor)
                 if (
@@ -1447,9 +1401,7 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
                 temporary_name = candidate
                 break
             if descriptor is None or temporary_name is None:
-                raise EncryptionKeyUnavailableError(
-                    "key-state temporary file is unavailable"
-                )
+                raise EncryptionKeyUnavailableError("key-state temporary file is unavailable")
             with os.fdopen(descriptor, "wb") as stream:
                 stream.write(content)
                 stream.flush()
@@ -1474,13 +1426,10 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
         metadata = os.fstat(descriptor)
         if (
             not stat.S_ISDIR(metadata.st_mode)
-            or (metadata.st_dev, metadata.st_ino)
-            != self._state_parent_identity
+            or (metadata.st_dev, metadata.st_ino) != self._state_parent_identity
             or stat.S_IMODE(metadata.st_mode) & 0o077
         ):
-            raise EncryptionKeyUnavailableError(
-                "key-state directory identity changed"
-            )
+            raise EncryptionKeyUnavailableError("key-state directory identity changed")
 
     def _verify_state_parent_identity(self) -> None:
         try:
@@ -1489,15 +1438,10 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
                 follow_symlinks=False,
             )
         except OSError as exc:
-            raise EncryptionKeyUnavailableError(
-                "key-state directory is unavailable"
-            ) from exc
+            raise EncryptionKeyUnavailableError("key-state directory is unavailable") from exc
         if (
             not stat.S_ISDIR(metadata.st_mode)
-            or (metadata.st_dev, metadata.st_ino)
-            != self._state_parent_identity
+            or (metadata.st_dev, metadata.st_ino) != self._state_parent_identity
             or stat.S_IMODE(metadata.st_mode) & 0o077
         ):
-            raise EncryptionKeyUnavailableError(
-                "key-state directory identity changed"
-            )
+            raise EncryptionKeyUnavailableError("key-state directory identity changed")

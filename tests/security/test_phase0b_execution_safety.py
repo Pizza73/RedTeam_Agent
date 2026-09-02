@@ -80,11 +80,7 @@ class _MismatchedReceiptAdapter(MockExecutionAdapter):
             }
         )
         mismatched = provisional.model_copy(
-            update={
-                "receipt_digest": digest_model(
-                    provisional, exclude={"receipt_digest"}
-                )
-            }
+            update={"receipt_digest": digest_model(provisional, exclude={"receipt_digest"})}
         )
         return metadata.model_copy(update={"receipt": mismatched})
 
@@ -109,9 +105,7 @@ class _ChangedRetryMetadataAdapter(MockExecutionAdapter):
     ) -> AdapterRawResult:
         metadata = await super().collect_result(task_id, sink)
         if self.collect_calls > 1:
-            return metadata.model_copy(
-                update={"provider_status": "FAILED", "exit_code": 1}
-            )
+            return metadata.model_copy(update={"provider_status": "FAILED", "exit_code": 1})
         return metadata
 
 
@@ -375,6 +369,7 @@ def test_executor_rejects_missing_trusted_runtime_dependency(missing: str) -> No
         "adapter_registry": harness.adapter_registry,
         "capability_probe": harness.capability_probe,
         "finalization_requester": harness.finalization,
+        "clock": harness.clock,
     }
     dependencies[missing] = None
     with pytest.raises(TrustedDependencyUnavailableError):
@@ -424,9 +419,7 @@ def test_execution_read_rejects_recomputed_digest_with_reduced_parent_binding() 
             "record_digest": "pending",
         }
     )
-    tampered = tampered.model_copy(
-        update={"record_digest": execution_record_digest(tampered)}
-    )
+    tampered = tampered.model_copy(update={"record_digest": execution_record_digest(tampered)})
     harness.database.connection.execute(
         "UPDATE execution_records SET record_digest = ?, idempotency_key = ?, payload_json = ? "
         "WHERE execution_id = ?",
@@ -450,12 +443,7 @@ def test_result_repository_rejects_result_before_secure_ingestion_starts() -> No
             now=FIXED_TIME + timedelta(minutes=3),
         )
     )
-    metadata = asyncio.run(
-        harness.executor.collect_result(
-            running.execution_id,
-            now=FIXED_TIME + timedelta(minutes=4),
-        )
-    )
+    metadata = asyncio.run(harness.executor.collect_result(running.execution_id))
     current = harness.executions.get(running.execution_id)
     assert current is not None
     forged = harness.executor._normalize_result(
@@ -486,7 +474,6 @@ def test_ingestion_failure_pauses_mission_and_blocks_later_dispatch() -> None:
             harness.executor.ingest_result(
                 running.execution_id,
                 ingester=ingester,
-                now=FIXED_TIME + timedelta(minutes=4),
             )
         )
 
@@ -512,12 +499,7 @@ def test_existing_result_converges_split_ingestion_success_commit() -> None:
             now=FIXED_TIME + timedelta(minutes=3),
         )
     )
-    metadata = asyncio.run(
-        harness.executor.collect_result(
-            running.execution_id,
-            now=FIXED_TIME + timedelta(minutes=4),
-        )
-    )
+    metadata = asyncio.run(harness.executor.collect_result(running.execution_id))
     ingestion = harness.ingestions.get_by_execution(running.execution_id)
     record = harness.executions.get(running.execution_id)
     assert ingestion is not None and record is not None
@@ -552,7 +534,6 @@ def test_existing_result_converges_split_ingestion_success_commit() -> None:
         harness.executor.resume_result_ingestion(
             running.execution_id,
             ingester=unused_ingester,
-            now=FIXED_TIME + timedelta(minutes=6),
         )
     )
     final_ingestion = harness.ingestions.get_by_execution(running.execution_id)
@@ -590,12 +571,7 @@ def test_quarantine_quota_failure_persists_recovery_and_blocks_later_dispatch() 
         )
     )
     with pytest.raises(RawResultQuarantineError):
-        asyncio.run(
-            harness.executor.collect_result(
-                running.execution_id,
-                now=FIXED_TIME + timedelta(minutes=4),
-            )
-        )
+        asyncio.run(harness.executor.collect_result(running.execution_id))
 
     sink = limited_factory.mock_sink(running.execution_id)
     assert sink is not None
@@ -634,12 +610,7 @@ def test_sink_construction_failure_persists_recovery_and_releases_claim(
     monkeypatch.setattr(harness.sink_factory, "for_execution", fail_reconstruction)
     failure_time = FIXED_TIME + timedelta(minutes=4)
     with pytest.raises(RawResultQuarantineError, match="reconstruction"):
-        asyncio.run(
-            harness.executor.collect_result(
-                running.execution_id,
-                now=failure_time,
-            )
-        )
+        asyncio.run(harness.executor.collect_result(running.execution_id))
 
     expected = harness.sink_factory.recovery_metadata_for_failure(
         running.execution_id,
@@ -650,10 +621,13 @@ def test_sink_construction_failure_persists_recovery_and_releases_claim(
     assert recovery.bytes_received == 0
     assert recovery.last_chunk_sequence == -1
     assert harness.finalization.missions.current(running.mission_id).state == "PAUSED"
-    assert harness.database.connection.execute(
-        "SELECT COUNT(*) FROM result_collection_claims WHERE execution_id = ?",
-        (running.execution_id,),
-    ).fetchone()[0] == 0
+    assert (
+        harness.database.connection.execute(
+            "SELECT COUNT(*) FROM result_collection_claims WHERE execution_id = ?",
+            (running.execution_id,),
+        ).fetchone()[0]
+        == 0
+    )
     blocked = asyncio.run(
         harness.executor.dispatch(
             later.execution_id,
@@ -690,12 +664,7 @@ def test_mid_artifact_interruption_pauses_for_human_recovery() -> None:
         )
     )
     with pytest.raises(RawResultStreamingError):
-        asyncio.run(
-            harness.executor.collect_result(
-                running.execution_id,
-                now=FIXED_TIME + timedelta(minutes=4),
-            )
-        )
+        asyncio.run(harness.executor.collect_result(running.execution_id))
 
     sink = harness.sink_factory.mock_sink(running.execution_id)
     assert sink is not None
@@ -737,17 +706,10 @@ def test_terminal_persistence_failure_pauses_for_raw_result_recovery(
 
     monkeypatch.setattr(sink, "commit", fail_terminal)
     with pytest.raises(RawResultQuarantineError, match="terminal persistence"):
-        asyncio.run(
-            harness.executor.collect_result(
-                running.execution_id,
-                now=FIXED_TIME + timedelta(minutes=4),
-            )
-        )
+        asyncio.run(harness.executor.collect_result(running.execution_id))
 
     recovery = harness.recovery.get(
-        sink.recovery_metadata(
-            updated_at=FIXED_TIME + timedelta(minutes=4)
-        ).recovery_id
+        sink.recovery_metadata(updated_at=FIXED_TIME + timedelta(minutes=4)).recovery_id
     )
     assert recovery is not None and recovery.state == "RECOVERY_REQUIRED"
     assert harness.finalization.missions.current(running.mission_id).state == "PAUSED"
@@ -779,12 +741,7 @@ def test_adapter_receipt_must_exactly_match_bound_sink_commit() -> None:
         )
     )
     with pytest.raises(RawResultStreamingError, match="metadata binding mismatch"):
-        asyncio.run(
-            harness.executor.collect_result(
-                running.execution_id,
-                now=FIXED_TIME + timedelta(minutes=4),
-            )
-        )
+        asyncio.run(harness.executor.collect_result(running.execution_id))
 
     sink = harness.sink_factory.mock_sink(running.execution_id)
     assert sink is not None
@@ -821,12 +778,7 @@ def test_committed_sink_metadata_mismatch_uses_raw_result_recovery() -> None:
         )
     )
     with pytest.raises(RawResultStreamingError, match="metadata binding mismatch"):
-        asyncio.run(
-            harness.executor.collect_result(
-                running.execution_id,
-                now=FIXED_TIME + timedelta(minutes=4),
-            )
-        )
+        asyncio.run(harness.executor.collect_result(running.execution_id))
 
     sink = harness.sink_factory.mock_sink(running.execution_id)
     assert sink is not None and sink.committed
@@ -870,12 +822,7 @@ def test_collection_retry_rejects_metadata_changed_after_ingestion_commit_crash(
             crash_before_provider_transition,
         )
         with pytest.raises(RuntimeError, match="simulated crash"):
-            asyncio.run(
-                harness.executor.collect_result(
-                    running.execution_id,
-                    now=FIXED_TIME + timedelta(minutes=4),
-                )
-            )
+            asyncio.run(harness.executor.collect_result(running.execution_id))
 
     persisted = harness.ingestions.get_by_execution(running.execution_id)
     interrupted = harness.executions.get(running.execution_id)
@@ -886,12 +833,7 @@ def test_collection_retry_rejects_metadata_changed_after_ingestion_commit_crash(
         RawResultStreamingError,
         match="metadata changed across collection attempts",
     ):
-        asyncio.run(
-            harness.executor.collect_result(
-                running.execution_id,
-                now=FIXED_TIME + timedelta(minutes=5),
-            )
-        )
+        asyncio.run(harness.executor.collect_result(running.execution_id))
 
     unchanged = harness.ingestions.get_by_execution(running.execution_id)
     current = harness.executions.get(running.execution_id)
@@ -953,7 +895,6 @@ def test_collection_rejects_metadata_conflicting_with_reconciled_terminal_state(
             harness.executor.ingest_result(
                 reconciled.execution_id,
                 ingester=ingester,
-                now=FIXED_TIME + timedelta(minutes=4),
             )
         )
 
@@ -1029,7 +970,6 @@ def test_collection_pauses_mission_when_reconciliation_changes_state(
             harness.executor.ingest_result(
                 running.execution_id,
                 ingester=ingester,
-                now=FIXED_TIME + timedelta(minutes=4),
             )
         )
 
@@ -1067,12 +1007,7 @@ def test_expired_ingestion_lease_is_taken_over_without_action_resubmit() -> None
             now=FIXED_TIME + timedelta(minutes=3),
         )
     )
-    asyncio.run(
-        harness.executor.collect_result(
-            running.execution_id,
-            now=FIXED_TIME + timedelta(minutes=4),
-        )
-    )
+    asyncio.run(harness.executor.collect_result(running.execution_id))
     ingestion = harness.ingestions.get_by_execution(running.execution_id)
     record = harness.executions.get(running.execution_id)
     assert ingestion is not None and record is not None
@@ -1093,19 +1028,24 @@ def test_expired_ingestion_lease_is_taken_over_without_action_resubmit() -> None
     ingester = MockSecureResultIngester(
         summary=SecureIngestionSummary(secure_ingestion_id="lease-recovered")
     )
+    ingestion_time = [FIXED_TIME + timedelta(minutes=4, seconds=30)]
+    harness.executor = executor_with_adapter(
+        harness,
+        harness.adapter,
+        clock=lambda: ingestion_time[0],
+    )
     with pytest.raises(ResultIngestionLeaseError):
         asyncio.run(
             harness.executor.ingest_result(
                 running.execution_id,
                 ingester=ingester,
-                now=FIXED_TIME + timedelta(minutes=4, seconds=30),
             )
         )
+    ingestion_time[0] = FIXED_TIME + timedelta(minutes=6)
     result = asyncio.run(
         harness.executor.ingest_result(
             running.execution_id,
             ingester=ingester,
-            now=FIXED_TIME + timedelta(minutes=6),
         )
     )
     recovered = harness.ingestions.get(leased.ingestion_id)
@@ -1170,22 +1110,14 @@ def test_duplicate_active_result_collectors_are_rejected(
             "collect_result",
             wait_during_collection,
         )
-        first = asyncio.create_task(
-            harness.executor.collect_result(
-                running.execution_id,
-                now=FIXED_TIME + timedelta(minutes=4),
-            )
-        )
+        first = asyncio.create_task(harness.executor.collect_result(running.execution_id))
         await entered.wait()
         try:
             with pytest.raises(
                 ResultIngestionLeaseError,
                 match="result-collection lease is still active",
             ):
-                await harness.executor.collect_result(
-                    running.execution_id,
-                    now=FIXED_TIME + timedelta(minutes=4),
-                )
+                await harness.executor.collect_result(running.execution_id)
         finally:
             release.set()
         await first
@@ -1195,9 +1127,12 @@ def test_duplicate_active_result_collectors_are_rejected(
     assert harness.adapter.collect_calls == 1
     assert harness.receipts.get_by_execution(running.execution_id) is not None
     assert harness.ingestions.get_by_execution(running.execution_id) is not None
-    assert harness.database.connection.execute(
-        "SELECT COUNT(*) FROM result_collection_claims"
-    ).fetchone()[0] == 0
+    assert (
+        harness.database.connection.execute(
+            "SELECT COUNT(*) FROM result_collection_claims"
+        ).fetchone()[0]
+        == 0
+    )
 
 
 def test_ingestion_failure_is_preserved_while_mission_is_finalizing() -> None:
@@ -1224,7 +1159,6 @@ def test_ingestion_failure_is_preserved_while_mission_is_finalizing() -> None:
             harness.executor.ingest_result(
                 running.execution_id,
                 ingester=ingester,
-                now=FIXED_TIME + timedelta(minutes=4),
             )
         )
 
@@ -1240,9 +1174,10 @@ def test_require_approval_has_no_execution_until_exact_approval_exists() -> None
     harness = build_execution_harness(approval_rule="always")
     with pytest.raises(ExecutionAuthorizationError):
         prepare_execution(harness)
-    assert harness.database.connection.execute(
-        "SELECT COUNT(*) FROM execution_records"
-    ).fetchone()[0] == 0
+    assert (
+        harness.database.connection.execute("SELECT COUNT(*) FROM execution_records").fetchone()[0]
+        == 0
+    )
 
     service = ApprovalService(
         runtime_resolver=harness.kernel.runtime_resolver,

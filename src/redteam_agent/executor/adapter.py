@@ -28,10 +28,25 @@ from redteam_agent.models.execution import (
 from .raw_results import RawResultSink
 
 
+@dataclass(frozen=True, slots=True)
+class AdapterSecretValue:
+    """Borrowed mutable Secret buffer valid only for one fixed Adapter call."""
+
+    secret_reference_id: str
+    value: memoryview
+
+
 class ExecutionAdapter(Protocol):
     async def get_capabilities(self) -> AdapterCapabilities: ...
 
     async def submit(self, request: ExecutionRequest, idempotency_key: str) -> TaskHandle: ...
+
+    async def submit_with_secrets(
+        self,
+        request: ExecutionRequest,
+        idempotency_key: str,
+        secrets: tuple[AdapterSecretValue, ...],
+    ) -> TaskHandle: ...
 
     async def get_task(self, task_id: str) -> TaskStatus: ...
 
@@ -62,8 +77,7 @@ class TrustedExecutionAdapterRegistry:
 
     def __init__(self, registrations: tuple[ExecutionAdapterRegistration, ...]) -> None:
         bindings = tuple(
-            (registration.adapter_type, registration.adapter_id)
-            for registration in registrations
+            (registration.adapter_type, registration.adapter_id) for registration in registrations
         )
         if not registrations or len(bindings) != len(set(bindings)):
             raise AdapterResolutionError("trusted adapter registrations must be unique")
@@ -125,6 +139,8 @@ class MockExecutionAdapter:
         self.submit_calls = 0
         self.reconcile_calls = 0
         self.collect_calls = 0
+        self.secret_dispatch_calls = 0
+        self.secret_reference_ids: tuple[str, ...] = ()
 
     async def get_capabilities(self) -> AdapterCapabilities:
         return self._capabilities
@@ -154,6 +170,16 @@ class MockExecutionAdapter:
         if self._submit_uncertain:
             raise AdapterDispatchUncertainError("mock submit result was intentionally uncertain")
         return handle
+
+    async def submit_with_secrets(
+        self,
+        request: ExecutionRequest,
+        idempotency_key: str,
+        secrets: tuple[AdapterSecretValue, ...],
+    ) -> TaskHandle:
+        self.secret_dispatch_calls += 1
+        self.secret_reference_ids = tuple(item.secret_reference_id for item in secrets)
+        return await self.submit(request, idempotency_key)
 
     async def get_task(self, task_id: str) -> TaskStatus:
         if task_id not in self._execution_by_task:

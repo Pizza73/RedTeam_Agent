@@ -126,11 +126,30 @@ class ResultCollectionAuthority(StrictImmutableBoundaryModel):
 
 
 class DurableIngestionResource(StrictImmutableBoundaryModel):
-    resource_type: Literal[
-        "redacted_artifact", "encrypted_raw_artifact", "secret_reference"
-    ]
+    resource_type: Literal["redacted_artifact", "encrypted_raw_artifact", "secret_reference"]
     resource_id: str = Field(min_length=1)
     resource_digest: str = Field(min_length=1)
+
+
+class ExecutionResultProjection(StrictImmutableBoundaryModel):
+    """Plaintext-free provider metadata persisted before quarantine erasure."""
+
+    projection_id: str = Field(min_length=1)
+    projection_digest: str = Field(min_length=1)
+    execution_id: str = Field(min_length=1)
+    provider_task_id: str = Field(min_length=1)
+    receipt_id: str = Field(min_length=1)
+    provider_status: Literal["SUCCEEDED", "FAILED", "CANCELLED"]
+    exit_code: int | None
+    started_at: UtcDatetime
+    finished_at: UtcDatetime
+    timed_out: bool = False
+
+    @model_validator(mode="after")
+    def projection_invariants(self) -> ExecutionResultProjection:
+        if self.finished_at < self.started_at:
+            raise ValueError("result projection finished before it started")
+        return self
 
 
 class SecureIngestionManifest(StrictImmutableBoundaryModel):
@@ -148,6 +167,7 @@ class SecureIngestionManifest(StrictImmutableBoundaryModel):
     rule_version: str = Field(min_length=1)
     resources: tuple[DurableIngestionResource, ...]
     redaction_metadata_digest: str = Field(min_length=1)
+    result_projection: ExecutionResultProjection
     created_at: UtcDatetime
 
 
@@ -269,10 +289,7 @@ class ExecutionRecord(StrictImmutableBoundaryModel):
             "CANCEL_REQUESTED",
             "CANCELLED",
         }
-        if (
-            self.provider_execution_state in confirmed_task_states
-            and self.provider_task_id is None
-        ):
+        if self.provider_execution_state in confirmed_task_states and self.provider_task_id is None:
             raise ValueError("confirmed provider state requires a provider task ID")
         if self.result_ingestion_state == "NOT_AVAILABLE" and (
             self.raw_result_quarantine_id is not None
@@ -341,6 +358,7 @@ class ResultIngestionRecord(StrictImmutableBoundaryModel):
     receipt_id: str | None = None
     quarantine_id: str | None = None
     adapter_metadata_digest: str | None = None
+    result_projection: ExecutionResultProjection | None = None
     lease_id: str | None = None
     lease_expires_at: UtcDatetime | None = None
     attempt_count: int = Field(default=0, ge=0)
@@ -354,7 +372,12 @@ class ResultIngestionRecord(StrictImmutableBoundaryModel):
             raise ValueError("ingestion update cannot precede creation")
         if self.status == "NOT_AVAILABLE" and any(
             value is not None
-            for value in (self.receipt_id, self.quarantine_id, self.adapter_metadata_digest)
+            for value in (
+                self.receipt_id,
+                self.quarantine_id,
+                self.adapter_metadata_digest,
+                self.result_projection,
+            )
         ):
             raise ValueError("NOT_AVAILABLE ingestion cannot reference raw-result metadata")
         if self.status in {
@@ -366,8 +389,17 @@ class ResultIngestionRecord(StrictImmutableBoundaryModel):
             "SUCCEEDED",
             "FAILED",
             "QUARANTINED",
-        } and (self.receipt_id is None or self.quarantine_id is None):
-            raise ValueError("available ingestion requires receipt and quarantine bindings")
+        } and (
+            self.receipt_id is None or self.quarantine_id is None or self.result_projection is None
+        ):
+            raise ValueError(
+                "available ingestion requires receipt, quarantine, and result projection bindings"
+            )
+        if self.result_projection is not None and not (
+            self.result_projection.execution_id == self.execution_id
+            and self.result_projection.receipt_id == self.receipt_id
+        ):
+            raise ValueError("result projection ingestion binding mismatch")
         if self.status == "INGESTING" and self.lease_id is None:
             raise ValueError("INGESTING requires a lease")
         if self.status == "INGESTING" and self.lease_expires_at is None:
@@ -451,13 +483,17 @@ class ReconciliationResult(StrictImmutableBoundaryModel):
 
     @model_validator(mode="after")
     def reconciliation_bindings(self) -> ReconciliationResult:
-        if self.status in {
-            "QUEUED",
-            "RUNNING",
-            "SUCCEEDED",
-            "FAILED",
-            "CANCELLED",
-        } and self.provider_task_id is None:
+        if (
+            self.status
+            in {
+                "QUEUED",
+                "RUNNING",
+                "SUCCEEDED",
+                "FAILED",
+                "CANCELLED",
+            }
+            and self.provider_task_id is None
+        ):
             raise ValueError("confirmed reconciliation requires provider task ID")
         return self
 
