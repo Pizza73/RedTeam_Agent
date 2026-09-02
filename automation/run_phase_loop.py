@@ -2966,7 +2966,7 @@ class PhaseLoop:
             return True
         if recurring_families:
             check_state = self.check_state(state.head_sha)
-            if check_state == "pending":
+            if check_state == "waiting":
                 return True
             if check_state != "success":
                 raise LoopBlockedError(
@@ -2978,7 +2978,7 @@ class PhaseLoop:
             )
             return True
         check_state = self.check_state(state.head_sha)
-        if check_state == "pending":
+        if check_state == "waiting":
             return True
         if check_state != "success":
             raise LoopBlockedError(

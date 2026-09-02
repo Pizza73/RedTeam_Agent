@@ -2479,6 +2479,13 @@ def test_refreshed_blocked_phase_dispatches_one_bounded_resume() -> None:
     loop.dispatched_blocked_resumes = set()
     loop.dry_run = False
     loop.log = lambda _message: None  # type: ignore[method-assign]
+    loop.check_state = lambda _head: "waiting"  # type: ignore[method-assign]
+
+    assert loop.perform_post_blocked_refresh_resume(
+        state, [], [base_pass, gate], [], DEFAULT_BRANCH_SHA
+    ) is True
+    assert github.workflow_calls == []
+
     loop.check_state = lambda _head: "success"  # type: ignore[method-assign]
 
     assert loop.perform_post_blocked_refresh_resume(
@@ -2552,7 +2559,7 @@ def test_refreshed_design_stop_never_dispatches_generic_resume() -> None:
     loop.dry_run = False
     messages: list[str] = []
     loop.log = messages.append  # type: ignore[method-assign]
-    loop.check_state = lambda _head: "pending"  # type: ignore[method-assign]
+    loop.check_state = lambda _head: "waiting"  # type: ignore[method-assign]
 
     assert loop.perform_post_blocked_refresh_resume(
         state,
