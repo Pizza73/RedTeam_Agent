@@ -1,5 +1,10 @@
 # Blocked Current-Phase Base Refresh Governance
 
+> Supersession note: this record remains the authority for the exact-HEAD branch-update mechanism,
+> but its post-refresh generic Resume rule does not apply to a later invariant-family recurrence
+> stop. `docs/review/phase-0c-coherent-redesign.md` and LOOP-027 through LOOP-029 require the stop to
+> remain in place until a current-HEAD, blocking-gate-bound Design Approval is issued.
+
 ## Finding
 
 After the cumulative Phase recovery control was merged to `main`, the long-lived implementation PR
@@ -21,8 +26,10 @@ evidence.
 - The local runner consumes the status, keeps the current Phase label, performs the existing
   expected-HEAD branch update, and verifies the old HEAD and target base are both ancestors of the
   resulting HEAD.
-- An incorporated blocked refresh can start only the existing approver-restricted bounded Resume,
-  bound to the original gate permalink and only after current-HEAD deterministic checks pass.
+- An incorporated blocked refresh for a non-design stop can start only the existing
+  approver-restricted bounded Resume, bound to the original gate permalink and only after
+  current-HEAD deterministic checks pass. An invariant-family recurrence remains blocked and uses
+  the dedicated Design Approval path.
 
 ## Non-goals
 

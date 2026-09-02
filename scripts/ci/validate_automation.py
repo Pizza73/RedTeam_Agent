@@ -62,6 +62,7 @@ def validate_automation(repo_root: Path) -> None:
     root = repo_root.resolve(strict=True)
     schemas = root / "automation" / "schemas"
     for schema_name in (
+        "design-approval.schema.json",
         "implementation-request.schema.json",
         "invariant-audit.schema.json",
         "invariant-families.schema.json",

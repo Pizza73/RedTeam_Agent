@@ -1,0 +1,80 @@
+name: Approve AI Loop Design Resume
+
+on:
+  workflow_dispatch:
+    inputs:
+      pull_request_number:
+        description: Blocked AI-loop pull request number
+        required: true
+        type: number
+      phase:
+        description: Current blocked Phase
+        required: true
+        type: choice
+        options:
+          - phase-0b
+          - phase-0c
+          - phase-1
+          - phase-2
+          - phase-3
+      head_sha:
+        description: Exact current 40-character PR HEAD after approved design refresh
+        required: true
+        type: string
+      blocked_gate_reference:
+        description: Latest trusted recurrence-gate permalink
+        required: true
+        type: string
+      design_commit_sha:
+        description: Full approved design commit SHA incorporated in main and this PR
+        required: true
+        type: string
+      design_reference:
+        description: Merged governance PR or exact-commit design permalink
+        required: true
+        type: string
+      confirmation:
+        description: Type APPROVE_DESIGN_RESUME
+        required: true
+        type: string
+
+concurrency:
+  group: redteam-design-resume-${{ inputs.pull_request_number }}
+  cancel-in-progress: false
+
+permissions:
+  checks: read
+  contents: read
+  issues: write
+  pull-requests: write
+  statuses: write
+
+jobs:
+  approve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      AI_GATE_APPROVER_LOGIN: ${{ vars.AI_GATE_APPROVER_LOGIN }}
+      AI_REVIEWER_LOGIN: ${{ vars.AI_REVIEWER_LOGIN }}
+      BLOCKED_GATE_REFERENCE: ${{ inputs.blocked_gate_reference }}
+      CONFIRMATION: ${{ inputs.confirmation }}
+      DESIGN_COMMIT_SHA: ${{ inputs.design_commit_sha }}
+      DESIGN_REFERENCE: ${{ inputs.design_reference }}
+      HEAD_SHA: ${{ inputs.head_sha }}
+      PHASE: ${{ inputs.phase }}
+      PR_NUMBER: ${{ inputs.pull_request_number }}
+    steps:
+      - name: Check out trusted approval implementation
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - name: Validate and consume single-use Design Approval
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const path = require('path');
+            const approval = require(path.join(
+              process.env.GITHUB_WORKSPACE, 'automation', 'approve_design_resume.js'
+            ));
+            await approval.run({github, context, core});

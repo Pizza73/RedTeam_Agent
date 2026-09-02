@@ -89,6 +89,12 @@ PHASE_GATE_RECORD_KEYS = frozenset(
         "loop_state",
     }
 )
+DESIGN_STOP_PHASE_GATE_RECORD_KEYS = PHASE_GATE_RECORD_KEYS | frozenset(
+    {"stop_reason", "recurring_families", "finding_references"}
+)
+INVARIANT_FAMILY_REVIEW_KEYS = frozenset(
+    {"schema_version", "phase", "reviewed_sha", "review_reference", "verdict", "families"}
+)
 FINAL_MERGE_ATTEMPT_KEYS = frozenset(
     {
         "schema_version",
@@ -333,6 +339,43 @@ def validate_implementation_request(
                 raise UntrustedEvidenceError(
                     "audited fix request must classify every finding by invariant family"
                 )
+
+
+def validate_design_approval(
+    payload: dict[str, Any],
+    *,
+    schema: dict[str, Any],
+    phase: str,
+    head_sha: str,
+    blocked_gate_reference: str,
+    policy_digest: str,
+    approver_login: str,
+    pull_request_prefix: str,
+) -> None:
+    errors = sorted(
+        Draft202012Validator(schema).iter_errors(payload), key=lambda item: item.json_path
+    )
+    if errors:
+        first = errors[0]
+        raise UntrustedEvidenceError(
+            f"design approval schema failure at {first.json_path}: {first.message}"
+        )
+    if payload.get("phase") != phase or payload.get("head_sha") != head_sha:
+        raise UntrustedEvidenceError("design approval is stale for the current Phase or HEAD")
+    if payload.get("blocked_gate_reference") != blocked_gate_reference:
+        raise UntrustedEvidenceError("design approval is bound to a non-current blocking gate")
+    if payload.get("policy_digest") != policy_digest:
+        raise UntrustedEvidenceError("design approval invariant-family policy is stale")
+    if payload.get("approved_by") != approver_login:
+        raise UntrustedEvidenceError("design approval has an untrusted approver")
+    if not str(payload.get("blocked_gate_reference", "")).startswith(
+        f"{pull_request_prefix}#issuecomment-"
+    ):
+        raise UntrustedEvidenceError("design approval gate reference is outside this pull request")
+    if not str(payload.get("design_reference", "")).startswith(
+        f"https://github.com/{pull_request_prefix.removeprefix('https://github.com/').split('/pull/')[0]}/"
+    ):
+        raise UntrustedEvidenceError("design approval reference is outside this repository")
 
 
 def select_finding_key(review_result: dict[str, Any]) -> str:
@@ -1432,6 +1475,13 @@ class PhaseLoop:
         self.implementation_schema = self._load_json(
             repo_root / "automation" / "schemas" / "implementation-request.schema.json"
         )
+        self.design_approval_schema = self._load_json(
+            repo_root / "automation" / "schemas" / "design-approval.schema.json"
+        )
+        invariant_policy = self._load_json(
+            repo_root / "automation" / "invariant-families.json"
+        )
+        self.invariant_policy_digest = canonical_digest(invariant_policy)
         final_merge_schema = self._load_json(
             repo_root / "automation" / "schemas" / "final-merge-policy.schema.json"
         )
@@ -1586,11 +1636,18 @@ class PhaseLoop:
         payload = record.payload
         phase = str(payload.get("phase", ""))
         reviewed_sha = str(payload.get("reviewed_sha", ""))
+        base_record = (
+            set(payload) == PHASE_GATE_RECORD_KEYS
+            and payload.get("schema_version") == "1.0"
+        )
+        design_stop_record = (
+            set(payload) == DESIGN_STOP_PHASE_GATE_RECORD_KEYS
+            and payload.get("schema_version") == "1.1"
+        )
         if (
-            set(payload) != PHASE_GATE_RECORD_KEYS
+            not (base_record or design_stop_record)
             or phase not in PHASES[1:6]
             or not SHA_PATTERN.fullmatch(reviewed_sha)
-            or payload.get("schema_version") != "1.0"
             or payload.get("verdict") != "CHANGES_REQUESTED"
             or payload.get("loop_state") != "BLOCKED_LIMIT"
             or payload.get("evidence_format") != "codex-native-v1"
@@ -1601,6 +1658,33 @@ class PhaseLoop:
             raise UntrustedEvidenceError(
                 "blocked base-refresh gate is malformed or not bounded"
             )
+        if design_stop_record:
+            recurring_families = payload.get("recurring_families")
+            finding_references = payload.get("finding_references")
+            pull_prefix = (
+                f"https://github.com/{self.github.repository}/pull/"
+                f"{self.pull_request_number}"
+            )
+            if (
+                payload.get("stop_reason") != "INVARIANT_FAMILY_RECURRENCE"
+                or not isinstance(recurring_families, list)
+                or not recurring_families
+                or any(not isinstance(item, str) for item in recurring_families)
+                or recurring_families != sorted(set(recurring_families))
+                or any(item not in INVARIANT_FAMILIES for item in recurring_families)
+                or not isinstance(finding_references, list)
+                or not finding_references
+                or any(not isinstance(item, str) for item in finding_references)
+                or len(set(finding_references)) != len(finding_references)
+                or any(
+                    not isinstance(item, str)
+                    or not item.startswith(f"{pull_prefix}#discussion_r")
+                    for item in finding_references
+                )
+            ):
+                raise UntrustedEvidenceError(
+                    "design-stop gate has malformed recurrence evidence"
+                )
         checks = payload.get("required_checks")
         if checks != [
             {"name": name, "status": "PASS"} for name in REQUIRED_CHECK_ORDER
@@ -1634,6 +1718,216 @@ class PhaseLoop:
                 f"{self.pull_request_number}"
             ),
         )
+
+    def recurring_invariant_families(
+        self,
+        gate: MarkerEvidence,
+        family_records: list[MarkerEvidence],
+    ) -> tuple[str, ...]:
+        payload = gate.payload
+        phase = str(payload.get("phase", ""))
+        reviewed_sha = str(payload.get("reviewed_sha", ""))
+        relevant = [
+            record for record in family_records if record.payload.get("phase") == phase
+        ]
+        for record in relevant:
+            value = record.payload
+            families = value.get("families")
+            if (
+                set(value) != INVARIANT_FAMILY_REVIEW_KEYS
+                or value.get("schema_version") != "1.0"
+                or not SHA_PATTERN.fullmatch(str(value.get("reviewed_sha", "")))
+                or value.get("verdict") not in {"PASS", "CHANGES_REQUESTED"}
+                or not isinstance(families, list)
+                or any(not isinstance(item, str) for item in families)
+                or families != sorted(set(families))
+                or any(item not in INVARIANT_FAMILIES for item in families)
+                or not str(value.get("review_reference", "")).startswith(
+                    f"https://github.com/{self.github.repository}/pull/"
+                    f"{self.pull_request_number}"
+                )
+            ):
+                raise UntrustedEvidenceError(
+                    "trusted invariant-family review marker is malformed"
+                )
+        current = [
+            record
+            for record in relevant
+            if record.payload.get("reviewed_sha") == reviewed_sha
+            and record.payload.get("review_reference") == payload.get("review_reference")
+            and record.payload.get("verdict") == "CHANGES_REQUESTED"
+        ]
+        if not current:
+            if set(payload) == DESIGN_STOP_PHASE_GATE_RECORD_KEYS:
+                raise UntrustedEvidenceError(
+                    "design-stop gate lacks its exact invariant-family review"
+                )
+            return ()
+        identities = {canonical_digest(record.payload) for record in current}
+        if len(identities) != 1:
+            raise UntrustedEvidenceError(
+                "current design-stop invariant-family review is ambiguous"
+            )
+        current_families = set(current[-1].payload["families"])
+        recurring: set[str] = set()
+        for record in relevant:
+            prior_sha = str(record.payload.get("reviewed_sha", ""))
+            if (
+                prior_sha == reviewed_sha
+                or record.payload.get("verdict") != "CHANGES_REQUESTED"
+                or not self.github.is_ancestor(prior_sha, reviewed_sha)
+            ):
+                continue
+            recurring.update(current_families.intersection(record.payload["families"]))
+        result = tuple(sorted(recurring))
+        if set(payload) == DESIGN_STOP_PHASE_GATE_RECORD_KEYS and list(result) != payload.get(
+            "recurring_families"
+        ):
+            raise UntrustedEvidenceError(
+                "design-stop gate family set does not match trusted review history"
+            )
+        return result
+
+    def latest_incorporated_phase_gate(
+        self,
+        state: PullRequestState,
+        phase_records: list[MarkerEvidence],
+    ) -> MarkerEvidence | None:
+        candidates = [
+            record
+            for record in phase_records
+            if record.payload.get("phase") == state.phase
+            and SHA_PATTERN.fullmatch(str(record.payload.get("reviewed_sha", "")))
+            and self.github.is_ancestor(
+                str(record.payload["reviewed_sha"]), state.head_sha
+            )
+        ]
+        if not candidates:
+            return None
+        maximal = [
+            candidate
+            for candidate in candidates
+            if not any(
+                candidate.payload.get("reviewed_sha")
+                != other.payload.get("reviewed_sha")
+                and self.github.is_ancestor(
+                    str(candidate.payload["reviewed_sha"]),
+                    str(other.payload["reviewed_sha"]),
+                )
+                for other in candidates
+            )
+        ]
+        identities = {
+            (record.url, canonical_digest(record.payload)) for record in maximal
+        }
+        if len(identities) != 1:
+            raise UntrustedEvidenceError(
+                "latest incorporated current-Phase gate is ambiguous"
+            )
+        return maximal[0]
+
+    def validate_design_resume_authority(
+        self,
+        state: PullRequestState,
+        request: MarkerEvidence,
+        *,
+        comments: list[dict[str, Any]],
+        default_branch_sha: str,
+    ) -> None:
+        phase_records = self.trusted_markers(comments, "redteam-phase-gate")
+        family_records = self.trusted_markers(
+            comments, "redteam-invariant-family-review"
+        )
+        latest_gate = self.latest_incorporated_phase_gate(state, phase_records)
+        if latest_gate is None:
+            if request.payload.get("trigger") == "RESUME_AFTER_DESIGN_APPROVAL":
+                raise UntrustedEvidenceError(
+                    "design resume request has no incorporated current-Phase gate"
+                )
+            return
+        is_blocked_gate = (
+            latest_gate.payload.get("verdict") == "CHANGES_REQUESTED"
+            and latest_gate.payload.get("loop_state") == "BLOCKED_LIMIT"
+        )
+        recurring_families: tuple[str, ...] = ()
+        if is_blocked_gate:
+            self.validate_blocked_refresh_gate(latest_gate, phase_records)
+            recurring_families = self.recurring_invariant_families(
+                latest_gate, family_records
+            )
+        if not recurring_families:
+            if request.payload.get("trigger") == "RESUME_AFTER_DESIGN_APPROVAL":
+                raise UntrustedEvidenceError(
+                    "design resume request is not bound to a recurrence stop"
+                )
+            return
+        if request.payload.get("trigger") != "RESUME_AFTER_DESIGN_APPROVAL":
+            raise UntrustedEvidenceError(
+                "DESIGN_CHANGE_REQUIRED rejects generic implementation or Resume evidence"
+            )
+        approval_reference = str(request.payload.get("design_approval_reference", ""))
+        approvals = [
+            record
+            for record in self.trusted_markers(comments, "redteam-design-approval")
+            if record.url == approval_reference
+        ]
+        if len(approvals) != 1:
+            raise UntrustedEvidenceError(
+                "design resume request lacks one referenced trusted approval"
+            )
+        approval = approvals[0]
+        validate_design_approval(
+            approval.payload,
+            schema=self.design_approval_schema,
+            phase=state.phase,
+            head_sha=state.head_sha,
+            blocked_gate_reference=latest_gate.url,
+            policy_digest=self.invariant_policy_digest,
+            approver_login=self.approver_login,
+            pull_request_prefix=(
+                f"https://github.com/{self.github.repository}/pull/{state.number}"
+            ),
+        )
+        design_commit_sha = str(approval.payload["design_commit_sha"])
+        if not self.github.is_ancestor(
+            design_commit_sha, default_branch_sha
+        ) or not self.github.is_ancestor(design_commit_sha, state.head_sha):
+            raise UntrustedEvidenceError(
+                "approved design commit is not incorporated in main and the current PR HEAD"
+            )
+        consuming_requests = [
+            record
+            for record in self.trusted_markers(
+                comments, "redteam-implementation-request"
+            )
+            if record.payload.get("design_approval_reference") == approval.url
+        ]
+        identities = {
+            (record.url, canonical_digest(record.payload)) for record in consuming_requests
+        }
+        if len(identities) != 1 or request.url != consuming_requests[0].url:
+            raise UntrustedEvidenceError(
+                "design approval is missing, reused, or consumed ambiguously"
+            )
+        required_labels = {"ai-loop", "ai-needs-implementation", state.phase}
+        forbidden_labels = {
+            "ai-loop-blocked",
+            "ai-needs-fix",
+            "ai-needs-review",
+            "ai-review-passed",
+            "ai-human-gate",
+            "ai-project-complete",
+        }
+        if not required_labels.issubset(state.labels) or state.labels.intersection(
+            forbidden_labels
+        ):
+            raise UntrustedEvidenceError(
+                "design resume labels do not match the single-use implementation transition"
+            )
+        if self.check_state(state.head_sha) != "success":
+            raise UntrustedEvidenceError(
+                "design resume requires successful current-HEAD checks"
+            )
 
     def trusted_base_refresh_statuses(
         self,
@@ -2057,6 +2351,7 @@ class PhaseLoop:
         state: PullRequestState,
         requests: list[MarkerEvidence],
         phase_records: list[MarkerEvidence],
+        family_records: list[MarkerEvidence],
         refresh_records: list[MarkerEvidence],
         default_branch_sha: str,
     ) -> bool:
@@ -2114,6 +2409,20 @@ class PhaseLoop:
                 "incorporated blocked base-refresh evidence is ambiguous"
             )
         record = maximal[0]
+        gate = blocked_gates[
+            (
+                str(record.payload["prior_pass_reference"]),
+                str(record.payload["head_sha"]),
+            )
+        ]
+        latest_gate = self.latest_incorporated_phase_gate(state, phase_records)
+        if latest_gate is None or latest_gate.url != gate.url:
+            raise UntrustedEvidenceError(
+                "post-refresh authorization does not reference the latest current-Phase gate"
+            )
+        recurring_families = self.recurring_invariant_families(
+            gate, family_records
+        )
         current_request = self.matching_payload(
             requests,
             phase=state.phase,
@@ -2127,6 +2436,18 @@ class PhaseLoop:
                 phase=state.phase,
                 head_sha=state.head_sha,
                 phase_prompt=self.phase_prompts[state.phase],
+            )
+            if recurring_families and current_request.payload.get(
+                "trigger"
+            ) != "RESUME_AFTER_DESIGN_APPROVAL":
+                raise UntrustedEvidenceError(
+                    "DESIGN_CHANGE_REQUIRED rejects a generic post-refresh request"
+                )
+            return True
+        if recurring_families:
+            self.log(
+                f"waiting for dedicated design approval in {state.phase} at "
+                f"{state.head_sha[:12]}"
             )
             return True
         check_state = self.check_state(state.head_sha)
@@ -2339,6 +2660,39 @@ class PhaseLoop:
             head_sha=state.head_sha,
             phase_prompt=self.phase_prompts[state.phase],
         )
+        if request.payload.get("trigger") == "RESUME_AFTER_DESIGN_APPROVAL":
+            default_branch_sha = self.current_default_branch_sha()
+            fresh_state = self.pr_state()
+            if fresh_state != state:
+                raise UntrustedEvidenceError(
+                    "pull request changed before the design-approved Codex trigger"
+                )
+            comments = self.comments()
+            matching_requests = [
+                record
+                for record in self.trusted_markers(
+                    comments, "redteam-implementation-request"
+                )
+                if record.url == request.url and record.payload == request.payload
+            ]
+            if len(matching_requests) != 1:
+                raise UntrustedEvidenceError(
+                    "design-approved implementation request changed before Codex trigger"
+                )
+            self.validate_design_resume_authority(
+                fresh_state,
+                matching_requests[0],
+                comments=comments,
+                default_branch_sha=default_branch_sha,
+            )
+            if self.pr_state() != fresh_state:
+                raise UntrustedEvidenceError(
+                    "pull request changed during design approval revalidation"
+                )
+            if self.current_default_branch_sha() != default_branch_sha:
+                raise UntrustedEvidenceError(
+                    "default branch changed during design approval revalidation"
+                )
         digest = canonical_digest(request.payload)
         if self.local_trigger_exists(
             comments,
@@ -2714,6 +3068,9 @@ class PhaseLoop:
 
             comments = self.comments()
             phase_records = self.trusted_markers(comments, "redteam-phase-gate")
+            family_records = self.trusted_markers(
+                comments, "redteam-invariant-family-review"
+            )
             if "ai-project-complete" in state.labels:
                 merge_result = self.automatic_final_merge(
                     state, comments, phase_records, default_branch_sha
@@ -2771,10 +3128,11 @@ class PhaseLoop:
                 state,
                 implementation_requests,
                 phase_records,
+                family_records,
                 refresh_records,
                 default_branch_sha,
             ):
-                status = f"waiting for bounded post-refresh resume: {state.phase}"
+                status = f"waiting for post-refresh authorization: {state.phase}"
                 if status != last_status:
                     self.log(status)
                     last_status = status

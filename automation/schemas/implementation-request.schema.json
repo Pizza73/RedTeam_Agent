@@ -11,6 +11,10 @@
     "phase": {"pattern": "^phase-(0a|0b|0c|[1-5])$", "type": "string"},
     "head_sha": {"pattern": "^[0-9a-f]{40}$", "type": "string"},
     "phase_prompt": {"pattern": "^prompts/phases/[a-z0-9-]+\\.md$", "type": "string"},
+    "design_approval_reference": {
+      "pattern": "^https://github\\.com/[^/]+/[^/]+/pull/[0-9]+#issuecomment-[0-9]+$",
+      "type": "string"
+    },
     "invariant_audit": {
       "type": "object",
       "additionalProperties": false,
@@ -21,7 +25,14 @@
       }
     },
     "trigger": {
-      "enum": ["PHASE_START", "CI_FAILURE", "HUMAN_GATE", "HUMAN_RESUME", "REVIEW_FINDINGS"]
+      "enum": [
+        "PHASE_START",
+        "CI_FAILURE",
+        "HUMAN_GATE",
+        "HUMAN_RESUME",
+        "RESUME_AFTER_DESIGN_APPROVAL",
+        "REVIEW_FINDINGS"
+      ]
     },
     "review": {
       "type": "object",
@@ -79,6 +90,17 @@
     {
       "if": {"properties": {"action": {"const": "IMPLEMENT_PHASE"}}},
       "then": {"not": {"required": ["review"]}}
+    },
+    {
+      "if": {
+        "required": ["trigger"],
+        "properties": {"trigger": {"const": "RESUME_AFTER_DESIGN_APPROVAL"}}
+      },
+      "then": {
+        "required": ["design_approval_reference"],
+        "properties": {"action": {"const": "IMPLEMENT_PHASE"}}
+      },
+      "else": {"not": {"required": ["design_approval_reference"]}}
     }
   ]
 }

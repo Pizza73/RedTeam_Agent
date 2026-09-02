@@ -46,10 +46,19 @@ jobs:
       RESOLUTION_REFERENCE: ${{ inputs.resolution_reference }}
       RESOLUTION_SUMMARY: ${{ inputs.resolution_summary }}
     steps:
+      - name: Check out trusted evidence parser
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
       - name: Validate resolution and issue bounded resume request
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
         with:
           script: |
+            const path = require('path');
+            const {markerPayloads} = require(path.join(
+              process.env.GITHUB_WORKSPACE, 'automation', 'approve_design_resume.js'
+            ));
             if (process.env.CONFIRMATION !== 'RESUME_AI_LOOP') {
               core.setFailed('Confirmation text does not match.');
               return;
@@ -144,6 +153,126 @@ jobs:
             const comments = await github.paginate(github.rest.issues.listComments, {
               owner, repo, issue_number: pull_number, per_page: 100,
             });
+            function exactKeys(value, expected) {
+              return value && typeof value === 'object' && !Array.isArray(value) &&
+                JSON.stringify(Object.keys(value).sort()) ===
+                  JSON.stringify([...expected].sort());
+            }
+            async function isAncestor(ancestorSha, descendantSha) {
+              if (ancestorSha === descendantSha) return true;
+              const comparison = await github.request(
+                'GET /repos/{owner}/{repo}/compare/{basehead}',
+                {owner, repo, basehead: `${ancestorSha}...${descendantSha}`}
+              );
+              return comparison.data.merge_base_commit?.sha === ancestorSha &&
+                comparison.data.behind_by === 0 &&
+                ['ahead', 'identical'].includes(comparison.data.status);
+            }
+            const gateKeys = [
+              'schema_version', 'phase', 'reviewed_sha', 'base_sha', 'verdict',
+              'summary', 'evidence_format', 'ready_reference',
+              'review_trigger_reference', 'review_reference', 'reviewer_login',
+              'recorded_by', 'finding_key', 'required_checks', 'loop_state',
+            ];
+            const designGateKeys = [
+              ...gateKeys, 'stop_reason', 'recurring_families', 'finding_references',
+            ];
+            const gates = [];
+            for (const comment of comments) {
+              if (comment.user?.login !== 'github-actions[bot]') continue;
+              for (const record of markerPayloads(comment.body, 'redteam-phase-gate')) {
+                if (record.phase !== phase ||
+                    !/^[0-9a-f]{40}$/.test(record.reviewed_sha || '') ||
+                    !await isAncestor(record.reviewed_sha, headSha)) continue;
+                const baseGate = exactKeys(record, gateKeys) &&
+                  record.schema_version === '1.0';
+                const designGate = exactKeys(record, designGateKeys) &&
+                  record.schema_version === '1.1';
+                if (!baseGate && !designGate) {
+                  core.setFailed('Incorporated current-Phase gate is malformed.');
+                  return;
+                }
+                gates.push({record, url: comment.html_url});
+              }
+            }
+            const maximalGates = [];
+            for (const candidate of gates) {
+              let dominated = false;
+              for (const other of gates) {
+                if (candidate.record.reviewed_sha !== other.record.reviewed_sha &&
+                    await isAncestor(
+                      candidate.record.reviewed_sha, other.record.reviewed_sha
+                    )) {
+                  dominated = true;
+                  break;
+                }
+              }
+              if (!dominated) maximalGates.push(candidate);
+            }
+            if (maximalGates.length > 1) {
+              core.setFailed('Latest incorporated current-Phase gate is ambiguous.');
+              return;
+            }
+            const latestGate = maximalGates[0];
+            if (latestGate?.record.verdict === 'CHANGES_REQUESTED' &&
+                latestGate.record.loop_state === 'BLOCKED_LIMIT') {
+              const familyKeys = [
+                'schema_version', 'phase', 'reviewed_sha', 'review_reference',
+                'verdict', 'families',
+              ];
+              const familyRecords = [];
+              for (const comment of comments) {
+                if (comment.user?.login !== 'github-actions[bot]') continue;
+                for (const record of markerPayloads(
+                  comment.body, 'redteam-invariant-family-review'
+                )) {
+                  if (record.phase !== phase) continue;
+                  if (!exactKeys(record, familyKeys) || record.schema_version !== '1.0' ||
+                      !/^[0-9a-f]{40}$/.test(record.reviewed_sha || '') ||
+                      !Array.isArray(record.families) ||
+                      record.families.length !== new Set(record.families).size ||
+                      !record.families.every((item) =>
+                        /^[a-z][a-z0-9-]{2,63}$/.test(item))) {
+                    core.setFailed('Trusted invariant-family evidence is malformed.');
+                    return;
+                  }
+                  familyRecords.push(record);
+                }
+              }
+              const currentFamilies = familyRecords.filter((record) =>
+                record.reviewed_sha === latestGate.record.reviewed_sha &&
+                record.review_reference === latestGate.record.review_reference &&
+                record.verdict === 'CHANGES_REQUESTED'
+              );
+              const currentFamilyIdentities = new Set(
+                currentFamilies.map((record) => JSON.stringify(record))
+              );
+              if (currentFamilyIdentities.size > 1) {
+                core.setFailed('Current invariant-family evidence is ambiguous.');
+                return;
+              }
+              const recurring = new Set();
+              if (currentFamilyIdentities.size === 1) {
+                const currentSet = new Set(currentFamilies[0].families);
+                for (const record of familyRecords) {
+                  if (record.verdict !== 'CHANGES_REQUESTED' ||
+                      record.reviewed_sha === latestGate.record.reviewed_sha ||
+                      !await isAncestor(
+                        record.reviewed_sha, latestGate.record.reviewed_sha
+                      )) continue;
+                  for (const family of record.families) {
+                    if (currentSet.has(family)) recurring.add(family);
+                  }
+                }
+              }
+              if (latestGate.record.stop_reason === 'INVARIANT_FAMILY_RECURRENCE' ||
+                  recurring.size > 0) {
+                core.setFailed(
+                  'DESIGN_CHANGE_REQUIRED rejects generic Resume AI Loop.'
+                );
+                return;
+              }
+            }
             const trustedDuplicate = comments.some(
               (item) => item.user?.login === 'github-actions[bot]' && item.body?.includes(marker)
             );
