@@ -59,6 +59,9 @@ jobs:
             const {markerPayloads} = require(path.join(
               process.env.GITHUB_WORKSPACE, 'automation', 'approve_design_resume.js'
             ));
+            const {verifyAppliedCheckpoint} = require(path.join(
+              process.env.GITHUB_WORKSPACE, 'automation', 'base_refresh_checkpoint.js'
+            ));
             if (process.env.CONFIRMATION !== 'RESUME_AI_LOOP') {
               core.setFailed('Confirmation text does not match.');
               return;
@@ -158,15 +161,20 @@ jobs:
                 JSON.stringify(Object.keys(value).sort()) ===
                   JSON.stringify([...expected].sort());
             }
+            const ancestryCache = new Map();
             async function isAncestor(ancestorSha, descendantSha) {
               if (ancestorSha === descendantSha) return true;
+              const key = `${ancestorSha}:${descendantSha}`;
+              if (ancestryCache.has(key)) return ancestryCache.get(key);
               const comparison = await github.request(
                 'GET /repos/{owner}/{repo}/compare/{basehead}',
                 {owner, repo, basehead: `${ancestorSha}...${descendantSha}`}
               );
-              return comparison.data.merge_base_commit?.sha === ancestorSha &&
+              const result = comparison.data.merge_base_commit?.sha === ancestorSha &&
                 comparison.data.behind_by === 0 &&
                 ['ahead', 'identical'].includes(comparison.data.status);
+              ancestryCache.set(key, result);
+              return result;
             }
             const gateKeys = [
               'schema_version', 'phase', 'reviewed_sha', 'base_sha', 'verdict',
@@ -177,13 +185,16 @@ jobs:
             const designGateKeys = [
               ...gateKeys, 'stop_reason', 'recurring_families', 'finding_references',
             ];
-            const gates = [];
+            const referencedGates = [];
+            const currentHeadGates = [];
             for (const comment of comments) {
               if (comment.user?.login !== 'github-actions[bot]') continue;
               for (const record of markerPayloads(comment.body, 'redteam-phase-gate')) {
-                if (record.phase !== phase ||
-                    !/^[0-9a-f]{40}$/.test(record.reviewed_sha || '') ||
-                    !await isAncestor(record.reviewed_sha, headSha)) continue;
+                if (record.phase !== phase) continue;
+                if (record.reviewed_sha === headSha) {
+                  currentHeadGates.push({record, url: comment.html_url});
+                }
+                if (comment.html_url !== resolutionReference) continue;
                 const baseGate = exactKeys(record, gateKeys) &&
                   record.schema_version === '1.0';
                 const designGate = exactKeys(record, designGateKeys) &&
@@ -192,28 +203,52 @@ jobs:
                   core.setFailed('Incorporated current-Phase gate is malformed.');
                   return;
                 }
-                gates.push({record, url: comment.html_url});
+                referencedGates.push({record, url: comment.html_url});
               }
             }
-            const maximalGates = [];
-            for (const candidate of gates) {
-              let dominated = false;
-              for (const other of gates) {
-                if (candidate.record.reviewed_sha !== other.record.reviewed_sha &&
-                    await isAncestor(
-                      candidate.record.reviewed_sha, other.record.reviewed_sha
-                    )) {
-                  dominated = true;
-                  break;
-                }
-              }
-              if (!dominated) maximalGates.push(candidate);
-            }
-            if (maximalGates.length > 1) {
-              core.setFailed('Latest incorporated current-Phase gate is ambiguous.');
+            if (currentHeadGates.length > 0) {
+              core.setFailed(
+                'A current-HEAD Phase Gate supersedes the base-refresh checkpoint.'
+              );
               return;
             }
-            const latestGate = maximalGates[0];
+            if (referencedGates.length !== 1) {
+              core.setFailed(
+                'Resolution reference must identify one trusted blocking Phase Gate.'
+              );
+              return;
+            }
+            const latestGate = referencedGates[0];
+            if (latestGate.record.verdict !== 'CHANGES_REQUESTED' ||
+                latestGate.record.loop_state !== 'BLOCKED_LIMIT' ||
+                !/^[0-9a-f]{40}$/.test(latestGate.record.reviewed_sha || '')) {
+              core.setFailed('Referenced Phase Gate is not a bounded blocker.');
+              return;
+            }
+            const phaseOrder = [
+              'phase-0a', 'phase-0b', 'phase-0c', 'phase-1',
+              'phase-2', 'phase-3', 'phase-4', 'phase-5',
+            ];
+            const phaseIndex = phaseOrder.indexOf(phase);
+            if (phaseIndex < 1 || phaseIndex > 5) {
+              core.setFailed('Generic Resume is outside the checkpoint Phase range.');
+              return;
+            }
+            try {
+              await verifyAppliedCheckpoint({
+                github, owner, repo,
+                headSha,
+                authorizationReference: latestGate.url,
+                sourcePhase: phaseOrder[phaseIndex + 1],
+                revalidationPhase: phase,
+              });
+            } catch (error) {
+              core.setFailed(
+                error instanceof Error ? error.message :
+                  'Current-HEAD base-refresh checkpoint validation failed.'
+              );
+              return;
+            }
             if (latestGate?.record.verdict === 'CHANGES_REQUESTED' &&
                 latestGate.record.loop_state === 'BLOCKED_LIMIT') {
               const familyKeys = [
