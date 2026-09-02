@@ -320,8 +320,7 @@ jobs:
               authorization.loop_state === 'PASS' && authorization.finding_key === null;
             const isBlockedCurrentPhase = commonAuthorizationValid &&
               currentPhase === previousPhase && sourceIndex > 1 && sourceIndex <= 6 &&
-              (authorization.reviewed_sha === expectedHeadSha || designStopAuthorization ||
-                (isConfirmation && authorization.reviewed_sha === previousHeadSha)) &&
+              /^[0-9a-f]{40}$/.test(authorization.reviewed_sha) &&
               authorization.verdict === 'CHANGES_REQUESTED' &&
               authorization.loop_state === 'BLOCKED_LIMIT' &&
               /^[A-Z0-9][A-Z0-9._-]{0,63}$/.test(authorization.finding_key) &&
@@ -517,11 +516,6 @@ jobs:
               }
               try {
                 if (authorization.reviewed_sha !== previousHeadSha) {
-                  if (!designStopAuthorization) {
-                    throw new Error(
-                      'Non-design blocked Gate cannot cross more than one refresh edge.'
-                    );
-                  }
                   await refreshCheckpoint.verifyAppliedCheckpoint({
                     github, owner, repo,
                     headSha: previousHeadSha,

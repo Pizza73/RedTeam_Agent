@@ -327,6 +327,11 @@ def test_resume_workflow_can_comment_on_pr_without_merge_authority() -> None:
         "  statuses: write",
     ]
     assert "github.rest.issues.createComment" in workflow
+    assert "verifyAppliedCheckpoint" in workflow
+    assert "resolutionReference" in workflow
+    assert "maximalGates" not in workflow
+    assert "const ancestryCache = new Map()" in workflow
+    assert "A current-HEAD Phase Gate supersedes" in workflow
     for forbidden_operation in (
         "github.rest.pulls.merge",
         "mergePullRequest",
@@ -472,10 +477,8 @@ def test_blocked_base_refresh_uses_one_current_head_checkpoint() -> None:
     assert "base_refresh_checkpoint.js" in workflow
     assert "verifyAppliedCheckpoint" in workflow
     assert "ready.head_sha !== authorization.reviewed_sha" in workflow
-    assert (
-        "authorization.reviewed_sha === expectedHeadSha || designStopAuthorization"
-        in workflow
-    )
+    assert "/^[0-9a-f]{40}$/.test(authorization.reviewed_sha)" in workflow
+    assert "Non-design blocked Gate cannot cross" not in workflow
     assert "verifyPreparedRefreshEdge" in workflow
     assert "BASE_REFRESH_APPLIED" in helper_path.read_text(encoding="utf-8")
     for required_control in (

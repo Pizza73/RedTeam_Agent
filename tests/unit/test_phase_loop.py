@@ -1850,6 +1850,23 @@ def test_refreshed_blocked_gate_authorizes_another_exact_base_refresh() -> None:
     ) == gate
 
 
+def test_checkpointed_normal_blocker_authorizes_another_exact_base_refresh() -> None:
+    base_pass, gate = blocked_refresh_records()
+    checkpoint = base_refresh_checkpoint_status(authorization_reference=gate.url)
+    loop, github = blocked_refresh_loop({REFRESHED_HEAD_SHA: [checkpoint]})
+    github.ancestors.add((HEAD_SHA, REFRESHED_HEAD_SHA))
+    state = replace(
+        blocked_phase_state(),
+        head_sha=REFRESHED_HEAD_SHA,
+        base_sha=DEFAULT_BRANCH_SHA,
+        labels=frozenset({"ai-loop", "ai-loop-blocked", "phase-0b"}),
+    )
+
+    assert loop.blocked_base_refresh_candidate(
+        state, [base_pass, gate], SECOND_DEFAULT_BRANCH_SHA
+    ) == gate
+
+
 def test_checkpoint_binds_next_prepared_refresh_to_inherited_gate() -> None:
     base_pass, gate = design_stop_refresh_records()
     first_status = base_refresh_status(
@@ -1926,7 +1943,7 @@ def test_normal_output_cannot_inherit_gate_for_another_refresh() -> None:
         labels=frozenset({"ai-loop", "ai-needs-review", "phase-0b"}),
     )
 
-    with pytest.raises(UntrustedEvidenceError, match="two-parent merge"):
+    with pytest.raises(UntrustedEvidenceError, match="not bound to trusted Phase evidence"):
         loop.trusted_base_refresh_statuses(state, [base_pass, gate])
 
 
@@ -1991,6 +2008,55 @@ def test_current_head_checkpoint_replaces_historical_chain_walk() -> None:
     assert evidence is not None
     assert evidence.payload["previous_head_sha"] == REFRESHED_HEAD_SHA
     assert evidence.payload["target_base_sha"] == SECOND_DEFAULT_BRANCH_SHA
+
+
+def test_latest_gate_uses_current_checkpoint_without_historical_gate_walk() -> None:
+    base_pass, gate = blocked_refresh_records()
+    checkpoint = base_refresh_checkpoint_status(authorization_reference=gate.url)
+    loop, github = blocked_refresh_loop({REFRESHED_HEAD_SHA: [checkpoint]})
+    calls: list[tuple[str, str]] = []
+    original_is_ancestor = github.is_ancestor
+
+    def counted_is_ancestor(ancestor_sha: str, descendant_sha: str) -> bool:
+        calls.append((ancestor_sha, descendant_sha))
+        return original_is_ancestor(ancestor_sha, descendant_sha)
+
+    github.is_ancestor = counted_is_ancestor  # type: ignore[method-assign]
+    state = replace(blocked_phase_state(), head_sha=REFRESHED_HEAD_SHA)
+
+    assert loop.latest_incorporated_phase_gate(state, [base_pass, gate]) == gate
+    assert (HEAD_SHA, REFRESHED_HEAD_SHA) not in calls
+
+
+def test_latest_gate_fallback_scales_linearly_for_a_linear_history() -> None:
+    heads = [f"{index:040x}" for index in range(1, 31)]
+    current_head = f"{31:040x}"
+    rank = {head: index for index, head in enumerate([*heads, current_head])}
+    calls: list[tuple[str, str]] = []
+
+    class RankedGitHub:
+        def commit_statuses(self, _sha: str) -> list[dict[str, object]]:
+            return []
+
+        def is_ancestor(self, ancestor_sha: str, descendant_sha: str) -> bool:
+            calls.append((ancestor_sha, descendant_sha))
+            return rank[ancestor_sha] <= rank[descendant_sha]
+
+    records = [
+        MarkerEvidence(
+            {"phase": "phase-0b", "reviewed_sha": head},
+            f"{PULL_REQUEST_PREFIX}#issuecomment-linear-{index}",
+            "github-actions[bot]",
+            "",
+        )
+        for index, head in enumerate(heads)
+    ]
+    loop = PhaseLoop.__new__(PhaseLoop)
+    loop.github = RankedGitHub()  # type: ignore[assignment]
+    state = replace(blocked_phase_state(), head_sha=current_head)
+
+    assert loop.latest_incorporated_phase_gate(state, records) == records[-1]
+    assert len(calls) < len(records) * 4
 
 
 def test_completed_refresh_without_checkpoint_awaits_confirmation() -> None:
@@ -2089,6 +2155,33 @@ def test_second_refresh_rejects_a_missing_previous_checkpoint() -> None:
 
     with pytest.raises(UntrustedEvidenceError, match="previous HEAD lacks"):
         loop.pending_base_refresh_checkpoint(state, [base_pass, gate])
+
+
+def test_checkpointed_normal_blocker_can_confirm_the_next_refresh() -> None:
+    base_pass, gate = blocked_refresh_records()
+    checkpoint = base_refresh_checkpoint_status(authorization_reference=gate.url)
+    next_status = base_refresh_status(
+        from_phase="phase-0c",
+        revalidate_phase="phase-0b",
+        target_url=gate.url,
+        target_base_sha=SECOND_DEFAULT_BRANCH_SHA,
+    )
+    loop, github = blocked_refresh_loop(
+        {REFRESHED_HEAD_SHA: [checkpoint, next_status]}
+    )
+    github.parents[SECOND_REFRESHED_HEAD_SHA] = (
+        REFRESHED_HEAD_SHA,
+        SECOND_DEFAULT_BRANCH_SHA,
+    )
+    state = replace(
+        blocked_phase_state(),
+        head_sha=SECOND_REFRESHED_HEAD_SHA,
+        labels=frozenset({"ai-loop", "ai-loop-blocked", "phase-0b"}),
+    )
+
+    pending = loop.pending_base_refresh_checkpoint(state, [base_pass, gate])
+
+    assert pending == (gate, REFRESHED_HEAD_SHA, SECOND_DEFAULT_BRANCH_SHA)
 
 
 def test_first_refresh_confirmation_rejects_missing_previous_authorization() -> None:
@@ -3248,8 +3341,10 @@ class _ComparisonGitHub:
 
     def __init__(self, comparison: dict[str, object]) -> None:
         self.comparison = comparison
+        self.calls = 0
 
     def compare(self, base_sha: str, head_sha: str) -> dict[str, object]:
+        self.calls += 1
         assert (base_sha, head_sha) == (HEAD_SHA, REFRESHED_HEAD_SHA)
         return self.comparison
 
@@ -3297,6 +3392,20 @@ def test_ancestor_check_requires_exact_merge_base_and_forward_history(
     github = _ComparisonGitHub(comparison)
 
     assert github.is_ancestor(HEAD_SHA, REFRESHED_HEAD_SHA) is expected
+
+
+def test_ancestor_check_caches_immutable_comparison_results() -> None:
+    github = _ComparisonGitHub(
+        {
+            "merge_base_commit": {"sha": HEAD_SHA},
+            "behind_by": 0,
+            "status": "ahead",
+        }
+    )
+
+    assert github.is_ancestor(HEAD_SHA, REFRESHED_HEAD_SHA) is True
+    assert github.is_ancestor(HEAD_SHA, REFRESHED_HEAD_SHA) is True
+    assert github.calls == 1
 
 
 def test_branch_update_uses_expected_head_and_never_final_merge_endpoint() -> None:
