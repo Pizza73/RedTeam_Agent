@@ -234,6 +234,9 @@ machine-readable phase record.
   confirmation; `REFRESH_AWAITING_CONFIRMATION` cannot Resume, implement, or refresh again. The
   checkpoint authorization permalink selects the Gate directly; Resume does not compare every
   historical Gate pair. A bot-authored current-HEAD Gate always supersedes an older checkpoint.
+  For a blocked-Phase refresh, the trusted workflow restores `ai-loop-blocked` and removes stale
+  lifecycle projections before branch update. Confirmation may perform the same conservative
+  repair for an already-applied exact refresh, but it never issues the implementation request.
 - For `DESIGN_CHANGE_REQUIRED`, first review and merge the coherent design as a governance PR.
   Refresh the blocked PR to incorporate that exact design commit, wait for current-HEAD checks,
   then run **Approve AI Loop Design Resume** with the latest blocking gate permalink, full current

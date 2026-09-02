@@ -499,9 +499,13 @@ def test_blocked_base_refresh_uses_one_current_head_checkpoint() -> None:
     )[0]
     assert permissions.strip().splitlines() == [
         "contents: read",
+        "  issues: write",
         "  pull-requests: read",
         "  statuses: write",
     ]
+    assert "blocked refresh projection repair" in workflow
+    assert "issues.addLabels" in workflow
+    assert "issues.removeLabel" in workflow
     for forbidden_operation in (
         "github.rest.pulls.merge",
         "updateBranch",
@@ -733,6 +737,7 @@ def test_base_refresh_is_sha_bound_and_separate_from_exact_sha_final_merge() -> 
     )[0]
     assert permissions.strip().splitlines() == [
         "contents: read",
+        "  issues: write",
         "  pull-requests: read",
         "  statuses: write",
     ]
