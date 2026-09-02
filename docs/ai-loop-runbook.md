@@ -227,9 +227,11 @@ machine-readable phase record.
   Resume or Codex. After current-HEAD CI succeeds, a recurrence stop still requires the dedicated
   **Approve AI Loop Design Resume** operation.
 - If `main` advances again while that Design Stop remains active, restart the runner from the new
-  clean `main`. It may reuse the same blocking Gate only after validating every intervening
-  base-refresh merge and trusted status, up to 32 edges. Do not manually merge, push, relabel, or
-  reuse a status when an edge is absent; the runner must report the chained refresh candidate.
+  clean `main`. It may reuse the same blocking Gate only when the exact current HEAD has one valid
+  `BASE_REFRESH_APPLIED` checkpoint. After a branch update the runner dispatches the confirmation
+  mode of **Prepare AI Loop Base Refresh**, which verifies the immediate two-parent merge and
+  previous-HEAD authorization, then certifies the new HEAD. Do not manually merge, push, relabel, or skip the
+  confirmation; `REFRESH_AWAITING_CONFIRMATION` cannot Resume, implement, or refresh again.
 - For `DESIGN_CHANGE_REQUIRED`, first review and merge the coherent design as a governance PR.
   Refresh the blocked PR to incorporate that exact design commit, wait for current-HEAD checks,
   then run **Approve AI Loop Design Resume** with the latest blocking gate permalink, full current
@@ -271,10 +273,10 @@ machine-readable phase record.
 - `waiting for refreshed PR head`: GitHub accepted or is processing the exact-HEAD branch update.
   A changed HEAD causes the request to fail closed; restart from current clean `main` and inspect
   the PR evidence rather than forcing an update.
-- A stopped PR immediately reports `AI_LOOP=BLOCKED` after a later governance merge: verify that
-  each prior refresh output is a two-parent merge and that its first parent has the matching
-  `redteam/base-refresh/...` status. A missing chain edge requires governance repair, not a manual
-  branch update.
+- A stopped PR immediately reports `AI_LOOP=BLOCKED` after a later governance merge: verify the
+  exact current-HEAD `redteam/base-refresh-applied/...` checkpoint, its immediate two-parent merge,
+  and the matching `redteam/base-refresh/...` authorization on the previous HEAD. A missing
+  checkpoint requires confirmation or governance repair, not a manual branch update.
 - Automatic final merge blocked: inspect the Phase 0A→5 PASS chain, latest
   `redteam/phase-review`, four Check Runs, stop labels, current `main` ancestry, the exact-HEAD
   attempt comment and `refs/redteam-final-merge-attempts/pr-<PR>-<HEAD>`. Do not retry an uncertain

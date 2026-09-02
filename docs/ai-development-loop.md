@@ -124,8 +124,9 @@ boundary while retaining the current Phase as `revalidate_phase`. This exception
 only a trusted current-HEAD `BLOCKED_LIMIT` gate, validates its unique adjacent base PASS and their
 ancestry, and writes the same SHA-bound status used by the local update mechanism. The local runner
 does not roll the Phase label back. It performs one expected-HEAD branch update, verifies both the
-old HEAD and target default SHA are ancestors of the result, waits for current-HEAD checks, and can
-then remain blocked. The base-refresh evidence authorizes exactly one expected-HEAD branch update;
+old HEAD and target default SHA are ancestors of the result, and dispatches the confirmation
+workflow. Only after the resulting current-HEAD checkpoint exists does it wait for current-HEAD
+checks and continue the blocked flow. The base-refresh evidence authorizes exactly one expected-HEAD branch update;
 it is not Resume authority. If the blocking gate is `DESIGN_CHANGE_REQUIRED`, remediation may
 restart only after current-HEAD CI and a separate approver-restricted Design Approval bound to the
 blocking gate, current Phase/HEAD and an approved design commit incorporated from `main`.
@@ -223,15 +224,18 @@ fix request and label state. Labels are projections for operators, not authoriza
 After the coherent redesign is human-reviewed and merged to the default branch, a base refresh may
 incorporate it into the blocked implementation PR. That update consumes only the exact refresh
 transition. It must not remove `ai-loop-blocked`, issue a fix request, dispatch `Resume AI Loop`, or
-trigger Codex. The runner records or derives one consumed transition identity bound to old HEAD,
-new HEAD, target base SHA, phase and blocking gate; another update cannot reuse it.
+trigger Codex. The workflow's confirmation mode records one consumed transition identity bound to old
+HEAD, new HEAD, target base SHA, phase and blocking gate on the new current HEAD; another update
+cannot reuse it.
 
 If another human-reviewed governance change reaches `main` before Design Approval, the original
-Gate is not authority for an arbitrary newer HEAD. The runner and preparation workflow walk at
-most 32 refresh edges back to the Gate HEAD. Every edge must be a two-parent merge with the
-previous PR HEAD first, the exact previously authorized default-branch SHA second, and a matching
-`github-actions[bot]` base-refresh status on that previous HEAD. Only that complete chain permits
-one more expected-HEAD refresh; it never permits Resume or implementation by itself.
+Gate is not authority for an arbitrary newer HEAD. After each exact-HEAD update, the runner invokes
+the approver-restricted confirmation mode of the same workflow. It verifies only the new HEAD's immediate edge: the
+previous PR HEAD is the first parent, the authorized default-branch SHA is the second parent, and
+the previous HEAD carries the matching `github-actions[bot]` authorization. The workflow then
+publishes a digest-bound `BASE_REFRESH_APPLIED` status on the new current HEAD. Only that current
+checkpoint permits one more expected-HEAD refresh; it never permits Resume or implementation by
+itself. Until the checkpoint exists, the runner remains in `REFRESH_AWAITING_CONFIRMATION`.
 
 The approver then invokes the separate `Approve AI Loop Design Resume` operation. The workflow
 revalidates the latest recurrence gate, unique adjacent phase base, current open PR, exact current

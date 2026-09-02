@@ -7,7 +7,11 @@ from pathlib import Path
 
 import pytest
 
-from automation.run_phase_loop import INVARIANT_FAMILIES, canonical_digest
+from automation.run_phase_loop import (
+    INVARIANT_FAMILIES,
+    base_refresh_checkpoint_payload,
+    canonical_digest,
+)
 from scripts.ci.validate_automation import (
     AutomationValidationError,
     strict_json_load,
@@ -450,38 +454,78 @@ if (!rejected) process.exit(1);
     )
 
 
-def test_blocked_base_refresh_chain_requires_status_for_every_merge_edge() -> None:
-    helper_path = REPO_ROOT / "automation" / "base_refresh_chain.js"
+def test_blocked_base_refresh_uses_one_current_head_checkpoint() -> None:
+    helper_path = REPO_ROOT / "automation" / "base_refresh_checkpoint.js"
     workflow = (
         REPO_ROOT / ".github" / "workflows" / "refresh-ai-loop-base.yml"
     ).read_text(encoding="utf-8")
-    assert "base_refresh_chain.js" in workflow
-    assert "verifyBlockedRefreshChain" in workflow
+    assert "base_refresh_checkpoint.js" in workflow
+    assert "verifyAppliedCheckpoint" in workflow
     assert "ready.head_sha !== authorization.reviewed_sha" in workflow
-    assert "authorization.reviewed_sha === expectedHeadSha || designStopAuthorization" in workflow
+    assert (
+        "authorization.reviewed_sha === expectedHeadSha || designStopAuthorization"
+        in workflow
+    )
+    assert "verifyPreparedRefreshEdge" in workflow
+    assert "BASE_REFRESH_APPLIED" in helper_path.read_text(encoding="utf-8")
+    for required_control in (
+        "AI_GATE_APPROVER_LOGIN",
+        "context.actor",
+        "pr.head.sha !== expectedHeadSha",
+        "defaultCommit.sha !== context.sha",
+        "ai-loop-blocked",
+        "contains a duplicate JSON key",
+        "authorization.reviewed_sha !== previousHeadSha",
+        "verifyAppliedCheckpoint",
+        "Pull request changed before checkpoint publication",
+        "createCommitStatus",
+    ):
+        assert required_control in workflow
+    permissions = workflow.split("\npermissions:\n", maxsplit=1)[1].split(
+        "\njobs:\n", maxsplit=1
+    )[0]
+    assert permissions.strip().splitlines() == [
+        "contents: read",
+        "  pull-requests: read",
+        "  statuses: write",
+    ]
+    for forbidden_operation in (
+        "github.rest.pulls.merge",
+        "updateBranch",
+        "contents: write",
+        "pull-requests: write",
+    ):
+        assert forbidden_operation not in workflow
 
     node = shutil.which("node")
     assert node is not None
     policy_test = """
 const control = require(process.argv[1]);
-const gate = 'a'.repeat(40);
-const first = 'b'.repeat(40);
-const firstBase = 'c'.repeat(40);
-const current = 'd'.repeat(40);
-const currentBase = 'e'.repeat(40);
+const previous = 'a'.repeat(40);
+const current = 'b'.repeat(40);
+const currentBase = 'c'.repeat(40);
 const gateReference = 'https://github.com/example/repo/pull/3#issuecomment-gate';
-const status = (base) => ({
-  context: `redteam/base-refresh/phase-0c/phase-0b/${base}`,
+const authorization = {
+  context: `redteam/base-refresh/phase-0c/phase-0b/${currentBase}`,
   state: 'success',
-  description: control.REFRESH_STATUS_DESCRIPTION,
+  description: control.AUTHORIZATION_STATUS_DESCRIPTION,
   target_url: gateReference,
   creator: {login: 'github-actions[bot]'},
-});
-const commits = {
-  [current]: {sha: current, parents: [{sha: first}, {sha: currentBase}]},
-  [first]: {sha: first, parents: [{sha: gate}, {sha: firstBase}]},
 };
-const statuses = {[first]: [status(currentBase)], [gate]: [status(firstBase)]};
+const payload = control.checkpointPayload({
+  headSha: current, previousHeadSha: previous, targetBaseSha: currentBase,
+  sourcePhase: 'phase-0c', revalidationPhase: 'phase-0b',
+  authorizationReference: gateReference,
+});
+const applied = {
+  context: `${control.CHECKPOINT_STATUS_PREFIX}${control.checkpointDigest(payload)}`,
+  state: 'success', description: control.CHECKPOINT_STATUS_DESCRIPTION,
+  target_url: gateReference, creator: {login: 'github-actions[bot]'},
+};
+const commits = {[current]: {
+  sha: current, parents: [{sha: previous}, {sha: currentBase}],
+}};
+const statuses = {[previous]: [authorization], [current]: [applied]};
 const github = {
   rest: {
     git: {getCommit: async ({commit_sha}) => ({data: commits[commit_sha]})},
@@ -490,18 +534,23 @@ const github = {
   paginate: async (_method, {ref}) => statuses[ref] || [],
 };
 (async () => {
-  const edges = await control.verifyBlockedRefreshChain({
-    github, owner: 'example', repo: 'repo', currentHeadSha: current,
-    gateHeadSha: gate, gateReference, sourcePhase: 'phase-0c',
+  await control.verifyPreparedRefreshEdge({
+    github, owner: 'example', repo: 'repo', headSha: current,
+    previousHeadSha: previous, targetBaseSha: currentBase,
+    authorizationReference: gateReference, sourcePhase: 'phase-0c',
     revalidationPhase: 'phase-0b',
   });
-  if (edges.length !== 2) process.exit(1);
-  delete statuses[first];
+  await control.verifyAppliedCheckpoint({
+    github, owner: 'example', repo: 'repo', headSha: current,
+    authorizationReference: gateReference, sourcePhase: 'phase-0c',
+    revalidationPhase: 'phase-0b',
+  });
+  applied.context = `${control.CHECKPOINT_STATUS_PREFIX}${'0'.repeat(64)}`;
   let rejected = false;
   try {
-    await control.verifyBlockedRefreshChain({
-      github, owner: 'example', repo: 'repo', currentHeadSha: current,
-      gateHeadSha: gate, gateReference, sourcePhase: 'phase-0c',
+    await control.verifyAppliedCheckpoint({
+      github, owner: 'example', repo: 'repo', headSha: current,
+      authorizationReference: gateReference, sourcePhase: 'phase-0c',
       revalidationPhase: 'phase-0b',
     });
   } catch (_) {
@@ -515,6 +564,36 @@ const github = {
         cwd=REPO_ROOT,
         check=True,
     )
+
+
+def test_checkpoint_digest_is_identical_in_python_and_workflow_javascript() -> None:
+    helper_path = REPO_ROOT / "automation" / "base_refresh_checkpoint.js"
+    payload = base_refresh_checkpoint_payload(
+        head_sha="b" * 40,
+        previous_head_sha="a" * 40,
+        target_base_sha="c" * 40,
+        source_phase="phase-0c",
+        revalidation_phase="phase-0b",
+        authorization_reference=(
+            "https://github.com/example/repo/pull/3#issuecomment-gate"
+        ),
+    )
+    node = shutil.which("node")
+    assert node is not None
+    script = """
+const control = require(process.argv[1]);
+const payload = JSON.parse(process.argv[2]);
+process.stdout.write(control.checkpointDigest(payload));
+"""
+    result = subprocess.run(  # noqa: S603 - fixed node executable and test-only source.
+        [node, "-e", script, str(helper_path), json.dumps(payload)],
+        cwd=REPO_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.stdout == canonical_digest(payload)
 
 
 def test_generic_resume_and_recovery_reject_design_stop() -> None:

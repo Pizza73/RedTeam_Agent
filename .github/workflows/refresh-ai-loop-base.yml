@@ -15,6 +15,11 @@ on:
         description: Exact current 40-character PR head SHA
         required: true
         type: string
+      previous_head_sha:
+        description: Exact pre-refresh PR HEAD; set only when confirming an applied refresh
+        required: false
+        default: ""
+        type: string
       target_base_sha:
         description: Exact current default-branch SHA to incorporate
         required: true
@@ -24,7 +29,7 @@ on:
         required: true
         type: string
       confirmation:
-        description: Type REFRESH_AI_LOOP_BASE
+        description: Type REFRESH_AI_LOOP_BASE or CONFIRM_AI_LOOP_BASE_REFRESH
         required: true
         type: string
 
@@ -46,6 +51,7 @@ jobs:
       AI_REVIEWER_LOGIN: ${{ vars.AI_REVIEWER_LOGIN }}
       CONFIRMATION: ${{ inputs.confirmation }}
       EXPECTED_HEAD_SHA: ${{ inputs.expected_head_sha }}
+      PREVIOUS_HEAD_SHA: ${{ inputs.previous_head_sha }}
       PR_NUMBER: ${{ inputs.pull_request_number }}
       PRIOR_PASS_REFERENCE: ${{ inputs.prior_pass_reference }}
       SOURCE_PHASE: ${{ inputs.source_phase }}
@@ -61,10 +67,13 @@ jobs:
         with:
           script: |
             const path = require('path');
-            const refreshChain = require(path.join(
-              process.env.GITHUB_WORKSPACE, 'automation', 'base_refresh_chain.js'
+            const refreshCheckpoint = require(path.join(
+              process.env.GITHUB_WORKSPACE, 'automation', 'base_refresh_checkpoint.js'
             ));
-            if (process.env.CONFIRMATION !== 'REFRESH_AI_LOOP_BASE') {
+            const isPreparation = process.env.CONFIRMATION === 'REFRESH_AI_LOOP_BASE';
+            const isConfirmation =
+              process.env.CONFIRMATION === 'CONFIRM_AI_LOOP_BASE_REFRESH';
+            if (!isPreparation && !isConfirmation) {
               core.setFailed('Confirmation text does not match.');
               return;
             }
@@ -77,13 +86,16 @@ jobs:
             const repo = context.repo.repo;
             const pull_number = Number.parseInt(process.env.PR_NUMBER, 10);
             const expectedHeadSha = process.env.EXPECTED_HEAD_SHA.trim();
+            const previousHeadSha = process.env.PREVIOUS_HEAD_SHA.trim();
             const targetBaseSha = process.env.TARGET_BASE_SHA.trim();
             const priorPassReference = process.env.PRIOR_PASS_REFERENCE.trim();
             const sourcePhase = process.env.SOURCE_PHASE.trim();
             if (
               !Number.isInteger(pull_number) || pull_number < 1 ||
               !/^[0-9a-f]{40}$/.test(expectedHeadSha) ||
-              !/^[0-9a-f]{40}$/.test(targetBaseSha)
+              !/^[0-9a-f]{40}$/.test(targetBaseSha) ||
+              (isConfirmation && !/^[0-9a-f]{40}$/.test(previousHeadSha)) ||
+              (isPreparation && previousHeadSha !== '')
             ) {
               core.setFailed('Pull request number or SHA input is invalid.');
               return;
@@ -199,6 +211,7 @@ jobs:
             const { data: pr } = await github.rest.pulls.get({owner, repo, pull_number});
             const defaultBranch = context.payload.repository.default_branch;
             if (
+              context.ref !== `refs/heads/${defaultBranch}` ||
               pr.state !== 'open' || pr.head.repo.full_name !== `${owner}/${repo}` ||
               pr.base.ref !== defaultBranch || pr.head.sha !== expectedHeadSha
             ) {
@@ -208,17 +221,23 @@ jobs:
             const { data: defaultCommit } = await github.rest.repos.getCommit({
               owner, repo, ref: defaultBranch,
             });
-            if (defaultCommit.sha !== targetBaseSha) {
-              core.setFailed('The target base SHA is no longer the current default branch.');
+            if (defaultCommit.sha !== context.sha) {
+              core.setFailed('Base-refresh workflow code is not the current default-branch revision.');
               return;
             }
-            const comparison = await github.request(
-              'GET /repos/{owner}/{repo}/compare/{basehead}',
-              {owner, repo, basehead: `${expectedHeadSha}...${targetBaseSha}`}
-            );
-            if (!Number.isInteger(comparison.data.ahead_by) || comparison.data.ahead_by < 1) {
-              core.setFailed('The default branch has no commit to incorporate.');
-              return;
+            if (isPreparation) {
+              if (defaultCommit.sha !== targetBaseSha) {
+                core.setFailed('The target base SHA is no longer the current default branch.');
+                return;
+              }
+              const comparison = await github.request(
+                'GET /repos/{owner}/{repo}/compare/{basehead}',
+                {owner, repo, basehead: `${expectedHeadSha}...${targetBaseSha}`}
+              );
+              if (!Number.isInteger(comparison.data.ahead_by) || comparison.data.ahead_by < 1) {
+                core.setFailed('The default branch has no commit to incorporate.');
+                return;
+              }
             }
 
             const { data: planFile } = await github.rest.repos.getContent({
@@ -301,7 +320,8 @@ jobs:
               authorization.loop_state === 'PASS' && authorization.finding_key === null;
             const isBlockedCurrentPhase = commonAuthorizationValid &&
               currentPhase === previousPhase && sourceIndex > 1 && sourceIndex <= 6 &&
-              (authorization.reviewed_sha === expectedHeadSha || designStopAuthorization) &&
+              (authorization.reviewed_sha === expectedHeadSha || designStopAuthorization ||
+                (isConfirmation && authorization.reviewed_sha === previousHeadSha)) &&
               authorization.verdict === 'CHANGES_REQUESTED' &&
               authorization.loop_state === 'BLOCKED_LIMIT' &&
               /^[A-Z0-9][A-Z0-9._-]{0,63}$/.test(authorization.finding_key) &&
@@ -338,20 +358,22 @@ jobs:
                 core.setFailed('Blocked current-Phase authorization is incomplete.');
                 return;
               }
-              try {
-                await refreshChain.verifyBlockedRefreshChain({
-                  github, owner, repo,
-                  currentHeadSha: expectedHeadSha,
-                  gateHeadSha: authorization.reviewed_sha,
-                  gateReference: priorPassReference,
-                  sourcePhase,
-                  revalidationPhase: currentPhase,
-                });
-              } catch (error) {
-                core.setFailed(
-                  error instanceof Error ? error.message : 'Blocked refresh chain validation failed.'
-                );
-                return;
+              if (!isConfirmation && authorization.reviewed_sha !== expectedHeadSha) {
+                try {
+                  await refreshCheckpoint.verifyAppliedCheckpoint({
+                    github, owner, repo,
+                    headSha: expectedHeadSha,
+                    authorizationReference: priorPassReference,
+                    sourcePhase,
+                    revalidationPhase: currentPhase,
+                  });
+                } catch (error) {
+                  core.setFailed(
+                    error instanceof Error ? error.message :
+                      'Current-HEAD base-refresh checkpoint validation failed.'
+                  );
+                  return;
+                }
               }
               const basePhase = plan.phases[sourceIndex - 2].id;
               const basePasses = [];
@@ -392,6 +414,10 @@ jobs:
                 return;
               }
             } else {
+              if (isConfirmation) {
+                core.setFailed('Only a blocked current-Phase refresh can be confirmed.');
+                return;
+              }
               if (!labels.includes('ai-needs-implementation')) {
                 core.setFailed(
                   'Normal base refresh is allowed only before current-phase implementation.'
@@ -482,6 +508,65 @@ jobs:
                 );
                 return;
               }
+            }
+
+            if (isConfirmation) {
+              if (!isBlockedCurrentPhase || !labels.includes('ai-loop-blocked')) {
+                core.setFailed('Refresh confirmation requires the exact blocked Phase state.');
+                return;
+              }
+              try {
+                if (authorization.reviewed_sha !== previousHeadSha) {
+                  if (!designStopAuthorization) {
+                    throw new Error(
+                      'Non-design blocked Gate cannot cross more than one refresh edge.'
+                    );
+                  }
+                  await refreshCheckpoint.verifyAppliedCheckpoint({
+                    github, owner, repo,
+                    headSha: previousHeadSha,
+                    authorizationReference: priorPassReference,
+                    sourcePhase,
+                    revalidationPhase: currentPhase,
+                  });
+                }
+                const checkpointPayload =
+                  await refreshCheckpoint.verifyPreparedRefreshEdge({
+                    github, owner, repo,
+                    headSha: expectedHeadSha,
+                    previousHeadSha,
+                    targetBaseSha,
+                    sourcePhase,
+                    revalidationPhase: currentPhase,
+                    authorizationReference: priorPassReference,
+                  });
+                const checkpointContext =
+                  `${refreshCheckpoint.CHECKPOINT_STATUS_PREFIX}` +
+                  refreshCheckpoint.checkpointDigest(checkpointPayload);
+                if (checkpointContext.length > 100) {
+                  throw new Error('Base-refresh checkpoint context exceeds GitHub limits.');
+                }
+                const {data: livePr} = await github.rest.pulls.get({
+                  owner, repo, pull_number,
+                });
+                const liveLabels = livePr.labels.map((item) => item.name).sort();
+                if (livePr.state !== 'open' || livePr.head.sha !== expectedHeadSha ||
+                    JSON.stringify(liveLabels) !== JSON.stringify([...labels].sort())) {
+                  throw new Error('Pull request changed before checkpoint publication.');
+                }
+                await github.rest.repos.createCommitStatus({
+                  owner, repo, sha: expectedHeadSha, state: 'success',
+                  context: checkpointContext,
+                  description: refreshCheckpoint.CHECKPOINT_STATUS_DESCRIPTION,
+                  target_url: priorPassReference,
+                });
+              } catch (error) {
+                core.setFailed(
+                  error instanceof Error ? error.message :
+                    'Base-refresh checkpoint validation failed.'
+                );
+              }
+              return;
             }
 
             await github.rest.repos.createCommitStatus({
