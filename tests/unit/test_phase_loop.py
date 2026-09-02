@@ -2079,6 +2079,56 @@ def test_completed_refresh_without_checkpoint_awaits_confirmation() -> None:
     assert pending == (gate, HEAD_SHA, DEFAULT_BRANCH_SHA)
 
 
+def test_completed_blocked_refresh_repairs_missing_stop_projection() -> None:
+    base_pass, gate = blocked_refresh_records()
+    prepared = base_refresh_status(
+        from_phase="phase-0c",
+        revalidate_phase="phase-0b",
+        target_url=gate.url,
+    )
+    loop, github = blocked_refresh_loop({HEAD_SHA: [prepared]})
+    github.ancestors.add((HEAD_SHA, REFRESHED_HEAD_SHA))
+    state = replace(
+        blocked_phase_state(),
+        head_sha=REFRESHED_HEAD_SHA,
+        labels=frozenset({"ai-loop", "ai-needs-implementation", "phase-0b"}),
+    )
+
+    pending = loop.pending_base_refresh_checkpoint(state, [base_pass, gate])
+
+    assert pending == (gate, HEAD_SHA, DEFAULT_BRANCH_SHA)
+
+
+def test_unblocked_non_refresh_output_does_not_request_a_checkpoint() -> None:
+    base_pass, gate = blocked_refresh_records()
+    loop, _github = blocked_refresh_loop({})
+    state = replace(
+        blocked_phase_state(),
+        head_sha=IMPLEMENTATION_OUTPUT_HEAD_SHA,
+        labels=frozenset({"ai-loop", "ai-needs-implementation", "phase-0b"}),
+    )
+
+    assert loop.pending_base_refresh_checkpoint(state, [base_pass, gate]) is None
+
+
+def test_unblocked_prior_pass_refresh_is_not_a_blocker_checkpoint() -> None:
+    base_pass, gate = blocked_refresh_records()
+    prepared = base_refresh_status(
+        from_phase="phase-0c",
+        revalidate_phase="phase-0b",
+        target_url=base_pass.url,
+    )
+    loop, github = blocked_refresh_loop({HEAD_SHA: [prepared]})
+    github.ancestors.add((HEAD_SHA, REFRESHED_HEAD_SHA))
+    state = replace(
+        blocked_phase_state(),
+        head_sha=REFRESHED_HEAD_SHA,
+        labels=frozenset({"ai-loop", "ai-needs-implementation", "phase-0b"}),
+    )
+
+    assert loop.pending_base_refresh_checkpoint(state, [base_pass, gate]) is None
+
+
 def test_pending_checkpoint_dispatches_one_exact_confirmation() -> None:
     _base_pass, gate = design_stop_refresh_records()
     loop, github = blocked_refresh_loop({})

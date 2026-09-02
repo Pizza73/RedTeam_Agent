@@ -244,6 +244,13 @@ checkpoint permits one more expected-HEAD refresh. This applies to both ordinary
 and Design Stop gates; it never permits Resume or implementation by itself. Until the checkpoint
 exists, the runner remains in `REFRESH_AWAITING_CONFIRMATION`.
 
+A blocked-Phase refresh also restores `ai-loop-blocked` and removes stale lifecycle projections
+before it authorizes the branch update. This is required when a trusted Resume already removed the
+stop latch but `main` advanced before implementation began. If an older transition already applied
+the exact two-parent refresh without restoring the latch, confirmation may repair that projection
+only after it revalidates the same Gate, prepared status, previous HEAD, target base and current
+HEAD. The repair does not create an implementation request.
+
 On a checkpointed HEAD, the runner and generic Resume workflow resolve the blocking Gate directly
 from the checkpoint's authorization permalink. They do not recompute a maximal Gate by comparing
 every historical Gate pair. A bot-authored current-HEAD Gate supersedes the checkpoint and blocks

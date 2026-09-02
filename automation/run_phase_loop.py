@@ -1987,7 +1987,8 @@ class PhaseLoop:
         phase_records: list[MarkerEvidence],
     ) -> tuple[MarkerEvidence, str, str] | None:
         """Find one completed refresh edge that still needs current-HEAD certification."""
-        if "ai-loop-blocked" not in state.labels:
+        recovery_projection = "ai-loop-blocked" not in state.labels
+        if recovery_projection and "ai-needs-implementation" not in state.labels:
             return None
         if any(
             record.payload.get("phase") == state.phase
@@ -2002,6 +2003,8 @@ class PhaseLoop:
             return None
         parents = self.github.commit_parents(state.head_sha)
         if len(parents) != 2 or parents[0] == parents[1]:
+            if recovery_projection:
+                return None
             raise UntrustedEvidenceError(
                 "base-refresh checkpoint requires one exact two-parent merge"
             )
@@ -2020,6 +2023,8 @@ class PhaseLoop:
             canonical_digest(record.payload) for record in prepared
         }
         if len(prepared_identities) != 1:
+            if recovery_projection and not prepared:
+                return None
             raise UntrustedEvidenceError(
                 "refresh edge lacks one trusted previous-HEAD authorization"
             )
@@ -2037,6 +2042,8 @@ class PhaseLoop:
             for record in gate_candidates
         }
         if len(gate_identities) != 1:
+            if recovery_projection and not gate_candidates:
+                return None
             raise UntrustedEvidenceError(
                 "refresh edge is not bound to one blocking Phase Gate"
             )
