@@ -4535,6 +4535,9 @@ class ArtifactStore:
         return value
 
 
+_SECRET_INJECTION_TOKEN = object()
+
+
 class SecretStore:
     def __init__(
         self,
@@ -4971,6 +4974,26 @@ class SecretStore:
         execution_id: str,
         now: datetime,
     ) -> bytes:
+        del reference, execution_id, now
+        raise SecretAccessError(
+            "direct Secret plaintext resolution is unavailable; use the injection broker"
+        )
+
+    def _resolve_for_injection(
+        self,
+        reference: SecretReferenceMetadata,
+        *,
+        claim: object,
+        now: datetime,
+        token: object,
+    ) -> bytearray:
+        from redteam_agent.models.execution import DispatchClaim
+
+        if token is not _SECRET_INJECTION_TOKEN or type(claim) is not DispatchClaim:
+            raise SecretAccessError("Secret injection authority is invalid")
+        if claim.execution_id == "" or claim.consumed_at is not None:
+            raise SecretAccessError("Dispatch Claim is invalid or consumed")
+        execution_id = claim.execution_id
         del now
         operation_time = self._trusted_time()
         self._sweep_expired_secrets(
@@ -5005,12 +5028,12 @@ class SecretStore:
             now=operation_time,
         )
         try:
-            return self._release_authorized_secret(
+            return bytearray(self._release_authorized_secret(
                 authoritative,
                 source_execution_id=source_execution_id,
                 version=version,
                 now=operation_time,
-            )
+            ))
         except Exception as failure:
             failure.__traceback__ = None
         raise SecretAccessError("secret resolution failed closed")

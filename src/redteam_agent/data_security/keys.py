@@ -35,6 +35,7 @@ from redteam_agent.errors import (
 )
 from redteam_agent.models.base import StrictImmutableBoundaryModel
 
+from .generations import AuthenticatedGenerationCoordinator
 from .models import EncryptedPayload, EncryptionMetadata, KeyDomain, RotationState
 
 ALGORITHM = "HMAC-SHA256-STREAM-v1"
@@ -665,9 +666,21 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
         *,
         state_path: Path,
         wrapping_key: bytes,
-        generation_store: KeyStateGenerationStore,
+        generation_store: KeyStateGenerationStore | None = None,
+        generation_coordinator: AuthenticatedGenerationCoordinator | None = None,
     ) -> None:
         super().__init__()
+        if (generation_store is None) == (generation_coordinator is None):
+            raise EncryptionKeyUnavailableError(
+                "exactly one key-state generation authority is required"
+            )
+        if (
+            generation_coordinator is not None
+            and generation_coordinator.namespace != "wrapped-key-state"
+        ):
+            raise EncryptionKeyUnavailableError(
+                "key-state generation namespace is invalid"
+            )
         if len(wrapping_key) < 32:
             raise EncryptionKeyUnavailableError(
                 "key-state wrapping material does not meet provider policy"
@@ -701,6 +714,7 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
         )
         self._wrapping_key = bytes(wrapping_key)
         self._generation_store = generation_store
+        self._generation_coordinator = generation_coordinator
         self._generation = 0
         self._state_lock_path = parent / f".{absolute_path.name}.lock"
         self._state_lock = RLock()
@@ -1015,12 +1029,43 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
             raise EncryptionKeyUnavailableError(
                 "key-state file exceeds provider limit"
             )
+        if self._generation_coordinator is not None:
+            current_anchor = self._generation_coordinator.current_anchor()
+            if (0 if current_anchor is None else current_anchor.generation) != (
+                expected_generation
+            ):
+                raise EncryptionKeyUnavailableError(
+                    "external key-state generation changed"
+                )
+            try:
+                committed = self._generation_coordinator.commit(
+                    wrapped,
+                    expected_anchor_digest=(
+                        None
+                        if current_anchor is None
+                        else current_anchor.anchor_digest
+                    ),
+                )
+            except Exception as exc:
+                raise EncryptionKeyUnavailableError(
+                    "content-bound key-state generation is unavailable"
+                ) from exc
+            if committed.generation != generation:
+                raise EncryptionKeyUnavailableError(
+                    "content-bound key-state generation mismatch"
+                )
+            self._generation = generation
+            self._load_persisted_state(
+                directory_descriptor=directory_descriptor
+            )
+            return
         target_path = self._state_path_for_generation(generation)
         self._write_wrapped_state_locked(
             target_path,
             wrapped,
             directory_descriptor=directory_descriptor,
         )
+        assert self._generation_store is not None
         try:
             advanced = self._generation_store.compare_and_set_generation(
                 expected=expected_generation,
@@ -1071,10 +1116,22 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
         external_generation = self._external_generation()
         if external_generation == 0:
             raise EncryptionKeyUnavailableError("key-state file is unavailable")
-        raw = self._read_wrapped_state(
-            self._state_path_for_generation(external_generation),
-            directory_descriptor=directory_descriptor,
-        )
+        if self._generation_coordinator is None:
+            raw = self._read_wrapped_state(
+                self._state_path_for_generation(external_generation),
+                directory_descriptor=directory_descriptor,
+            )
+        else:
+            try:
+                anchor, raw = self._generation_coordinator.recover()
+            except Exception as exc:
+                raise EncryptionKeyUnavailableError(
+                    "content-bound key-state generation is unavailable"
+                ) from exc
+            if anchor.generation != external_generation:
+                raise EncryptionKeyUnavailableError(
+                    "content-bound key-state generation mismatch"
+                )
         try:
             duplicate_free = canonical_loads(raw)
             wrapped = _WrappedKeyState.model_validate_json(
@@ -1129,6 +1186,15 @@ class WrappedFileEncryptionKeyProvider(InMemoryEncryptionKeyProvider):
         return self._state_paths[0 if generation % 2 else 1]
 
     def _external_generation(self) -> int:
+        if self._generation_coordinator is not None:
+            try:
+                anchor = self._generation_coordinator.current_anchor()
+            except Exception as exc:
+                raise EncryptionKeyUnavailableError(
+                    "content-bound key-state generation is unavailable"
+                ) from exc
+            return 0 if anchor is None else anchor.generation
+        assert self._generation_store is not None
         try:
             generation = self._generation_store.current_generation()
         except Exception as exc:

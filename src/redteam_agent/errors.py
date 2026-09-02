@@ -199,5 +199,9 @@ class AuditSequenceConflictError(RedTeamAgentError):
     """A mission audit event conflicted with its atomic sequence allocation."""
 
 
+class AuthenticatedGenerationError(RedTeamAgentError):
+    """A content-bound generation anchor or immutable blob failed closed."""
+
+
 class SandboxCapabilityStaleError(SandboxRuntimeBindingError):
     """Current sandbox enforcement no longer matches the trusted capability snapshot."""

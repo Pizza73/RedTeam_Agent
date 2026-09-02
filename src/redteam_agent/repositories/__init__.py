@@ -9,11 +9,15 @@ from .capabilities import (
 )
 from .context import ContextAuthorizationRepository, ContextResourceIndexRepository
 from .execution import (
+    DispatchClaimRepository,
     ExecutionRepository,
     ExecutionResultRepository,
+    QuarantineDeletionIntentRepository,
     RawResultReceiptRepository,
     RawResultRecoveryRepository,
+    ResultCollectionAuthorityRepository,
     ResultIngestionRepository,
+    SecureIngestionManifestRepository,
     WorkflowRunRepository,
 )
 from .llm import LLMProfileRepository
@@ -31,6 +35,7 @@ __all__ = [
     "AuthorizationRuntimeBindingRepository",
     "ContextAuthorizationRepository",
     "ContextResourceIndexRepository",
+    "DispatchClaimRepository",
     "ExecutionRepository",
     "ExecutionResultRepository",
     "LLMProfileRepository",
@@ -41,12 +46,15 @@ __all__ = [
     "PlanRepository",
     "PolicyDecisionRepository",
     "PolicyStateRepository",
+    "QuarantineDeletionIntentRepository",
     "RawResultReceiptRepository",
     "RawResultRecoveryRepository",
+    "ResultCollectionAuthorityRepository",
     "RemoteMCPTrustSnapshotRepository",
     "SandboxCapabilitySnapshotRepository",
     "SessionSecurityContextSnapshotRepository",
     "ToolRegistryRepository",
     "ResultIngestionRepository",
+    "SecureIngestionManifestRepository",
     "WorkflowRunRepository",
 ]

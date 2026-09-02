@@ -17,6 +17,7 @@ from .tools import ToolRef
 ProviderExecutionState = Literal[
     "PLANNED",
     "AUTHORIZED",
+    "DISPATCH_CLAIMED",
     "DISPATCHED",
     "RUNNING",
     "SUCCEEDED",
@@ -31,6 +32,9 @@ ResultIngestionStatus = Literal[
     "NOT_AVAILABLE",
     "PENDING",
     "INGESTING",
+    "INGESTED_DURABLE",
+    "DELETE_PENDING",
+    "QUARANTINE_ERASED",
     "SUCCEEDED",
     "FAILED",
     "QUARANTINED",
@@ -60,6 +64,105 @@ ReconciliationStatus = Literal[
     "UNKNOWN",
     "UNSUPPORTED",
 ]
+
+
+class DispatchClaim(StrictImmutableBoundaryModel):
+    """Durable, non-bearer evidence that one provider submit attempt was claimed."""
+
+    claim_id: str = Field(min_length=1)
+    claim_digest: str = Field(min_length=1)
+    execution_id: str = Field(min_length=1)
+    execution_state_version: int = Field(ge=1)
+    mission_id: str = Field(min_length=1)
+    mission_revision: int = Field(ge=1)
+    authorization_epoch: int = Field(ge=0)
+    policy_decision_id: str = Field(min_length=1)
+    authorization_digest: str = Field(min_length=1)
+    tool_ref: ToolRef
+    adapter_id: str = Field(min_length=1)
+    approval_request_id: str | None = None
+    approval_record_id: str | None = None
+    idempotency_key: str = Field(min_length=1)
+    issued_at: UtcDatetime
+    expires_at: UtcDatetime
+    consumed_at: UtcDatetime | None = None
+
+    @model_validator(mode="after")
+    def claim_window_is_valid(self) -> DispatchClaim:
+        if self.issued_at >= self.expires_at:
+            raise ValueError("dispatch claim expiry must follow issuance")
+        if self.consumed_at is not None and not (
+            self.issued_at <= self.consumed_at < self.expires_at
+        ):
+            raise ValueError("dispatch claim consumption is outside its validity window")
+        return self
+
+
+class ResultCollectionAuthority(StrictImmutableBoundaryModel):
+    """Persisted exact-tool authority for one provider-result collection stream."""
+
+    authority_id: str = Field(min_length=1)
+    authority_digest: str = Field(min_length=1)
+    execution_id: str = Field(min_length=1)
+    provider_task_id: str = Field(min_length=1)
+    mission_id: str = Field(min_length=1)
+    mission_revision: int = Field(ge=1)
+    authorization_epoch: int = Field(ge=0)
+    tool_ref: ToolRef
+    registry_digest: str = Field(min_length=1)
+    sink_id: str = Field(min_length=1)
+    max_result_bytes: int = Field(gt=0)
+    system_hard_output_cap: int = Field(gt=0)
+    collection_started_at: UtcDatetime
+    retention_until: UtcDatetime
+
+    @model_validator(mode="after")
+    def collection_window_is_valid(self) -> ResultCollectionAuthority:
+        if self.collection_started_at >= self.retention_until:
+            raise ValueError("result collection retention must follow collection start")
+        if self.max_result_bytes > self.system_hard_output_cap:
+            raise ValueError("result collection limit exceeds the system hard cap")
+        return self
+
+
+class DurableIngestionResource(StrictImmutableBoundaryModel):
+    resource_type: Literal[
+        "redacted_artifact", "encrypted_raw_artifact", "secret_reference"
+    ]
+    resource_id: str = Field(min_length=1)
+    resource_digest: str = Field(min_length=1)
+
+
+class SecureIngestionManifest(StrictImmutableBoundaryModel):
+    """Read-back-verifiable application commit preceding quarantine erasure."""
+
+    manifest_id: str = Field(min_length=1)
+    manifest_digest: str = Field(min_length=1)
+    ingestion_id: str = Field(min_length=1)
+    secure_ingestion_id: str = Field(min_length=1)
+    execution_id: str = Field(min_length=1)
+    receipt_id: str = Field(min_length=1)
+    receipt_digest: str = Field(min_length=1)
+    quarantine_id: str = Field(min_length=1)
+    quarantine_digest: str = Field(min_length=1)
+    rule_version: str = Field(min_length=1)
+    resources: tuple[DurableIngestionResource, ...]
+    redaction_metadata_digest: str = Field(min_length=1)
+    created_at: UtcDatetime
+
+
+class QuarantineDeletionIntent(StrictImmutableBoundaryModel):
+    """Durable manifest-bound authorization to erase one quarantine object."""
+
+    intent_id: str = Field(min_length=1)
+    intent_digest: str = Field(min_length=1)
+    ingestion_id: str = Field(min_length=1)
+    execution_id: str = Field(min_length=1)
+    manifest_id: str = Field(min_length=1)
+    manifest_digest: str = Field(min_length=1)
+    receipt_id: str = Field(min_length=1)
+    quarantine_id: str = Field(min_length=1)
+    created_at: UtcDatetime
 
 
 class ExecutionRetryPolicy(StrictImmutableBoundaryModel):
@@ -147,6 +250,7 @@ class ExecutionRecord(StrictImmutableBoundaryModel):
         ):
             raise ValueError("pre-dispatch execution cannot contain provider state")
         post_dispatch = {
+            "DISPATCH_CLAIMED",
             "DISPATCHED",
             "RUNNING",
             "SUCCEEDED",
@@ -157,7 +261,7 @@ class ExecutionRecord(StrictImmutableBoundaryModel):
             "OUTCOME_UNKNOWN",
         }
         if self.provider_execution_state in post_dispatch and self.dispatch_attempts != 1:
-            raise ValueError("post-dispatch execution requires exactly one submit attempt")
+            raise ValueError("claimed/post-dispatch execution requires one submit claim")
         confirmed_task_states = {
             "RUNNING",
             "SUCCEEDED",
@@ -256,6 +360,9 @@ class ResultIngestionRecord(StrictImmutableBoundaryModel):
         if self.status in {
             "PENDING",
             "INGESTING",
+            "INGESTED_DURABLE",
+            "DELETE_PENDING",
+            "QUARANTINE_ERASED",
             "SUCCEEDED",
             "FAILED",
             "QUARANTINED",

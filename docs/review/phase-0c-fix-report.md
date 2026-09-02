@@ -474,6 +474,137 @@ PHASE_GATE=phase-0c PASS
 - A fresh independent Phase 0C review remains required on the resulting 40-character PR HEAD; this
   local PASS is not an independent Phase Gate PASS.
 
+## Thirty-first design-approved coherent redesign cycle
+
+Current phase: **Phase 0C — Data Security Foundation**.
+
+Input review SHA: `edd6ed62db38d53f3bda6ebb59327b5f32175178`.
+
+Trusted Phase 0C base: `5cda9a5f8792ee33c3e153d8e791499f5619d82e`.
+
+Implementation request:
+[`issuecomment-5503202054`](https://github.com/Pizza73/RedTeam_Agent/pull/3#issuecomment-5503202054).
+
+Human-approved design:
+[`issuecomment-5503201808`](https://github.com/Pizza73/RedTeam_Agent/pull/3#issuecomment-5503201808).
+
+Input native review:
+[`pullrequestreview-5081290374`](https://github.com/Pizza73/RedTeam_Agent/pull/3#pullrequestreview-5081290374).
+
+### Findings addressed
+
+The six retained P1 findings were resolved as one coherent lifecycle redesign rather than six
+independent exceptions:
+
+1. **Full-object publication minting:** public full-object Artifact/Secret publication factories,
+   legacy receipt loading, and receipt-taking ingestion entry points now deny. The supported path
+   is a bounded stream into trusted Quarantine followed by repository-owned ingestion lookup.
+2. **Pre-dispatch Secret resolution:** an Executor first persists an exact `DISPATCH_CLAIMED`
+   execution/claim transition. `SecretStore.resolve` never returns plaintext. A
+   `SecretInjectionBroker` revalidates the exact current claim with its trusted clock, selects a
+   fixed adapter channel from trusted configuration, injects directly, consumes the claim even on
+   channel failure, and zeroes its temporary plaintext buffer. Restart after a submit crash enters
+   reconciliation and cannot replay submit.
+3. **Caller-selected result bounds:** a durable `ResultCollectionAuthority` binds execution,
+   adapter, tool, provider task, Quarantine sink, collection start, deadline, and the lower of the
+   trusted tool limit and system cap. Restart reloads the same authority instead of accepting new
+   limits or destinations.
+4. **Deletion before durable ingestion state:** secure ingestion now follows explicit paired
+   execution/ingestion states: `INGESTING`, `INGESTED_DURABLE`, `DELETE_PENDING`,
+   `QUARANTINE_ERASED`, and `SUCCEEDED`. It persists and verifies both the secure ingestion
+   manifest and exact deletion intent before Quarantine erasure, then resumes idempotently from the
+   immutable repositories.
+5. **Post-CAS generation recoverability:** wrapped-key state and audit-head state can use a shared
+   content-bound generation protocol with separate namespaces. Each authenticated anchor binds the
+   namespace, generation, immutable blob identifier, state digest, and previous-anchor digest.
+   Recovery loads the exact external blob, so a local pathname swap, missing blob, or corrupt blob
+   fails closed rather than making a committed generation unrecoverable.
+6. **Retention starting after collection:** Quarantine retention is derived once from the trusted
+   collection start and capped by the Mission deadline. A delayed collection or restart cannot
+   reset or extend it.
+
+The redesign also adds schema migration version 5 and repository integrity checks for dispatch
+claims, collection authorities, ingestion manifests, deletion intents, and ingestion lifecycle
+state. The Phase 0C invariant audit was updated for all seven required security families.
+
+### Modified files and regression tests
+
+Resulting working-tree diff before this report entry: `19 files changed, 2391 insertions(+), 545 deletions(-)`.
+
+- `src/redteam_agent/data_security/__init__.py`
+- `src/redteam_agent/data_security/audit.py`
+- `src/redteam_agent/data_security/authorization.py`
+- `src/redteam_agent/data_security/generations.py`
+- `src/redteam_agent/data_security/ingestion.py`
+- `src/redteam_agent/data_security/keys.py`
+- `src/redteam_agent/data_security/secret_injection.py`
+- `src/redteam_agent/data_security/stores.py`
+- `src/redteam_agent/data_security/streaming.py`
+- `src/redteam_agent/errors.py`
+- `src/redteam_agent/executor/ingestion.py`
+- `src/redteam_agent/executor/service.py`
+- `src/redteam_agent/models/execution.py`
+- `src/redteam_agent/repositories/__init__.py`
+- `src/redteam_agent/repositories/execution.py`
+- `src/redteam_agent/storage/migrations.py`
+- `tests/security/test_gate_review_regressions.py`
+- `tests/security/test_phase0c_data_security.py`
+- `docs/review/phase-0c-invariant-audit.json`
+- `docs/review/phase-0c-fix-report.md`
+
+New regression scenarios cover dispatch-claim crash recovery without replay, fixed-channel Secret
+injection and buffer zeroing, authorization/expiry/missing-adapter/channel-failure denial paths,
+trusted result-collection time and exact caps, content-bound generation recovery and corrupt or
+missing blob rejection, and wrapped-key/audit recovery after local path replacement. Existing
+positive, negative, and failure-path tests remain enabled; no test was deleted, skipped, weakened,
+or marked as an expected failure.
+
+### Validation
+
+Invariant-audit digest:
+
+```text
+INVARIANT_AUDIT=PASS:28dd77d7ba933e9f2ddb85883a7a2eb2cb7c50bef6c08dda37467a4c8b54b515
+```
+
+Required phase-gate command:
+
+```text
+PATH="$PWD/.venv/bin:$PATH" bash scripts/ci/run_phase_gate.sh phase-0c
+```
+
+Result:
+
+```text
+AUTOMATION_VALIDATION=PASS
+INVARIANT_AUDIT=PASS:28dd77d7ba933e9f2ddb85883a7a2eb2cb7c50bef6c08dda37467a4c8b54b515
+ruff: All checks passed
+mypy: Success: no issues found in 81 source files
+unit: 213 passed
+integration: 7 passed
+security: 236 passed
+full/coverage run: 456 passed
+skipped=0, errors=0, failures=0
+coverage: 80% total (branch coverage enabled)
+pip check: No broken requirements found
+PHASE_GATE=phase-0c PASS
+```
+
+### Remaining findings and constraints
+
+- No retained P0/P1 finding is knowingly left unaddressed; a fresh independent review must confirm
+  the resulting 40-character PR HEAD.
+- The legacy integer/local-slot generation store is retained only as a development compatibility
+  path. Production must provide the content-bound coordinator backed by trusted external immutable
+  blob and authenticated-anchor services.
+- Process-isolated adapter transport is a later integration boundary. Phase 0C provides the
+  fail-closed broker contract and trusted fixed-channel test double without real provider dispatch.
+- The Phase 0B mock secure ingester remains an explicit isolated-test compatibility path. Non-mock
+  execution requires durable Quarantine erasure evidence before success.
+- No real C2, MCP, provider, subprocess, local-attack, credential-collection, or external-target
+  action was executed.
+- No protected governance file was modified, and no merge was attempted.
+
 ## Post-governance invariant-family correction cycle
 
 Current phase: `phase-0c`.

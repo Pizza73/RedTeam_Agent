@@ -29,6 +29,7 @@ from redteam_agent.models.base import StrictImmutableBoundaryModel
 from redteam_agent.repositories.audit import AuditLogRepository
 from redteam_agent.storage import Database
 
+from .generations import AuthenticatedGenerationCoordinator
 from .keys import EncryptionKeyProvider
 from .models import AuditEvent, EncryptionMetadata
 
@@ -222,8 +223,18 @@ class KeyedFileAuditHeadStore:
         *,
         state_path: Path,
         authenticator: AuditChainAuthenticator,
-        generation_store: AuditHeadGenerationStore,
+        generation_store: AuditHeadGenerationStore | None = None,
+        generation_coordinator: AuthenticatedGenerationCoordinator | None = None,
     ) -> None:
+        if (generation_store is None) == (generation_coordinator is None):
+            raise AuditIntegrityError(
+                "exactly one audit-head generation authority is required"
+            )
+        if (
+            generation_coordinator is not None
+            and generation_coordinator.namespace != "audit-head-state"
+        ):
+            raise AuditIntegrityError("audit-head generation namespace is invalid")
         absolute_path = Path(os.path.abspath(state_path))
         if not absolute_path.is_absolute() or absolute_path.name in {"", ".", ".."}:
             raise AuditIntegrityError("audit-head state path is invalid")
@@ -250,6 +261,7 @@ class KeyedFileAuditHeadStore:
         self._lock_path = absolute_path.parent / f".{absolute_path.name}.lock"
         self._authenticator = authenticator
         self._generation_store = generation_store
+        self._generation_coordinator = generation_coordinator
         self._lock = RLock()
 
     def head(self, mission_id: str) -> tuple[int, str] | None:
@@ -393,10 +405,22 @@ class KeyedFileAuditHeadStore:
         )
         if generation == 0:
             return {}, {}
-        raw = self._read_state(
-            self._state_path_for_generation(generation),
-            directory_descriptor=directory_descriptor,
-        )
+        if self._generation_coordinator is None:
+            raw = self._read_state(
+                self._state_path_for_generation(generation),
+                directory_descriptor=directory_descriptor,
+            )
+        else:
+            try:
+                anchor, raw = self._generation_coordinator.recover()
+            except Exception as exc:
+                raise AuditIntegrityError(
+                    "content-bound audit-head generation is unavailable"
+                ) from exc
+            if anchor.generation != generation:
+                raise AuditIntegrityError(
+                    "content-bound audit-head generation mismatch"
+                )
         try:
             duplicate_free = canonical_loads(raw)
             state = _AuditHeadState.model_validate_json(
@@ -463,11 +487,39 @@ class KeyedFileAuditHeadStore:
                 signing_key_version=signer.key_version,
             ),
         )
+        encoded = canonicalize(persisted.model_dump(mode="python"))
+        if self._generation_coordinator is not None:
+            current_anchor = self._generation_coordinator.current_anchor()
+            if (0 if current_anchor is None else current_anchor.generation) != generation:
+                raise AuditIntegrityError("external audit-head generation changed")
+            try:
+                committed = self._generation_coordinator.commit(
+                    encoded,
+                    expected_anchor_digest=(
+                        None
+                        if current_anchor is None
+                        else current_anchor.anchor_digest
+                    ),
+                )
+            except Exception as exc:
+                raise AuditIntegrityError(
+                    "content-bound audit-head generation is unavailable"
+                ) from exc
+            if committed.generation != next_generation:
+                raise AuditIntegrityError(
+                    "content-bound audit-head generation mismatch"
+                )
+            self._load_state(
+                directory_descriptor=directory_descriptor,
+                expected_generation=next_generation,
+            )
+            return
         self._write_state(
             self._state_path_for_generation(next_generation),
-            canonicalize(persisted.model_dump(mode="python")),
+            encoded,
             directory_descriptor=directory_descriptor,
         )
+        assert self._generation_store is not None
         try:
             advanced = self._generation_store.compare_and_set_generation(
                 expected=generation,
@@ -543,6 +595,15 @@ class KeyedFileAuditHeadStore:
         }
 
     def _external_generation(self) -> int:
+        if self._generation_coordinator is not None:
+            try:
+                anchor = self._generation_coordinator.current_anchor()
+            except Exception as exc:
+                raise AuditIntegrityError(
+                    "content-bound audit-head generation is unavailable"
+                ) from exc
+            return 0 if anchor is None else anchor.generation
+        assert self._generation_store is not None
         try:
             generation = self._generation_store.current_generation()
         except Exception as exc:

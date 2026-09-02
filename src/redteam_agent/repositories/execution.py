@@ -15,14 +15,18 @@ from redteam_agent.errors import (
     WorkflowRunBindingError,
 )
 from redteam_agent.models.execution import (
+    DispatchClaim,
     ExecutionRecord,
     ExecutionResult,
     PreDispatchBlockReason,
     ProviderExecutionState,
+    QuarantineDeletionIntent,
     RawResultReceipt,
     RawResultRecoveryMetadata,
+    ResultCollectionAuthority,
     ResultIngestionRecord,
     ResultIngestionStatus,
+    SecureIngestionManifest,
     WorkflowRunBinding,
 )
 from redteam_agent.repositories.approval import (
@@ -33,6 +37,7 @@ from redteam_agent.repositories.plans import PlanRepository
 from redteam_agent.repositories.policy import PolicyDecisionRepository
 
 from .base import ImmutableJsonRepository, model_json
+from .tools import ToolRegistryRepository
 
 
 def execution_record_digest(record: ExecutionRecord) -> str:
@@ -41,6 +46,385 @@ def execution_record_digest(record: ExecutionRecord) -> str:
 
 def ingestion_record_digest(record: ResultIngestionRecord) -> str:
     return digest_model(record, exclude={"ingestion_digest"})
+
+
+def dispatch_claim_digest(claim: DispatchClaim) -> str:
+    return digest_model(claim, exclude={"claim_digest"})
+
+
+def result_collection_authority_digest(authority: ResultCollectionAuthority) -> str:
+    return digest_model(authority, exclude={"authority_digest"})
+
+
+def secure_ingestion_manifest_digest(manifest: SecureIngestionManifest) -> str:
+    return digest_model(manifest, exclude={"manifest_digest"})
+
+
+def quarantine_deletion_intent_digest(intent: QuarantineDeletionIntent) -> str:
+    return digest_model(intent, exclude={"intent_digest"})
+
+
+class DispatchClaimRepository(ImmutableJsonRepository[DispatchClaim]):
+    table = "dispatch_claims"
+    id_column = "claim_id"
+    model_type = DispatchClaim
+
+    def verify_integrity(self, model: DispatchClaim) -> None:
+        verify_model_digest(model, model.claim_digest, exclude={"claim_digest"})
+        identity = {
+            "schema_version": "dispatch-claim-v1",
+            "execution_id": model.execution_id,
+            "authorization_digest": model.authorization_digest,
+            "idempotency_key": model.idempotency_key,
+        }
+        if model.claim_id != stable_id("dispatchclaim", identity):
+            raise DigestIntegrityError("dispatch claim ID mismatch")
+        execution = ExecutionRepository(self.database).get(model.execution_id)
+        if execution is None or not (
+            execution.mission_id == model.mission_id
+            and execution.mission_revision == model.mission_revision
+            and execution.authorization_epoch == model.authorization_epoch
+            and execution.policy_decision_id == model.policy_decision_id
+            and execution.authorization_digest == model.authorization_digest
+            and execution.tool_ref == model.tool_ref
+            and execution.resolved_adapter_id == model.adapter_id
+            and execution.approval_request_id == model.approval_request_id
+            and execution.approval_record_id == model.approval_record_id
+            and execution.idempotency_key == model.idempotency_key
+            and execution.state_version >= model.execution_state_version
+            and execution.dispatch_attempts == 1
+            and execution.provider_execution_state
+            not in {"PLANNED", "AUTHORIZED", "BLOCKED"}
+        ):
+            raise DigestIntegrityError("dispatch claim execution binding mismatch")
+
+    def verify_row_binding(self, identifier: str | int, model: DispatchClaim) -> None:
+        row = self.database.connection.execute(
+            "SELECT claim_digest, execution_id, consumed_at FROM dispatch_claims "
+            "WHERE claim_id = ?",
+            (identifier,),
+        ).fetchone()
+        if row is None or not (
+            model.claim_id == identifier
+            and row["claim_digest"] == model.claim_digest
+            and row["execution_id"] == model.execution_id
+            and row["consumed_at"]
+            == (None if model.consumed_at is None else model.consumed_at.isoformat())
+        ):
+            raise DigestIntegrityError("dispatch claim row binding mismatch")
+
+    def add_current(self, claim: DispatchClaim) -> DispatchClaim:
+        execution = ExecutionRepository(self.database).get(claim.execution_id)
+        if execution is None or not (
+            execution.provider_execution_state == "DISPATCH_CLAIMED"
+            and execution.state_version == claim.execution_state_version
+        ):
+            raise ExecutionStateTransitionError(
+                "dispatch claim requires the current claimed execution state"
+            )
+        self.verify_integrity(claim)
+        payload = model_json(claim)
+        self._insert_or_same(
+            "INSERT INTO dispatch_claims"
+            "(claim_id, claim_digest, execution_id, consumed_at, payload_json) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                claim.claim_id,
+                claim.claim_digest,
+                claim.execution_id,
+                None,
+                payload,
+            ),
+            payload,
+        )
+        return claim
+
+    def get_by_execution(self, execution_id: str) -> DispatchClaim | None:
+        row = self.database.connection.execute(
+            "SELECT claim_id FROM dispatch_claims WHERE execution_id = ?",
+            (execution_id,),
+        ).fetchone()
+        return None if row is None else self.get(str(row["claim_id"]))
+
+    def current_for_injection(
+        self,
+        execution_id: str,
+        *,
+        now: datetime,
+    ) -> DispatchClaim:
+        claim = self.get_by_execution(execution_id)
+        execution = ExecutionRepository(self.database).get(execution_id)
+        if claim is None or execution is None or not (
+            claim.execution_id == execution_id
+            and claim.consumed_at is None
+            and claim.issued_at <= now < claim.expires_at
+            and execution.provider_execution_state == "DISPATCH_CLAIMED"
+            and execution.state_version == claim.execution_state_version
+            and execution.authorization_digest == claim.authorization_digest
+            and execution.tool_ref == claim.tool_ref
+            and execution.resolved_adapter_id == claim.adapter_id
+        ):
+            raise ExecutionStateTransitionError(
+                "dispatch claim is unavailable for Secret injection"
+            )
+        return claim
+
+    def consume(self, execution_id: str, *, now: datetime) -> DispatchClaim:
+        claim = self.current_for_injection(execution_id, now=now)
+        updated = claim.model_copy(update={"consumed_at": now, "claim_digest": "pending"})
+        updated = updated.model_copy(update={"claim_digest": dispatch_claim_digest(updated)})
+        cursor = self.database.connection.execute(
+            "UPDATE dispatch_claims SET claim_digest = ?, consumed_at = ?, payload_json = ? "
+            "WHERE claim_id = ? AND claim_digest = ? AND consumed_at IS NULL",
+            (
+                updated.claim_digest,
+                now.isoformat(),
+                model_json(updated),
+                claim.claim_id,
+                claim.claim_digest,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise ExecutionStateTransitionError("dispatch claim consumption conflicted")
+        return updated
+
+
+class ResultCollectionAuthorityRepository(
+    ImmutableJsonRepository[ResultCollectionAuthority]
+):
+    table = "result_collection_authorities"
+    id_column = "authority_id"
+    model_type = ResultCollectionAuthority
+
+    def verify_integrity(self, model: ResultCollectionAuthority) -> None:
+        verify_model_digest(model, model.authority_digest, exclude={"authority_digest"})
+        identity = {
+            "schema_version": "result-collection-authority-v1",
+            "execution_id": model.execution_id,
+            "provider_task_id": model.provider_task_id,
+            "sink_id": model.sink_id,
+        }
+        if model.authority_id != stable_id("collectionauthority", identity):
+            raise DigestIntegrityError("result collection authority ID mismatch")
+        execution = ExecutionRepository(self.database).get(model.execution_id)
+        registry = ToolRegistryRepository(self.database).get(
+            model.tool_ref.registry_revision
+        )
+        tool = None if registry is None else next(
+            (item for item in registry.tools if item.tool_ref == model.tool_ref), None
+        )
+        if execution is None or registry is None or tool is None or not (
+            execution.provider_task_id == model.provider_task_id
+            and execution.mission_id == model.mission_id
+            and execution.mission_revision == model.mission_revision
+            and execution.authorization_epoch == model.authorization_epoch
+            and execution.tool_ref == model.tool_ref
+            and execution.provider_execution_state
+            in {"RUNNING", "SUCCEEDED", "FAILED", "CANCELLED"}
+            and registry.registry_digest == model.registry_digest
+            and model.sink_id
+            == stable_id(
+                "sink",
+                {
+                    "schema_version": "encrypted-stream-v1",
+                    "execution_id": model.execution_id,
+                },
+            )
+            and model.max_result_bytes
+            == min(tool.max_output_bytes, model.system_hard_output_cap)
+        ):
+            raise DigestIntegrityError("result collection authority binding mismatch")
+
+    def verify_row_binding(
+        self, identifier: str | int, model: ResultCollectionAuthority
+    ) -> None:
+        row = self.database.connection.execute(
+            "SELECT authority_digest, execution_id, provider_task_id "
+            "FROM result_collection_authorities WHERE authority_id = ?",
+            (identifier,),
+        ).fetchone()
+        if row is None or not (
+            model.authority_id == identifier
+            and row["authority_digest"] == model.authority_digest
+            and row["execution_id"] == model.execution_id
+            and row["provider_task_id"] == model.provider_task_id
+        ):
+            raise DigestIntegrityError("result collection authority row binding mismatch")
+
+    def add(self, authority: ResultCollectionAuthority) -> ResultCollectionAuthority:
+        self.verify_integrity(authority)
+        payload = model_json(authority)
+        self._insert_or_same(
+            "INSERT INTO result_collection_authorities"
+            "(authority_id, authority_digest, execution_id, provider_task_id, payload_json) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                authority.authority_id,
+                authority.authority_digest,
+                authority.execution_id,
+                authority.provider_task_id,
+                payload,
+            ),
+            payload,
+        )
+        return authority
+
+    def get_by_execution(self, execution_id: str) -> ResultCollectionAuthority | None:
+        row = self.database.connection.execute(
+            "SELECT authority_id FROM result_collection_authorities WHERE execution_id = ?",
+            (execution_id,),
+        ).fetchone()
+        return None if row is None else self.get(str(row["authority_id"]))
+
+
+class SecureIngestionManifestRepository(
+    ImmutableJsonRepository[SecureIngestionManifest]
+):
+    table = "secure_ingestion_manifests"
+    id_column = "manifest_id"
+    model_type = SecureIngestionManifest
+
+    def verify_integrity(self, model: SecureIngestionManifest) -> None:
+        verify_model_digest(model, model.manifest_digest, exclude={"manifest_digest"})
+        identity = {
+            "schema_version": "secure-ingestion-manifest-v1",
+            "ingestion_id": model.ingestion_id,
+            "secure_ingestion_id": model.secure_ingestion_id,
+            "receipt_digest": model.receipt_digest,
+            "quarantine_digest": model.quarantine_digest,
+            "rule_version": model.rule_version,
+        }
+        if model.manifest_id != stable_id("ingestionmanifest", identity):
+            raise DigestIntegrityError("secure ingestion manifest ID mismatch")
+        ingestion = ResultIngestionRepository(self.database).get(model.ingestion_id)
+        receipt = RawResultReceiptRepository(self.database).get(model.receipt_id)
+        if ingestion is None or receipt is None or not (
+            ingestion.execution_id == model.execution_id == receipt.execution_id
+            and ingestion.receipt_id == model.receipt_id
+            and ingestion.quarantine_id == model.quarantine_id == receipt.quarantine_id
+            and receipt.receipt_digest == model.receipt_digest
+            and receipt.ciphertext_digest == model.quarantine_digest
+            and tuple(model.resources)
+            == tuple(
+                sorted(
+                    model.resources,
+                    key=lambda item: (item.resource_type, item.resource_id),
+                )
+            )
+            and len({(item.resource_type, item.resource_id) for item in model.resources})
+            == len(model.resources)
+        ):
+            raise DigestIntegrityError("secure ingestion manifest binding mismatch")
+
+    def verify_row_binding(
+        self, identifier: str | int, model: SecureIngestionManifest
+    ) -> None:
+        row = self.database.connection.execute(
+            "SELECT manifest_digest, ingestion_id, execution_id "
+            "FROM secure_ingestion_manifests WHERE manifest_id = ?",
+            (identifier,),
+        ).fetchone()
+        if row is None or not (
+            model.manifest_id == identifier
+            and row["manifest_digest"] == model.manifest_digest
+            and row["ingestion_id"] == model.ingestion_id
+            and row["execution_id"] == model.execution_id
+        ):
+            raise DigestIntegrityError("secure ingestion manifest row binding mismatch")
+
+    def add(self, manifest: SecureIngestionManifest) -> SecureIngestionManifest:
+        self.verify_integrity(manifest)
+        payload = model_json(manifest)
+        self._insert_or_same(
+            "INSERT INTO secure_ingestion_manifests"
+            "(manifest_id, manifest_digest, ingestion_id, execution_id, payload_json) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                manifest.manifest_id,
+                manifest.manifest_digest,
+                manifest.ingestion_id,
+                manifest.execution_id,
+                payload,
+            ),
+            payload,
+        )
+        return manifest
+
+    def get_by_ingestion(self, ingestion_id: str) -> SecureIngestionManifest | None:
+        row = self.database.connection.execute(
+            "SELECT manifest_id FROM secure_ingestion_manifests WHERE ingestion_id = ?",
+            (ingestion_id,),
+        ).fetchone()
+        return None if row is None else self.get(str(row["manifest_id"]))
+
+
+class QuarantineDeletionIntentRepository(
+    ImmutableJsonRepository[QuarantineDeletionIntent]
+):
+    table = "quarantine_deletion_intents"
+    id_column = "intent_id"
+    model_type = QuarantineDeletionIntent
+
+    def verify_integrity(self, model: QuarantineDeletionIntent) -> None:
+        verify_model_digest(model, model.intent_digest, exclude={"intent_digest"})
+        identity = {
+            "schema_version": "quarantine-deletion-intent-v1",
+            "ingestion_id": model.ingestion_id,
+            "manifest_digest": model.manifest_digest,
+            "quarantine_id": model.quarantine_id,
+        }
+        if model.intent_id != stable_id("quarantinedeletion", identity):
+            raise DigestIntegrityError("quarantine deletion intent ID mismatch")
+        manifest = SecureIngestionManifestRepository(self.database).get(model.manifest_id)
+        if manifest is None or not (
+            manifest.ingestion_id == model.ingestion_id
+            and manifest.execution_id == model.execution_id
+            and manifest.manifest_digest == model.manifest_digest
+            and manifest.receipt_id == model.receipt_id
+            and manifest.quarantine_id == model.quarantine_id
+        ):
+            raise DigestIntegrityError("quarantine deletion intent binding mismatch")
+
+    def verify_row_binding(
+        self, identifier: str | int, model: QuarantineDeletionIntent
+    ) -> None:
+        row = self.database.connection.execute(
+            "SELECT intent_digest, ingestion_id, quarantine_id "
+            "FROM quarantine_deletion_intents WHERE intent_id = ?",
+            (identifier,),
+        ).fetchone()
+        if row is None or not (
+            model.intent_id == identifier
+            and row["intent_digest"] == model.intent_digest
+            and row["ingestion_id"] == model.ingestion_id
+            and row["quarantine_id"] == model.quarantine_id
+        ):
+            raise DigestIntegrityError("quarantine deletion intent row binding mismatch")
+
+    def add(self, intent: QuarantineDeletionIntent) -> QuarantineDeletionIntent:
+        self.verify_integrity(intent)
+        payload = model_json(intent)
+        self._insert_or_same(
+            "INSERT INTO quarantine_deletion_intents"
+            "(intent_id, intent_digest, ingestion_id, quarantine_id, payload_json) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                intent.intent_id,
+                intent.intent_digest,
+                intent.ingestion_id,
+                intent.quarantine_id,
+                payload,
+            ),
+            payload,
+        )
+        return intent
+
+    def get_by_ingestion(self, ingestion_id: str) -> QuarantineDeletionIntent | None:
+        row = self.database.connection.execute(
+            "SELECT intent_id FROM quarantine_deletion_intents WHERE ingestion_id = ?",
+            (ingestion_id,),
+        ).fetchone()
+        return None if row is None else self.get(str(row["intent_id"]))
 
 
 class WorkflowRunRepository(ImmutableJsonRepository[WorkflowRunBinding]):
@@ -99,7 +483,10 @@ class ExecutionRepository(ImmutableJsonRepository[ExecutionRecord]):
 
     _allowed_provider_transitions: dict[str, frozenset[str]] = {
         "PLANNED": frozenset({"AUTHORIZED"}),
-        "AUTHORIZED": frozenset({"BLOCKED", "DISPATCHED"}),
+        "AUTHORIZED": frozenset({"BLOCKED", "DISPATCH_CLAIMED"}),
+        "DISPATCH_CLAIMED": frozenset(
+            {"RUNNING", "RECONCILING", "OUTCOME_UNKNOWN"}
+        ),
         "DISPATCHED": frozenset(
             {
                 "RUNNING",
@@ -141,7 +528,10 @@ class ExecutionRepository(ImmutableJsonRepository[ExecutionRecord]):
     _allowed_ingestion_transitions: dict[str, frozenset[str]] = {
         "NOT_AVAILABLE": frozenset({"PENDING"}),
         "PENDING": frozenset({"INGESTING"}),
-        "INGESTING": frozenset({"SUCCEEDED", "FAILED"}),
+        "INGESTING": frozenset({"INGESTED_DURABLE", "SUCCEEDED", "FAILED"}),
+        "INGESTED_DURABLE": frozenset({"DELETE_PENDING", "SUCCEEDED"}),
+        "DELETE_PENDING": frozenset({"QUARANTINE_ERASED"}),
+        "QUARANTINE_ERASED": frozenset({"SUCCEEDED"}),
         "FAILED": frozenset({"INGESTING", "QUARANTINED"}),
         "SUCCEEDED": frozenset(),
         "QUARANTINED": frozenset(),
@@ -454,7 +844,8 @@ class ExecutionRepository(ImmutableJsonRepository[ExecutionRecord]):
         rows = self.database.connection.execute(
             "SELECT execution_id FROM execution_records WHERE mission_id = ? AND "
             "provider_execution_state IN "
-            "('DISPATCHED', 'RUNNING', 'CANCEL_REQUESTED', 'RECONCILING', 'OUTCOME_UNKNOWN') "
+            "('DISPATCH_CLAIMED', 'DISPATCHED', 'RUNNING', 'CANCEL_REQUESTED', "
+            "'RECONCILING', 'OUTCOME_UNKNOWN') "
             "ORDER BY execution_id",
             (mission_id,),
         ).fetchall()
@@ -546,6 +937,7 @@ class RawResultRecoveryRepository(ImmutableJsonRepository[RawResultRecoveryMetad
         if execution is None or execution.provider_execution_state in {
             "PLANNED",
             "AUTHORIZED",
+            "DISPATCH_CLAIMED",
             "BLOCKED",
         }:
             raise DigestIntegrityError("raw-result recovery has no dispatched execution")
@@ -639,7 +1031,10 @@ class ResultIngestionRepository(ImmutableJsonRepository[ResultIngestionRecord]):
 
     _allowed: dict[str, frozenset[str]] = {
         "PENDING": frozenset({"INGESTING"}),
-        "INGESTING": frozenset({"SUCCEEDED", "FAILED"}),
+        "INGESTING": frozenset({"INGESTED_DURABLE", "SUCCEEDED", "FAILED"}),
+        "INGESTED_DURABLE": frozenset({"DELETE_PENDING", "SUCCEEDED"}),
+        "DELETE_PENDING": frozenset({"QUARANTINE_ERASED"}),
+        "QUARANTINE_ERASED": frozenset({"SUCCEEDED"}),
         "FAILED": frozenset({"INGESTING", "QUARANTINED"}),
         "NOT_AVAILABLE": frozenset(),
         "SUCCEEDED": frozenset(),
@@ -824,7 +1219,14 @@ class ExecutionResultRepository(ImmutableJsonRepository[ExecutionResult]):
         if (
             ingestion is None
             or ingestion.receipt_id is None
-            or ingestion.status not in {"INGESTING", "SUCCEEDED"}
+            or ingestion.status
+            not in {
+                "INGESTING",
+                "INGESTED_DURABLE",
+                "DELETE_PENDING",
+                "QUARANTINE_ERASED",
+                "SUCCEEDED",
+            }
         ):
             raise DigestIntegrityError("execution result is not bound to result ingestion")
         identity = {

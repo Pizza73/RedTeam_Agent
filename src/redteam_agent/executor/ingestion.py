@@ -7,17 +7,16 @@ from typing import Protocol
 from redteam_agent.errors import ResultIngestionError
 from redteam_agent.models.execution import (
     ExecutionResult,
-    RawResultReceipt,
     SecureIngestionSummary,
 )
 
 
 class SecureResultIngester(Protocol):
-    async def ingest(self, receipt: RawResultReceipt) -> SecureIngestionSummary: ...
+    async def run(self, ingestion_id: str) -> SecureIngestionSummary: ...
 
     async def acknowledge_persisted(
         self,
-        receipt: RawResultReceipt,
+        ingestion_id: str,
         result: ExecutionResult,
     ) -> None: ...
 
@@ -35,8 +34,8 @@ class MockSecureResultIngester:
         self._fail = fail
         self.calls = 0
 
-    async def ingest(self, receipt: RawResultReceipt) -> SecureIngestionSummary:
-        del receipt
+    async def run(self, ingestion_id: str) -> SecureIngestionSummary:
+        del ingestion_id
         self.calls += 1
         if self._fail:
             self._fail = False
@@ -45,7 +44,7 @@ class MockSecureResultIngester:
 
     async def acknowledge_persisted(
         self,
-        receipt: RawResultReceipt,
+        ingestion_id: str,
         result: ExecutionResult,
     ) -> None:
-        del receipt, result
+        del ingestion_id, result

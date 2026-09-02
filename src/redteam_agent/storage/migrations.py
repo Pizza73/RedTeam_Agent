@@ -317,4 +317,50 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             """,
         ),
     ),
+    (
+        5,
+        (
+            """
+            CREATE TABLE dispatch_claims (
+                claim_id TEXT PRIMARY KEY,
+                claim_digest TEXT NOT NULL,
+                execution_id TEXT NOT NULL UNIQUE
+                    REFERENCES execution_records(execution_id),
+                consumed_at TEXT,
+                payload_json TEXT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE result_collection_authorities (
+                authority_id TEXT PRIMARY KEY,
+                authority_digest TEXT NOT NULL,
+                execution_id TEXT NOT NULL UNIQUE
+                    REFERENCES execution_records(execution_id),
+                provider_task_id TEXT NOT NULL,
+                payload_json TEXT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE secure_ingestion_manifests (
+                manifest_id TEXT PRIMARY KEY,
+                manifest_digest TEXT NOT NULL,
+                ingestion_id TEXT NOT NULL UNIQUE
+                    REFERENCES result_ingestions(ingestion_id),
+                execution_id TEXT NOT NULL UNIQUE
+                    REFERENCES execution_records(execution_id),
+                payload_json TEXT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE quarantine_deletion_intents (
+                intent_id TEXT PRIMARY KEY,
+                intent_digest TEXT NOT NULL,
+                ingestion_id TEXT NOT NULL UNIQUE
+                    REFERENCES result_ingestions(ingestion_id),
+                quarantine_id TEXT NOT NULL UNIQUE,
+                payload_json TEXT NOT NULL
+            )
+            """,
+        ),
+    ),
 )

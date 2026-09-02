@@ -18,6 +18,14 @@ from .authorization import (
     RepositoryDataAccessAuthorizer,
     ingestion_output_authority,
 )
+from .generations import (
+    AuthenticatedGenerationAnchor,
+    AuthenticatedGenerationAnchorStore,
+    AuthenticatedGenerationCoordinator,
+    ImmutableGenerationBlobStore,
+    InMemoryGenerationAnchorStore,
+    InMemoryImmutableGenerationBlobStore,
+)
 from .ingestion import EncryptedSecureResultIngester, SecureIngestor
 from .keys import (
     EncryptionKeyProvider,
@@ -38,6 +46,11 @@ from .models import (
     SecureIngestionResult,
 )
 from .sandbox import SandboxPolicy, SandboxRequirement, require_sandbox_capabilities
+from .secret_injection import (
+    SecretAdapterChannel,
+    SecretInjectionBroker,
+    TrustedSecretChannelRegistry,
+)
 from .stores import (
     ArtifactStore,
     EncryptedRawResultQuarantine,
@@ -54,6 +67,9 @@ from .streaming import (
 __all__ = [
     "ArtifactReference",
     "ArtifactStore",
+    "AuthenticatedGenerationAnchor",
+    "AuthenticatedGenerationAnchorStore",
+    "AuthenticatedGenerationCoordinator",
     "AuditChainAuthenticator",
     "AuditContext",
     "AuditContextResolver",
@@ -71,6 +87,9 @@ __all__ = [
     "EncryptionKeyProvider",
     "EncryptionMetadata",
     "InMemoryEncryptionKeyProvider",
+    "InMemoryGenerationAnchorStore",
+    "InMemoryImmutableGenerationBlobStore",
+    "ImmutableGenerationBlobStore",
     "KeyDomain",
     "KeyedAuditChainAuthenticator",
     "KeyedFileAuditHeadStore",
@@ -88,6 +107,9 @@ __all__ = [
     "SecretDiscoveryReference",
     "SecretReferenceMetadata",
     "SecretStore",
+    "SecretAdapterChannel",
+    "SecretInjectionBroker",
+    "TrustedSecretChannelRegistry",
     "SecureIngestionResult",
     "SecureIngestor",
     "WrappedFileEncryptionKeyProvider",

@@ -37,6 +37,7 @@ from redteam_agent.repositories import (
     MissionRevisionRepository,
     MissionStateRepository,
     RawResultRecoveryRepository,
+    ResultCollectionAuthorityRepository,
 )
 from redteam_agent.storage import Database
 
@@ -99,6 +100,7 @@ class RepositoryQuarantineStreamBindingResolver:
         self._mission_revisions = MissionRevisionRepository(database)
         self._mission_states = MissionStateRepository(database)
         self._recovery = RawResultRecoveryRepository(database)
+        self._authorities = ResultCollectionAuthorityRepository(database)
         self._retention = retention
         self._max_result_bytes = max_result_bytes
 
@@ -106,6 +108,8 @@ class RepositoryQuarantineStreamBindingResolver:
         execution = self._executions.get(execution_id)
         if execution is None or execution.provider_execution_state in {
             "PLANNED",
+            "AUTHORIZED",
+            "DISPATCH_CLAIMED",
             "BLOCKED",
         }:
             raise RawResultQuarantineError(
@@ -122,13 +126,21 @@ class RepositoryQuarantineStreamBindingResolver:
             raise RawResultQuarantineError(
                 "execution mission binding is stale"
             )
-        retention_until = min(
-            execution.created_at + self._retention,
-            revision.valid_until,
-        )
-        if retention_until <= execution.created_at:
+        authority = self._authorities.get_by_execution(execution_id)
+        if authority is None or not (
+            authority.execution_id == execution.execution_id
+            and authority.provider_task_id == execution.provider_task_id
+            and authority.mission_id == execution.mission_id
+            and authority.mission_revision == execution.mission_revision
+            and authority.authorization_epoch == execution.authorization_epoch
+            and authority.tool_ref == execution.tool_ref
+            and authority.retention_until <= revision.valid_until
+            and authority.retention_until
+            <= authority.collection_started_at + self._retention
+            and authority.max_result_bytes <= self._max_result_bytes
+        ):
             raise RawResultQuarantineError(
-                "execution quarantine retention is unavailable"
+                "result collection authority is unavailable or stale"
             )
         quarantine_id = stable_id(
             "quarantine",
@@ -164,8 +176,8 @@ class RepositoryQuarantineStreamBindingResolver:
             mission_id=execution.mission_id,
             mission_revision=execution.mission_revision,
             execution_id=execution.execution_id,
-            retention_until=retention_until,
-            max_result_bytes=self._max_result_bytes,
+            retention_until=authority.retention_until,
+            max_result_bytes=authority.max_result_bytes,
             resume_mode=resume_mode,
             resume_cursor=resume_cursor,
         )

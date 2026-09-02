@@ -2,8 +2,8 @@
   "schema_version": "1.0",
   "phase": "phase-0c",
   "request": {
-    "head_sha": "66c00e7a0a58e6b453cabac833fbb4d816a85bf9",
-    "reference": "https://github.com/Pizza73/RedTeam_Agent/pull/3#issuecomment-5497701145",
+    "head_sha": "edd6ed62db38d53f3bda6ebb59327b5f32175178",
+    "reference": "https://github.com/Pizza73/RedTeam_Agent/pull/3#issuecomment-5503202054",
     "action": "IMPLEMENT_PHASE"
   },
   "families": [
@@ -11,17 +11,19 @@
       "id": "authorization-lifecycle",
       "status": "affected",
       "entry_points": [
+        "src/redteam_agent/executor/service.py",
+        "src/redteam_agent/repositories/execution.py",
         "src/redteam_agent/data_security/streaming.py",
         "src/redteam_agent/data_security/authorization.py"
       ],
       "sibling_paths": [
+        "src/redteam_agent/data_security/secret_injection.py",
         "src/redteam_agent/data_security/ingestion.py",
-        "src/redteam_agent/repositories/execution.py",
         "src/redteam_agent/repositories/mission.py"
       ],
       "invariant_evidence": [
-        "Raw-result stream bindings are reconstructed from the trusted Execution, latest MissionRevision, current MissionState, authorization epoch, and durable recovery repositories.",
-        "The sink factory rejects caller-selected structural resolvers, and secret/full-object publication paths require current repository-backed authority."
+        "Pre-dispatch success atomically transitions AUTHORIZED to DISPATCH_CLAIMED and persists the exact Decision, Mission, Tool, Adapter, approval and idempotency binding before the one allowed submit attempt.",
+        "Restart from DISPATCH_CLAIMED performs reconciliation only, while Secret injection and result collection require their distinct current repository-backed authorities."
       ],
       "tests": [
         "tests/security/test_phase0c_data_security.py",
@@ -34,15 +36,17 @@
       "status": "affected",
       "entry_points": [
         "src/redteam_agent/data_security/stores.py",
+        "src/redteam_agent/data_security/secret_injection.py",
         "src/redteam_agent/data_security/ingestion.py"
       ],
       "sibling_paths": [
         "src/redteam_agent/data_security/streaming.py",
-        "src/redteam_agent/data_security/models.py"
+        "src/redteam_agent/data_security/models.py",
+        "src/redteam_agent/repositories/execution.py"
       ],
       "invariant_evidence": [
-        "Direct quarantine plaintext resume is denied; only the instance-bound trusted ingestion publication may release content.",
-        "Quarantine, artifact, and secret release helpers isolate decrypted bytes and replace audit failures with typed plaintext-free errors."
+        "SecretStore has no plaintext-returning application resolve path; the broker loads a current unconsumed Dispatch Claim, selects only the fixed Adapter channel, zeroes its temporary bytearray and durably consumes the Claim.",
+        "Caller Receipt, QuarantineReference, legacy loader and full-object publication paths are denied; only repository-bound ingestion_id execution may open committed chunks inside the redaction pipeline."
       ],
       "tests": ["tests/security/test_phase0c_data_security.py"],
       "test_modes": ["positive", "negative", "failure"]
@@ -52,15 +56,16 @@
       "status": "affected",
       "entry_points": [
         "src/redteam_agent/data_security/stores.py",
-        "src/redteam_agent/data_security/keys.py"
+        "src/redteam_agent/data_security/keys.py",
+        "src/redteam_agent/data_security/generations.py"
       ],
       "sibling_paths": [
         "src/redteam_agent/data_security/streaming.py",
         "src/redteam_agent/data_security/audit.py"
       ],
       "invariant_evidence": [
-        "Quarantine deletion verifies the authoritative encrypted envelope and authenticated deletion intent before cryptographic erasure.",
-        "Restart recovery repeats the deterministic audit operation and destroys the exact resource key without plaintext fallback."
+        "Audit Head and Wrapped Key State can use the shared content-bound generation coordinator with separate namespaces, immutable blob IDs, complete anchor CAS and exact read-back verification.",
+        "Missing or corrupt committed blobs fail closed, while key and audit state recover from the external blob after replacement of the non-authoritative local path."
       ],
       "tests": ["tests/security/test_phase0c_data_security.py"],
       "test_modes": ["positive", "negative", "failure", "state-machine"]
@@ -69,16 +74,16 @@
       "id": "audit-recovery-durability",
       "status": "affected",
       "entry_points": [
-        "src/redteam_agent/data_security/stores.py",
-        "src/redteam_agent/data_security/audit.py"
+        "src/redteam_agent/data_security/ingestion.py",
+        "src/redteam_agent/executor/service.py"
       ],
       "sibling_paths": [
         "src/redteam_agent/data_security/streaming.py",
         "src/redteam_agent/repositories/execution.py"
       ],
       "invariant_evidence": [
-        "A strictly typed authenticated quarantine deletion intent is durable before the delete audit event.",
-        "Constructor sweeps reconcile interruption after audit and before erasure, preserving one deterministic audit event and completing key destruction."
+        "The repository-bound coordinator read-back verifies SecureIngestionManifest before creating its manifest-bound QuarantineDeletionIntent and advances INGESTED_DURABLE, DELETE_PENDING and QUARANTINE_ERASED through paired OCC transitions.",
+        "Restart reuses immutable manifest and deletion evidence, resumes key destruction/unlink idempotently, and persists ExecutionResult before the final SUCCEEDED acknowledgement without replaying provider submit."
       ],
       "tests": ["tests/security/test_phase0c_data_security.py"],
       "test_modes": ["positive", "negative", "failure", "state-machine"]
@@ -87,16 +92,16 @@
       "id": "filesystem-concurrency-retention",
       "status": "affected",
       "entry_points": [
-        "src/redteam_agent/data_security/stores.py",
-        "src/redteam_agent/data_security/streaming.py"
+        "src/redteam_agent/data_security/streaming.py",
+        "src/redteam_agent/executor/service.py"
       ],
       "sibling_paths": [
         "src/redteam_agent/data_security/keys.py",
         "src/redteam_agent/data_security/ingestion.py"
       ],
       "invariant_evidence": [
-        "Retention enforcement uses store-owned trusted clocks rather than per-call timestamps across artifact, secret, and quarantine paths.",
-        "Deletion intents use anchored encrypted storage, quota-exempt bounded metadata, deterministic IDs, and restart-safe cleanup."
+        "Executor persists collection_started_at and retention_until once at result collection, caps retention at the exact Mission deadline, and restart reuses the same authority.",
+        "The authority binds the exact ToolRef, Registry digest, Provider task and deterministic sink, and max_result_bytes is the minimum of that ToolDefinition limit and the system hard cap."
       ],
       "tests": ["tests/security/test_phase0c_data_security.py"],
       "test_modes": ["positive", "negative", "failure", "state-machine"]
@@ -113,8 +118,8 @@
         "src/redteam_agent/data_security/stores.py"
       ],
       "invariant_evidence": [
-        "Full-object ingestion accepts only the exact internal publication type bound to the receipt, quarantine reference, content, and active ingestion lease.",
-        "Typed deletion and publication records reject unknown fields and coercion through strict boundary models and canonical JSON."
+        "The application coordinator accepts only ingestion_id and loads the canonical Receipt, Execution, Result Collection Authority, Mission and quarantine stream from trusted repositories.",
+        "Strict immutable Dispatch Claim, collection authority, manifest, deletion-intent and generation-anchor models reject unknown fields, coercion and digest/row binding changes."
       ],
       "tests": ["tests/security/test_phase0c_data_security.py"],
       "test_modes": ["positive", "negative", "failure"]
@@ -131,8 +136,8 @@
         "src/redteam_agent/data_security/ingestion.py"
       ],
       "invariant_evidence": [
-        "The exported sink factory remains Executor-compatible while requiring the exported repository-backed resolver.",
-        "Positive, denial, stale-state, audit-failure, crash-recovery, retention, and production-authority paths are covered without weakening earlier tests."
+        "The Phase 0B isolated Mock ingester remains an exact test-double exception while non-mock ingestion requires the durable Phase 0C erasure state machine.",
+        "Phase 0B flow/safety regressions and Phase 0C positive, denial, crash, restart, retention, path-replacement and corrupt-blob cases remain covered."
       ],
       "tests": [
         "tests/security/test_phase0c_data_security.py",
@@ -146,5 +151,5 @@
     "tests/security/test_gate_review_regressions.py",
     "tests/integration/test_phase0b_flow.py"
   ],
-  "notes": "The implementation combines the four retained pre-refresh Phase 0C fixes with the three family-classified findings on the refreshed HEAD. The audit covers every exported data-security entry point and sibling repository, ingestion, retention, key-erasure, parsing, and Executor path before a fresh independent review."
+  "notes": "This audit is rebound to the dedicated current-HEAD design-approved implementation request. It covers the six retained P1 findings as one durable lifecycle redesign: post-validation Dispatch Claim, fixed-channel JIT Secret injection, exact result collection authority, ingestion_id-only secure ingestion, manifest-before-erasure recovery states, and shared digest/blob-bound generation coordination. No external provider or target action is introduced."
 }

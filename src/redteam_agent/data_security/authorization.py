@@ -113,6 +113,7 @@ class RepositoryDataAccessAuthorizer(DataAccessAuthorizer):
     """Revalidate immutable grants and execution provenance against current state."""
 
     _POST_DISPATCH_STATES = (
+        "DISPATCH_CLAIMED",
         "DISPATCHED",
         "RUNNING",
         "SUCCEEDED",
@@ -122,11 +123,7 @@ class RepositoryDataAccessAuthorizer(DataAccessAuthorizer):
         "RECONCILING",
         "OUTCOME_UNKNOWN",
     )
-    _SECRET_RESOLUTION_STATES = (
-        "AUTHORIZED",
-        "DISPATCHED",
-        "RUNNING",
-    )
+    _SECRET_RESOLUTION_STATES = ("DISPATCH_CLAIMED",)
 
     def __init__(
         self,
