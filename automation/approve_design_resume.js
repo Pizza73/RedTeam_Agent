@@ -1,6 +1,7 @@
 'use strict';
 
 const crypto = require('crypto');
+const loopControl = require('./loop_control_state');
 
 const PHASES = [
   'phase-0a', 'phase-0b', 'phase-0c', 'phase-1',
@@ -297,19 +298,14 @@ async function run({github, context, core}) {
       }),
     ]);
     const labels = pr.labels.map((item) => item.name);
-    const phases = labels.filter((name) => /^phase-(0a|0b|0c|[1-5])$/.test(name));
-    const forbidden = [
-      'ai-needs-fix', 'ai-needs-review', 'ai-review-passed',
-      'ai-human-gate', 'ai-project-complete',
-    ];
     if (defaultCommit.sha !== authorizedDefaultSha || pr.state !== 'open' ||
         pr.head.repo.full_name !== `${owner}/${repo}` || pr.base.ref !== defaultBranch ||
-        pr.head.sha !== headSha || phases.length !== 1 || phases[0] !== phase ||
-        !labels.includes('ai-loop') || labels.some((name) => forbidden.includes(name)) ||
-        (requireStop && (!labels.includes('ai-loop-blocked') ||
-          labels.includes('ai-needs-implementation'))) ||
-        (!requireStop && (labels.includes('ai-loop-blocked') ||
-          !labels.includes('ai-needs-implementation')))) {
+        pr.head.sha !== headSha) {
+      throw new Error('PR, default branch, or complete managed label state changed.');
+    }
+    try {
+      loopControl.assertDesignApprovalProjection(labels, phase, requireStop);
+    } catch (_) {
       throw new Error('PR, default branch, or complete managed label state changed.');
     }
     for (const name of REQUIRED_CHECKS) {

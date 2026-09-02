@@ -47,11 +47,27 @@ If a blocked cumulative Phase 0B through Phase 3 HEAD predates required governan
 trusted current-Phase `BLOCKED_LIMIT` gate may authorize an exact-HEAD base refresh without changing
 the Phase label. The gate's adjacent base PASS, default-branch SHA, resulting ancestry, current-HEAD
 checks, and transition consumption must all be revalidated; a free-form branch update is not
-authority. A base refresh authorizes only one expected-HEAD branch update and never authorizes
-Resume. If the latest gate records invariant-family recurrence, it is `DESIGN_CHANGE_REQUIRED` and
+authority. While an invariant-family Design Stop remains active, each completed governance refresh
+must be certified on its new current HEAD by `github-actions[bot]`. The checkpoint binds the new
+HEAD, previous HEAD, exact authorized default-branch SHA, Phase pair, and blocking Gate.
+Certification requires one two-parent merge and the matching trusted authorization on its first
+parent. A later refresh may inherit the Gate only from the single valid checkpoint on its exact
+current HEAD; missing, malformed, ambiguous, or skipped checkpoints are rejected without
+re-walking historical edges. A base refresh
+authorizes only one expected-HEAD branch update and never authorizes Resume. If the latest gate
+records invariant-family recurrence, it is `DESIGN_CHANGE_REQUIRED` and
 dominates every earlier refresh / Resume record. Implementation may resume only from a single-use
 `DESIGN_APPROVED` record bound to that gate, the current Phase / full HEAD, and an approved design
 commit incorporated from the default branch.
+
+Lifecycle labels such as `ai-needs-implementation`, `ai-needs-fix`, `ai-needs-review`, and
+`ai-review-passed` are operator-visible projections, not authorization evidence. Current-HEAD
+trusted records take precedence over delayed or stale lifecycle projections. The exact Phase label
+remains routing evidence, and `ai-loop-blocked` remains a conservative stop latch that only a
+trusted Resume, Design Approval, or Phase transition may remove. A trusted transition may
+idempotently reconcile lifecycle projections after it revalidates the unchanged PR, full HEAD,
+Phase, required checks, and applicable authority record; projection drift alone is not a new
+product-design failure.
 
 ## Protected Files
 

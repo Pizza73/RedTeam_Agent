@@ -204,6 +204,10 @@ jobs:
         with:
           script: |
             const fs = require('fs');
+            const path = require('path');
+            const loopControl = require(path.join(
+              process.env.GITHUB_WORKSPACE, 'automation', 'loop_control_state.js'
+            ));
             function canonicalJson(value) {
               if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
               if (value && typeof value === 'object') {
@@ -213,11 +217,24 @@ jobs:
               }
               return JSON.stringify(value);
             }
-            const pr = context.payload.pull_request;
+            const eventPr = context.payload.pull_request;
+            const {data: pr} = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: eventPr.number,
+            });
+            if (pr.state !== 'open' || pr.head.sha !== eventPr.head.sha) {
+              core.setFailed('Pull request changed before review-ready projection.');
+              return;
+            }
             const labels = pr.labels.map((item) => item.name);
             const phases = labels.filter((name) => /^phase-(0a|0b|0c|[1-5])$/.test(name));
             if (phases.length !== 1) {
               core.setFailed(`Exactly one phase label is required, got: ${phases.join(', ')}`);
+              return;
+            }
+            if (!loopControl.shouldPublishReviewReady(labels)) {
+              core.info('Blocked PR passed deterministic checks; review-ready projection is suppressed.');
               return;
             }
             const plan = JSON.parse(fs.readFileSync('automation/phase-plan.json', 'utf8'));

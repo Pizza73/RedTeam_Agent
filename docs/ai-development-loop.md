@@ -10,8 +10,10 @@ to zero when the private-repository included quota must not be exceeded.
 
 The orchestrator reads GitHub credentials only through `gh`; it never places the credential in a
 Codex prompt or process environment. Trusted machine comments / statuses and checks are the durable
-authority events; labels are operator-visible projections that must agree with those events. Thus,
-terminating the local process pauses polling without losing phase progress.
+authority events. Lifecycle labels are operator-visible projections and are reconciled from those
+events; their delivery order is not authorization. The exact Phase label remains routing evidence,
+and `ai-loop-blocked` remains a conservative stop latch. Thus, terminating the local process pauses
+polling without losing phase progress.
 `docs/implementation-status.md` is a default-branch/bootstrap snapshot; an active PR's Phase
 authority is the exact label plus the trusted current-HEAD implementation request and the unique
 maximal adjacent prior-Phase PASS incorporated in the current HEAD. Comment order is never phase
@@ -55,7 +57,7 @@ provider-specific Human Gates and CI never connects to a real C2, MCP server or 
 | Local phase orchestrator | Request implementation/review, record validated evidence, and perform the gated final `ai-loop` merge | PR comments, approved workflow dispatch, one atomic claim ref and one exact-SHA final merge |
 | Codex Cloud | Current-phase implementation/fix requested through GitHub | PR branch only |
 | Codex GitHub Review or ChatGPT | Fresh-context semantic/security review | PR review/comment only |
-| CI | Tests, lint, type check, coverage and protected-path enforcement | Check results and ready comment |
+| CI | Tests, lint, type check, coverage and protected-path enforcement | Check results; ready evidence only for non-blocked HEADs |
 | Record AI Phase Review | Revalidate reviewer identity, review SHA, base SHA and actual checks | PR labels/comments/status |
 | Human | Start/restart local orchestration, approve Phase 4/5 provider governance, review/merge governance PRs | Explicit provider approval and governance UI merge |
 
@@ -66,6 +68,11 @@ review trigger, unchanged PR timeline, current PR head, native result and requir
 shortened commit ID displayed by Codex is corroborating evidence, never the sole binding.
 
 ## State machine
+
+The runner resolves one effective control state per polling cycle from current-HEAD trusted
+evidence. A current implementation request takes precedence over an older ready projection; a
+design-stop gate takes precedence over every request except its single-use Design Approval
+consumption. Transient labels never select the action.
 
 ```text
 IMPLEMENTATION_REQUESTED
@@ -87,6 +94,13 @@ IMPLEMENTATION_REQUESTED
        -> DESIGN_CHANGE_REQUIRED -> TRUSTED_BASE_REFRESH_ONLY
             -> CURRENT_HEAD_CI -> HUMAN_DESIGN_APPROVAL -> DESIGN_RESUME
 ```
+
+CI does not publish `REVIEW_READY` while the stop latch is present. This prevents a blocked design
+refresh from racing its approval path. An older `ai-needs-review` label may remain from a previous
+control version, but it is only a projection: the Design Approval transition accepts that one stale
+projection after revalidating the exact HEAD, gate, design commit and checks, then replaces the
+managed projection with `ai-needs-implementation`. Conflicting fix, pass, provider-gate or project-
+complete projections remain rejected.
 
 `PASS` never starts an AI process inside GitHub Actions. It creates the next SHA-bound
 implementation request; the local orchestrator detects the trusted request and asks Codex Cloud to
@@ -110,8 +124,9 @@ boundary while retaining the current Phase as `revalidate_phase`. This exception
 only a trusted current-HEAD `BLOCKED_LIMIT` gate, validates its unique adjacent base PASS and their
 ancestry, and writes the same SHA-bound status used by the local update mechanism. The local runner
 does not roll the Phase label back. It performs one expected-HEAD branch update, verifies both the
-old HEAD and target default SHA are ancestors of the result, waits for current-HEAD checks, and can
-then remain blocked. The base-refresh evidence authorizes exactly one expected-HEAD branch update;
+old HEAD and target default SHA are ancestors of the result, and dispatches the confirmation
+workflow. Only after the resulting current-HEAD checkpoint exists does it wait for current-HEAD
+checks and continue the blocked flow. The base-refresh evidence authorizes exactly one expected-HEAD branch update;
 it is not Resume authority. If the blocking gate is `DESIGN_CHANGE_REQUIRED`, remediation may
 restart only after current-HEAD CI and a separate approver-restricted Design Approval bound to the
 blocking gate, current Phase/HEAD and an approved design commit incorporated from `main`.
@@ -209,13 +224,25 @@ fix request and label state. Labels are projections for operators, not authoriza
 After the coherent redesign is human-reviewed and merged to the default branch, a base refresh may
 incorporate it into the blocked implementation PR. That update consumes only the exact refresh
 transition. It must not remove `ai-loop-blocked`, issue a fix request, dispatch `Resume AI Loop`, or
-trigger Codex. The runner records or derives one consumed transition identity bound to old HEAD,
-new HEAD, target base SHA, phase and blocking gate; another update cannot reuse it.
+trigger Codex. The workflow's confirmation mode records one consumed transition identity bound to old
+HEAD, new HEAD, target base SHA, phase and blocking gate on the new current HEAD; another update
+cannot reuse it.
+
+If another human-reviewed governance change reaches `main` before Design Approval, the original
+Gate is not authority for an arbitrary newer HEAD. After each exact-HEAD update, the runner invokes
+the approver-restricted confirmation mode of the same workflow. It verifies only the new HEAD's immediate edge: the
+previous PR HEAD is the first parent, the authorized default-branch SHA is the second parent, and
+the previous HEAD carries the matching `github-actions[bot]` authorization. The workflow then
+publishes a digest-bound `BASE_REFRESH_APPLIED` status on the new current HEAD. Only that current
+checkpoint permits one more expected-HEAD refresh; it never permits Resume or implementation by
+itself. Until the checkpoint exists, the runner remains in `REFRESH_AWAITING_CONFIRMATION`.
 
 The approver then invokes the separate `Approve AI Loop Design Resume` operation. The workflow
 revalidates the latest recurrence gate, unique adjacent phase base, current open PR, exact current
 HEAD, current default branch ancestry, successful required checks, exact Phase label, stop label,
-and that the approved design commit is contained in both current `main` and the PR HEAD. It emits:
+and that the approved design commit is contained in both current `main` and the PR HEAD. A residual
+`ai-needs-review` is accepted only as a non-authoritative projection and is removed by the approved
+transition; other conflicting lifecycle projections fail closed. It emits:
 
 ```html
 <!-- redteam-design-approval

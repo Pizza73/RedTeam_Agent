@@ -25,7 +25,7 @@ ACTIVE PR STATE: Resolve from trusted GitHub evidence; do not copy from this sna
   `9060c6c7ded3158072989035cab78c5f97946642`
 - Current Phase: Phase 0C (`phase-0c`, `ai-loop-blocked`)
 - Current implementation HEAD:
-  `4e86a7e4f5a6578133cd3579fbb5a004ab5c80c3`
+  `91392eb375bd10d840cae542acf36d79a00a3f4f`
 - The latest formal Phase 0C review retained six P1 findings across
   `authorization-lifecycle`, `secret-plaintext-boundary`, `audit-recovery-durability`,
   `filesystem-concurrency-retention`, and `integrity-cryptography-keys`:
@@ -34,12 +34,24 @@ ACTIVE PR STATE: Resolve from trusted GitHub evidence; do not copy from this sna
   implementation request:
   `https://github.com/Pizza73/RedTeam_Agent/pull/3#issuecomment-5503904111` and
   `https://github.com/Pizza73/RedTeam_Agent/pull/3#issuecomment-5503904489`.
-- The human-approved second coherent-redesign direction is documented in
-  `docs/review/phase-0c-coherent-redesign.md` and the corresponding Source-of-Truth changes on the
-  current governance branch. This snapshot does not itself constitute a Design Approval marker.
+- The human-approved second coherent redesign was merged by PR #30 as
+  `0e092ad8117e196eb9496db30fa71f6f7237e524`; its design commit
+  `a3cca860dc2cf7fb43ecef9af536d39a7463a56c` is incorporated in the current implementation HEAD.
+- Required checks passed on the refreshed HEAD, but Design Approval run `33601359533` correctly
+  emitted no marker because CI had projected `ai-needs-review` while the stop latch was present and
+  the approval workflow treated that projection as a conflicting authority state.
+- PR #31 merged the lifecycle-projection simplification as
+  `3adac80f42842631208ea59ef3593cf99a75db82`: stopped CI emits checks only, trusted evidence
+  selects the next action, and an older `ai-needs-review` projection is normalized during the
+  exact-HEAD Design Approval transition.
+- A post-merge dry run then exposed that the first refresh output could not receive another
+  exact-HEAD refresh authorization when `main` advanced again. The follow-up governance change
+  certifies each completed two-parent refresh on its new current HEAD and permits another update
+  only from that digest-bound checkpoint; it does not authorize Resume or implementation.
 
 This snapshot does not itself authorize work. The trusted current-Phase gate, adjacent Phase 0A
-base PASS, exact labels/request, and current default-branch evidence remain the active authority.
+base PASS, exact Phase label / stop latch, SHA-bound request, and current default-branch evidence
+remain the active authority.
 
 ## Phase 0A evidence snapshot
 
@@ -58,13 +70,16 @@ base PASS, exact labels/request, and current default-branch evidence remain the 
 ## Next allowed action
 
 Do not restart the local runner or issue a generic Resume while the latest Phase 0C gate is the
-recurrence stop above. After this design governance change is human-reviewed and merged:
+recurrence stop above. After the current-HEAD refresh-checkpoint governance change is human-reviewed
+and merged:
 
-1. human-review and merge this second coherent redesign into the default branch;
-2. incorporate the resulting approved design commit into PR #3 using only the exact-HEAD
-   base-refresh operation; that operation must keep the Phase 0C label and stop state;
-3. wait for current-HEAD required checks, then issue the dedicated Design Approval bound to the
-   latest recurrence gate, full current HEAD, Phase 0C and incorporated design commit;
+1. certify PR #3's existing `91392eb...` refresh edge using the confirmation mode of
+   **Prepare AI Loop Base Refresh**, then
+   incorporate the resulting governance commit using only the next exact-HEAD base-refresh
+   operation; certify that new HEAD too and keep the Phase 0C label and stop latch;
+2. wait for the four current-HEAD required checks; stopped CI must not publish Review Ready;
+3. issue the dedicated Design Approval bound to the latest recurrence gate, full current HEAD,
+   Phase 0C and the incorporated PR #30 design commit;
 4. resume once with `RESUME_AFTER_DESIGN_APPROVAL` and implement Executor-owned
    consume-before-release Secret delivery, trusted collection Clock ownership, side-effect-free
    verified erasure, manifest/projection-only result recovery and the durable Production generation

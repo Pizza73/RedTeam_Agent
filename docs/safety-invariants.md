@@ -82,6 +82,9 @@
 - Loop回数を制限し、同じ失敗を無限反復しない。
 - 同じInvariant Familyの2回目のFormal Reviewは`DESIGN_CHANGE_REQUIRED`として通常Resume不能にする。過去のbase-refresh / Resume Evidenceは新しいDesign Stopを越えて再利用しない。
 - Design Stop後の再開は、停止Gate、Current 40桁HEAD、Phase、承認済みDesign revisionへBindingした単回`DESIGN_APPROVED` Evidenceだけを使用する。LabelやFree-text commentを権限にしない。
+- Transient Lifecycle LabelはOperator向けProjectionであり、Implementation / Review Actionを認可しない。RunnerはCurrent-HEAD Trusted Request / Ready EvidenceからActionを決定する。
+- `ai-loop-blocked`中のCIは決定論的Checkだけを確定し、Review Readyを生成しない。Stop latchはTrusted Resume / Design Approval / Phase transitionだけが除去できる。旧`ai-needs-review` ProjectionはAuthority再検証後のDesign Approval遷移だけが正規化できる。
+- Design Stop中の各Base Refreshは、直前1 Edgeの2親Merge、Previous HEAD上のTrusted Exact-SHA Authorization、Current / Previous HEAD、認可済みDefault SHA、Phase pair、Gateを検証したbot-authored `BASE_REFRESH_APPLIED` CheckpointをCurrent HEADへ持つ。後続RefreshはCurrent HEAD上の単一Checkpointからだけ権限を継承し、自由なMerge、通常Commit、未確認Edge、欠落・改ざん・曖昧なCheckpointから継承しない。
 - Phase 4/5の外部選択はHuman Gateを通す。
 - 最終mergeは、承認済みDefault Branch上のLocal OrchestratorだけがPhase 0A～5の
   SHA-bound PASS Chain、Current-HEAD CI/Status、Stop Label不在、Current Default Branch
