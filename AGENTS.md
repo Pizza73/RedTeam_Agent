@@ -53,7 +53,10 @@ HEAD, previous HEAD, exact authorized default-branch SHA, Phase pair, and blocki
 Certification requires one two-parent merge and the matching trusted authorization on its first
 parent. A later refresh may inherit the Gate only from the single valid checkpoint on its exact
 current HEAD; missing, malformed, ambiguous, or skipped checkpoints are rejected without
-re-walking historical edges. A base refresh
+re-walking historical edges. After a single-use Design Approval is consumed, its authorized
+implementation may create a normal child commit and that output may proceed to current-HEAD CI and
+review without being a new two-parent refresh checkpoint. The output inherits no authority for
+Resume or another refresh. A base refresh
 authorizes only one expected-HEAD branch update and never authorizes Resume. If the latest gate
 records invariant-family recurrence, it is `DESIGN_CHANGE_REQUIRED` and
 dominates every earlier refresh / Resume record. Implementation may resume only from a single-use
