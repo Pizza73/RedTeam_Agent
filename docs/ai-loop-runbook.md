@@ -277,6 +277,10 @@ machine-readable phase record.
   exact current-HEAD `redteam/base-refresh-applied/...` checkpoint, its immediate two-parent merge,
   and the matching `redteam/base-refresh/...` authorization on the previous HEAD. A missing
   checkpoint requires confirmation or governance repair, not a manual branch update.
+- If a Design-Approved implementation output reports `base-refresh checkpoint requires one exact
+  two-parent merge`, the runner is incorrectly applying refresh inheritance to a normal output
+  commit. That commit should proceed to current-HEAD review, but it does not authorize Resume or a
+  later refresh.
 - Automatic final merge blocked: inspect the Phase 0A→5 PASS chain, latest
   `redteam/phase-review`, four Check Runs, stop labels, current `main` ancestry, the exact-HEAD
   attempt comment and `refs/redteam-final-merge-attempts/pr-<PR>-<HEAD>`. Do not retry an uncertain

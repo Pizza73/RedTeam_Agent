@@ -237,6 +237,12 @@ publishes a digest-bound `BASE_REFRESH_APPLIED` status on the new current HEAD. 
 checkpoint permits one more expected-HEAD refresh; it never permits Resume or implementation by
 itself. Until the checkpoint exists, the runner remains in `REFRESH_AWAITING_CONFIRMATION`.
 
+After the single-use Design Approval is consumed, the authorized implementation request may
+produce a normal child commit. That output proceeds through current-HEAD CI and review without
+being mistaken for another base-refresh edge or requiring a new two-parent checkpoint. It does not
+inherit authority to Resume or perform another refresh; either action must independently satisfy
+the current trusted transition rules.
+
 The approver then invokes the separate `Approve AI Loop Design Resume` operation. The workflow
 revalidates the latest recurrence gate, unique adjacent phase base, current open PR, exact current
 HEAD, current default branch ancestry, successful required checks, exact Phase label, stop label,

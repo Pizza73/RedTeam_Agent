@@ -5181,9 +5181,12 @@ Previous PR HEADを第1親、認可済みExact Default-Branch SHAを第2親と�
 Current HEAD、Previous HEAD、Default SHA、Phase pair、Design Stop GateをCanonical DigestへBindingした
 `BASE_REFRESH_APPLIED` StatusをCurrent HEADへ発行する。次のExpected-HEAD RefreshはCurrent HEAD上の単一で
 正しいCheckpointだけから同じGateを継承する。更新後からCheckpoint発行までを
-`REFRESH_AWAITING_CONFIRMATION`として扱い、Resume、Implementation Request、次Refreshを禁止する。通常Commit、
-Status欠落、親順序・Digest・Gate不一致、Checkpoint欠落または曖昧性はFail Closedとする。過去Edgeは監査履歴
-として残すが通常判定で再走査せず、CheckpointはResumeやImplementation Requestを認可しない。
+`REFRESH_AWAITING_CONFIRMATION`として扱い、Resume、Implementation Request、次Refreshを禁止する。
+Design Approval消費前に通常CommitでHEADを進めてGateを継承する経路、Status欠落、親順序・Digest・Gate不一致、
+Checkpoint欠落または曖昧性はFail Closedとする。一方、単回Design Approvalが正しく消費された後の実装出力は
+通常の子Commitであり、Current-HEAD CIとReviewへ進むために新たな2親Checkpointを要求しない。その出力Commitは
+Resumeまたは次Refreshの権限を継承しない。過去Edgeは監査履歴として残すが通常判定で再走査せず、Checkpointは
+ResumeやImplementation Requestを認可しない。
 
 ---
 

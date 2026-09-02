@@ -98,8 +98,10 @@
   Default SHA、Phase pair、GateをDigest Bindingしたbot-authored `BASE_REFRESH_APPLIED` Statusとして
   Current HEADへ記録する
 - Design Stop後にDefault Branchが再度進んだ場合、同じGateの継承はCurrent HEAD上の単一で正しい
-  `BASE_REFRESH_APPLIED` Checkpointだけを認可根拠とする。Checkpoint発行前、通常Commit、親・Digest・
-  Gate不一致、欠落または曖昧なCheckpointは実装・Resume・次Refreshへ進めずFail Closedにする
+  `BASE_REFRESH_APPLIED` Checkpointだけを認可根拠とする。Design Approval消費前の通常Commit、親・Digest・
+  Gate不一致、欠落または曖昧なCheckpointは実装・Resume・次Refreshへ進めずFail Closedにする。単回Design
+  Approvalを消費した実装出力は通常の子CommitとしてCurrent-HEAD CIとReviewへ進めるが、そのCommitはResumeや
+  次Refreshの権限を継承しない
 - Design ApprovalはStop latch、Current Phase / HEAD、最新Blocking Gate、Required Check、Design commit
   の包含を再検証する。Current HEADの旧`ai-needs-review`はAuthorityではないため許容して最終Label遷移で
   除去するが、`ai-needs-fix`、`ai-review-passed`、`ai-human-gate`等の競合状態は拒否する
