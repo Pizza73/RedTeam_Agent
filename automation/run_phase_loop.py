@@ -1907,9 +1907,7 @@ class PhaseLoop:
             for record in phase_records
         ):
             return None
-        gate = self.incorporated_design_stop_gate(state, phase_records)
-        if gate is None:
-            gate = self.latest_incorporated_phase_gate(state, phase_records)
+        gate = self.latest_incorporated_phase_gate(state, phase_records)
         if (
             gate is None
             or gate.payload.get("verdict") != "CHANGES_REQUESTED"
@@ -2055,6 +2053,21 @@ class PhaseLoop:
         state: PullRequestState,
         phase_records: list[MarkerEvidence],
     ) -> MarkerEvidence | None:
+        direct = [
+            record
+            for record in phase_records
+            if record.payload.get("phase") == state.phase
+            and record.payload.get("reviewed_sha") == state.head_sha
+        ]
+        if direct:
+            identities = {
+                (record.url, canonical_digest(record.payload)) for record in direct
+            }
+            if len(identities) != 1:
+                raise UntrustedEvidenceError(
+                    "latest incorporated current-Phase gate is ambiguous"
+                )
+            return direct[-1]
         candidates = [
             record
             for record in phase_records
@@ -2655,9 +2668,7 @@ class PhaseLoop:
         ):
             return False
         expected_source = PHASES[phase_index + 1]
-        gate = self.incorporated_design_stop_gate(state, phase_records)
-        if gate is None:
-            gate = self.latest_incorporated_phase_gate(state, phase_records)
+        gate = self.latest_incorporated_phase_gate(state, phase_records)
         if (
             gate is None
             or gate.payload.get("verdict") != "CHANGES_REQUESTED"
@@ -2665,6 +2676,8 @@ class PhaseLoop:
         ):
             return False
         self.validate_blocked_refresh_gate(gate, phase_records)
+        if gate.payload.get("reviewed_sha") == state.head_sha:
+            return False
         checkpoint = self.trusted_base_refresh_checkpoint(
             head_sha=state.head_sha,
             phase=state.phase,

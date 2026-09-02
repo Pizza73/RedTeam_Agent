@@ -147,6 +147,12 @@ current output HEAD, phase-specific report path and canonical report digest. Leg
 evidence created before this policy remains readable, but every newly issued implementation or fix
 request uses the audited path.
 
+Inside the audit file, `request.head_sha` remains the trusted implementation input HEAD and must be
+an ancestor of the reviewed output. The ready marker separately binds that output HEAD. The marker's
+`audit_digest` is calculated from recursively key-sorted, whitespace-free JSON rather than the
+file's raw bytes. Those intentional input/output and canonical/raw differences are not stale
+evidence.
+
 ```html
 <!-- redteam-invariant-audit
 {"schema_version":"1.0","phase":"phase-0c","head_sha":"<output-sha>","audit_path":"docs/review/phase-0c-invariant-audit.json","audit_digest":"<sha256>","request_reference":"https://github.com/..."}
