@@ -51,7 +51,7 @@ authority revalidation remain mandatory even if a lifecycle projection was parti
 - `scripts/ci/run_phase_gate.sh`: explicitly select non-authorizing preflight; retain every existing
   compile, validation, lint, type, test, coverage, zero-skip and dependency check.
 - `.github/workflows/ci.yml`: minimum read permission and current-state/stop guards for failure handoff.
-- `tests/unit/test_automation_validation.py`: 32 additional regression cases (including parametrized
+- `tests/unit/test_automation_validation.py`: 40 additional regression cases (including parametrized
   cases); existing tests are retained.
 - `docs/acceptance-criteria.md`, `docs/ai-development-loop.md`, `docs/ai-loop-runbook.md`: describe
   the historical/current distinction and failure-handoff requirements.
@@ -69,6 +69,9 @@ Approval workflow, retry limit or merge permission is changed.
   evidence, duplicate JSON keys and unknown fields are rejected.
 - The original policy's stateful requirement is still enforced; a new strategy uses the current
   stateful requirement even in preflight. Removing strategy from a new-policy report is rejected.
+- Both recorded policies are schema-validated. Numeric values cannot stand in for Boolean
+  requirements/stateful flags; unknown fields, duplicate keys, invalid JSON, missing policy blobs
+  and policy drift between input and report are rejected.
 - The actual workflow script runs against fake GitHub APIs for normal handoff, existing/late stop,
   stop after label write, HEAD/Phase drift, closed/fork PR, read denial, duplicate request and retry
   exhaustion. No live AI/C2/MCP/target operation is used by these tests.
@@ -86,7 +89,7 @@ python scripts/ci/validate_automation.py
 git diff --check
 ```
 
-Results: **297 governance tests passed**; scoped lint, compile, automation validation and whitespace
+Results: **305 governance tests passed**; scoped lint, compile, automation validation and whitespace
 checks passed. Formatting errors found during the first two lint iterations were corrected; no
 tests, safety assertions or requirements were weakened to obtain a pass.
 
@@ -123,14 +126,21 @@ Result: **`PHASE_GATE=phase-0c PASS` (local deterministic validation only)**.
 
 - Compile, automation validation, preflight and full-tree Ruff: PASS.
 - Mypy: PASS, 81 application source files.
-- Unit: 336 passed; integration: 7 passed; security: 240 passed.
-- Branch-enabled coverage run: 583 passed; report total 80% (9,936 statements, 3,004 branches).
+- Unit: 344 passed; integration: 7 passed; security: 240 passed.
+- Branch-enabled coverage run: 591 passed; report total 80% (9,936 statements, 3,004 branches).
 - JUnit zero-skip/error/failure check and `pip check`: PASS.
 
 This exercises the cumulative implementation tree rather than the older application snapshot on
 the governance/default branch. It does not certify the existing product against the new design or
 replace independent Phase review. The GitHub Python 3.12/3.14 governance checks must pass on the
 published Governance PR HEAD before human review/merge.
+
+Publication: [Governance PR #41](https://github.com/Pizza73/RedTeam_Agent/pull/41), branch
+`codex/legacy-audit-preflight-fix`. The first published commit
+`a60ddfbff7584d5f0ee9153b7c206b0dbcfe642e` passed both GitHub Python versions and all governance
+checks. The follow-up tightens historical-policy typing and adds eight failure-path cases; the
+counts above are the final local rerun including that follow-up. Verify the final PR HEAD's checks,
+not the first commit's results, before human merge.
 
 ## Remaining constraints / next step
 

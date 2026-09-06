@@ -24,6 +24,7 @@ from scripts.ci.validate_invariant_audit import (
     InvariantAuditError,
     validate_invariant_audit,
 )
+from scripts.ci.validate_invariant_audit import _git_bytes as audit_git_bytes
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -494,6 +495,51 @@ def test_historical_preflight_preserves_stateful_requirement_of_original_policy(
 ) -> None:
     repo, _ = _legacy_audit_repo(tmp_path, secret_stateful=True)
     with pytest.raises(InvariantAuditError, match="property/state-machine"):
+        validate_invariant_audit(repo, "phase-0c", if_present=True, historical_preflight=True)
+
+
+@pytest.mark.parametrize("fault", [
+    "numeric-required", "unknown-requirement", "duplicate-plan-key", "invalid-policy-json",
+    "missing-history", "recorded-numeric-stateful", "recorded-unknown-policy", "policy-drift",
+])
+def test_historical_preflight_rejects_malformed_or_unavailable_policy_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str,
+) -> None:
+    repo, report_path = _legacy_audit_repo(tmp_path)
+    request_head = json.loads(report_path.read_text())["request"]["head_sha"]
+
+    def read_history(root: Path, *arguments: str) -> bytes:
+        raw = audit_git_bytes(root, *arguments)
+        if arguments[0] != "show":
+            return raw
+        spec = arguments[1]
+        if spec.endswith(":automation/phase-plan.json"):
+            plan = json.loads(raw)
+            if fault == "numeric-required":
+                plan["invariant_audit"]["required"] = 1
+            elif fault == "unknown-requirement":
+                plan["invariant_audit"]["unknown"] = True
+            elif fault == "duplicate-plan-key":
+                return b'{"invariant_audit":{},"invariant_audit":{}}'
+            return json.dumps(plan).encode()
+        if spec.endswith(":automation/invariant-families.json"):
+            if fault == "invalid-policy-json":
+                return b'{'
+            if fault == "missing-history":
+                raise InvariantAuditError("historical policy blob is unavailable")
+            if not spec.startswith(request_head + ":"):
+                policy = json.loads(raw)
+                if fault == "recorded-numeric-stateful":
+                    policy["families"][0]["stateful"] = 1
+                elif fault == "recorded-unknown-policy":
+                    policy["unknown"] = True
+                elif fault == "policy-drift":
+                    policy["families"][0]["title"] = "Policy changed after the input request"
+                return json.dumps(policy).encode()
+        return raw
+
+    monkeypatch.setattr("scripts.ci.validate_invariant_audit._git_bytes", read_history)
+    with pytest.raises(InvariantAuditError):
         validate_invariant_audit(repo, "phase-0c", if_present=True, historical_preflight=True)
 
 

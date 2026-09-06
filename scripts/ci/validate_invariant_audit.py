@@ -137,11 +137,17 @@ def _historical_preflight_policy(
     legacy_requirement = {"policy_version": "1.0", "required": True}
     for commit in (request_head, record_commit):
         plan = _git_json(root, commit, "automation/phase-plan.json")
-        if not isinstance(plan, dict) or plan.get("invariant_audit") != legacy_requirement:
+        requirement = plan.get("invariant_audit") if isinstance(plan, dict) else None
+        if (not isinstance(requirement, dict) or requirement != legacy_requirement
+                or requirement.get("required") is not True):
             raise InvariantAuditError("historical audit was not recorded under the legacy policy")
     policy_path = "automation/invariant-families.json"
     policy = _git_json(root, request_head, policy_path)
-    if policy != _git_json(root, record_commit, policy_path):
+    recorded_policy = _git_json(root, record_commit, policy_path)
+    schema = _load_json(root / "automation/schemas/invariant-families.schema.json")
+    for candidate in (policy, recorded_policy):
+        _validate(candidate, schema, name="historical invariant-family policy")
+    if policy != recorded_policy:
         raise InvariantAuditError("historical audit policy changed between input and recording")
 
     # A carried-forward audit cannot cover new application code or changed evidence.
@@ -298,8 +304,6 @@ def validate_invariant_audit(
 
     if historical_preflight and "implementation_strategy" not in audit:
         historical = _historical_preflight_policy(root, audit_path, audit)
-        _validate(historical, _load_json(schemas / "invariant-families.schema.json"),
-                  name="historical invariant-family policy")
         if historical["phases"].get(phase) != policy["phases"].get(phase):
             raise InvariantAuditError("historical audit cannot replace the current family set")
         policy = historical
