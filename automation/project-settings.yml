@@ -16,7 +16,8 @@ repository_setup:
 
 loop:
   max_iterations_per_phase: 5
-  same_finding_limit: 3
+  # Mirrors the existing trusted workflow; invariant-family recurrence still stops at two.
+  same_finding_limit: 5
   final_merge_requires_human: false
   final_merge_mode: local_orchestrator_exact_sha
   allow_fork_pull_requests: false
@@ -24,7 +25,16 @@ loop:
   ai_runs_in_github_actions: false
   implementation_trigger: local_orchestrator
   review_trigger: local_orchestrator_after_ci
-  review_evidence_format: codex-native-v1
+  execution_policy: automation/local-execution-policy.json
+  implementation_backend: local-codex-cli
+  review_backend: local-codex-cli
+  cloud_fallback: false
+  unattended_review: true
+  review_requires_fresh_process: true
+  review_requires_read_only: true
+  worker_github_credentials: false
+  review_evidence_format: local-review-v1
+  historical_review_evidence_format: codex-native-v1
   active_phase_authority: github-sha-bound-marker-chain
   refresh_default_branch_before_new_phase_implementation: true
   refresh_revalidates_previous_phase: true
@@ -32,7 +42,8 @@ loop:
   local_orchestrator:
     command: .venv/bin/python automation/run_phase_loop.py
     github_actor_must_equal: AI_GATE_APPROVER_LOGIN
-    reviewer_login_variable: AI_REVIEWER_LOGIN
+    local_review_attestor_login_variable: AI_GATE_APPROVER_LOGIN
+    historical_reviewer_login_variable: AI_REVIEWER_LOGIN
     trusted_marker_author: github-actions[bot]
     poll_seconds: 30
     max_runtime_hours: 24
@@ -62,6 +73,7 @@ human_gates:
 
 required_repository_variables:
   - AI_GATE_APPROVER_LOGIN
+  # Retained only to verify existing codex-native-v1 gate ancestry.
   - AI_REVIEWER_LOGIN
   - AI_LOOP_MAX_ITERATIONS
 

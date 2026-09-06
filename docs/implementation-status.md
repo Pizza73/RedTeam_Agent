@@ -9,6 +9,28 @@ unique maximal adjacent prior-Phase PASS incorporated in that HEAD as defined in
 Requirements, acceptance criteria, safety invariants, protected-file rules, and Human Gates remain
 authoritative in all contexts.
 
+## Local-only development-loop migration — 2026-09-06 (not deployed)
+
+- The approved change is local Codex CLI implementation and a separate fresh read-only local
+  review session, with unattended routine review recording. New Codex Cloud tasks and GitHub
+  `@codex` triggers are disabled by the new `automation/local-execution-policy.json` contract.
+- Only the trusted clean-main launcher holds GitHub credentials and publishes validated normal
+  implementation commits, local review provenance and workflow requests. `local-review-v1`
+  authenticates launcher provenance through the operator account; the host/sandbox/launcher is
+  the trust boundary, not an account-independent Cloud reviewer.
+- The local implementation, review and Runner integration are implemented. Synthetic live CLI
+  review and scoped-edit checks passed; no product implementation or GitHub publication was
+  performed. The governance change is not deployed and is not a new Phase PASS. Exact commands,
+  tests and existing product-baseline blockers are recorded in
+  `docs/review/local-ai-development-loop.md`.
+- Existing Cloud requests/output must be reconciled before local execution consumes the same
+  input. Old native gates, findings, retry counters and consumed approvals remain historical
+  evidence; stopping polling is not proof that an already-sent Cloud task has stopped.
+- Human governance review/merge, authorized incorporation, current-HEAD authority/CI and existing
+  Design/Provider Human Gates remain prerequisites for live operation. This change does not
+  resume PR #3 or authorize any Phase transition. The dated snapshots below are preserved as
+  history and are not current GitHub status.
+
 ## Specification adoption — 2026-09-06
 
 - `system-design-v1-r1` has been reflected locally in `SystemDesign.md` together with the normative

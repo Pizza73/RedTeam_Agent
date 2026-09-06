@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from automation.local_execution import LocalExecution
 from automation.run_phase_loop import (
     BASE_REFRESH_CHECKPOINT_STATUS_DESCRIPTION,
     BASE_REFRESH_CHECKPOINT_STATUS_PREFIX,
@@ -1081,6 +1082,17 @@ class _ReviewPromptGitHub:
         return {"body": body}
 
 
+class _LocalExecutorSpy:
+    def __init__(self) -> None:
+        self.calls: list[tuple[object, ...]] = []
+
+    def implement(self, *arguments: object) -> None:
+        self.calls.append(("implementation", *arguments))
+
+    def review(self, *arguments: object) -> None:
+        self.calls.append(("review", *arguments))
+
+
 def strategy_implementation_loop() -> tuple[PhaseLoop, _ReviewPromptGitHub]:
     github = _ReviewPromptGitHub()
     loop = PhaseLoop.__new__(PhaseLoop)
@@ -1093,11 +1105,13 @@ def strategy_implementation_loop() -> tuple[PhaseLoop, _ReviewPromptGitHub]:
     plan = json.loads((REPO_ROOT / "automation/phase-plan.json").read_text())
     loop.phase_prompts = {item["id"]: item["prompt"] for item in plan["phases"]}
     loop.implementation_audit_policy = plan["invariant_audit"]
+    loop.repo_root = REPO_ROOT
+    loop._local_executor = _LocalExecutorSpy()
     return loop, github
 
 
 @pytest.mark.parametrize("phase", PHASES)
-def test_each_phase_passes_current_strategy_to_implementation_once(phase: str) -> None:
+def test_each_phase_passes_current_strategy_to_local_implementation(phase: str) -> None:
     loop, github = strategy_implementation_loop()
     payload = {
         **implementation_request(), "phase": phase, "phase_prompt": loop.phase_prompts[phase],
@@ -1105,8 +1119,11 @@ def test_each_phase_passes_current_strategy_to_implementation_once(phase: str) -
     }
     request = MarkerEvidence(payload, PHASE_RECORD_URL, "github-actions[bot]", "")
     loop.request_implementation(phase_state(phase=phase), request, [])
-    assert len(github.posted) == 1
-    prompt = github.posted[0]
+    assert len(loop._local_executor.calls) == 1
+    call = loop._local_executor.calls[0]
+    assert call == ("implementation", loop, phase_state(phase=phase), request, [])
+    assert github.posted == []
+    prompt = LocalExecution(REPO_ROOT).implementation_prompt(phase_state(phase=phase), request)
     for expected in (
         HEAD_SHA, PHASE_RECORD_URL, "SystemDesign_AI_Control.md", "SystemDesign Section 38",
         "reuse/replace/new", "storage/recovery", "implementation_strategy", "before/after",
@@ -1114,11 +1131,8 @@ def test_each_phase_passes_current_strategy_to_implementation_once(phase: str) -
         "complete phase gate",
     ):
         assert expected in prompt
-    loop.request_implementation(phase_state(phase=phase), request, [
-        {"user": {"login": ACTOR_LOGIN}, "body": prompt, "html_url": TRIGGER_URL,
-         "created_at": "2026-09-06T00:00:00Z"},
-    ])
-    assert len(github.posted) == 1
+    assert "leave changes uncommitted" in prompt
+    assert "@codex implement" not in prompt
 
 
 @pytest.mark.parametrize("audit_policy", [
@@ -1144,6 +1158,7 @@ def test_implementation_dispatch_rejects_legacy_downgraded_or_unknown_strategy(
 def test_new_strategy_request_dry_run_does_not_post() -> None:
     loop, github = strategy_implementation_loop()
     loop.dry_run = True
+    loop._local_executor = LocalExecution(REPO_ROOT)
     payload = {**implementation_request(), "invariant_audit": loop.implementation_audit_policy}
     loop.request_implementation(
         phase_state(), MarkerEvidence(payload, PHASE_RECORD_URL, "github-actions[bot]", ""), [],
@@ -1159,6 +1174,7 @@ def test_every_phase_uses_one_exhaustive_all_findings_review(phase: str) -> None
     loop.actor_login = ACTOR_LOGIN
     loop.dry_run = False
     loop.log = lambda _message: None  # type: ignore[method-assign]
+    loop._local_executor = _LocalExecutorSpy()
     ready = MarkerEvidence(
         payload={"schema_version": "1.0", "phase": phase, "head_sha": HEAD_SHA},
         url=READY_URL,
@@ -1168,19 +1184,21 @@ def test_every_phase_uses_one_exhaustive_all_findings_review(phase: str) -> None
 
     loop.request_review(phase_state(phase=phase), ready, BASE_SHA, [])
 
-    assert len(github.posted) == 1
-    prompt = github.posted[0]
-    assert prompt.count("@codex review") == 1
+    assert github.posted == []
+    assert loop._local_executor.calls == [("review", loop, phase_state(phase=phase),
+                                           ready, BASE_SHA, [])]
+    prompt = LocalExecution(REPO_ROOT).review_prompt(phase_state(phase=phase), BASE_SHA)
     assert "one exhaustive independent review" in prompt
     assert "applies identically to every Phase" in prompt
-    assert "retain every consequential finding in this single native review" in prompt
-    assert "standard P0 or P1 inline format" in prompt
-    assert "Invariant family: FAMILY_ID" in prompt
+    assert "Retain every consequential finding in this single structured review" in prompt
+    assert "`BLOCKER`/`HIGH` severity" in prompt
+    assert "invariant_family" in prompt
     assert "pre-review audit" in prompt
     assert "SystemDesign_AI_Control.md" in prompt
     assert "Independently verify reuse/replace/new" in prompt
     assert "migration/recovery" in prompt
-    assert prompt.count("redteam-local-codex-trigger") == 1
+    assert "redteam-local-codex-trigger" not in prompt
+    assert "read-only snapshot" in prompt
 
 
 def base_refresh_payload() -> dict[str, object]:

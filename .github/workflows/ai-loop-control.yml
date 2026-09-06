@@ -21,7 +21,7 @@ on:
           - phase-4
           - phase-5
       reviewed_sha:
-        description: Exact 40-character PR head SHA reviewed by Codex Cloud or ChatGPT
+        description: Exact 40-character PR head SHA independently reviewed
         required: true
         type: string
       base_sha:
@@ -37,7 +37,7 @@ on:
           - CHANGES_REQUESTED
           - BLOCKED
       review_reference:
-        description: Permalink to the native Codex PR review or no-finding comment
+        description: Permalink to local-review result or historical native review evidence
         required: true
         type: string
       ready_reference:
@@ -45,7 +45,7 @@ on:
         required: true
         type: string
       review_trigger_reference:
-        description: Permalink to the operator-authored SHA-bound @codex review request
+        description: Permalink to the launcher-authored exact-SHA local review start
         required: true
         type: string
       summary:
@@ -104,6 +104,7 @@ jobs:
           script: |
             const crypto = require('crypto');
             const loopControl = require(`${process.env.GITHUB_WORKSPACE}/automation/loop_control_state.js`);
+            const localReview = require(`${process.env.GITHUB_WORKSPACE}/automation/local_review_evidence.js`);
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const pull_number = Number.parseInt(process.env.PR_NUMBER, 10);
@@ -389,8 +390,9 @@ jobs:
                   (record) => isExactPhaseGate(record) &&
                     record.phase === previousPhase &&
                     record.verdict === 'PASS' && record.loop_state === 'PASS' &&
-                    record.evidence_format === 'codex-native-v1' &&
-                    record.reviewer_login === process.env.AI_REVIEWER_LOGIN &&
+                    localReview.isTrustedGateEvidence(
+                      record, process.env.AI_REVIEWER_LOGIN, process.env.AI_GATE_APPROVER_LOGIN
+                    ) &&
                     record.recorded_by === process.env.AI_GATE_APPROVER_LOGIN &&
                     record.finding_key === null && hasPassingRequiredChecks(record) &&
                     /^[0-9a-f]{40}$/.test(record.reviewed_sha)
@@ -608,10 +610,15 @@ jobs:
               return;
             }
             const triggerBody = triggerEvidence.body || '';
+            const localRoute = triggerBody.includes(localReview.START_MARKER);
+            if (!localRoute) {
+              core.setFailed('New phase gates require local-review-v1 evidence; native reviews are historical only.');
+              return;
+            }
             if (
-              triggerBody.split(/\r?\n/, 1)[0].trim() !== '@codex review' ||
+              !localRoute && (triggerBody.split(/\r?\n/, 1)[0].trim() !== '@codex review' ||
               !triggerBody.includes(`\`${reviewedSha}\``) ||
-              !triggerBody.includes(`\`${suppliedBaseSha}\``)
+              !triggerBody.includes(`\`${suppliedBaseSha}\``))
             ) {
               core.setFailed('Review trigger must use @codex review and contain both full SHAs.');
               return;
@@ -631,14 +638,15 @@ jobs:
               ready_url: readyReference,
             };
             const sourceDigest = crypto.createHash('sha256').update(JSON.stringify(source)).digest('hex');
-            const triggerMarker = singleMarker(triggerBody, 'redteam-local-codex-trigger');
+            const triggerMarker = localRoute ? null :
+              singleMarker(triggerBody, 'redteam-local-codex-trigger');
             if (
-              !exactKeys(triggerMarker, [
+              !localRoute && (!exactKeys(triggerMarker, [
                 'schema_version', 'kind', 'phase', 'head_sha', 'source_digest',
               ]) ||
               triggerMarker.schema_version !== '1.0' || triggerMarker.kind !== 'review' ||
               triggerMarker.phase !== phase || triggerMarker.head_sha !== reviewedSha ||
-              triggerMarker.source_digest !== sourceDigest
+              triggerMarker.source_digest !== sourceDigest)
             ) {
               core.setFailed('Review trigger marker is not exactly bound to ready/head/base evidence.');
               return;
@@ -661,6 +669,52 @@ jobs:
             const timeline = await github.paginate(github.rest.issues.listEventsForTimeline, {
               owner, repo, issue_number: pull_number, per_page: 100,
             });
+            let localEvidence = null;
+            let localPolicyDigest = null;
+            if (localRoute) {
+              if (!invariantAudit) {
+                core.setFailed('Local review requires the current SHA-bound invariant audit.');
+                return;
+              }
+              const {data: trustedDefault} = await github.rest.repos.getCommit({
+                owner, repo, ref: context.payload.repository.default_branch,
+              });
+              if (context.ref !== `refs/heads/${context.payload.repository.default_branch}` ||
+                  !/^[0-9a-f]{40}$/.test(context.sha || '') || trustedDefault.sha !== context.sha ||
+                  pr.base.ref !== context.payload.repository.default_branch ||
+                  !labels.includes('ai-loop') || labels.some((label) => [
+                    'ai-loop-blocked', 'ai-human-gate', 'governance-change',
+                    'ai-project-complete', 'ai-review-passed',
+                  ].includes(label))) {
+                core.setFailed('Local review requires current default-branch governance and active PR authority.');
+                return;
+              }
+              const {data: policyFile} = await github.rest.repos.getContent({
+                owner, repo, path: 'automation/local-execution-policy.json', ref: context.sha,
+              });
+              if (Array.isArray(policyFile) || policyFile.type !== 'file' || !policyFile.content) {
+                core.setFailed('Trusted local execution policy is unavailable.');
+                return;
+              }
+              const localPolicy = JSON.parse(Buffer.from(policyFile.content, 'base64').toString('utf8'));
+              if (localPolicy.schema_version !== '1.0' || localPolicy.backend !== 'local-codex-cli' ||
+                  localPolicy.cloud_fallback !== false || localPolicy.review_evidence_format !== 'local-review-v1' ||
+                  localPolicy.review_requires_fresh_process !== true ||
+                  localPolicy.review_requires_read_only !== true ||
+                  localPolicy.worker_github_credentials !== false || localPolicy.unattended_review !== true) {
+                core.setFailed('Local review execution policy does not enforce the approved trust boundary.');
+                return;
+              }
+              localPolicyDigest = localReview.canonicalDigest(localPolicy);
+              localEvidence = localReview.evaluateLocalReview({
+                comments, timeline, startReference: reviewTriggerReference,
+                reportReference: reviewReference, operatorLogin: process.env.AI_GATE_APPROVER_LOGIN,
+                phase, headSha: reviewedSha, baseSha: suppliedBaseSha,
+                readyReference, readyCreatedAt: readyEvidence.created_at, sourceDigest,
+                policyDigest: localPolicyDigest,
+                familyIds, requiredCheckNames, pullRequestUrl: `https://github.com/${owner}/${repo}/pull/${pull_number}`,
+              });
+            }
             const reviewEvidence = reviews.find((item) => item.html_url === reviewReference);
             const commentEvidence = comments.find((item) => item.html_url === reviewReference);
             const evidence = reviewEvidence || commentEvidence;
@@ -668,7 +722,7 @@ jobs:
               core.setFailed('review_reference does not resolve to a PR review or issue comment.');
               return;
             }
-            if (evidence.user?.login !== process.env.AI_REVIEWER_LOGIN) {
+            if (!localRoute && evidence.user?.login !== process.env.AI_REVIEWER_LOGIN) {
               core.setFailed(`Unexpected reviewer: ${evidence.user?.login || 'unknown'}`);
               return;
             }
@@ -689,6 +743,7 @@ jobs:
               return matches[0][1];
             }
             function nativeFindingKey(comment) {
+              if (localRoute) return comment.finding_key;
               const priority = codexPriority(comment.body);
               if (!priority || typeof comment.path !== 'string' || !comment.path) {
                 throw new Error('Codex finding is missing priority or path.');
@@ -707,7 +762,7 @@ jobs:
               if (changed) throw new Error('PR head changed while Codex review was running.');
             }
 
-            const currentFindings = reviewComments.filter((item) => {
+            const currentFindings = localRoute ? localEvidence.currentFindings : reviewComments.filter((item) => {
               if (
                 item.user?.login !== process.env.AI_REVIEWER_LOGIN ||
                 item.commit_id !== reviewedSha
@@ -716,7 +771,7 @@ jobs:
               return codexPriority(item.body);
             }).sort((left, right) => left.id - right.id);
             const validReviews = new Map();
-            for (const item of reviews) {
+            for (const item of localRoute ? [] : reviews) {
               if (
                 item.user?.login === process.env.AI_REVIEWER_LOGIN &&
                 item.commit_id === reviewedSha && item.state === 'COMMENTED' &&
@@ -724,7 +779,7 @@ jobs:
               ) validReviews.set(item.id, item);
             }
             for (const finding of currentFindings) {
-              if (!validReviews.has(finding.pull_request_review_id)) {
+              if (!localRoute && !validReviews.has(finding.pull_request_review_id)) {
                 core.setFailed('Codex finding is not bound to a trusted current-head review.');
                 return;
               }
@@ -741,8 +796,8 @@ jobs:
               currentFindings.map((item) => item.pull_request_review_id)
             );
             if (
-              validReviews.size !== findingReviewIds.size ||
-              [...validReviews.keys()].some((id) => !findingReviewIds.has(id))
+              !localRoute && (validReviews.size !== findingReviewIds.size ||
+              [...validReviews.keys()].some((id) => !findingReviewIds.has(id)))
             ) {
               core.setFailed('Current-head Codex formal review is missing retained P0/P1 findings.');
               return;
@@ -754,7 +809,16 @@ jobs:
 
             let expectedSummary;
             let completedTime;
-            if (currentFindings.length > 0) {
+            if (localRoute) {
+              const expectedFindingKey = localEvidence.result.verdict === 'CHANGES_REQUESTED'
+                ? currentFindings[0].finding_key : '';
+              if (verdict !== localEvidence.result.verdict || findingKey !== expectedFindingKey) {
+                core.setFailed('Local review verdict or finding key differs from its complete report.');
+                return;
+              }
+              expectedSummary = localEvidence.result.summary;
+              completedTime = localEvidence.completedTime;
+            } else if (currentFindings.length > 0) {
               const owningReview = validReviews.get(currentFindings[0].pull_request_review_id);
               if (verdict !== 'CHANGES_REQUESTED' || reviewEvidence?.id !== owningReview.id) {
                 core.setFailed('P0/P1 findings require their owning native review as evidence.');
@@ -860,6 +924,59 @@ jobs:
               priorChanges.length + 1 >= maximum || sameFindingCount + 1 >= 5 || designStop
             );
 
+            if (localRoute) {
+              // Reports and model-emitted check statuses are not CI authority.
+              // Re-read mutable evidence immediately before the gate write.
+              const {data: currentDefault} = await github.rest.repos.getCommit({
+                owner, repo, ref: context.payload.repository.default_branch,
+              });
+              const freshChecks = await github.paginate(github.rest.checks.listForRef, {
+                owner, repo, ref: reviewedSha, filter: 'latest', per_page: 100,
+              });
+              if (currentDefault.sha !== context.sha || requiredCheckNames.some((name) => {
+                const check = freshChecks.find((item) => item.name === name && item.head_sha === reviewedSha);
+                return check?.conclusion !== 'success';
+              })) {
+                core.setFailed('Local review governance or current-HEAD checks changed before gate recording.');
+                return;
+              }
+              const freshComments = await github.paginate(github.rest.issues.listComments, {
+                owner, repo, issue_number: pull_number, per_page: 100,
+              });
+              const freshTimeline = await github.paginate(github.rest.issues.listEventsForTimeline, {
+                owner, repo, issue_number: pull_number, per_page: 100,
+              });
+              const freshReady = freshComments.filter((item) => item.html_url === readyReference);
+              if (freshReady.length !== 1 || freshReady[0].body !== readyEvidence.body ||
+                  freshReady[0].user?.login !== 'github-actions[bot]') {
+                core.setFailed('Local review ready evidence changed before gate recording.');
+                return;
+              }
+              const controlHistory = (items) => items.filter((item) =>
+                item.user?.login === 'github-actions[bot]' &&
+                ['redteam-phase-gate', 'redteam-invariant-family-review'].some(
+                  (name) => (item.body || '').includes(name)
+                )).map((item) => ({url: item.html_url, body: item.body}));
+              if (localReview.canonicalDigest(controlHistory(freshComments)) !==
+                  localReview.canonicalDigest(controlHistory(comments))) {
+                core.setFailed('Local review phase or recurrence authority changed before gate recording.');
+                return;
+              }
+              const freshReview = localReview.evaluateLocalReview({
+                comments: freshComments, timeline: freshTimeline,
+                startReference: reviewTriggerReference, reportReference: reviewReference,
+                operatorLogin: process.env.AI_GATE_APPROVER_LOGIN,
+                phase, headSha: reviewedSha, baseSha: suppliedBaseSha, readyReference,
+                readyCreatedAt: readyEvidence.created_at, sourceDigest, policyDigest: localPolicyDigest,
+                familyIds, requiredCheckNames, pullRequestUrl: `https://github.com/${owner}/${repo}/pull/${pull_number}`,
+              });
+              if (localReview.canonicalDigest(freshReview.report) !==
+                  localReview.canonicalDigest(localEvidence.report)) {
+                core.setFailed('Local review report changed before gate recording.');
+                return;
+              }
+            }
+
             const { data: livePr } = await github.rest.pulls.get({owner, repo, pull_number});
             const livePhases = livePr.labels.map((item) => item.name)
               .filter((name) => /^phase-(0a|0b|0c|[1-5])$/.test(name));
@@ -870,6 +987,14 @@ jobs:
               core.setFailed('Pull request head or phase changed before recording the gate.');
               return;
             }
+            if (localRoute && (livePr.head.repo.full_name !== `${owner}/${repo}` ||
+                livePr.base.ref !== context.payload.repository.default_branch ||
+                !livePr.labels.some((item) => item.name === 'ai-loop') ||
+                livePr.labels.some((item) => ['ai-loop-blocked', 'ai-human-gate',
+                  'governance-change', 'ai-project-complete', 'ai-review-passed'].includes(item.name)))) {
+              core.setFailed('Local review authority changed before gate recording.');
+              return;
+            }
             const record = {
               schema_version: designStop ? '1.1' : '1.0',
               phase,
@@ -877,11 +1002,11 @@ jobs:
               base_sha: suppliedBaseSha,
               verdict,
               summary,
-              evidence_format: 'codex-native-v1',
+              evidence_format: localRoute ? 'local-review-v1' : 'codex-native-v1',
               review_reference: reviewReference,
               ready_reference: readyReference,
               review_trigger_reference: reviewTriggerReference,
-              reviewer_login: process.env.AI_REVIEWER_LOGIN,
+              reviewer_login: localRoute ? process.env.AI_GATE_APPROVER_LOGIN : process.env.AI_REVIEWER_LOGIN,
               recorded_by: context.actor,
               finding_key: findingKey || null,
               required_checks: requiredChecks,

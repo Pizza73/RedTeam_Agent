@@ -70,6 +70,7 @@ def validate_automation(repo_root: Path) -> None:
         "phase-plan.schema.json",
         "provider-gates.schema.json",
         "final-merge-policy.schema.json",
+        "local-execution-policy.schema.json",
     ):
         schema = strict_json_load(schemas / schema_name)
         try:
@@ -80,6 +81,10 @@ def validate_automation(repo_root: Path) -> None:
     plan = _validate_instance(
         root / "automation" / "phase-plan.json",
         schemas / "phase-plan.schema.json",
+    )
+    _validate_instance(
+        root / "automation" / "local-execution-policy.json",
+        schemas / "local-execution-policy.schema.json",
     )
     phase_ids = tuple(item["id"] for item in plan["phases"])
     if phase_ids != EXPECTED_PHASES:
