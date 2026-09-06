@@ -23,6 +23,7 @@ def test_regular_implementation_change_is_allowed() -> None:
     "path",
     [
         "AGENTS.md",
+        "SystemDesign_AI_Control.md",
         ".github/workflows/ci.yml",
         "automation/phase-plan.json",
         "docs/ai-loop-runbook.md",
@@ -64,6 +65,13 @@ def test_unlabelled_governance_change_is_blocked() -> None:
 
     assert result.allowed is False
     assert "governance-change" in result.reason
+
+
+def test_ai_control_companion_requires_human_governance_review() -> None:
+    path = "SystemDesign_AI_Control.md"
+    assert not evaluate_governance([path], set()).allowed
+    assert evaluate_governance([path], {"governance-change"}).allowed
+    assert not evaluate_governance([path], {"governance-change", "ai-loop"}).allowed
 
 
 @pytest.mark.parametrize("path", ["../AGENTS.md", "/AGENTS.md", "docs//requirements.md"])

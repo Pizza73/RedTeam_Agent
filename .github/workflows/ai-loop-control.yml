@@ -103,6 +103,7 @@ jobs:
         with:
           script: |
             const crypto = require('crypto');
+            const loopControl = require(`${process.env.GITHUB_WORKSPACE}/automation/loop_control_state.js`);
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const pull_number = Number.parseInt(process.env.PR_NUMBER, 10);
@@ -587,6 +588,9 @@ jobs:
                 auditData.request?.action !== requestPayload.action ||
                 auditData.request?.reference !== invariantAudit.request_reference ||
                 requestPayload.phase !== phase ||
+                !loopControl.hasRequiredImplementationStrategy(
+                  auditData, requestPayload.invariant_audit
+                ) ||
                 JSON.stringify(requestPayload.invariant_audit || null) !==
                   JSON.stringify(plan.invariant_audit)
               ) {

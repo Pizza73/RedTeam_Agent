@@ -20,7 +20,9 @@ maximal adjacent prior-Phase PASS incorporated in the current HEAD. Comment orde
 authority.
 
 A `governance-change` PR is not a phase implementation and does not receive an AI phase verdict.
-CI runs the complete test suite plus control-file validation and marks `redteam/phase-review` as
+CI runs the three governance test modules (`test_automation_validation`, `test_governance_check`,
+`test_phase_loop`) plus control-file compilation, lint and schema validation, and marks
+`redteam/phase-review` as
 not applicable only after those deterministic jobs succeed. A human owner review is still a
 mandatory operator step, although the current GitHub plan does not enforce `CODEOWNERS`. An
 `ai-loop` PR always runs the complete current-phase gate, including Mypy and coverage.
@@ -174,7 +176,7 @@ checks and validates the reviewer permalink. AI-authored markers are not accepte
 
 ```html
 <!-- redteam-implementation-request
-{"schema_version":"1.0","action":"IMPLEMENT_PHASE","trigger":"PHASE_START","phase":"phase-0b","head_sha":"<sha>","phase_prompt":"prompts/phases/phase-0b.md","invariant_audit":{"policy_version":"1.0","required":true}}
+{"schema_version":"1.0","action":"IMPLEMENT_PHASE","trigger":"PHASE_START","phase":"phase-0b","head_sha":"<sha>","phase_prompt":"prompts/phases/phase-0b.md","invariant_audit":{"policy_version":"1.0","required":true,"implementation_strategy_version":"1.0"}}
 -->
 ```
 
@@ -182,6 +184,52 @@ Only exact markers, trusted workflow authors, the current phase label and the cu
 accepted for an implementation task. For Phase 0B and later, the adjacent PASS must be incorporated
 in that SHA and must be the unique maximal candidate under Git ancestry. Repository content, PR
 comments and reviewer output remain untrusted data.
+
+### Implementation strategy handoff (LOOP-031/032)
+
+This is the **development** loop's handoff of SystemDesign Section 38, not the application's
+Planner/Executor/Analyzer runtime loop. New requests copy the trusted phase plan's invariant-audit
+policy, including `implementation_strategy_version=1.0`. The runner refuses to dispatch an
+implementation request with a different or missing current policy. Both implementation and
+independent-review prompts require the normative `SystemDesign_AI_Control.md` companion.
+
+The existing `docs/review/<phase>-invariant-audit.json` carries an `implementation_strategy`
+object with `version=1.0` and nonempty `units`. No new authorization record or additional approval
+workflow is introduced. Each unit identifies the owner and current-phase boundary and records:
+
+| Fields | Meaning |
+| --- | --- |
+| `id`, `owner`, `disposition`, `rationale` | Unique unit, responsible component and justified `reuse` / `replace` / `new` classification |
+| `input_paths`, `output_paths` | Whole files at the full request input HEAD / current output. New units have no input files; replaced/deleted input files remain traceable |
+| `entry_points`, `sibling_paths` | Current public/internal entry points, callers, dependencies and recovery/cleanup siblings; selectors such as `#symbol` help review |
+| `specification_refs`, `invariant_families` | Current main/AI companion, requirements, acceptance, safety or current Phase prompt references and required-family IDs |
+| `state_migration`, `preserved_tests` | Concrete state/schema/activation impact and preserved regression safety properties, or an explanation of no impact |
+| `tests`, `test_modes`, `change_summary` | Test references, positive/negative/failure plus required model-based evidence, and before → after with the reason |
+
+The closed schema and Python audit validator reject unknown/duplicate fields, duplicate unit IDs,
+noncanonical/outside-repository paths, absent input files at the exact request HEAD, stale normative
+references, missing affected families, and omitted changed source/test paths (including deletion).
+Every unit requires positive/negative/failure evidence. A replaced/new stateful unit additionally
+requires property or state-machine evidence; the existing affected-stateful-family rule still
+applies to all changes. The complete phase gate runs the actual tests. Path existence and declared
+test modes do not establish semantic coverage: the independent reviewer checks that evidence.
+
+CI validates a present strategy block through the phase gate. Before publishing review-ready,
+it also requires the block and matching version for a current-policy request. The trusted phase
+gate repeats that requirement. The existing input request / proper-ancestor / output HEAD /
+canonical audit digest binding includes the entire block, including change summaries.
+
+Historical requests and audits without this field remain parseable for ancestry, stopped-base
+refresh and recovery. They are not silently upgraded, newly dispatched, or accepted as new-policy
+review evidence. In particular, blocked governance-refresh CI may inspect an old audit without
+demanding product implementation **before** Design Approval; no ready marker is issued for that
+blocked HEAD. After adoption, a fresh authorized request requires the new block in its output.
+
+Reuse preserves current safety properties, not obsolete authorization interfaces. Replacements
+cover the owner, callers, storage and recovery together; new common AI control stays in its
+authorized Phase. No data reset, migration bypass, phase reordering, retry-limit increase,
+Design Stop bypass or automatic grant of Design Approval is implied. Both normative design files
+are protected against implementation-PR edits.
 
 ### Base refresh authorization
 

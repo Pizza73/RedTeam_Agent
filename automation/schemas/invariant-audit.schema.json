@@ -63,6 +63,55 @@
       "type": "array", "minItems": 1,
       "items": {"pattern": "^tests/.+\\.py$", "type": "string"}
     },
-    "notes": {"minLength": 1, "maxLength": 2000, "type": "string"}
+    "notes": {"minLength": 1, "maxLength": 2000, "type": "string"},
+    "implementation_strategy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "units"],
+      "properties": {
+        "version": {"const": "1.0"},
+        "units": {
+          "type": "array", "minItems": 1, "maxItems": 200,
+          "items": {
+            "type": "object", "additionalProperties": false,
+            "required": [
+              "id", "owner", "disposition", "rationale", "input_paths", "output_paths",
+              "entry_points", "sibling_paths", "specification_refs", "invariant_families",
+              "state_migration", "preserved_tests", "tests", "test_modes", "change_summary"
+            ],
+            "properties": {
+              "id": {"type": "string", "pattern": "^[a-z][a-z0-9-]{2,63}$"},
+              "owner": {"$ref": "#/$defs/nonblank"},
+              "disposition": {"enum": ["reuse", "replace", "new"]},
+              "rationale": {"$ref": "#/$defs/nonblank"},
+              "input_paths": {"$ref": "#/$defs/paths"},
+              "output_paths": {"$ref": "#/$defs/nonemptyPaths"},
+              "entry_points": {"$ref": "#/$defs/nonemptyPaths"},
+              "sibling_paths": {"$ref": "#/$defs/paths"},
+              "specification_refs": {"$ref": "#/$defs/nonemptyPaths"},
+              "invariant_families": {"$ref": "#/$defs/nonemptyPaths"},
+              "state_migration": {"$ref": "#/$defs/nonblank"},
+              "preserved_tests": {"$ref": "#/$defs/nonblank"},
+              "tests": {"$ref": "#/$defs/nonemptyPaths"},
+              "test_modes": {
+                "type": "array", "minItems": 3, "uniqueItems": true,
+                "items": {"enum": ["positive", "negative", "failure", "property", "state-machine"]}
+              },
+              "change_summary": {"$ref": "#/$defs/nonblank"}
+            },
+            "allOf": [{
+              "if": {"properties": {"disposition": {"const": "new"}}},
+              "then": {"properties": {"input_paths": {"maxItems": 0}}},
+              "else": {"properties": {"input_paths": {"minItems": 1}}}
+            }]
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "nonblank": {"type": "string", "minLength": 1, "maxLength": 2000, "pattern": "\\S"},
+    "paths": {"type": "array", "maxItems": 500, "uniqueItems": true, "items": {"$ref": "#/$defs/nonblank"}},
+    "nonemptyPaths": {"allOf": [{"$ref": "#/$defs/paths"}], "minItems": 1}
   }
 }

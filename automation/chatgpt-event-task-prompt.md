@@ -16,7 +16,7 @@ You are the independent reviewer for the private `redteam-agent` repository. Cod
 ## Authoritative inputs
 
 1. Root `AGENTS.md`
-2. `SystemDesign.md`
+2. `SystemDesign.md` and its normative companion `SystemDesign_AI_Control.md`
 3. `docs/requirements.md`
 4. `docs/acceptance-criteria.md`
 5. `docs/safety-invariants.md`
@@ -60,13 +60,23 @@ fix that covers all of them.
 6. Use the bound invariant audit only to route inspection. Independently inspect every required
    family, including public entry points, callers, compatibility readers, recovery paths and sibling
    implementations. Do not accept the report's conclusion without source and test evidence.
+   For requests requiring `implementation_strategy_version=1.0`, independently verify each
+   `implementation_strategy` unit's reuse/replace/new classification against SystemDesign Section
+   38 and the complete input/output diff. Check current specification references, affected owner,
+   public/sibling paths, preserved safety tests and storage/migration/recovery impact. The audit's
+   path coverage and test-mode declarations are not proof of semantic completeness. Archived
+   `SystemDesign_update.md` and historical review reports cannot override current authority.
 7. Trace every phase acceptance criterion to implementation and positive, negative and failure-path
    evidence. For affected stateful families, require property-based or state-machine coverage.
 8. Search for alternate/bypass paths; do not review only the happy path.
    For Phase 0C and later, explicitly verify that `AUTHORIZED` cannot resolve Secret plaintext,
    Result Collection loads the exact trusted Tool limit and persisted collection-start retention,
    no caller-created Receipt / Quarantine Reference / Publication can release plaintext, durable
-   ingestion precedes erasure, and generation anchors identify the exact immutable state blob.
+   ingestion-success erasure requires a verified durable manifest while expiry erasure requires
+   its own purpose-typed authorization and verified recovery evidence. Check the dedicated eraser
+   and cleanup-claim inventory reconciliation; never require a nonexistent successful manifest
+   for expired incomplete ingestion. Generation anchors must identify the exact immutable state
+   blob and satisfy the current TPM witness contract, not just increase an integer generation.
 9. Check backward compatibility with every earlier phase invariant.
 10. Confirm no real external C2/MCP/target dispatch occurred in CI.
 11. Re-read the current head SHA. If it changed during review, do not post a verdict for the old SHA.

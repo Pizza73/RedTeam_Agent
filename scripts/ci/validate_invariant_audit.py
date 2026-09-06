@@ -48,13 +48,18 @@ def _repo_path(root: Path, raw: str, *, test_only: bool = False) -> Path:
     path = PurePosixPath(path_text)
     if (
         not path_text
+        or "\\" in raw
+        or "\x00" in raw
         or path.is_absolute()
         or ".." in path.parts
         or str(path) != path_text
         or (test_only and not path_text.startswith("tests/"))
     ):
         raise InvariantAuditError(f"audit evidence path is not canonical: {raw!r}")
-    resolved = (root / path_text).resolve(strict=True)
+    try:
+        resolved = (root / path_text).resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise InvariantAuditError(f"audit evidence path is unavailable: {raw!r}") from exc
     if not resolved.is_relative_to(root) or not resolved.is_file():
         raise InvariantAuditError(f"audit evidence path is outside the repository: {raw!r}")
     return resolved
@@ -84,6 +89,109 @@ def _require_ancestor(root: Path, request_head: str, *, require_output_commit: b
         raise InvariantAuditError("audit is not bound to an implementation output commit")
 
 
+def _git_bytes(root: Path, *arguments: str) -> bytes:
+    git = shutil.which("git")
+    if git is None:
+        raise InvariantAuditError("git is required for implementation strategy evidence")
+    result = subprocess.run(  # noqa: S603 - fixed read-only operations, no shell.
+        [git, *arguments], cwd=root, capture_output=True, check=False,
+    )
+    if result.returncode != 0:
+        raise InvariantAuditError("implementation strategy Git evidence is unavailable")
+    return result.stdout
+
+
+def _require_input_path(root: Path, request_head: str, raw: str) -> None:
+    path = PurePosixPath(raw)
+    if not raw or "#" in raw or "\\" in raw or "\x00" in raw or (
+        path.is_absolute() or ".." in path.parts or str(path) != raw
+    ):
+        raise InvariantAuditError("implementation input path is not canonical")
+    if _git_bytes(root, "cat-file", "-t", f"{request_head}:{raw}").strip() != b"blob":
+        raise InvariantAuditError("implementation input path is not a file at input HEAD")
+
+
+def _validate_implementation_strategy(
+    root: Path,
+    audit: dict[str, Any],
+    family_by_id: dict[str, Any],
+    required_families: list[str],
+    *,
+    required: bool,
+) -> None:
+    strategy = audit.get("implementation_strategy")
+    if strategy is None:
+        if required:
+            raise InvariantAuditError("trusted request requires implementation strategy evidence")
+        return  # Historical reports are readable, not authority for a new-policy request.
+    units = strategy["units"]  # Closed schema has already validated all structural fields.
+    ids = [unit["id"] for unit in units]
+    if len(ids) != len(set(ids)):
+        raise InvariantAuditError("implementation unit IDs must be unique")
+    request_head = audit["request"]["head_sha"]
+    allowed_specs = {
+        "SystemDesign.md", "SystemDesign_AI_Control.md", "docs/requirements.md",
+        "docs/acceptance-criteria.md", "docs/safety-invariants.md",
+    }
+    plan = _load_json(root / "automation" / "phase-plan.json")
+    _validate(plan, _load_json(root / "automation/schemas/phase-plan.schema.json"),
+              name="phase plan")
+    phase_configs = [item for item in plan["phases"] if item["id"] == audit["phase"]]
+    if len(phase_configs) != 1:
+        raise InvariantAuditError("implementation strategy phase prompt is ambiguous or missing")
+    phase_config = phase_configs[0]
+    allowed_specs.add(phase_config["prompt"])
+    input_paths: set[str] = set()
+    output_paths: set[str] = set()
+    covered_families: set[str] = set()
+    for unit in units:
+        families = set(unit["invariant_families"])
+        if not families.issubset(required_families):
+            raise InvariantAuditError("implementation unit references a non-current-phase family")
+        covered_families.update(families)
+        for raw in unit["input_paths"]:
+            _require_input_path(root, request_head, raw)
+            input_paths.add(raw)
+        for raw in unit["output_paths"]:
+            if "#" in raw:
+                raise InvariantAuditError("output_paths must name whole repository files")
+            _repo_path(root, raw)
+            output_paths.add(raw)
+        for field in ("entry_points", "sibling_paths"):
+            for raw in unit[field]:
+                _repo_path(root, raw)
+        for raw in unit["specification_refs"]:
+            if raw.partition("#")[0] not in allowed_specs:
+                raise InvariantAuditError("implementation unit must cite current normative specs")
+            _repo_path(root, raw)
+        for raw in unit["tests"]:
+            _repo_path(root, raw, test_only=True)
+        modes = set(unit["test_modes"])
+        if not {"positive", "negative", "failure"}.issubset(modes):
+            raise InvariantAuditError("implementation unit lacks positive/negative/failure tests")
+        if unit["disposition"] != "reuse" and any(
+            family_by_id[family]["stateful"] for family in families
+        ) and not modes.intersection({"property", "state-machine"}):
+            raise InvariantAuditError("stateful replacement/new unit lacks model-based tests")
+
+    affected = {item["id"] for item in audit["families"] if item["status"] == "affected"}
+    if not affected.issubset(covered_families):
+        raise InvariantAuditError("implementation units omit an affected invariant family")
+    changed = _git_bytes(root, "diff", "--no-renames", "--name-only", "-z", request_head,
+                         "--", "src", "tests")
+    untracked = _git_bytes(root, "ls-files", "--others", "--exclude-standard", "-z",
+                           "--", "src", "tests")
+    try:
+        changed_paths = {name.decode("utf-8") for name in (changed + untracked).split(b"\x00")
+                         if name}
+    except UnicodeError as exc:
+        raise InvariantAuditError("implementation paths must be valid UTF-8") from exc
+    changed_outputs = {name for name in changed_paths if (root / name).exists()}
+    deleted_inputs = changed_paths - changed_outputs
+    if not changed_outputs.issubset(output_paths) or not deleted_inputs.issubset(input_paths):
+        raise InvariantAuditError("implementation units omit changed source/test paths")
+
+
 def validate_invariant_audit(
     repo_root: Path,
     phase: str,
@@ -93,11 +201,12 @@ def validate_invariant_audit(
     expected_request_head: str | None = None,
     expected_request_action: str | None = None,
     expected_request_reference: str | None = None,
+    require_implementation_strategy: bool = False,
 ) -> str | None:
     root = repo_root.resolve(strict=True)
     audit_path = root / "docs" / "review" / f"{phase}-invariant-audit.json"
     if not audit_path.is_file():
-        if if_present:
+        if if_present and not require_implementation_strategy:
             return None
         raise InvariantAuditError(f"missing invariant-family audit: {audit_path}")
 
@@ -179,6 +288,9 @@ def validate_invariant_audit(
         if expected is not None and request.get(field) != expected:
             raise InvariantAuditError(f"audit request {field} does not match trusted evidence")
     _require_ancestor(root, str(request["head_sha"]), require_output_commit=require_output_commit)
+    _validate_implementation_strategy(
+        root, audit, family_by_id, required, required=require_implementation_strategy,
+    )
 
     encoded = json.dumps(audit, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
@@ -193,6 +305,7 @@ def main() -> int:
     parser.add_argument("--expected-request-head")
     parser.add_argument("--expected-request-action")
     parser.add_argument("--expected-request-reference")
+    parser.add_argument("--require-implementation-strategy", action="store_true")
     args = parser.parse_args()
     try:
         digest = validate_invariant_audit(
@@ -203,6 +316,7 @@ def main() -> int:
             expected_request_head=args.expected_request_head,
             expected_request_action=args.expected_request_action,
             expected_request_reference=args.expected_request_reference,
+            require_implementation_strategy=args.require_implementation_strategy,
         )
     except (InvariantAuditError, OSError, subprocess.SubprocessError) as exc:
         print(f"INVARIANT_AUDIT=BLOCKED: {exc}")

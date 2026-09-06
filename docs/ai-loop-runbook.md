@@ -299,6 +299,52 @@ machine-readable phase record.
   claim or merge response, and do not delete the claim, until the PR's live merged/open state and
   claim ownership have been explicitly reconciled.
 
+## Adopt the implementation-strategy update (2026-09-06)
+
+This update makes the development AI loop carry the approved reuse/replace/new strategy through
+implementation requests, the existing invariant audit, CI and independent review. It does not
+implement the product's AI runtime loop or authorize a stopped PR to resume.
+
+1. Human-review the governance/design diff, including the protected normative AI companion and
+   invariant-family review questions, and merge it through a `governance-change` PR. Do not place
+   these protected-file edits directly on the implementation PR. Historical PR status in documents
+   is not authority; re-query the exact Phase, full HEAD, latest blocking gate and current `main`.
+2. For a Design Stop, use the existing authorized exact-HEAD base-refresh/checkpoint path to
+   incorporate the approved governance/design revision. Keep the stop latch and Phase label;
+   never use an ordinary branch update or generic Resume to bypass the stop.
+3. Require current-HEAD checks and the dedicated single-use Design Approval bound to the blocking
+   gate, incorporated design, current Phase/full HEAD and **current** invariant policy digest.
+   This update changes that digest; do not copy a historical approval or manually edit a request.
+4. The resulting trusted implementation request must contain
+   `invariant_audit.implementation_strategy_version=1.0`. Only after those prerequisites are met,
+   run the existing runner from a clean current-default-branch checkout as described above.
+5. Inspect the output's `docs/review/<phase>-invariant-audit.json`: each strategy unit explains
+   before → after, classification rationale, preserved tests and migration impact. Missing or
+   stale records must fail CI, not be waived. Independent review must verify the actual diff.
+
+For local governance validation, use the repository `.venv`, Git and Node.js on `PATH` (Node is
+needed by existing and new JavaScript boundary tests; missing Node is an environment failure):
+
+```bash
+python -m pytest -q tests/unit/test_automation_validation.py tests/unit/test_governance_check.py tests/unit/test_phase_loop.py --strict-markers
+python -m ruff check automation scripts/ci tests/unit/test_automation_validation.py tests/unit/test_governance_check.py tests/unit/test_phase_loop.py
+python -m compileall -q automation scripts/ci
+python scripts/ci/validate_automation.py
+```
+
+After an authorized implementation, run the unchanged complete Phase gate and the explicit
+strategy requirement check with the current Phase substituted:
+
+```bash
+bash scripts/ci/run_phase_gate.sh <current-phase>
+python scripts/ci/validate_invariant_audit.py --phase <current-phase> --require-implementation-strategy
+```
+
+The default `--if-present` audit check can read historical reports during blocked governance
+refresh; this is not a PASS for a new implementation. Review-ready and review-gate checks require
+the strategy block for a new-policy request. No tests, skip rules or phase-gate commands are removed.
+See `docs/review/ai-loop-strategy-update.md` for this update's file-level changes and local results.
+
 ## CI/CD boundary
 
 GitHub Actions invokes no AI model and uses no OpenAI API key. CI performs only deterministic

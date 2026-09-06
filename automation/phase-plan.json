@@ -2,7 +2,8 @@
   "schema_version": "1.0",
   "invariant_audit": {
     "policy_version": "1.0",
-    "required": true
+    "required": true,
+    "implementation_strategy_version": "1.0"
   },
   "phases": [
     {

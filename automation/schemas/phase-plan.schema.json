@@ -37,10 +37,11 @@
     "invariantAuditPolicy": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["policy_version", "required"],
+      "required": ["policy_version", "required", "implementation_strategy_version"],
       "properties": {
         "policy_version": {"const": "1.0"},
-        "required": {"const": true}
+        "required": {"const": true},
+        "implementation_strategy_version": {"const": "1.0"}
       }
     }
   }

@@ -322,7 +322,10 @@ jobs:
                 auditData.phase !== phases[0] ||
                 auditData.request?.head_sha !== auditedRequest.request.head_sha ||
                 auditData.request?.action !== auditedRequest.request.action ||
-                auditData.request?.reference !== auditedRequest.comment.html_url
+                auditData.request?.reference !== auditedRequest.comment.html_url ||
+                !loopControl.hasRequiredImplementationStrategy(
+                  auditData, auditedRequest.request.invariant_audit
+                )
               ) {
                 core.setFailed('Invariant-family audit is not bound to the trusted output transition.');
                 return;
