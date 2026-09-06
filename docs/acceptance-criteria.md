@@ -33,6 +33,14 @@
 
 ## AI Loop Control Acceptance
 
+- LOOP-035: 独立設定の承認者とWorker入力が一致し、欠落・不正ID・実行Account不一致を起動前に拒否する。
+  Approval内の自己申告値を変更しても、設定上の承認者が変化しない回帰試験を持つ。
+- LOOP-036: 既知BLOCKEDの終端化、旧Journalの明示照合、公開応答喪失、重複・改ざん・HEAD競合を検査する。
+  Claimを保持し、終端化後も同HEADを再実行せず、未解決実行のままRefresh / 新HEAD実行を許可しない。
+- Governance Unit Testは実HostのCodex設定やCredentialの存在・可視性に依存せず、Synthetic設定で検査する。
+  Workerと同じ隔離下でも実行し、試験成功のためにSandboxを緩めない。
+- Base Refresh後のCI未完了は`waiting`として待機し、承認やResumeを発行しない。
+  CI失敗と未完了を区別し、Design Stop中の成功だけでは自動Design Approvalへ進まない。
 - Local OrchestratorはCurrent default-branch SHAのClean Checkoutでだけ起動する
 - `automation/local-execution-policy.json`はLocal Codex CLI実装・Fresh Read-only Local Review・無人Reviewを固定し、Cloud Task / `@codex` Trigger / Cloud Fallbackを拒否する
 - Implementationは別のScoped Workspace、Reviewは別Process / Context / Read-only Snapshotとする。

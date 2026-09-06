@@ -8546,6 +8546,14 @@ Worker起動前のDurable Claimを再利用せず、Crash / Timeout / Cancellati
 Reconciliationまで停止する。送信済み旧Cloud Requestの終了や出力が不明な同一入力へLocal実装を重複起動しない。
 このGovernance変更の採用だけではProduct実装再開、Phase PASS、既存Design Approvalの再利用を認可しない。
 
+Worker入力の`configured_authorities`には、親がRepository設定と現在のOperator本人性から独立検証した
+承認者IDとTrusted Workflow IDを含める。Approval本文の自己申告を設定の代用にせず、Credentialを渡さない。
+親が終了を確認した既知BLOCKEDは、Claim / Start / Request / full HEAD / Session / Journal Digestへ
+Bindingした`BLOCKED_NO_OUTPUT`として確定する。旧版はOperatorの明示的な停止確認と記録照合を要する。
+これは停止結果の証明だけであり、同HEADの再実行、Claim削除、ResumeまたはPhase PASSを認可しない。
+未解決実行はDefault Branch取込や新HEAD実行で迂回しない。公開結果不明は再送せず照合のみとし、
+修正の採用後も既存のExact-HEAD Refresh / Checkpoint / Current CI / 新しいDesign Approvalを必要とする。
+
 Formal Local Reviewへ進む前に、実装担当はCurrent Phaseで要求される不変条件ファミリーを
 `automation/invariant-families.json`から解決し、各Familyについてpublic entry point、caller、
 compatibility reader、recovery path、sibling implementationを監査する。指摘行だけを直すのではなく、

@@ -2983,7 +2983,7 @@ class PhaseLoop:
             return True
         if recurring_families:
             check_state = self.check_state(state.head_sha)
-            if check_state == "pending":
+            if check_state == "waiting":
                 return True
             if check_state != "success":
                 raise LoopBlockedError(
@@ -2995,7 +2995,7 @@ class PhaseLoop:
             )
             return True
         check_state = self.check_state(state.head_sha)
-        if check_state == "pending":
+        if check_state == "waiting":
             return True
         if check_state != "success":
             raise LoopBlockedError(
@@ -3035,6 +3035,11 @@ class PhaseLoop:
         target_base_sha: str,
         source_phase: str | None = None,
     ) -> None:
+        from automation.local_attempt_reconciliation import assert_attempts_resolved
+
+        assert_attempts_resolved(
+            self, state, self.github.comments(state.number), include_current=True
+        )
         requested_source = source_phase or state.phase
         if not SHA_PATTERN.fullmatch(target_base_sha):
             raise UntrustedEvidenceError("base refresh requires the full default-branch SHA")
@@ -3155,6 +3160,11 @@ class PhaseLoop:
                     )
                 self.revalidate_base_refresh_transition_snapshot(
                     state, transition_snapshot
+                )
+                from automation.local_attempt_reconciliation import assert_attempts_resolved
+
+                assert_attempts_resolved(
+                    self, state, self.github.comments(state.number), include_current=True
                 )
                 self.github.update_pull_request_branch(state.number, state.head_sha)
                 self.validate_post_base_refresh_pr_state(

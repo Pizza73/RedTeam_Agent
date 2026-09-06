@@ -42,6 +42,8 @@
 | LOOP-032 | 新Policyの実装Requestは旧PolicyへDowngradeしない。旧Request / Auditは祖先・停止・Refreshの履歴確認用に読めるが、新規実装・Review Readyの必須分類を省略する権限にはしない。規範別冊SystemDesign_AI_Control.mdも保護対象にし、Human Governance Reviewなしに実装AIが書き換えられないようにする。Phase順序、停止上限、Design Approval、既存データ保護は変更しない |
 | LOOP-033 | ローカルWorkerの起動・終了・結果公開はUnique Run / SessionとCurrent RequestまたはReadyへBindingする。既存Run、重複・再利用・曖昧なResult、Process Crash / Timeout / Cancellation、Commit / Push結果不明は自動再送せずReconciliationで停止する。終了コード0やModelのPASSだけをGateへ昇格しない |
 | LOOP-034 | Local移行前に送信済みCloud Requestとその出力を正確な入力HEADへBindingしてReconcileし、旧Workerの継続や結果が不明な間は同じ入力のLocal Workerを起動しない。移行用GovernanceをReview / MergeするまでProduct実装は再開しない。移行後も履歴Gate・Finding・Retry消費・Design Stopを消去しない |
+| LOOP-035 | WorkerのRead-only入力に、親が設定から独立検証した`configured_authorities.approver_login`とTrusted Workflow IDを渡す。Approval本文の`approved_by`、環境変数や自由文から設定上の承認者を推定しない。Credential StoreへのWorkerアクセスは引き続き禁止する |
+| LOOP-036 | 親がWorker終了を確認した既知BLOCKEDは、Commit / Push前に`BLOCKED_NO_OUTPUT`終端記録へBindingする。旧版の終了済み実行は、明示Operator停止確認とJournal / Claim / Start / Request / HEAD照合によってのみ同記録を公開する。結果不明・公開ACK不明は再送せず照合だけを行う。未解決実行をBase Refreshや新HEADによって迂回せず、終端記録も同HEADの再実行・Resume・Phase PASSを認可しない |
 
 ## Non-Functional Requirements
 
