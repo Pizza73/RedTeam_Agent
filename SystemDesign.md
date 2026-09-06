@@ -8527,7 +8527,26 @@ Tool Availability Resolver、Policy Engine、Executor、Knowledge Reducer、Sess
 
 ## 40.1 不変条件ファミリー単位の実装・Review Loop
 
-Formal Codex Reviewへ進む前に、実装担当はCurrent Phaseで要求される不変条件ファミリーを
+本節は本製品のPlanner / Executor / Analyzerではなく、本Repositoryを開発するAI Loopの規約である。
+`automation/local-execution-policy.json`に従い、実装は別WorkspaceのローカルCodex CLI Worker、
+Reviewは実装履歴を引き継がない別Process / Fresh SessionのRead-only Snapshotで行う。
+Clean Current Main上のTrusted RunnerだけがGitHub Credential、実行Claim / Journal、通常Commit / PR Push、
+Evidence公開とWorkflow Dispatchを所有する。Workerは仕様・Gate・親の状態を変更せず、自己承認しない。
+新しいCloud Task、GitHub `@codex` Trigger、Cloud ReviewへのFallbackは使用しない。
+OpenAI API Key連携は追加しないが、CLIのChatGPT AccountによるModel通信は必要であり、ローカル実行は
+Offline推論や製品のLocal LLM仕様への変更を意味しない。
+
+独立Reviewは`local-review-v1`として、LauncherのOperator AccountがUnique Run / Session、Current full
+HEAD / Base、Ready / Audit Source / Policy Digest、開始・終了と全FindingへBindingして公開する。
+Trusted Workflowは公開Evidenceの本人性・一意性・完全性とCurrent CI / PR不変性を独立再検証する。
+Root of TrustはOperator Host / Sandbox / Clean-main Launcherであり、Operatorから独立した別GitHub
+Accountの証明ではない。通常の実装・Reviewごとに人間の承認は要求しないが、Governance Review / Merge、
+Design Approval、Provider Human Gateは維持する。旧`codex-native-v1`は既存Gate Chainの履歴確認だけに残す。
+Worker起動前のDurable Claimを再利用せず、Crash / Timeout / Cancellation、Push / Evidence結果不明は
+Reconciliationまで停止する。送信済み旧Cloud Requestの終了や出力が不明な同一入力へLocal実装を重複起動しない。
+このGovernance変更の採用だけではProduct実装再開、Phase PASS、既存Design Approvalの再利用を認可しない。
+
+Formal Local Reviewへ進む前に、実装担当はCurrent Phaseで要求される不変条件ファミリーを
 `automation/invariant-families.json`から解決し、各Familyについてpublic entry point、caller、
 compatibility reader、recovery path、sibling implementationを監査する。指摘行だけを直すのではなく、
 同じSemantic Invariantを共有する経路を1つの修正単位とする。

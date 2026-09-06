@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "backend", "cloud_fallback", "review_evidence_format", "max_worker_seconds", "max_output_bytes", "claim_ref_prefix", "review_requires_fresh_process", "review_requires_read_only", "worker_github_credentials", "unattended_review"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "backend": {"const": "local-codex-cli"},
+    "cloud_fallback": {"const": false},
+    "review_evidence_format": {"const": "local-review-v1"},
+    "max_worker_seconds": {"type": "integer", "minimum": 60, "maximum": 3600},
+    "max_output_bytes": {"type": "integer", "minimum": 4096, "maximum": 8388608},
+    "claim_ref_prefix": {"const": "refs/redteam-local-attempts"},
+    "review_requires_fresh_process": {"const": true},
+    "review_requires_read_only": {"const": true},
+    "worker_github_credentials": {"const": false},
+    "unattended_review": {"const": true}
+  }
+}

@@ -1,4 +1,4 @@
-# AI Loop Runbook (No OpenAI API)
+# AI Loop Runbook (Local Workers, No Codex Cloud)
 
 ## What is automated
 
@@ -6,17 +6,20 @@ Start `automation/run_phase_loop.py` once for the long-lived implementation pull
 repeats this sequence:
 
 1. Read a SHA-bound implementation request created by `github-actions[bot]`.
-2. Post an `@codex` implementation request as the ChatGPT-linked GitHub user.
-3. Wait for Codex to push a normal PR commit and for all required CI checks to pass.
+2. Claim that exact request and launch a fresh local implementation worker in a separate scoped
+   workspace. Do not send an `@codex` comment or create a Cloud task.
+3. Have the trusted launcher validate the complete phase gate and resulting diff, create and push
+   a normal commit to the existing PR branch, then require all current-HEAD CI checks to pass.
 4. Require Codex's phase-specific invariant-family audit, including sibling-path coverage and
    positive/negative/failure tests; stateful changes also require property/state-machine evidence.
    CI binds its canonical digest to the implementation request and output HEAD.
-5. Post one exhaustive `@codex review` for that exact phase, head SHA and phase base SHA. The same
-   review instruction applies to every Phase.
-6. Require Codex to continue after the first issue and retain every consequential P0/P1 in that
-   single native review. Validate reviewer identity, ready/trigger chain, current head, bot 👍 and
-   unchanged review timeline, then request one fix covering every retained finding.
-7. Dispatch **Record AI Phase Review**, which independently revalidates the SHA, review and CI.
+5. Publish a unique local review start and launch a fresh read-only local review session for the
+   exact phase, head SHA and phase base SHA. The same exhaustive instruction applies to every Phase.
+6. Require the reviewer to continue after the first issue and retain every consequential P0/P1 in
+   one structured result. The launcher verifies session/source integrity and publishes the full
+   `local-review-v1` start/result/finding chain with its own authenticated GitHub account.
+7. Dispatch **Record AI Phase Review**, which independently revalidates that evidence, all
+   findings, current SHA/base/ready/audit/policy and CI. No human approval is needed for each review.
 8. Request a bounded semantic-family fix or continue with the next phase. A family recurring in a
    second formal review stops for coherent redesign instead of requesting another local patch.
 9. If `main` advanced before the next Phase implementation began, roll back one Phase, incorporate
@@ -25,12 +28,35 @@ repeats this sequence:
    merge the `ai-loop` PR once with the exact current HEAD SHA.
 
 The process stops on a failure limit, `BLOCKED`, a runtime limit, the Phase 4/5 Human Gates, or
-successful project merge. It never deploys. Closing it with Ctrl-C only pauses local polling;
-trusted GitHub comments, statuses and checks preserve authority for a later restart. Lifecycle
+successful project merge. It never deploys. Ctrl-C cancels the local run and stops its child process
+group; an in-flight or uncertain outcome must be reconciled rather than replayed on restart.
+Trusted GitHub evidence and the durable launcher journal preserve progress. Lifecycle
 labels are a reconstructable operator projection; only the Phase label and conservative stop latch
 participate in routing/safety checks.
 
 ## One-time repository setup
+
+The qualified runtime is Linux with the desktop-bundled Codex CLI at
+`/usr/lib/chatgpt/resources/codex`, its root-owned standalone
+`/usr/lib/chatgpt/resources/codex-code-mode-host`, `bubblewrap` at `/usr/bin/bwrap`,
+and Node at `/usr/lib/chatgpt/resources/cua_node/bin/node`. There is no unisolated,
+Cloud, in-process Code Mode, or alternate-runtime fallback. Maintain the repository's
+locked `.venv`; it is mounted read-only into each isolated workspace. The launcher
+creates the empty `.venv` mount point before freezing a review snapshot.
+
+Only the trusted host's top-level `model` and `model_reasoning_effort` preferences
+are copied from Codex configuration. Other host settings, providers, plugins, MCP,
+hooks and prior conversations are not inherited. Model inference still uses native
+Codex account authentication and its service connection; worker tool networking is denied.
+
+Each attempt keeps a private `redteam-local-implementation-*` or
+`redteam-local-review-*` directory in the host temporary directory, containing the
+isolated checkout, read-only input bundle and parent-only append-only journal. Preserve
+it when reconciling an unknown result. Do not delete the GitHub claim or manually
+relaunch the same input. Apply operator retention/cleanup only after reconciliation;
+normal execution does not erase attempt evidence. No model transcript is copied into
+GitHub: the journal stores the result and transcript digest, and GitHub receives bound
+start/result/finding records.
 
 1. Put the governance/bootstrap changes on a dedicated pull request created with only the
    `governance-change` label. Review and merge it manually before starting the loop. This first
@@ -43,23 +69,34 @@ participate in routing/safety checks.
    gh api user --jq .login
    ```
 
-3. In ChatGPT/Codex, connect that same GitHub account and authorize only this private repository.
-   Enable Codex Code Review. The [official GitHub integration guide](https://learn.chatgpt.com/docs/third-party/github)
-   documents `@codex review` and GitHub-comment task requests.
-4. Set repository variables. Both actor values are exact, case-sensitive GitHub logins:
+3. Make the supported local Codex CLI and its ChatGPT account authentication available to the
+   trusted launcher. Verify CLI sandbox / fresh-session support and isolation from the operator's
+   GitHub credentials, user configuration, MCP/plugins and previous conversation history. Do not
+   enable GitHub Code Review or connect GitHub to a Cloud task for this loop. Local execution still
+   needs model-service network access; it is not offline inference or a local-model integration.
+4. Set repository variables. The operator value is an exact, case-sensitive GitHub login:
 
    ```bash
    gh variable set AI_GATE_APPROVER_LOGIN --body '<operator-login>'
-   gh variable set AI_REVIEWER_LOGIN --body 'chatgpt-codex-connector[bot]'
    gh variable set AI_LOOP_MAX_ITERATIONS --body '5'
    ```
 
    `AI_GATE_APPROVER_LOGIN` must equal the account returned by `gh api user --jq .login`.
-   `AI_REVIEWER_LOGIN` must equal the author shown on a real Codex PR review/comment, including the
-   `[bot]` suffix; do not guess or use a display name.
+   Local review provenance uses this same configured operator account, not the Cloud bot identity.
+   Preserve an existing `AI_REVIEWER_LOGIN` for historical `codex-native-v1` gate verification;
+   it is not the authenticator for new `local-review-v1` evidence and must not be rewritten to
+   pretend the launcher is a Cloud reviewer.
    `AI_LOOP_MAX_ITERATIONS` is fail-closed at exactly `5`; smaller or larger values block the loop.
-5. Do not create an `OPENAI_API_KEY` secret. The local process uses the existing `gh` credential
-   store and never passes its token to Codex.
+
+   For migration of an existing native gate chain only, the historical reviewer configuration is
+   retained as `gh variable set AI_REVIEWER_LOGIN --body 'chatgpt-codex-connector[bot]'` when that
+   exact login authored the existing verified reviews. This value neither starts Cloud work nor
+   authenticates local results. Do not infer the author from a display name.
+
+5. Do not create an `OPENAI_API_KEY` secret. Only the parent launcher accesses the existing `gh`
+   credential store. Workers receive neither its token nor access to the store, parent journal,
+   main checkout or GitHub write tools. The reviewer gets a separate read-only snapshot; the
+   implementer gets only its scoped workspace. Missing isolation must block startup.
 6. Create the labels through the approved workflow:
 
    ```bash
@@ -167,7 +204,9 @@ Optional bounded controls:
 
 Use `--dry-run` to validate local/GitHub prerequisites and report the next action without posting a
 comment or dispatching a workflow. A normal restart is idempotent: the runner recognizes its own
-SHA-bound trigger markers and does not intentionally request the same work twice.
+SHA-bound local run claims and evidence and does not intentionally request the same work twice.
+An existing claim with unknown process/publication/push outcome is a reconciliation stop, not
+permission to relaunch. Do not manually invoke a worker to bypass this stop.
 
 The runner selects work from current-HEAD trusted evidence, not from transient lifecycle labels. A
 current implementation request wins over an older ready projection; otherwise a current ready
@@ -188,16 +227,20 @@ writes. The branch-update request includes the old full HEAD as `expected_head_s
 Codex or human commit is rejected. CI must then produce a new SHA-bound PASS. This operation does
 not merge the PR into `main`; it is distinct from the local Phase 5 final merge gate above.
 
-Codex Code Review posts standard GitHub evidence rather than repository-defined JSON. For PASS,
-the single review requires the standard no-major-issues comment, a matching 10-or-more-character
-commit prefix and a reviewer-authored 👍 reaction. For `CHANGES_REQUESTED`, it requires one formal
-review bound to the full current SHA and aggregates every retained P0/P1 inline comment from that
-review. The trusted fix request records the exact `finding_count`, every finding permalink and
-each invariant-family ID; `finding_key` is used only for bounded retry counting, and Codex must
-resolve every retained finding plus its sibling paths. Head synchronization between the trigger
-and completion is forbidden. The
-approver-restricted workflow re-queries and validates the same evidence before producing the
-machine-readable phase record.
+The local reviewer returns the closed `review-result.schema.json` result to the launcher, with
+P0/P1 represented by `BLOCKER`/`HIGH`. The launcher publishes `redteam-local-review-start`, every
+`redteam-local-review-finding` and one `redteam-local-review-result`; only the trusted workflow
+publishes `redteam-phase-gate`. The workflow checks launcher identity, full head/base, canonical
+ready/audit source and policy digests, unique run and fresh session, unchanged review timeline and
+every finding reference. A missing/ambiguous/edited record blocks; model output alone cannot PASS.
+The fix request records the exact `finding_count`, every finding permalink and each family ID.
+`finding_key` is only the retry key; the local implementer must resolve all findings and sibling
+paths. Routine recording is unattended. No bot reaction or Cloud review is required.
+
+This trusts the operator host/sandbox/launcher and its GitHub account. It is context and process
+separation, not a second independent GitHub identity. A host/account compromise can undermine this
+boundary; the GitHub workflow cannot remotely attest the local model process. Historical native
+Cloud gate evidence retains its original identity and timeline rules for ancestry only.
 
 ## Human Gates and blocked runs
 
@@ -227,7 +270,7 @@ machine-readable phase record.
   `BLOCKED_LIMIT` gate as the authorization reference. The workflow validates that gate and its
   adjacent base PASS, and the runner performs one expected-HEAD update without a Phase rollback.
   The refresh authorizes only that branch update; it must keep `ai-loop-blocked` and cannot trigger
-  Resume or Codex. After current-HEAD CI succeeds, a recurrence stop still requires the dedicated
+  Resume or any local worker. After current-HEAD CI succeeds, a recurrence stop still requires the dedicated
   **Approve AI Loop Design Resume** operation.
 - If `main` advances again while the same `BLOCKED_LIMIT` remains active, restart the runner from
   the new clean `main`. It may reuse the same blocking Gate only when the exact current HEAD has one valid
@@ -257,18 +300,26 @@ machine-readable phase record.
 
 ## Troubleshooting
 
-- `required executable is not installed`: install `gh` or use the repository `.venv` command shown
-  above.
+- `required executable is not installed`: provision the supported local Codex CLI, `gh` and the
+  repository `.venv` before starting. Do not substitute a Cloud task or disable sandbox checks.
 - `gh login must exactly match ...`: reauthenticate as `AI_GATE_APPROVER_LOGIN`, or correct the
   repository variable through human governance.
 - `local governance checkout must have a clean working tree`: commit/stash unrelated work and run
   from clean `main`. Do not discard user changes.
 - `local governance checkout is not the current default-branch SHA`: run `git pull --ff-only`.
-- No Codex response: verify the GitHub account is connected to ChatGPT/Codex, repository access is
-  granted, and `AI_REVIEWER_LOGIN` matches the actual integration author.
-- Native review remains pending: confirm the single runner-authored `@codex review` follows the
-  current-head ready marker and contains `redteam-local-codex-trigger`. Manual review comments are
-  not accepted as phase-gate evidence.
+- Local worker unavailable: verify supported CLI/authentication and the launcher's isolation
+  preflight. Do not print account credentials, enable arbitrary plugins/MCP, or fall back to Cloud.
+- Local review remains pending: inspect the exact `redteam-local-review-start`, durable run state,
+  reviewer process outcome and matching result. A missing result after crash/timeout is not PASS
+  and is not permission to start another session for the same claim. Manually pasted model output
+  and implementation-worker summaries are not review provenance.
+- Implementation or push outcome unknown: reconcile the durable claimed request and exact output
+  commit against the current PR before restarting. Do not delete claims, reset the branch or
+  repeat a push/worker invocation merely because the previous acknowledgement was lost.
+- Old Cloud request outstanding: stop cutover for that input and reconcile the previously sent
+  task, its terminal outcome and any PR commit. Stopping a local runner does not cancel a Cloud
+  task. Do not send another Cloud request or run local implementation against the same input while
+  the old outcome is unknown.
 - An audit-binding review finding must distinguish the implementation request's input HEAD from the
   ready marker's output HEAD and compare the marker against canonical JSON digest, not raw file
   bytes. CI already rejects a non-ancestor input, wrong request binding, wrong output HEAD, or wrong
@@ -350,6 +401,36 @@ the strategy to use legacy validation; review-ready and review-gate checks requi
 Do not add unexecuted test modes to an old audit, waive checks, or issue Design Approval on failure.
 No tests or skip rules are removed; the gate still runs every existing lint/type/test/coverage step.
 See `docs/review/ai-loop-strategy-update.md` for this update's file-level changes and local results.
+
+## Adopt local-only unattended execution
+
+This governance change changes the development runner, not the application's AI runtime. Do not
+resume product implementation as part of preparing or validating the control-plane change.
+
+1. Stop old polling and identify every already-issued Cloud implementation/review request for the
+   active Phase and full input HEAD. Reconcile its terminal state and any late output before a
+   local worker can consume that same input. Preserve all records, retry consumption and findings;
+   a label change, missing response or stopped polling process is not cancellation evidence.
+2. Human-review and merge the protected launcher/workflow/schema/prompt/documentation changes
+   through a `governance-change` PR. This is the initial trust-boundary approval, not a new human
+   approval required at each ordinary implementation/review cycle.
+3. Run deterministic governance tests, launcher isolation/failure/replay tests and the local
+   environment preflight. Verify that workers cannot access GitHub credentials, write the parent
+   journal or alter trusted governance; reviewer source and session/context remain separate.
+   Never use live C2/MCP/target commands for this validation.
+4. Incorporate the approved governance into the implementation PR only through its existing
+   authorized refresh/checkpoint path. Re-query current Phase/full HEAD/request, adjacent base,
+   current CI and any Design/Provider stop. A past approval for another input or policy does not
+   authorize the refreshed input. Retain historical `codex-native-v1` gates as historical evidence.
+5. Once cutover, isolation and authority are verified, start the same local runner command above
+   from clean current `main`. Observe a claimed local implementation run, launcher-published normal
+   output commit, CI, a distinct local review session and a trusted `local-review-v1` phase gate.
+   No Cloud task, `@codex` comment or routine human review-approval step belongs in this sequence.
+
+Cancel/timeout, sandbox/authentication failure, uncertain legacy task, duplicate run or unknown
+publication/push requires reconciliation, not automatic retry or fallback. The existing five-cycle
+and exact-finding limits, two-review family recurrence Design Stop, Provider Human Gates and exact-
+SHA final-merge safeguards remain unchanged.
 
 ## CI/CD boundary
 

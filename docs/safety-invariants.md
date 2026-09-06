@@ -137,7 +137,12 @@
 ## Development loop
 
 - Codexは自分を評価する仕様、Gate、Workflowを変更しない。
-- 独立AI Reviewは最新HEAD SHAへBindingする。
+- 実装とReviewは別々のローカルCodex CLI Process / Contextで行い、Review SnapshotはRead-onlyとする。新規Cloud Task / `@codex` Trigger / Cloud Fallbackは禁止する。
+- GitHub Credential、実行Claim / Journal、通常Commit / Push、Evidence公開とWorkflow DispatchはClean Current MainのTrusted Runnerだけが所有する。WorkerへCredential Storeや親の状態へのAccessを与えず、Model自身の出力は起動・検証の証跡にしない。
+- 独立AI Reviewは`local-review-v1`のUnique Run / Session、最新full HEAD / Base、Ready / Audit Source / Policy Digest、全FindingへBindingする。LauncherのOperator Accountが認証主体であり、Host / Sandbox / Launcherを信頼基盤とする。Operatorと独立した第三者Accountの証明を主張しない。
+- Trusted WorkflowはLauncherのStart / Result / 全Finding Evidence、本人性・一意性・TimelineとCurrent CIを独立再検証する。通常Reviewの都度人間承認は要求せず、初回Governance Review / Merge、Design Approval、Provider Human Gateは維持する。
+- 旧`codex-native-v1` Gate / Finding / Retry消費は履歴として保持し、新規Cloud起動権限へ使用しない。送信済み旧Taskやその出力が不明な同一入力でLocal Workerを起動しない。
+- Workerの起動・終了・Push・Evidence公開の結果不明はDurable Claim / JournalとRemote EvidenceのReconciliationまで再送しない。Crash / Timeout / CancellationでClaimを消さず、Sandbox不足時にCloudや権限緩和へFallbackしない。
 - Stale Reviewは無効。
 - Loop回数を制限し、同じ失敗を無限反復しない。
 - 同じInvariant Familyの2回目のFormal Reviewは`DESIGN_CHANGE_REQUIRED`として通常Resume不能にする。過去のbase-refresh / Resume Evidenceは新しいDesign Stopを越えて再利用しない。
