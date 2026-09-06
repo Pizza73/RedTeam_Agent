@@ -1081,6 +1081,76 @@ class _ReviewPromptGitHub:
         return {"body": body}
 
 
+def strategy_implementation_loop() -> tuple[PhaseLoop, _ReviewPromptGitHub]:
+    github = _ReviewPromptGitHub()
+    loop = PhaseLoop.__new__(PhaseLoop)
+    loop.github = github  # type: ignore[assignment]
+    loop.actor_login = ACTOR_LOGIN
+    loop.reviewer_login = REVIEWER_LOGIN
+    loop.dry_run = False
+    loop.log = lambda _message: None  # type: ignore[method-assign]
+    loop.implementation_schema = load_schema("implementation-request.schema.json")
+    plan = json.loads((REPO_ROOT / "automation/phase-plan.json").read_text())
+    loop.phase_prompts = {item["id"]: item["prompt"] for item in plan["phases"]}
+    loop.implementation_audit_policy = plan["invariant_audit"]
+    return loop, github
+
+
+@pytest.mark.parametrize("phase", PHASES)
+def test_each_phase_passes_current_strategy_to_implementation_once(phase: str) -> None:
+    loop, github = strategy_implementation_loop()
+    payload = {
+        **implementation_request(), "phase": phase, "phase_prompt": loop.phase_prompts[phase],
+        "invariant_audit": dict(loop.implementation_audit_policy),
+    }
+    request = MarkerEvidence(payload, PHASE_RECORD_URL, "github-actions[bot]", "")
+    loop.request_implementation(phase_state(phase=phase), request, [])
+    assert len(github.posted) == 1
+    prompt = github.posted[0]
+    for expected in (
+        HEAD_SHA, PHASE_RECORD_URL, "SystemDesign_AI_Control.md", "SystemDesign Section 38",
+        "reuse/replace/new", "storage/recovery", "implementation_strategy", "before/after",
+        "Do not infer current authority from archived designs or erase existing state",
+        "complete phase gate",
+    ):
+        assert expected in prompt
+    loop.request_implementation(phase_state(phase=phase), request, [
+        {"user": {"login": ACTOR_LOGIN}, "body": prompt, "html_url": TRIGGER_URL,
+         "created_at": "2026-09-06T00:00:00Z"},
+    ])
+    assert len(github.posted) == 1
+
+
+@pytest.mark.parametrize("audit_policy", [
+    None, {"policy_version": "1.0", "required": True},
+    {"policy_version": "1.0", "required": True, "implementation_strategy_version": "2.0"},
+    {"policy_version": "1.0", "required": True, "implementation_strategy_version": "1.0",
+     "skip_strategy": True},
+])
+def test_implementation_dispatch_rejects_legacy_downgraded_or_unknown_strategy(
+    audit_policy: object,
+) -> None:
+    loop, github = strategy_implementation_loop()
+    payload = implementation_request()
+    if audit_policy is not None:
+        payload["invariant_audit"] = audit_policy
+    with pytest.raises(UntrustedEvidenceError):
+        loop.request_implementation(
+            phase_state(), MarkerEvidence(payload, PHASE_RECORD_URL, "github-actions[bot]", ""), [],
+        )
+    assert github.posted == []
+
+
+def test_new_strategy_request_dry_run_does_not_post() -> None:
+    loop, github = strategy_implementation_loop()
+    loop.dry_run = True
+    payload = {**implementation_request(), "invariant_audit": loop.implementation_audit_policy}
+    loop.request_implementation(
+        phase_state(), MarkerEvidence(payload, PHASE_RECORD_URL, "github-actions[bot]", ""), [],
+    )
+    assert github.posted == []
+
+
 @pytest.mark.parametrize("phase", PHASES)
 def test_every_phase_uses_one_exhaustive_all_findings_review(phase: str) -> None:
     github = _ReviewPromptGitHub()
@@ -1107,6 +1177,9 @@ def test_every_phase_uses_one_exhaustive_all_findings_review(phase: str) -> None
     assert "standard P0 or P1 inline format" in prompt
     assert "Invariant family: FAMILY_ID" in prompt
     assert "pre-review audit" in prompt
+    assert "SystemDesign_AI_Control.md" in prompt
+    assert "Independently verify reuse/replace/new" in prompt
+    assert "migration/recovery" in prompt
     assert prompt.count("redteam-local-codex-trigger") == 1
 
 

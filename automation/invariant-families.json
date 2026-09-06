@@ -16,11 +16,12 @@
     {
       "id": "secret-plaintext-boundary",
       "title": "Secrets, plaintext and LLM-visible data",
-      "stateful": false,
+      "stateful": true,
       "review_questions": [
         "Can secret values or raw output reach prompts, normal storage, logs, exceptions or reports?",
         "Do every public resolve, read, export and recovery path enforce the same reference-only boundary?",
-        "Can caller-created receipts, quarantine references, publications, callbacks or compatibility loaders obtain plaintext or choose its destination?"
+        "Can caller-created receipts, quarantine references, publications, callbacks or compatibility loaders obtain plaintext or choose its destination?",
+        "Does only the winning Executor call obtain a one-call Secret delivery continuation, with exact-version lifecycle validation and no reusable consumed-claim resolver or lifetime-use counter?"
       ]
     },
     {
@@ -30,7 +31,8 @@
       "review_questions": [
         "Are digests, IDs, bindings, algorithms, nonces and key domains checked on both write and read?",
         "Do rotation, revocation and unavailable-key paths fail closed without plaintext or cross-domain fallback?",
-        "Do external generation anchors bind the exact state digest and immutable blob identity, not only an integer generation?"
+        "Do external generation anchors bind the exact state digest and immutable blob identity, not only an integer generation?",
+        "For Phase 0C production, does the authenticated record/blob pair match the current TPM NV Extend digest, with explicit Genesis and no automatic reseed or unqualified D4 erasure?"
       ]
     },
     {
@@ -40,7 +42,8 @@
       "review_questions": [
         "Are crash, retry, reconciliation and unknown-outcome transitions complete and non-duplicating?",
         "Are audit ordering, integrity and recovery decisions derived from durable trusted state?",
-        "Is a durable ingestion manifest committed and verified before quarantine erasure, with recovery at every commit/delete/ack boundary?"
+        "Does post-ingestion erasure verify the durable manifest, projection and every referenced resource, while typed expiry erasure verifies its own complete evidence without fabricating a manifest or successful result?",
+        "Do all erasure paths require the dedicated one-use claim, exact resource/key/copy inventory and same-identity reconciliation after an unknown outcome?"
       ]
     },
     {
@@ -68,7 +71,8 @@
       "stateful": false,
       "review_questions": [
         "Does every acceptance criterion have positive, negative and failure-path evidence?",
-        "Do changed interfaces preserve every earlier-phase invariant and supported caller?"
+        "Do changed interfaces preserve every earlier-phase safety invariant while obsolete authority inputs are rejected under the approved migration contract?",
+        "Does each reuse/replace/new unit match the current specification, cover all affected callers and recovery paths, and retain the earlier regression scenarios without weakening tests?"
       ]
     }
   ],

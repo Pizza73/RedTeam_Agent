@@ -21,7 +21,8 @@
       "required": ["policy_version", "required"],
       "properties": {
         "policy_version": {"const": "1.0"},
-        "required": {"const": true}
+        "required": {"const": true},
+        "implementation_strategy_version": {"const": "1.0"}
       }
     },
     "trigger": {
