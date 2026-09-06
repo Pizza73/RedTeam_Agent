@@ -101,6 +101,72 @@ def _git_bytes(root: Path, *arguments: str) -> bytes:
     return result.stdout
 
 
+def _git_json(root: Path, commit: str, path: str) -> Any:
+    try:
+        return json.loads(
+            _git_bytes(root, "show", f"{commit}:{path}"),
+            object_pairs_hook=_reject_duplicate_pairs,
+        )
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise InvariantAuditError("historical audit Git JSON is invalid") from exc
+
+
+def _historical_preflight_policy(
+    root: Path, audit_path: Path, audit: dict[str, Any],
+) -> Any:
+    """Read an unchanged legacy report, never certify new implementation evidence.
+
+    Neither this local history check nor its digest is Resume/Review authority. The
+    trusted workflows still require the exact-HEAD checkpoint, Design Approval and
+    new-policy request/strategy before implementation or formal review.
+    """
+    relative_path = audit_path.relative_to(root).as_posix()
+    record_commit = _git_bytes(
+        root, "log", "-1", "--format=%H", "HEAD", "--", relative_path,
+    ).decode("ascii").strip()
+    if len(record_commit) != 40 or any(c not in "0123456789abcdef" for c in record_commit):
+        raise InvariantAuditError("historical audit must already be committed")
+    _require_ancestor(root, record_commit, require_output_commit=True)
+    if _git_bytes(root, "show", f"{record_commit}:{relative_path}") != audit_path.read_bytes():
+        raise InvariantAuditError("historical audit differs from its committed record")
+    request_head = audit["request"]["head_sha"]
+    if request_head == record_commit:
+        raise InvariantAuditError("historical audit needs a proper-ancestor input request")
+    _git_bytes(root, "merge-base", "--is-ancestor", request_head, record_commit)
+
+    legacy_requirement = {"policy_version": "1.0", "required": True}
+    for commit in (request_head, record_commit):
+        plan = _git_json(root, commit, "automation/phase-plan.json")
+        requirement = plan.get("invariant_audit") if isinstance(plan, dict) else None
+        if (not isinstance(requirement, dict) or requirement != legacy_requirement
+                or requirement.get("required") is not True):
+            raise InvariantAuditError("historical audit was not recorded under the legacy policy")
+    policy_path = "automation/invariant-families.json"
+    policy = _git_json(root, request_head, policy_path)
+    recorded_policy = _git_json(root, record_commit, policy_path)
+    schema = _load_json(root / "automation/schemas/invariant-families.schema.json")
+    for candidate in (policy, recorded_policy):
+        _validate(candidate, schema, name="historical invariant-family policy")
+    if policy != recorded_policy:
+        raise InvariantAuditError("historical audit policy changed between input and recording")
+
+    # A carried-forward audit cannot cover new application code or changed evidence.
+    if _git_bytes(root, "diff", "--no-ext-diff", "--name-only", record_commit, "--", "src"):
+        raise InvariantAuditError("historical audit cannot cover changed application code")
+    if _git_bytes(root, "ls-files", "--others", "--exclude-standard", "--", "src"):
+        raise InvariantAuditError("historical audit cannot cover untracked application code")
+    evidence = set(audit["cross_family_tests"])
+    for family in audit["families"]:
+        for field in ("entry_points", "sibling_paths", "tests"):
+            evidence.update(family[field])
+    for raw in evidence:
+        path = _repo_path(root, raw)
+        recorded = _git_bytes(root, "show", f"{record_commit}:{raw.partition('#')[0]}")
+        if path.read_bytes() != recorded:
+            raise InvariantAuditError("historical audit evidence changed since recording")
+    return policy
+
+
 def _require_input_path(root: Path, request_head: str, raw: str) -> None:
     path = PurePosixPath(raw)
     if not raw or "#" in raw or "\\" in raw or "\x00" in raw or (
@@ -202,7 +268,15 @@ def validate_invariant_audit(
     expected_request_action: str | None = None,
     expected_request_reference: str | None = None,
     require_implementation_strategy: bool = False,
+    historical_preflight: bool = False,
 ) -> str | None:
+    if historical_preflight and (
+        not if_present or require_output_commit or require_implementation_strategy
+        or any(value is not None for value in (
+            expected_request_head, expected_request_action, expected_request_reference,
+        ))
+    ):
+        raise InvariantAuditError("historical preflight cannot certify a trusted output request")
     root = repo_root.resolve(strict=True)
     audit_path = root / "docs" / "review" / f"{phase}-invariant-audit.json"
     if not audit_path.is_file():
@@ -227,6 +301,12 @@ def validate_invariant_audit(
         raise InvariantAuditError("invariant policy and audit must be objects")
     if audit.get("phase") != phase:
         raise InvariantAuditError("audit phase does not match the current phase")
+
+    if historical_preflight and "implementation_strategy" not in audit:
+        historical = _historical_preflight_policy(root, audit_path, audit)
+        if historical["phases"].get(phase) != policy["phases"].get(phase):
+            raise InvariantAuditError("historical audit cannot replace the current family set")
+        policy = historical
 
     family_items = policy.get("families")
     phase_map = policy.get("phases")
@@ -306,6 +386,7 @@ def main() -> int:
     parser.add_argument("--expected-request-action")
     parser.add_argument("--expected-request-reference")
     parser.add_argument("--require-implementation-strategy", action="store_true")
+    parser.add_argument("--historical-preflight", action="store_true")
     args = parser.parse_args()
     try:
         digest = validate_invariant_audit(
@@ -317,12 +398,15 @@ def main() -> int:
             expected_request_action=args.expected_request_action,
             expected_request_reference=args.expected_request_reference,
             require_implementation_strategy=args.require_implementation_strategy,
+            historical_preflight=args.historical_preflight,
         )
     except (InvariantAuditError, OSError, subprocess.SubprocessError) as exc:
         print(f"INVARIANT_AUDIT=BLOCKED: {exc}")
         return 1
     if digest is None:
         print("INVARIANT_AUDIT=NOT_REQUIRED")
+    elif args.historical_preflight:
+        print(f"INVARIANT_AUDIT=PREFLIGHT_ONLY:{digest}")
     else:
         print(f"INVARIANT_AUDIT=PASS:{digest}")
     return 0
