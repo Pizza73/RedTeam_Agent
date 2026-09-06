@@ -58,6 +58,50 @@ normal execution does not erase attempt evidence. No model transcript is copied 
 GitHub: the journal stores the result and transcript digest, and GitHub receives bound
 start/result/finding records.
 
+Worker evidence also carries `configured_authorities.approver_login` and `workflow_login` from
+the trusted launcher's independently validated configuration. These are non-secret identity
+bindings, not credentials and not values inferred from the approval record itself.
+
+### Recover a known BLOCKED local implementation
+
+Do not restart the same input or delete its claim. A waited, schema-valid BLOCKED worker return
+is recorded by the parent as `redteam-local-implementation-terminal` / `BLOCKED_NO_OUTPUT` before
+any commit or push. The terminal record carries no Phase PASS, Resume or retry authority.
+`NO_OUTPUT` means no published implementation commit/push, not an empty workspace: uncommitted
+source changes or reports may remain and must be preserved.
+
+For the legacy launcher that left only `01-claimed`, `02-started` and `03-worker` journals, use
+`automation.local_attempt_reconciliation` only after the operator has confirmed that the launcher
+and all of its workers have stopped. The command verifies the known legacy code, private journals,
+exact HEAD, request/start/claim binding and absence of commit/push progression. Legacy journals do
+not contain a PID; the explicit operator attestation and conservative process check are required,
+not cryptographic proof that an arbitrary historical process has exited. Unknown outcomes remain
+blocked. Run the reconciler only from reviewed, merged, clean current `main`.
+
+```bash
+.venv/bin/python -m automation.local_attempt_reconciliation \
+  --repo Pizza73/RedTeam_Agent --pr 3 \
+  --attempt-directory /tmp/redteam-local-implementation-7bqyvp3j \
+  --confirmation RECONCILE_STOPPED_BLOCKED_NO_OUTPUT
+```
+
+This exact directory is the recorded legacy attempt, not a pattern to expand over other attempts.
+The confirmation attests that its launcher/workers have stopped; it does not approve execution.
+
+Preserve the workspace and journals, including uncommitted reports and diagnostic temporary files.
+Publication intent is durable before posting; if acknowledgement is lost, rerun only to compare
+the exact published record. The reconciler never blindly reposts or launches a worker. A missing
+remote record after a persisted publication intent requires operator investigation.
+
+After terminal reconciliation, incorporate the governance fix using the existing authorized
+base-refresh/checkpoint flow, wait for current-HEAD CI, then obtain a fresh Design Approval where
+required. Neither a terminal record nor a new HEAD silently discards the previous attempt.
+Both base refresh and new local work reject unresolved prior implementation starts.
+
+Governance unit tests must use synthetic host-model/account fixtures. The real account remains
+inaccessible from worker tools. Test failures caused by reading real host settings are test
+isolation defects, not permission to expose the account or relax the sandbox.
+
 1. Put the governance/bootstrap changes on a dedicated pull request created with only the
    `governance-change` label. Review and merge it manually before starting the loop. This first
    merge is not a Phase 0A PASS.

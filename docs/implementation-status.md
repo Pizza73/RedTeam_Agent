@@ -11,6 +11,16 @@ authoritative in all contexts.
 
 ## Local-only development-loop migration — 2026-09-06 (not deployed)
 
+Later execution update (2026-09-06): PR #42 was merged at
+`1befa35ece8b4f0875c002433d4effe9f01b1cd6`; the original local-only migration below was deployed.
+PR #3 incorporated it at `208233a2bade9d510356583ea3a3f14cf59c32bf`. A separately approved local
+implementation attempt then returned BLOCKED before commit/push because its immutable input lacked
+the configured approver identity. Its journals and claim remain intact. The worker's 21 test
+failures / 43 errors were reproduced as governance tests accessing real, intentionally hidden host
+configuration, not product implementation failures. The local recovery correction is under
+governance review; this snapshot neither reconciles that attempt nor authorizes replay. See
+`docs/review/local-worker-recovery.md` for current correction evidence.
+
 - The approved change is local Codex CLI implementation and a separate fresh read-only local
   review session, with unattended routine review recording. New Codex Cloud tasks and GitHub
   `@codex` triggers are disabled by the new `automation/local-execution-policy.json` contract.
