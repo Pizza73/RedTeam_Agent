@@ -206,7 +206,8 @@ machine-readable phase record.
   key or the fifth change cycle blocks the loop. A semantic family appearing in a second formal
   review blocks immediately as `DESIGN_CHANGE_REQUIRED` for a documented coherent redesign.
 - CI failure: the runner consumes the bounded failure request and asks Codex for a same-phase fix;
-  CI failure never counts as PASS.
+  CI failure never counts as PASS. For a stopped PR, CI records failure but issues no fix request
+  and does not clear the stop latch. Missing permission to read the trusted phase plan fails closed.
 - `BLOCKED`: resolve the recorded cause. For Phase 0A through Phase 3, run **Resume AI Loop** with
   the current HEAD SHA and a repository permalink documenting the resolution, then restart the
   local command. Do not use this workflow when the latest trusted gate has
@@ -332,7 +333,7 @@ python -m compileall -q automation scripts/ci
 python scripts/ci/validate_automation.py
 ```
 
-After an authorized implementation, run the unchanged complete Phase gate and the explicit
+After an authorized implementation, run the complete Phase gate and the explicit
 strategy requirement check with the current Phase substituted:
 
 ```bash
@@ -340,9 +341,14 @@ bash scripts/ci/run_phase_gate.sh <current-phase>
 python scripts/ci/validate_invariant_audit.py --phase <current-phase> --require-implementation-strategy
 ```
 
-The default `--if-present` audit check can read historical reports during blocked governance
-refresh; this is not a PASS for a new implementation. Review-ready and review-gate checks require
-the strategy block for a new-policy request. No tests, skip rules or phase-gate commands are removed.
+The gate's `--if-present --historical-preflight` audit check can read an unchanged committed legacy
+report during blocked governance refresh. It verifies the proper-ancestor report/input, unchanged
+evidence/source and the original policy before applying that policy's stateful test requirement.
+The result is `PREFLIGHT_ONLY`, never a PASS for new implementation or permission to resume.
+The validator without this option remains current-policy strict. New-policy reports cannot omit
+the strategy to use legacy validation; review-ready and review-gate checks require the new block.
+Do not add unexecuted test modes to an old audit, waive checks, or issue Design Approval on failure.
+No tests or skip rules are removed; the gate still runs every existing lint/type/test/coverage step.
 See `docs/review/ai-loop-strategy-update.md` for this update's file-level changes and local results.
 
 ## CI/CD boundary

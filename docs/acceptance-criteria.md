@@ -58,6 +58,14 @@
   §38のreuse / replace / new方針を引き継ぎ、同じRequestの再処理で重複依頼しない
 - 同RequestのAuditに閉じた`implementation_strategy`がない場合、CIはReview Readyを生成せず、
   GateもそのAuditを受理しない。旧Auditが履歴として読めることを新Policy適合へ読み替えない
+- LOOP-032の履歴Preflightは、Git上のproper-ancestor Audit / 入力Request、改変されていないAudit・
+  参照Evidence・Application Source、両Revisionの旧Request要件と同一Family Policyを検証し、当時の
+  Stateful試験要件を適用する。Current PhaseのRequired Family setは維持し、結果を`PREFLIGHT_ONLY`と
+  表示する。新Policyで作られたAuditのStrategy削除、履歴改変、証拠欠落、現行Request / Output認証との
+  併用を拒否する。新規StrategyにはPreflightでも現行Stateful要件を適用する
+- CI失敗引継ぎはDefault BranchのPhase Plan読取りにJob単位の`contents: read`だけを追加し、
+  Contents write / Merge権限を付与しない。Current open PR / exact HEAD / 同一Repository / Phaseを
+  再確認し、停止Latch存在時はFix Requestを生成しない。読取り拒否・途中の停止・HEAD / Phase Driftを検証する
 - 分類単位はOwner、理由、Input / Output File、Entry Point / 兄弟経路、現行規範・Family、
   移行影響、保持する安全試験、実行する試験と種別、変更前後を記録する。全変更Source / Test Path
   （追加・削除を含む）と全Affected Familyを網羅し、不正Path・不存在Input File・旧設計参照・

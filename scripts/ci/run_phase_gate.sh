@@ -30,7 +30,9 @@ PY
 
 python -m compileall -q src/redteam_agent
 python scripts/ci/validate_automation.py
-python scripts/ci/validate_invariant_audit.py --phase "$phase" --if-present
+# Deterministic preflight may read immutable legacy evidence during governance refresh.
+# It is not Review Ready or Resume authority; new requests still require current strategy.
+python scripts/ci/validate_invariant_audit.py --phase "$phase" --if-present --historical-preflight
 python -m ruff check .
 python -m mypy src/redteam_agent
 python -m pytest -q tests/unit --strict-markers
