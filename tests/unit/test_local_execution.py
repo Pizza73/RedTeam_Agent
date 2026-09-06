@@ -86,6 +86,13 @@ class GitHubDouble:
     def commit_statuses(self, _sha: str) -> list[dict[str, Any]]:
         return []
 
+    def api_object(self, endpoint: str) -> dict[str, Any]:
+        prefix = f"repos/{self.repository}/git/ref/"
+        assert endpoint.startswith(prefix)
+        reference = "refs/" + endpoint.removeprefix(prefix)
+        assert reference in self.claims
+        return {"ref": reference, "object": {"sha": self.head, "type": "commit"}}
+
     def check_runs(self, _sha: str) -> list[dict[str, Any]]:
         return [{"name": name, "status": "completed", "conclusion": self.check_status}
                 for name in REQUIRED_CHECK_ORDER]
@@ -146,6 +153,9 @@ def harness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[local.Loca
         (root / "automation/schemas/review-result.schema.json").read_text()
     )
     monkeypatch.setattr(local, "utc_now", gh.tick)
+    # Supervisor tests use synthetic model settings. Real host account configuration
+    # is intentionally unreadable when this suite runs inside a worker sandbox.
+    monkeypatch.setattr(local, "trusted_model_settings", lambda: {})
     monkeypatch.setattr(local, "preflight_local_worker", lambda _config: None)
     real_mkdtemp = local.tempfile.mkdtemp
     monkeypatch.setattr(local.tempfile, "mkdtemp",
@@ -310,6 +320,10 @@ def test_complete_local_implementation_validates_then_pushes_one_child(
         assert config.role == "implementation"
         assert request.url in prompt
         assert json.loads((config.input_dir / "request.json").read_text()) == request.payload
+        evidence = json.loads((config.input_dir / "evidence.json").read_text())
+        assert evidence["configured_authorities"] == {
+            "approver_login": "operator", "workflow_login": "github-actions[bot]",
+        }
         (config.workspace / "src/example.py").write_text("value = 2\n")
         events.append("worker")
         return LocalWorkerResult(SESSION, {"status": "READY", "summary": "fixture"}, "f" * 64)
@@ -340,6 +354,59 @@ def test_complete_local_implementation_validates_then_pushes_one_child(
     assert len(gh.claims) == 1
     assert "redteam-local-implementation-result" in gh.items[-1]["body"]
     assert real_git(backend.root, "rev-parse", "HEAD") == state.head_sha
+
+
+@pytest.mark.parametrize("approver", [None, "", "other", "operator\n", "a/b", 42])
+def test_input_bundle_rejects_missing_or_mismatched_configured_approver(
+    harness: Any, tmp_path: Path, approver: Any,
+) -> None:
+    backend, loop, gh = harness
+    source = authority(loop, gh, "implementation")
+    loop.approver_login = approver
+    with pytest.raises(local.LocalExecutionBlocked, match="LOCAL_CONFIGURED_APPROVER_INVALID"):
+        backend._inputs(loop, loop.pr_state(), source, gh.base, tmp_path, {})
+    assert not (tmp_path / "inputs").exists()
+    assert not gh.claims
+
+
+def test_input_bundle_does_not_infer_approver_from_approval_record(
+    harness: Any, tmp_path: Path,
+) -> None:
+    backend, loop, gh = harness
+    source = authority(loop, gh, "implementation")
+    item = gh.post_comment(3, local.marker_body("redteam-design-approval", {
+        "approved_by": "attacker",
+    }))
+    gh.items[-1]["user"]["login"] = "github-actions[bot]"
+    inputs = backend._inputs(loop, loop.pr_state(), source, gh.base, tmp_path, {})
+    bundle = json.loads((inputs / "evidence.json").read_text())
+    assert bundle["configured_authorities"]["approver_login"] == "operator"
+    assert any(record["reference"] == item["html_url"] for record in bundle["authority_records"])
+
+
+def test_blocked_worker_publishes_terminal_without_commit_push_or_replay(
+    harness: Any, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend, loop, gh = harness
+    source = authority(loop, gh, "implementation")
+    state = loop.pr_state()
+    calls = []
+
+    def worker(*_args: Any) -> LocalWorkerResult:
+        calls.append("worker")
+        return LocalWorkerResult(SESSION, {"status": "BLOCKED", "summary": "private detail"},
+                                 "f" * 64)
+
+    monkeypatch.setattr(local, "run_local_worker", worker)
+    monkeypatch.setattr(local, "run_local_validation", lambda *_args: pytest.fail("no gate"))
+    with pytest.raises(local.LocalExecutionBlocked, match="LOCAL_IMPLEMENTER_REPORTED_BLOCKED"):
+        backend.implement(loop, state, source, loop.comments())
+    terminal = gh.items[-1]["body"]
+    assert "redteam-local-implementation-terminal" in terminal
+    assert "BLOCKED_NO_OUTPUT" in terminal and "private detail" not in terminal
+    with pytest.raises(local.LocalReconciliationRequired):
+        backend.implement(loop, state, source, loop.comments())
+    assert calls == ["worker"] and gh.head == state.head_sha and len(gh.claims) == 1
 
 
 @pytest.mark.parametrize("kind", ["implementation", "review"])
@@ -605,16 +672,18 @@ def test_permanent_claim_allows_at_most_one_launch(sequence: list[str]) -> None:
     loop.default_branch = "main"
     loop.pull_request_number = 3
     state = loop.pr_state()
-    backend = local.LocalExecution(ROOT)
-    launched = 0
-    for action in sequence:
-        if action == "restart":
-            backend = local.LocalExecution(ROOT)
-            continue
-        gh.fail_claim = action == "ack_lost"
-        try:
-            backend._claim(loop, state, "review", canonical_digest({"source": "fixed"}))
-            launched += 1
-        except local.LocalReconciliationRequired:
-            pass
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(local, "trusted_model_settings", lambda: {})
+        backend = local.LocalExecution(ROOT)
+        launched = 0
+        for action in sequence:
+            if action == "restart":
+                backend = local.LocalExecution(ROOT)
+                continue
+            gh.fail_claim = action == "ack_lost"
+            try:
+                backend._claim(loop, state, "review", canonical_digest({"source": "fixed"}))
+                launched += 1
+            except local.LocalReconciliationRequired:
+                pass
     assert launched <= 1

@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from automation import local_execution
 from automation.local_execution import LocalExecution
 from automation.run_phase_loop import (
     BASE_REFRESH_CHECKPOINT_STATUS_DESCRIPTION,
@@ -1111,7 +1112,10 @@ def strategy_implementation_loop() -> tuple[PhaseLoop, _ReviewPromptGitHub]:
 
 
 @pytest.mark.parametrize("phase", PHASES)
-def test_each_phase_passes_current_strategy_to_local_implementation(phase: str) -> None:
+def test_each_phase_passes_current_strategy_to_local_implementation(
+    phase: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(local_execution, "trusted_model_settings", lambda: {})
     loop, github = strategy_implementation_loop()
     payload = {
         **implementation_request(), "phase": phase, "phase_prompt": loop.phase_prompts[phase],
@@ -1155,7 +1159,8 @@ def test_implementation_dispatch_rejects_legacy_downgraded_or_unknown_strategy(
     assert github.posted == []
 
 
-def test_new_strategy_request_dry_run_does_not_post() -> None:
+def test_new_strategy_request_dry_run_does_not_post(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(local_execution, "trusted_model_settings", lambda: {})
     loop, github = strategy_implementation_loop()
     loop.dry_run = True
     loop._local_executor = LocalExecution(REPO_ROOT)
@@ -1167,7 +1172,10 @@ def test_new_strategy_request_dry_run_does_not_post() -> None:
 
 
 @pytest.mark.parametrize("phase", PHASES)
-def test_every_phase_uses_one_exhaustive_all_findings_review(phase: str) -> None:
+def test_every_phase_uses_one_exhaustive_all_findings_review(
+    phase: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(local_execution, "trusted_model_settings", lambda: {})
     github = _ReviewPromptGitHub()
     loop = PhaseLoop.__new__(PhaseLoop)
     loop.github = github  # type: ignore[assignment]
@@ -1375,6 +1383,10 @@ class _BaseTransitionGitHub(_StatusGitHub):
         self.parents: dict[str, tuple[str, ...]] = {
             REFRESHED_HEAD_SHA: (HEAD_SHA, DEFAULT_BRANCH_SHA),
         }
+
+    def comments(self, number: int) -> list[dict[str, object]]:
+        assert number == 3
+        return []
 
     def set_pull_request_labels(
         self, number: int, labels: frozenset[str]
@@ -2570,6 +2582,11 @@ def test_refreshed_blocked_phase_dispatches_one_bounded_resume() -> None:
     loop.dispatched_blocked_resumes = set()
     loop.dry_run = False
     loop.log = lambda _message: None  # type: ignore[method-assign]
+    loop.check_state = lambda _head: "waiting"  # type: ignore[method-assign]
+    assert loop.perform_post_blocked_refresh_resume(
+        state, [], [base_pass, gate], [], DEFAULT_BRANCH_SHA
+    ) is True
+    assert github.workflow_calls == []
     loop.check_state = lambda _head: "success"  # type: ignore[method-assign]
 
     assert loop.perform_post_blocked_refresh_resume(
@@ -2643,7 +2660,10 @@ def test_refreshed_design_stop_never_dispatches_generic_resume() -> None:
     loop.dry_run = False
     messages: list[str] = []
     loop.log = messages.append  # type: ignore[method-assign]
-    loop.check_state = lambda _head: "pending"  # type: ignore[method-assign]
+    # Exercise the real check-state contract: incomplete checks return "waiting",
+    # not the GitHub status spelling "pending".
+    github.check_runs = lambda _head: []  # type: ignore[method-assign]
+    loop.check_state = PhaseLoop.check_state.__get__(loop)  # type: ignore[method-assign]
 
     assert loop.perform_post_blocked_refresh_resume(
         state,
@@ -2963,6 +2983,7 @@ def test_base_refresh_rejects_non_adjacent_or_stale_evidence(
 
 def test_stale_base_refresh_is_reauthorized_for_new_default_head() -> None:
     loop = PhaseLoop.__new__(PhaseLoop)
+    loop.github = _BaseTransitionGitHub({})  # type: ignore[assignment]
     loop.dispatched_base_refreshes = set()
     loop.started_base_updates = set()
     loop.dry_run = True
@@ -2981,6 +3002,33 @@ def test_stale_base_refresh_is_reauthorized_for_new_default_head() -> None:
     ) is True
     assert loop.dispatched_base_refreshes == {f"phase-0b:{HEAD_SHA}:{BASE_SHA}"}
     assert loop.started_base_updates == set()
+
+
+def test_base_refresh_cannot_hide_unresolved_local_implementation() -> None:
+    from automation.local_execution import LocalReconciliationRequired, marker_body
+
+    github = _BaseTransitionGitHub({})
+    start = {
+        "schema_version": "1.0", "phase": "phase-0a", "head_sha": HEAD_SHA,
+        "base_sha": BASE_SHA, "request_reference": f"{PULL_REQUEST_PREFIX}#issuecomment-1",
+        "source_digest": "a" * 64, "policy_digest": "b" * 64,
+        "run_id": "00000000-0000-4000-8000-000000000001",
+        "started_at": "2026-09-06T10:00:00Z",
+    }
+    github.comments = lambda _number: [{  # type: ignore[method-assign]
+        "user": {"login": "operator"}, "created_at": "2026-09-06T10:00:01Z",
+        "updated_at": "2026-09-06T10:00:01Z",
+        "html_url": f"{PULL_REQUEST_PREFIX}#issuecomment-2",
+        "body": marker_body("redteam-local-implementation-start", start),
+    }]
+    loop = PhaseLoop.__new__(PhaseLoop)
+    loop.github = github  # type: ignore[assignment]
+    loop.actor_login = "operator"
+    with pytest.raises(LocalReconciliationRequired):
+        loop.request_base_refresh(
+            phase_state(phase="phase-0a"), prior_phase_zero_pass(), target_base_sha=BASE_SHA
+        )
+    assert github.workflow_calls == [] and github.update_calls == []
 
 
 def test_sha_bound_codex_implementation_blocker_is_detected() -> None:

@@ -50,6 +50,16 @@ def config(tmp_path: Path) -> worker.LocalWorkerConfig:
     return worker.LocalWorkerConfig(workspace, "review")
 
 
+@pytest.fixture
+def synthetic_account(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Command-construction tests must never inspect the invoking CLI account."""
+    account = tmp_path / "synthetic-account"
+    account.mkdir()
+    environment = worker.sanitized_environment({"HOME": str(account)})
+    monkeypatch.setattr(worker, "sanitized_environment", lambda _source: dict(environment))
+    return account
+
+
 def test_complete_fresh_session_has_exact_transcript_digest() -> None:
     output = _encode(_events())
     result = worker.parse_worker_output(output)
@@ -360,7 +370,7 @@ def test_timeout_terminates_process_group(tmp_path: Path) -> None:
     for _ in range(100):
         try:
             state = Path(f"/proc/{child_pid}/stat").read_text().split()[2]
-        except FileNotFoundError:
+        except (FileNotFoundError, ProcessLookupError):
             return
         if state == "Z":
             return
@@ -371,6 +381,7 @@ def test_timeout_terminates_process_group(tmp_path: Path) -> None:
 def test_worker_launch_is_fresh_and_schema_validated(
     config: worker.LocalWorkerConfig,
     monkeypatch: pytest.MonkeyPatch,
+    synthetic_account: Path,
 ) -> None:
     captured: list[list[str]] = []
     monkeypatch.setattr(worker, "preflight_local_worker", lambda _config: None)
@@ -385,6 +396,7 @@ def test_worker_launch_is_fresh_and_schema_validated(
     result = worker.run_local_worker(config, "Trusted task", SCHEMA)
     assert result.final_json == {"verdict": "PASS"}
     command = captured[0]
+    assert str(synthetic_account) in command
     assert "exec" in command and "--ephemeral" in command and "--ignore-user-config" in command
     assert "--ignore-rules" in command and "--json" in command and "--strict-config" in command
     assert not {
@@ -402,6 +414,7 @@ def test_worker_launch_is_fresh_and_schema_validated(
 def test_transport_schema_never_replaces_conditional_review_validation(
     config: worker.LocalWorkerConfig,
     monkeypatch: pytest.MonkeyPatch,
+    synthetic_account: Path,
 ) -> None:
     schema_path = (
         Path(__file__).resolve().parents[2] / "automation/schemas/review-result.schema.json"
@@ -440,6 +453,7 @@ def test_validation_has_no_native_auth_or_network_and_requires_phase_gate_marker
     config: worker.LocalWorkerConfig,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    synthetic_account: Path,
 ) -> None:
     dependencies = tmp_path / "dependency"
     dependencies.mkdir()
@@ -457,6 +471,7 @@ def test_validation_has_no_native_auth_or_network_and_requires_phase_gate_marker
     result = worker.run_local_validation(config, "phase-0c")
     assert result.stdout.endswith("PHASE_GATE=phase-0c PASS\n")
     command = captured[0]
+    assert str(synthetic_account) in command
     assert "--share-net" not in command
     assert not any(item.endswith("/auth.json") for item in command)
     assert command[-3:] == ["/bin/bash", "scripts/ci/run_phase_gate.sh", "phase-0c"]

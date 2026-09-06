@@ -290,6 +290,10 @@ class LocalExecution:
     @staticmethod
     def _cutover_check(loop: PhaseLoop, state: PullRequestState,
                        comments: list[dict[str, Any]], kind: str) -> None:
+        from automation.local_attempt_reconciliation import assert_attempts_resolved
+
+        # Advancing the input HEAD must not hide a previous unresolved local attempt.
+        assert_attempts_resolved(loop, state, comments)
         for item in comments:
             if item.get("user", {}).get("login") != loop.actor_login:
                 continue
@@ -387,6 +391,13 @@ class LocalExecution:
 
     def _inputs(self, loop: PhaseLoop, state: PullRequestState, evidence: MarkerEvidence,
                 base_sha: str, directory: Path, start: dict[str, Any]) -> Path:
+        # These identities come from independently validated repository configuration,
+        # never from approved_by (or another field) inside a worker/PR supplied record.
+        approver = getattr(loop, "approver_login", None)
+        if (not isinstance(approver, str)
+                or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}", approver) is None
+                or approver != loop.actor_login):
+            raise LocalExecutionBlocked("LOCAL_CONFIGURED_APPROVER_INVALID")
         inputs = directory / "inputs"
         inputs.mkdir(mode=0o700)
         comments = loop.comments()
@@ -398,6 +409,10 @@ class LocalExecution:
                 "payload": evidence.payload, "body": evidence.body,
             },
             "start": start, "policy_digest": self.policy_digest,
+            "configured_authorities": {
+                "approver_login": approver,
+                "workflow_login": TRUSTED_WORKFLOW_LOGIN,
+            },
             "fix_findings": self._fix_findings(loop, state, evidence, comments),
             "required_checks": [
                 {"name": name, "status": "PASS" if loop.check_state(state.head_sha)
@@ -480,6 +495,9 @@ class LocalExecution:
                           "transcript_sha256": worker.transcript_sha256,
                           "result": worker.final_json})
             if worker.final_json["status"] != "READY":
+                from automation.local_attempt_reconciliation import publish_blocked_terminal
+
+                publish_blocked_terminal(loop, state, directory)
                 raise LocalExecutionBlocked("LOCAL_IMPLEMENTER_REPORTED_BLOCKED")
             paths = self._changed_paths(workspace, state.head_sha)
             diff_digest = self._diff_digest(workspace, paths)

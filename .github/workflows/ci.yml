@@ -76,6 +76,7 @@ jobs:
             tests/unit/test_governance_check.py \
             tests/unit/test_phase_loop.py \
             tests/unit/test_local_execution.py \
+            tests/unit/test_local_attempt_reconciliation.py \
             tests/unit/test_local_worker.py \
             tests/unit/test_local_review_evidence.py \
             --strict-markers
@@ -143,6 +144,7 @@ jobs:
             tests/unit/test_governance_check.py \
             tests/unit/test_phase_loop.py \
             tests/unit/test_local_execution.py \
+            tests/unit/test_local_attempt_reconciliation.py \
             tests/unit/test_local_worker.py \
             tests/unit/test_local_review_evidence.py
       - name: Run complete phase gate
