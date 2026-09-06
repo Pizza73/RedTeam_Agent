@@ -123,3 +123,12 @@ PATH=/home/kali/RedTeam_Agent/.venv/bin:/usr/lib/chatgpt/resources/cua_node/bin:
 `BLOCKED_NO_OUTPUT`は未Commit変更の削除や実装再開の許可ではない。旧JournalにPIDがないため、
 旧版ReconciliationはOperator停止確認と現在のProcess確認を信頼する。Host侵害に対する証明ではない。
 不明な実行、Push済み/結果不明、公開結果不明の自動再送、Claim削除による復旧は対象外で停止する。
+
+## 提出記録
+
+- Governance PR: https://github.com/Pizza73/RedTeam_Agent/pull/43
+- 初回提出Commit: `cfdfe7a6b5a5163696dbfd65ba113d2d72dacd5c`
+- 初回CI `34051565533`はPR作成イベントの`PR_LABELS_JSON=[]`で起動し、Governanceチェックが
+  正しく拒否した。後続の`governance-change`ラベル登録は確認済み。本記録を通常Commit / Pushし、
+  現在ラベルの新しいsynchronizeイベントで再検証する。旧イベントの拒否を合格へ書き換えない。
+- 本PRのHuman Review / Merge、旧Attemptの明示Reconciliation、実装PRへの正式取り込みは未実施。
