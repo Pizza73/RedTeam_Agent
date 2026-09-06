@@ -44,6 +44,21 @@ authoritative in all contexts.
   review/merge, authorized incorporation, current-HEAD checks and dedicated Design Approval
   are still required before live implementation resumes.
 
+## Governance submission — 2026-09-06
+
+- The approved canonical design and development-loop strategy integration were committed as
+  `435576ee1040047581311d6af3b3ccc4fc5ab491` and pushed to `codex/phase-0c-coherent-redesign-v3`.
+- [PR #40](https://github.com/Pizza73/RedTeam_Agent/pull/40) submits the changes to `main` under
+  `governance-change`; it is not an implementation-phase PR or a Phase PASS. Its current HEAD/checks
+  are authoritative for submission status; later publication-report commits do not alter phase authority.
+- PR #39's AGENTS guidance was already merged. The fetched default-branch SHA was
+  `353fb13cf635f560058754ded438c85504fd143d`. PR #38 remains a separate open governance change.
+- PR #3 remains at `ae09f40f6b593060d060cfb9a5090e0de4e2875d` with `phase-0c` and `ai-loop-blocked`.
+  Its latest trusted recurrence gate is still `issuecomment-5515692085`; no current-HEAD dedicated
+  Design Approval was found. Product implementation and the live runner have not resumed.
+- Human review/merge of the design, authorized incorporation/checkpoint, current-HEAD checks and
+  dedicated Design Approval remain required. This snapshot never authorizes merge or Resume.
+
 ## Default-branch bootstrap state
 
 ```text

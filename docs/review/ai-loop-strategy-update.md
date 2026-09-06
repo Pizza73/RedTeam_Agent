@@ -13,7 +13,7 @@
 - 作業ブランチ: `codex/phase-0c-coherent-redesign-v3`
 - 入力Review SHA: 今回のGovernance修正には該当なし。既存PRの最新SnapshotはPhase 0C、
   `ae09f40f6b593060d060cfb9a5090e0de4e2875d`のDesign Stopであり、この報告で再開を認可しない。
-- 出力: Working-tree差分のみ。Commit / Push / Merge / GitHub Label変更 / Runner実起動は行っていない。
+- 初回報告時の出力: Working-tree差分のみ。公開後のCommit / PR情報は末尾の公開記録を参照する。
 - 今回の差分: 既存23ファイルを更新し、本報告を新規追加。作業前から存在するSystemDesign等の大きな差分は
   保持しており、今回のAIループ実装変更と混同しない。製品`src/`、Integration / Security Test、DB、鍵は未変更。
 
@@ -148,3 +148,25 @@ COVERAGE_FILE=/tmp/redteam-loop-strategy-HWe7kE/full-coverage python -m coverage
    後続の共通AI制御はPhase 1 / 2のGate順序に従う。
 
 Governance変更はレビュー可能だが、現時点で「ライブAIループが稼働中」「製品実装完了」「Phase PASS」とは報告しない。
+
+## GitHub公開記録 — 2026-09-06
+
+- ユーザーのCommit / GitHub反映指示を受け、上記AIループ変更と先行の承認済み設計差分を
+  `435576ee1040047581311d6af3b3ccc4fc5ab491`として同じ設計ブランチへ通常Commit / Pushした。
+  39ファイル、16,242行追加・649行削除。8,706行の旧設計Archiveを含むため、差分量を製品コード変更と混同しない。
+- [Governance PR #40](https://github.com/Pizza73/RedTeam_Agent/pull/40)を`main`向けに作成し、
+  `governance-change` Labelを設定。公開時はDraftとしてCIとHuman Reviewの準備を行う。
+- 公開前に同じ265 Governance Test、対象Ruff、Automation Schema、設計文書検証、Whitespaceを再実行しPASS。
+  GitHub上の正式なCheck結果はPRの最新HEADを参照し、本報告から推定しない。
+- 本体Commit `435576ee1040047581311d6af3b3ccc4fc5ab491`の
+  [GitHub CI](https://github.com/Pizza73/RedTeam_Agent/actions/runs/34035129723)で
+  `tests (3.12)`、`tests (3.14)`、`quality`、`governance-integrity`、`governance-review-status`の成功を確認。
+  Governance PR用の結果であり、製品Phase 0CのGate成功やHuman Reviewの代替ではない。
+- AGENTS指針更新のPR #39は既にMerge済み。取得したCurrent `main`は
+  `353fb13cf635f560058754ded438c85504fd143d`。本PRはその後の設計・ループ修正を提出する。
+- PR #3は`ae09f40f6b593060d060cfb9a5090e0de4e2875d`、`phase-0c` / `ai-loop-blocked`のまま。
+  最新Trusted Gateは[Invariant Family再発の停止](https://github.com/Pizza73/RedTeam_Agent/pull/3#issuecomment-5515692085)。
+  このHEADに対する専用Design Approvalを確認できていないため、実装・Runner起動・停止解除は行わない。
+- 既存PR #38の別Governance修正は取り込まず維持する。いずれのPRもCodexからMergeしない。
+- この公開記録を別の通常Commitで追記し、Labelが確定した後の最新HEADでGovernance CIを再評価させる。
+  上記Commit SHAは設計・ループ実装本体の識別であり、最終PR HEADやPhase認可SHAを代替しない。
