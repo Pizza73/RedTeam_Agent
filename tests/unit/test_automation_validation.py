@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import sys
+import textwrap
 from pathlib import Path
 from typing import Any
 
@@ -366,6 +368,153 @@ def test_affected_stateful_family_requires_model_based_test(tmp_path: Path) -> N
         validate_invariant_audit(repo, "phase-0c")
 
 
+def _history_git(repo: Path, *arguments: str) -> str:
+    git = shutil.which("git")
+    assert git is not None
+    return subprocess.run(  # noqa: S603 - fixed test-only Git operations without a shell.
+        [git, *arguments], cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
+def _legacy_audit_repo(
+    tmp_path: Path, *, secret_stateful: bool = False,
+) -> tuple[Path, Path]:
+    repo, report_path = _audit_repo(tmp_path)
+    plan_path = repo / "automation/phase-plan.json"
+    policy_path = repo / "automation/invariant-families.json"
+    plan = json.loads(plan_path.read_text())
+    del plan["invariant_audit"]["implementation_strategy_version"]
+    plan_path.write_text(json.dumps(plan), encoding="utf-8")
+    policy = json.loads(policy_path.read_text())
+    secret = next(item for item in policy["families"] if item["id"] == "secret-plaintext-boundary")
+    secret["stateful"] = secret_stateful
+    policy_path.write_text(json.dumps(policy), encoding="utf-8")
+    _history_git(repo, "add", "automation")
+    _history_git(repo, "commit", "-qm", "legacy request policy")
+    report = json.loads(report_path.read_text())
+    report["request"]["head_sha"] = _history_git(repo, "rev-parse", "HEAD")
+    secret_report = next(
+        item for item in report["families"] if item["id"] == "secret-plaintext-boundary"
+    )
+    secret_report["status"] = "affected"
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    _history_git(repo, "add", "docs")
+    _history_git(repo, "commit", "-qm", "legacy implementation audit")
+    for path in (plan_path, policy_path):
+        path.write_bytes((REPO_ROOT / path.relative_to(repo)).read_bytes())
+    _history_git(repo, "add", "automation")
+    _history_git(repo, "commit", "-qm", "incorporate new governance policy")
+    return repo, report_path
+
+
+def test_preflight_reads_unchanged_legacy_audit_without_retroactive_stateful_rule(
+    tmp_path: Path,
+) -> None:
+    repo, report_path = _legacy_audit_repo(tmp_path)
+    original = report_path.read_bytes()
+    digest = validate_invariant_audit(repo, "phase-0c", if_present=True, historical_preflight=True)
+    assert digest == canonical_digest(json.loads(original))
+    assert report_path.read_bytes() == original
+    with pytest.raises(InvariantAuditError, match="property/state-machine"):
+        validate_invariant_audit(repo, "phase-0c")
+    with pytest.raises(InvariantAuditError):
+        validate_invariant_audit(repo, "phase-0c", require_implementation_strategy=True)
+
+
+def test_historical_preflight_cli_does_not_report_current_audit_pass(tmp_path: Path) -> None:
+    repo, _ = _legacy_audit_repo(tmp_path)
+    result = subprocess.run(  # noqa: S603 - local validator against an isolated test repository.
+        [sys.executable, str(REPO_ROOT / "scripts/ci/validate_invariant_audit.py"),
+         "--repo-root", str(repo), "--phase", "phase-0c", "--if-present",
+         "--historical-preflight"], check=True, capture_output=True, text=True,
+    )
+    assert result.stdout.startswith("INVARIANT_AUDIT=PREFLIGHT_ONLY:")
+    assert "INVARIANT_AUDIT=PASS" not in result.stdout
+
+
+@pytest.mark.parametrize("binding", [
+    {"if_present": False}, {"require_output_commit": True},
+    {"require_implementation_strategy": True}, {"expected_request_head": "a" * 40},
+    {"expected_request_action": "IMPLEMENT_PHASE"},
+    {"expected_request_reference": "https://github.com/example/repo/pull/1#issuecomment-1"},
+])
+def test_historical_preflight_cannot_be_used_as_output_authority(
+    tmp_path: Path, binding: dict[str, Any],
+) -> None:
+    repo, _ = _legacy_audit_repo(tmp_path)
+    options = {"if_present": True, "historical_preflight": True, **binding}
+    with pytest.raises(InvariantAuditError, match="cannot certify"):
+        validate_invariant_audit(repo, "phase-0c", **options)
+
+
+@pytest.mark.parametrize("mutation", [
+    "dirty-audit", "recommitted-audit", "new-source", "tracked-source", "changed-evidence",
+    "missing-evidence", "symlink-evidence", "duplicate-key", "unknown-field",
+])
+def test_historical_preflight_rejects_changed_or_malformed_evidence(
+    tmp_path: Path, mutation: str,
+) -> None:
+    repo, report_path = _legacy_audit_repo(tmp_path)
+    if mutation in {"dirty-audit", "recommitted-audit"}:
+        report = json.loads(report_path.read_text())
+        report["notes"] = "Changed historical report."
+        report_path.write_text(json.dumps(report), encoding="utf-8")
+        if mutation == "recommitted-audit":
+            _history_git(repo, "add", "docs")
+            _history_git(repo, "commit", "-qm", "new audit without required strategy")
+            _history_git(repo, "commit", "--allow-empty", "-qm", "later governance")
+    elif mutation in {"new-source", "tracked-source"}:
+        (repo / "src").mkdir()
+        (repo / "src/new.py").write_text("# New application code\n", encoding="utf-8")
+        if mutation == "tracked-source":
+            _history_git(repo, "add", "src")
+    elif mutation == "changed-evidence":
+        (repo / "tests/test_family.py").write_text("# Changed evidence\n", encoding="utf-8")
+    elif mutation == "missing-evidence":
+        (repo / "tests/test_family.py").unlink()
+    elif mutation == "symlink-evidence":
+        outside = tmp_path / "outside.py"
+        outside.write_text("# Outside the evidence boundary\n", encoding="utf-8")
+        (repo / "tests/test_family.py").unlink()
+        (repo / "tests/test_family.py").symlink_to(outside)
+    elif mutation == "duplicate-key":
+        report_path.write_text(report_path.read_text().replace(
+            '"schema_version": "1.0"', '"schema_version": "1.0", "schema_version": "1.0"',
+        ), encoding="utf-8")
+    else:
+        report = json.loads(report_path.read_text())
+        report["unknown"] = True
+        report_path.write_text(json.dumps(report), encoding="utf-8")
+    with pytest.raises(InvariantAuditError):
+        validate_invariant_audit(repo, "phase-0c", if_present=True, historical_preflight=True)
+
+
+def test_historical_preflight_preserves_stateful_requirement_of_original_policy(
+    tmp_path: Path,
+) -> None:
+    repo, _ = _legacy_audit_repo(tmp_path, secret_stateful=True)
+    with pytest.raises(InvariantAuditError, match="property/state-machine"):
+        validate_invariant_audit(repo, "phase-0c", if_present=True, historical_preflight=True)
+
+
+def test_new_strategy_uses_current_stateful_rule_even_in_preflight(tmp_path: Path) -> None:
+    repo, report_path, report = _strategy_repo(tmp_path)
+    secret = next(item for item in report["families"] if item["id"] == "secret-plaintext-boundary")
+    secret["status"] = "affected"
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    with pytest.raises(InvariantAuditError, match="property/state-machine"):
+        validate_invariant_audit(repo, "phase-0c", if_present=True, historical_preflight=True)
+
+
+def test_new_policy_report_cannot_downgrade_by_omitting_strategy(tmp_path: Path) -> None:
+    repo, _ = _audit_repo(tmp_path)
+    _history_git(repo, "add", "docs")
+    _history_git(repo, "commit", "-qm", "new-policy report without strategy")
+    _history_git(repo, "commit", "--allow-empty", "-qm", "later governance")
+    with pytest.raises(InvariantAuditError, match="legacy policy"):
+        validate_invariant_audit(repo, "phase-0c", if_present=True, historical_preflight=True)
+
+
 def test_nested_duplicate_json_key_is_rejected(tmp_path: Path) -> None:
     path = tmp_path / "duplicate.json"
     path.write_text('{"outer":{"phase":"phase-0a","phase":"phase-1"}}', encoding="utf-8")
@@ -503,6 +652,132 @@ def test_ci_and_review_retry_limits_are_exactly_five() -> None:
         assert "AI_LOOP_MAX_ITERATIONS must be exactly 5" in workflow
         assert "maximum < 1" not in workflow
         assert "maximum > 20" not in workflow
+
+
+def test_ci_failure_handoff_has_only_the_required_job_permissions() -> None:
+    workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text()
+    job = workflow.split("\n  ci_failure:\n", maxsplit=1)[1]
+    permissions = job.split("    permissions:\n", maxsplit=1)[1].split("    env:\n")[0]
+    assert permissions.strip().splitlines() == [
+        "contents: read", "      issues: write", "      pull-requests: write",
+        "      statuses: write",
+    ]
+    assert "pull_request_target:" not in workflow
+    assert "--historical-preflight" in (REPO_ROOT / "scripts/ci/run_phase_gate.sh").read_text()
+
+
+@pytest.mark.parametrize("scenario", [
+    "normal", "blocked", "head-drift", "phase-drift", "closed", "fork",
+    "late-stop", "post-label-stop", "read-denied", "duplicate", "retry-limit",
+])
+def test_ci_failure_handoff_preserves_stop_and_exact_head(
+    scenario: str,
+) -> None:
+    node = shutil.which("node")
+    assert node is not None
+    workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text()
+    job = workflow.split("\n  ci_failure:\n", maxsplit=1)[1]
+    source = textwrap.dedent(job.split("          script: |\n", maxsplit=1)[1])
+    harness = r"""
+const assert = require('node:assert/strict');
+const source = process.argv[1];
+const scenario = process.argv[2];
+const base = {
+  number: 1, state: 'open',
+  head: {sha: 'a'.repeat(40), repo: {full_name: 'example/repo'}},
+  labels: [{name: 'ai-loop'}, {name: 'phase-0c'}],
+};
+const policy = {policy_version: '1.0', required: true, implementation_strategy_version: '1.0'};
+const plan = {invariant_audit: policy,
+  phases: [{id: 'phase-0c', prompt: 'prompts/phases/phase-0c.md'}]};
+const prior = {
+  schema_version: '1.0', action: 'IMPLEMENT_PHASE', trigger: 'HUMAN_RESUME',
+  phase: 'phase-0c', head_sha: 'b'.repeat(40), phase_prompt: 'prompts/phases/phase-0c.md',
+  invariant_audit: policy,
+};
+const marker = (data) => `<!-- redteam-implementation-request\n${JSON.stringify(data)}\n-->`;
+const comment = (data) => ({user: {login: 'github-actions[bot]'}, body: marker(data)});
+const comments = [comment(prior)];
+if (scenario === 'duplicate') {
+  comments.push(comment({...prior, trigger: 'CI_FAILURE', head_sha: base.head.sha}));
+}
+if (scenario === 'retry-limit') {
+  for (let i = 0; i < 5; i++) comments.push(comment({...prior, trigger: 'CI_FAILURE'}));
+}
+const writes = [], failures = [];
+let reads = 0, pulls = 0;
+const github = {
+  rest: {
+    pulls: {get: async () => {
+      pulls++;
+      const pr = structuredClone(base);
+      if (scenario === 'blocked' || (scenario === 'late-stop' && pulls >= 2) ||
+          (scenario === 'post-label-stop' && pulls >= 3)) pr.labels.push({name: 'ai-loop-blocked'});
+      if (scenario === 'head-drift') pr.head.sha = 'c'.repeat(40);
+      if (scenario === 'phase-drift' && pulls >= 2) pr.labels[1].name = 'phase-1';
+      if (scenario === 'closed') pr.state = 'closed';
+      if (scenario === 'fork') pr.head.repo.full_name = 'other/repo';
+      return {data: pr};
+    }},
+    repos: {
+      createCommitStatus: async (data) => {writes.push(['status', data]);},
+      getContent: async (data) => {
+        reads++;
+        assert.equal(data.ref, 'main');
+        assert.equal(data.path, 'automation/phase-plan.json');
+        if (scenario === 'read-denied') throw new Error('Resource not accessible by integration');
+        const content = Buffer.from(JSON.stringify(plan)).toString('base64');
+        return {data: {type: 'file', content}};
+      },
+    },
+    issues: {
+      listComments: () => {},
+      addLabels: async (data) => {writes.push(['labels', data]);},
+      createComment: async (data) => {writes.push(['comment', data]);},
+    },
+  },
+  paginate: async () => comments,
+};
+const context = {repo: {owner: 'example', repo: 'repo'}, payload: {
+  pull_request: structuredClone(base),
+  repository: {full_name: 'example/repo', default_branch: 'main'},
+}};
+const core = {setFailed: (message) => failures.push(message), notice: () => {}, info: () => {}};
+const AsyncFunction = Object.getPrototypeOf(async function(){}).constructor;
+(async () => {
+  let error = null;
+  try {
+    await new AsyncFunction('github', 'context', 'core', 'process', source)(
+      github, context, core, {env: {GOVERNANCE_RESULT: 'success', AI_LOOP_MAX_ITERATIONS: '5'}},
+    );
+  } catch (caught) {error = caught;}
+  const requests = writes.filter(([kind, data]) => kind === 'comment' &&
+    data.body.includes('redteam-implementation-request'));
+  assert.equal(requests.length, scenario === 'normal' ? 1 : 0);
+  const errorCases = ['head-drift', 'phase-drift', 'closed', 'fork', 'read-denied'];
+  const errorExpected = errorCases.includes(scenario);
+  assert.equal(Boolean(error), errorExpected);
+  assert.deepEqual(failures, []);
+  if (scenario === 'normal') {
+    const body = requests[0][1].body;
+    const requestText = body.match(/<!-- redteam-implementation-request\n([\s\S]*?)\n-->/)[1];
+    const request = JSON.parse(requestText);
+    assert.equal(request.head_sha, base.head.sha);
+    assert.deepEqual(request.invariant_audit, policy);
+  }
+  if (scenario === 'blocked') {
+    assert.equal(reads, 0);
+    assert.deepEqual(writes.map(([kind]) => kind), ['status']);
+  }
+  if (['head-drift', 'closed', 'fork'].includes(scenario)) assert.deepEqual(writes, []);
+  if (['late-stop', 'phase-drift', 'read-denied', 'duplicate'].includes(scenario)) {
+    assert.equal(writes.filter(([kind]) => kind === 'labels').length, 0);
+  }
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+"""
+    subprocess.run(  # noqa: S603 - execute the actual workflow with isolated fake GitHub APIs.
+        [node, "-e", harness, source, scenario], check=True, capture_output=True, text=True,
+    )
 
 
 def test_phase_gate_uses_the_marker_transition_protocol() -> None:

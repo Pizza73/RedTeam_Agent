@@ -225,6 +225,24 @@ review evidence. In particular, blocked governance-refresh CI may inspect an old
 demanding product implementation **before** Design Approval; no ready marker is issued for that
 blocked HEAD. After adoption, a fresh authorized request requires the new block in its output.
 
+The phase gate's `--if-present --historical-preflight` check is explicitly non-authorizing. For a
+legacy audit without a strategy block, it derives the last committed report revision from Git and
+requires that revision to be a proper ancestor of HEAD, with byte-identical current audit and
+referenced evidence and no changed/untracked application source. The input request must precede
+that report revision; both revisions must contain the exact legacy audit requirement and the same
+closed-schema family policy. The required family set must still match the current Phase. Only then
+does it apply the recorded policy's stateful flags. Missing, malformed or changed evidence fails
+closed; no audit is rewritten and no test mode is invented. This check reports `PREFLIGHT_ONLY`,
+not current-policy audit PASS, and cannot be combined with trusted-request/output certification.
+A present strategy block always uses current requirements, even in preflight. New-policy reports
+cannot select the legacy path by removing the strategy block. Required checks, checkpoint, stop
+latch and dedicated Design Approval remain separate trusted workflow decisions.
+
+CI failure handoff uses job-scoped `contents: read` to read the default-branch phase plan; it has no
+contents-write, merge or credential-export capability. It re-reads the exact open same-repository
+PR and Phase before handoff. A current stop latch, including one arriving during handoff, suppresses
+the implementation request; read failures or HEAD/Phase drift stop without issuing a request.
+
 Reuse preserves current safety properties, not obsolete authorization interfaces. Replacements
 cover the owner, callers, storage and recovery together; new common AI control stays in its
 authorized Phase. No data reset, migration bypass, phase reordering, retry-limit increase,
