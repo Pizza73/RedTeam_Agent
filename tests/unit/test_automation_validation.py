@@ -4,6 +4,7 @@ import json
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -106,6 +107,243 @@ def test_complete_invariant_family_audit_is_valid(tmp_path: Path) -> None:
     digest = validate_invariant_audit(repo, "phase-0c")
 
     assert digest is not None and len(digest) == 64
+
+
+def _strategy_repo(tmp_path: Path) -> tuple[Path, Path, dict[str, Any]]:
+    repo, report_path = _audit_repo(tmp_path)
+    (repo / "SystemDesign.md").write_text("# Current normative design\n", encoding="utf-8")
+    report = json.loads(report_path.read_text())
+    report["implementation_strategy"] = {
+        "version": "1.0",
+        "units": [{
+            "id": "test-boundary", "owner": "Test fixture owner", "disposition": "reuse",
+            "rationale": "The existing boundary already satisfies the current contract.",
+            "input_paths": ["tests/test_family.py"],
+            "output_paths": ["tests/test_family.py"],
+            "entry_points": ["tests/test_family.py#test_family"], "sibling_paths": [],
+            "specification_refs": ["SystemDesign.md"],
+            "invariant_families": [report["families"][0]["id"]],
+            "state_migration": "None: this fixture has no persistent application state.",
+            "preserved_tests": "Keep the fixture boundary's existing regression test.",
+            "tests": ["tests/test_family.py#test_family"],
+            "test_modes": ["positive", "negative", "failure", "property"],
+            "change_summary": "Existing fixture remains unchanged after current-spec inspection.",
+        }],
+    }
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    return repo, report_path, report
+
+
+@pytest.mark.parametrize("disposition", ["reuse", "replace", "new"])
+def test_implementation_strategy_accepts_each_disposition(
+    tmp_path: Path, disposition: str,
+) -> None:
+    repo, report_path, report = _strategy_repo(tmp_path)
+    unit = report["implementation_strategy"]["units"][0]
+    unit["disposition"] = disposition
+    if disposition == "new":
+        unit["input_paths"] = []
+        unit["output_paths"] = ["tests/test_new.py"]
+        (repo / "tests/test_new.py").write_text("# New test fixture\n", encoding="utf-8")
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    assert validate_invariant_audit(repo, "phase-0c", require_implementation_strategy=True)
+
+
+@pytest.mark.parametrize("present", [True, False])
+def test_required_strategy_cannot_be_bypassed_by_legacy_or_absent_audit(
+    tmp_path: Path, present: bool,
+) -> None:
+    repo, report_path = _audit_repo(tmp_path)
+    if not present:
+        report_path.unlink()
+    with pytest.raises(InvariantAuditError):
+        validate_invariant_audit(
+            repo, "phase-0c", if_present=True, require_implementation_strategy=True,
+        )
+
+
+@pytest.mark.parametrize("field,value", [
+    ("owner", " "), ("rationale", ""), ("disposition", "rewrite-everything"),
+    ("state_migration", "\n"), ("preserved_tests", ""), ("change_summary", ""),
+    ("input_paths", []), ("output_paths", []), ("tests", []),
+    ("entry_points", []), ("specification_refs", []), ("invariant_families", []),
+    ("unexpected", True), ("test_modes", ["positive", "negative", "property"]),
+    ("invariant_families", ["unknown-family"]),
+    ("input_paths", ["tests/not-present-at-input.py"]),
+    ("input_paths", ["../tests/test_family.py"]),
+    ("output_paths", ["tests/test_family.py#test_family"]),
+    ("output_paths", ["tests/missing.py"]),
+    ("output_paths", ["/outside.py"]),
+    ("entry_points", ["../outside.py"]),
+    ("tests", ["SystemDesign.md"]),
+    ("specification_refs", ["SystemDesign_update.md"]),
+    ("specification_refs", ["docs/review/historical.md"]),
+    ("specification_refs", ["prompts/phases/phase-2.md"]),
+])
+def test_strategy_rejects_incomplete_noncanonical_or_stale_unit(
+    tmp_path: Path, field: str, value: Any,
+) -> None:
+    repo, report_path, report = _strategy_repo(tmp_path)
+    report["implementation_strategy"]["units"][0][field] = value
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    with pytest.raises(InvariantAuditError):
+        validate_invariant_audit(repo, "phase-0c", require_implementation_strategy=True)
+
+
+@pytest.mark.parametrize("disposition", ["replace", "new"])
+def test_strategy_stateful_units_require_model_based_evidence(
+    tmp_path: Path, disposition: str,
+) -> None:
+    repo, report_path, report = _strategy_repo(tmp_path)
+    unit = report["implementation_strategy"]["units"][0]
+    unit["disposition"] = disposition
+    unit["input_paths"] = [] if disposition == "new" else unit["input_paths"]
+    unit["test_modes"].remove("property")
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    with pytest.raises(InvariantAuditError, match="model-based"):
+        validate_invariant_audit(repo, "phase-0c", require_implementation_strategy=True)
+
+
+def test_strategy_rejects_duplicate_unit_identity(tmp_path: Path) -> None:
+    repo, report_path, report = _strategy_repo(tmp_path)
+    units = report["implementation_strategy"]["units"]
+    units.append(dict(units[0]))
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    with pytest.raises(InvariantAuditError, match="IDs must be unique"):
+        validate_invariant_audit(repo, "phase-0c")
+
+
+def test_strategy_rejects_duplicate_key_at_file_boundary(tmp_path: Path) -> None:
+    repo, report_path, report = _strategy_repo(tmp_path)
+    report_path.write_text(
+        json.dumps(report).replace('"version": "1.0"', '"version": "1.0", "version": "1.0"'),
+        encoding="utf-8",
+    )
+    with pytest.raises(InvariantAuditError, match="duplicate JSON key"):
+        validate_invariant_audit(repo, "phase-0c")
+
+
+def test_strategy_covers_every_affected_family(tmp_path: Path) -> None:
+    repo, report_path, report = _strategy_repo(tmp_path)
+    report["families"][1]["status"] = "affected"
+    report["families"][1]["test_modes"].append("property")
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    with pytest.raises(InvariantAuditError, match="omit an affected"):
+        validate_invariant_audit(repo, "phase-0c")
+
+
+@pytest.mark.parametrize("kind", ["tracked", "untracked", "deleted"])
+def test_strategy_covers_changed_source_and_test_paths(tmp_path: Path, kind: str) -> None:
+    repo, report_path, report = _strategy_repo(tmp_path)
+    fixture = repo / "tests/test_family.py"
+    # Route the report through an unchanged output so the omitted diff is the only failure.
+    output = repo / "tests/test_output.py"
+    output.write_text("# Independent output fixture\n", encoding="utf-8")
+    unit = report["implementation_strategy"]["units"][0]
+    unit["input_paths"] = ["automation/phase-plan.json"]
+    unit["output_paths"] = ["tests/test_output.py"]
+    unit["entry_points"] = unit["tests"] = ["tests/test_output.py"]
+    for family in report["families"]:
+        family["entry_points"] = family["sibling_paths"] = family["tests"] = unit["tests"]
+    report["cross_family_tests"] = unit["tests"]
+    if kind == "deleted":
+        fixture.unlink()
+    elif kind == "tracked":
+        fixture.write_text("# Changed fixture\n", encoding="utf-8")
+    else:
+        (repo / "src").mkdir()
+        (repo / "src/new.py").write_text("# New fixture\n", encoding="utf-8")
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    with pytest.raises(InvariantAuditError, match="omit changed source/test paths"):
+        validate_invariant_audit(repo, "phase-0c")
+    unit["input_paths"].append("tests/test_family.py")
+    if kind == "tracked":
+        unit["output_paths"].append("tests/test_family.py")
+    if kind == "untracked":
+        unit["output_paths"].append("src/new.py")
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    assert validate_invariant_audit(repo, "phase-0c")
+
+
+def test_strategy_rejects_output_symlink_outside_repository(tmp_path: Path) -> None:
+    repo, report_path, report = _strategy_repo(tmp_path)
+    outside = tmp_path / "outside.py"
+    outside.write_text("# External fixture\n", encoding="utf-8")
+    (repo / "tests/alias.py").symlink_to(outside)
+    report["implementation_strategy"]["units"][0]["output_paths"].append("tests/alias.py")
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    with pytest.raises(InvariantAuditError, match="outside the repository"):
+        validate_invariant_audit(repo, "phase-0c")
+
+
+def test_strategy_input_file_must_exist_at_input_not_just_output(tmp_path: Path) -> None:
+    repo, report_path, report = _strategy_repo(tmp_path)
+    (repo / "tests/late.py").write_text("# Not present at input\n", encoding="utf-8")
+    unit = report["implementation_strategy"]["units"][0]
+    unit["input_paths"].append("tests/late.py")
+    unit["output_paths"].append("tests/late.py")
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    with pytest.raises(InvariantAuditError, match="Git evidence is unavailable"):
+        validate_invariant_audit(repo, "phase-0c")
+
+
+def test_strategy_digest_covers_before_after_summary(tmp_path: Path) -> None:
+    repo, report_path, report = _strategy_repo(tmp_path)
+    original = validate_invariant_audit(repo, "phase-0c")
+    report["implementation_strategy"]["units"][0]["change_summary"] = "Different implementation."
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    assert validate_invariant_audit(repo, "phase-0c") != original
+
+
+def test_strategy_request_binding_is_still_exact(tmp_path: Path) -> None:
+    repo, _, _ = _strategy_repo(tmp_path)
+    with pytest.raises(InvariantAuditError, match="head_sha does not match"):
+        validate_invariant_audit(repo, "phase-0c", expected_request_head="a" * 40,
+                                 require_implementation_strategy=True)
+    with pytest.raises(InvariantAuditError, match="output commit"):
+        validate_invariant_audit(repo, "phase-0c", require_output_commit=True,
+                                 require_implementation_strategy=True)
+
+
+def test_strategy_ci_and_gate_use_the_trusted_shared_requirement_check() -> None:
+    node = shutil.which("node")
+    assert node is not None
+    helper_path = REPO_ROOT / "automation/loop_control_state.js"
+    script = """
+const assert = require('node:assert/strict');
+const {hasRequiredImplementationStrategy: check} = require(process.argv[1]);
+const policy = {policy_version: '1.0', required: true, implementation_strategy_version: '1.0'};
+assert.equal(check({}, policy), false);
+assert.equal(check({implementation_strategy: {version: '1.0', units: []}}, policy), false);
+assert.equal(check({implementation_strategy: {version: '2.0', units: [{}]}}, policy), false);
+assert.equal(check({implementation_strategy: {version: '1.0', units: [{}]}}, policy), true);
+assert.equal(check({}, {policy_version: '1.0', required: true}), true);
+assert.equal(check({}, {...policy, implementation_strategy_version: null}), false);
+"""
+    subprocess.run(  # noqa: S603 - fixed node executable with read-only test source.
+        [node, "-e", script, str(helper_path)], check=True, capture_output=True, text=True,
+    )
+    for filename in ("ci.yml", "ai-loop-control.yml"):
+        source = (REPO_ROOT / ".github/workflows" / filename).read_text()
+        assert source.index("const loopControl = require(") < source.index(
+            "!loopControl.hasRequiredImplementationStrategy("
+        )
+        assert "JSON.stringify(plan.invariant_audit)" in source
+
+
+def test_current_phase_plan_requires_the_new_strategy_policy(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    shutil.copytree(REPO_ROOT / "automation", repo / "automation")
+    shutil.copytree(REPO_ROOT / "prompts", repo / "prompts")
+    path = repo / "automation/phase-plan.json"
+    plan = json.loads(path.read_text())
+    del plan["invariant_audit"]["implementation_strategy_version"]
+    path.write_text(json.dumps(plan), encoding="utf-8")
+    with pytest.raises(AutomationValidationError, match="schema validation failed"):
+        validate_automation(repo)
 
 
 def test_invariant_family_audit_rejects_missing_family(tmp_path: Path) -> None:

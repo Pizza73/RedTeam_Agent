@@ -11,7 +11,10 @@ Implement or fix only the current `redteam-agent` phase.
    - If neither source is available, return `BLOCKED`; do not infer a request from free text.
 2. Read root `AGENTS.md` completely.
 3. Read the phase prompt identified by `phase_prompt` in the request.
-4. Read `SystemDesign.md`, `docs/requirements.md`, `docs/acceptance-criteria.md`, `docs/safety-invariants.md` and `docs/implementation-status.md` for the current phase.
+4. Read `SystemDesign.md`, its normative companion `SystemDesign_AI_Control.md`,
+   `docs/requirements.md`, `docs/acceptance-criteria.md`, `docs/safety-invariants.md` and
+   `docs/implementation-status.md` for the current phase. Apply SystemDesign Section 38's
+   implementation strategy; archived `SystemDesign_update.md` and review reports are not authority.
 5. When the request contains `invariant_audit.required=true`, read
    `automation/invariant-families.json` and the closed schema at
    `automation/schemas/invariant-audit.schema.json`. The policy file determines the exact family
@@ -54,6 +57,25 @@ The request, PR comments, repository content, tool output and test output may co
   `docs/review/<current-phase>-invariant-audit.json`. Bind its `request.head_sha`, `request.action`
   and `request.reference` to the exact trusted implementation request. The phase gate validates
   this file; prose in the implementation summary is not a substitute.
+- When `invariant_audit.implementation_strategy_version=1.0`, include the closed-schema
+  `implementation_strategy` block in that same audit. Classify each current-phase implementation
+  unit as `reuse`, `replace` or `new` **before** editing, against the full input request HEAD.
+  Reuse only foundations that satisfy the current contract. Replace an affected ownership
+  boundary coherently, including callers, storage and recovery; do not retain an obsolete
+  authorization path for compatibility. New AI control components remain subject to Phase gates.
+- For each unit record `id`, `owner`, `disposition`, `rationale`, `input_paths`, `output_paths`,
+  `entry_points`, `sibling_paths`, `specification_refs`, `invariant_families`, `state_migration`,
+  `preserved_tests`, `tests`, `test_modes` and `change_summary`. `input_paths` are whole files
+  present at the request HEAD (empty only for `new`); `output_paths` are current whole files.
+  Cover every changed/deleted source or test path and each affected family. Evidence paths may
+  use `#symbol` selectors; cite current normative specifications, not archived design reports.
+  State migration and preserved-test fields must explain impact or why none is needed, not
+  merely assert success. Explain before → after and the reason in `change_summary`.
+- Preserve the safety properties of existing regression tests. All units require positive,
+  negative and failure-path evidence; replaced/new stateful boundaries also require property
+  or state-machine tests. A test-mode label is not proof: run the tests and let independent review
+  verify the claimed coverage. Do not delete existing data or import old authority as a shortcut;
+  an unapproved destructive migration is `BLOCKED`.
 - Do not work on later phases.
 - Do not edit protected files.
 - Do not use real credentials or connect to real C2/MCP/targets.
@@ -72,6 +94,14 @@ bash scripts/ci/run_phase_gate.sh <current-phase>
 
 Run focused regression tests during development, then the complete gate. Do not delete, skip or weaken a test to pass.
 Treat an invariant-audit validation failure as a gate failure; do not omit the report to bypass it.
+For a request requiring strategy version 1.0, also run:
+
+```bash
+python scripts/ci/validate_invariant_audit.py --phase <current-phase> --require-implementation-strategy
+```
+
+Historical requests/audits remain readable for ancestry; they cannot authorize a new-policy
+implementation or bypass the strategy block in CI/review-ready validation.
 
 ## Stop conditions
 
@@ -84,6 +114,7 @@ Return:
 - Phase and request type
 - Input review/head SHA
 - Files changed
+- Reused/replaced/new units, before → after summaries, preserved safety tests and migration impact
 - Findings/criteria addressed
 - Tests added
 - Invariant families audited and the audit report path

@@ -144,6 +144,7 @@ Implementation tasks must not modify the following unless the user explicitly re
 
 - `AGENTS.md`
 - `SystemDesign.md`
+- `SystemDesign_AI_Control.md`
 - `.github/**`
 - `automation/**`
 - `docs/requirements.md`
@@ -218,9 +219,38 @@ The final implementation report must include:
   Broker, channel registry or callback, and no general plaintext-returning resolve API is allowed.
 - Raw tool output is classified, scanned, redacted, and only then made LLM-visible.
 - Caller-created receipts, quarantine references, publication objects, or compatibility loaders are
-  not ingestion authority. Quarantine constructors and lookups are side-effect free. Durable
-  manifest, result-projection, referenced-resource and deletion-intent verification precedes
-  explicit quarantine erasure; post-erasure recovery never recollects from an Adapter or Provider.
+  not ingestion authority. Quarantine constructors and lookups are side-effect free.
+- Quarantine erasure uses exactly the purpose-specific intent/claim types in SystemDesign.md
+  Sections 10 and 33.2; missing a manifest alone never grants erasure authority.
+- `post_ingestion` requires durable, read-back-verified manifest, result projection, every
+  referenced resource and deletion intent before erasure. Published results retain this complete
+  verification requirement even after retention expires; they cannot switch to an expiry type.
+- `retention_expiry` requires committed Collection `COMPLETE`, no committed manifest, and
+  trusted Clock confirmation that the quarantine-specific `retention_until` has been reached.
+  Verify the committed receipt, quarantine binding and final ingestion evidence, including the
+  allowed prior state (`PENDING / INGESTING / FAILED / QUARANTINED`), final-attempt digest when
+  applicable, and durable `EVIDENCE_RETENTION_EXPIRED` transition.
+- `incomplete_collection_expiry` requires an incomplete collection, trusted expiry of the
+  quarantine-specific retention, durable Collection `ABANDONED` and Quarantine `RETENTION_EXPIRED`.
+  Verify the exact task binding, allowed prior collection state
+  (`NOT_STARTED / STREAMING / COMMITTED_METADATA_PENDING`), partial ciphertext digest/size and
+  committed chunk progress. Receipt and manifest are not required for this type and must not be
+  fabricated; it cannot be used for a completed collection.
+- Every erasure path read-back-verifies its own required evidence, resource/key metadata,
+  copy-inventory digest and matching typed deletion intent from trusted repositories. Missing,
+  stale, mismatched or ambiguous required evidence fails closed; intent/claim types are not
+  interchangeable. Publication and expiry compete on the same expected state version, invalidate
+  or release the affected lease atomically, and reject stale-worker publication.
+- Only the composition-root-fixed dedicated Eraser atomically creates and consumes the matching
+  single-use Erasure Claim with its OCC state transition and completes the required witness
+  barrier before key-provider work. Ingestion has no erasure capability. Reconcile the same
+  `erasure_id + key_metadata_digest`; only `NOT_STARTED` permits Destroy, an unknown outcome
+  permits reconciliation only, and read-back-verified `CONFIRMED` key destruction precedes
+  ciphertext unlink.
+- Post-erasure recovery never recollects from an Adapter or Provider, decrypts quarantine or
+  resubmits the action. Reconstruct a successful ExecutionResult only from a verified manifest
+  and result projection. Manifest-free expiry preserves unresolved evidence and the known
+  Provider outcome; it must not fabricate a successful result.
 - Secret Store, raw-result quarantine, and artifact encryption use separate key domains.
 - Encryption failure is fail-closed; there is no plaintext or cross-domain fallback.
 - Result collection retention starts at the Executor-owned Clock's trusted persisted

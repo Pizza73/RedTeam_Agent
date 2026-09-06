@@ -38,6 +38,8 @@ Codex CloudまたはChatGPTによる独立ReviewとCodexによる実装を、Pha
 | LOOP-028 | Design Stop後の再開はApprover限定の専用操作で、停止Gate permalink、Current Phase、Current 40桁HEAD、承認済みDesign commit / permalink、Policy DigestへBindingした単回`DESIGN_APPROVED` recordを発行する。RecordのUnknown Field、Duplicate Key、Stale Head、未包含Design、再利用を拒否する |
 | LOOP-029 | Base Refresh Authorizationは1回のExpected-HEAD Branch Updateだけを認可し、ResumeまたはImplementation Requestを認可しない。更新後はApprover限定WorkflowがCurrent HEADの直前1 Edgeについて、2親Mergeの第1親がPrevious HEAD、第2親が認可済みDefault SHAであり、第1親に対応するTrusted Authorizationがあることを検証し、Current HEAD、Previous HEAD、Default SHA、Phase pair、Blocking GateをDigest Bindingした`BASE_REFRESH_APPLIED` StatusをCurrent HEADへ発行する。Design Stop中の後続Governance取込はCurrent HEAD上の単一Checkpointからだけ同じGateを継承し、Checkpoint未発行中は`REFRESH_AWAITING_CONFIRMATION`として実装・Resume・次Refreshを禁止する。単回Design Approvalを消費したImplementation Requestの出力は通常の子CommitとしてCurrent-HEAD CIとReviewへ進み、新たな2親Checkpointを要求しないが、Resumeまたは次Refreshの権限は継承しない。RunnerはTransition消費、最新Gate、Stop latch、Current HEADを各Remote Write後とCodex Trigger直前に再取得し、Design StopまたはAuthority Driftがあれば`ai-loop-blocked`を維持して停止する。Lifecycle Projectionだけの遅延・残存はTrusted Transitionが正規化する |
 | LOOP-030 | Runnerの次ActionはCurrent Phase / HEADへBindingされたTrusted Implementation Request、Review Ready、Phase Gate、Design Approvalの決定論的優先順位から一度だけ解決する。Transient Labelの到着順やProcess MemoryをAction認可に使用せず、同一Evidenceの再処理は冪等No-opとする |
+| LOOP-031 | SystemDesign.md §38の再利用・置換・新規実装方針を、新規Requestの`invariant_audit.implementation_strategy_version=1.0`と既存監査JSONの同Versionの`implementation_strategy`へ引き渡す。各単位の入力HEAD上のFile、現行Output / Entry Point / 兄弟経路、Owner、分類理由、現行規範参照、Family、移行影響、保持する試験、追加試験、変更前後を記録する。CIは閉じたSchema、Input File存在、全変更Source / Test Path・Affected Familyの網羅、試験種別を検証し、Request / Output HEAD / Audit DigestへBindingする。分類記録だけを適合証明にはしない |
+| LOOP-032 | 新Policyの実装Requestは旧PolicyへDowngradeしない。旧Request / Auditは祖先・停止・Refreshの履歴確認用に読めるが、新規実装・Review Readyの必須分類を省略する権限にはしない。規範別冊SystemDesign_AI_Control.mdも保護対象にし、Human Governance Reviewなしに実装AIが書き換えられないようにする。Phase順序、停止上限、Design Approval、既存データ保護は変更しない |
 
 ## Non-Functional Requirements
 
@@ -54,4 +56,8 @@ Codex CloudまたはChatGPTによる独立ReviewとCodexによる実装を、Pha
 
 ## Project Phase Requirements
 
-実装仕様のSource of Truthは`SystemDesign.md`と`docs/acceptance-criteria.md`である。Phase Promptは当該Phaseの範囲を狭める実行指示であり、仕様を緩和しない。
+実装仕様のSource of Truthは`SystemDesign.md`、同書が必須参照する規範別冊`SystemDesign_AI_Control.md`、
+`docs/safety-invariants.md`、`docs/acceptance-criteria.md`である。AI規約の適用範囲は別冊§12に限定する。
+Phase Promptは当該Phaseの範囲を狭める実行指示であり、仕様を緩和しない。`SystemDesign_update.md`と
+`docs/review/`配下の履歴・検証報告は現行規範を上書きしない。残る規範間の矛盾はBLOCKEDとして解決する。
+`system-design-v1-r1`の文書反映は、既存実装の受入完了・DB移行・Current-HEAD実装権限を意味しない。

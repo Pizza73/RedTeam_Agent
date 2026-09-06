@@ -31,6 +31,13 @@ function shouldPublishReviewReady(labels) {
   return !current.has('ai-loop-blocked');
 }
 
+function hasRequiredImplementationStrategy(audit, requestPolicy) {
+  const version = requestPolicy?.implementation_strategy_version;
+  if (version === undefined) return true; // Historical request, never upgraded by inference.
+  return version === '1.0' && audit?.implementation_strategy?.version === version &&
+    Array.isArray(audit.implementation_strategy.units) && audit.implementation_strategy.units.length > 0;
+}
+
 function assertDesignApprovalProjection(labels, phase, requireStop) {
   const current = requireRoutingLabels(labels, phase);
   const forbidden = new Set([
@@ -62,6 +69,7 @@ module.exports = {
   PHASE_PATTERN,
   TRANSIENT_LABELS,
   assertDesignApprovalProjection,
+  hasRequiredImplementationStrategy,
   requireRoutingLabels,
   shouldPublishReviewReady,
 };

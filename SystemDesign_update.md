@@ -1,13 +1,17 @@
 # レッドチーム演習支援AIエージェント 要件定義
 
-> 改訂状態: `system-design-v1-r1` / 2026-09-06。承認された更新案を設計正本へ反映した。
-> 本書は安全基盤・接続Schema・移行の正本であり、[SystemDesign_AI_Control.md](SystemDesign_AI_Control.md)を必須の規範別冊とする。
-> AI制御の意味・判断・受入Scenarioは別冊へ一元化する。適用・置換の範囲は別冊§12に限定し、その他の安全機構は維持する。
-> 関連する要件・安全条件・受入条件・Phase Promptも同じ改訂に整合させる。残る矛盾は実装者が独自に解釈せずBLOCKEDとして解決する。
+> **比較用スナップショット（2026-09-06正本反映前）**: 以下は当時のDraftを保存した履歴である。
+> 現行の設計正本は[SystemDesign.md](SystemDesign.md)と規範別冊[SystemDesign_AI_Control.md](SystemDesign_AI_Control.md)。
+> 本文の「Draft」「未反映」等は保存時点の状態を表す。本ファイルは今後の実装・認可の根拠にせず、正本との同期更新も行わない。
+
+> 改訂状態: R1〜R13、D1〜D11、F1〜F7を保持した安全基盤・移行参照Draft（2026-09-06）。
+> AI制御部分は [SystemDesign_AI_Control.md](SystemDesign_AI_Control.md) へ再設計した。
+> AI制御の規範は同文書へ一元化し、本書のSchema例・図・受入条件もその仕様に整合させた。旧規則は§41の改訂履歴だけに残す。
+> 適用・置換の正確な範囲は新文書§12。本書の安全基盤全体を廃止する意味ではなく、限定置換以外は維持する。
 > D4のTPM-backed Resource消去方式は採用候補であり、対象実機・Firmwareの保証と復元試験は未検証。
 > 本文の受入条件は実行済みTest結果ではなく、D4のProduction採用を承認した記録でもない。
-> 正本への文書反映は実装、DB移行、GitHub上のDesign Approval、Phase PASSまたは実装再開の権限を付与しない。
-> SystemDesign_update.mdは反映前の比較資料、docs/review/配下の報告は履歴・検証資料であり、現行仕様を上書きしない。
+> 本ファイルは仕様確定前の更新案であり、SystemDesign.md、関連する要件・安全条件・Phase Promptを
+> 自動的に置き換えず、既存PRのPhase権限や実装再開を付与しない。実装は仕様確定と正本への整合反映後に行う。
 > Phase構成の見直し（過去レビューのS1）は今回の変更対象外とする。
 
 ## AI再設計の読み方
@@ -19,7 +23,7 @@
 
 認証、Policy、Approval、単回Dispatch、Secret、Result Collection / Ingestion、Lease / Fencing、監査・暗号は引き続き
 本書の限定された安全基盤を参照する。旧Routingが担った制約の移管先は新文書§8に列挙し、移管前に保護を削除しない。
-本書と規範別冊は一つの設計改訂として扱う。Phase権限・Production採用は既存の正式Gateで別途検証する。
+新旧どちらのDraftも、実装正本・Phase権限・Production採用を自動的に変更しない。
 
 # 1. 目的
 
@@ -291,12 +295,6 @@ Host OS / Kernel、Policy、Executor、Trusted Adapterの完全性はSection 2.5
                        LangGraph
                            |
                            v
-          Unified Controller Entry Guard (§24.1)
-          Security / Hard Limit / Mission State / Pending Execution
-          (stop / finalize / hold / recoverを先に判定)
-                           |
-                    新規計画へ進める場合のみ
-                           v
                    Session Refresh
                            |
                            v
@@ -329,11 +327,6 @@ Host OS / Kernel、Policy、Executor、Trusted Adapterの完全性はSection 2.5
                            v
                         Planner
                            |
-                           v
-                     PlannerOutput
-                           +---- context_request ---> Bounded Context Rebuild
-                           |                         (同じControllerへ。Executionなし)
-                         action
                            v
                ExecutionPlanProposal
                            |
@@ -393,9 +386,6 @@ Host OS / Kernel、Policy、Executor、Trusted Adapterの完全性はSection 2.5
                     |              |
                     v              |
              ExecutionResult      |
-                    +----> Verified Source Updates (Analyzer非依存)
-                    |      Source Normalizer / Knowledge Service
-                    |      -> Current Knowledge / Critical Witness
                     |              |
                     v              |
          Analyzer Context Selector |
@@ -425,10 +415,6 @@ Host OS / Kernel、Policy、Executor、Trusted Adapterの完全性はSection 2.5
                     Knowledge Base
                            |
                            v
-          Unified Controller Entry Guard (§24.1)
-                           |
-                    Readへ進める場合のみ
-                           v
                     Session Refresh
                            |
                            v
@@ -437,12 +423,12 @@ Host OS / Kernel、Policy、Executor、Trusted Adapterの完全性はSection 2.5
                    v        v        v
        NOT_ACHIEVED  INDETERMINATE  ACHIEVED
               |            |           |
-              +------------+-----------+
-                           v
-                  Unified Controller (§24.1)
-                  Current安全状態・未完了Executionを再検証
-                  +--> Finalization -> COMPLETED / HUMAN REVIEW
-                  +--> candidates / wait / recover / hold / pause / stop
+              +-----+------+           v
+                    v              FINALIZING
+             Unified Controller        |
+             candidates / wait /       v
+             recover / pause        COMPLETED /
+                                    HUMAN REVIEW
 
 Session Manager = Session Runtime StateのSource of Truth
 
@@ -471,13 +457,6 @@ Shared deterministic services:
 - LLM Profile Repository / Capability Checker
 - Audit Logger
 ```
-
-この図のEntry Guardと戻り先は、[AI制御仕様](SystemDesign_AI_Control.md) §6.1の一つの判断表を適用する位置を示す。
-別のController状態・認可Token・優先順位を追加しない。GoalがACHIEVEDでもSecurity / Hard Limit / Mission State /
-Pending Executionの上位分岐を飛ばさない。context_requestは同じCurrent検査と予算付きContext再構築へ戻し、
-Execution / PolicyDecision / Approvalを作成しない。
-Verified Source UpdatesはSource Rule / Proof / Current認可を検証してAnalyzer開始前に独立して確定する。
-AnalyzerのCandidateObservationや予測効果はこの確定経路へ入れず、Analyzer失敗で確定Factを撤回しない。
 
 ---
 
@@ -562,8 +541,7 @@ External ExecutionのRetryはExecution State Machine、Tool Idempotency、Idempo
 
 > Pure Node Retry != Persistent State Mutation Retry != External Execution Retry
 
-基本ワークフローは以下。Entry Guardを含め、判断順序は[AI制御仕様](SystemDesign_AI_Control.md) §6.1だけを正本とする。
-既存Recovery・Context再構築・次反復から戻る場合も、Node位置から上位分岐を省略しない。
+基本ワークフローは以下。
 
 ```text
 START
@@ -572,20 +550,13 @@ START
 Load State
   |
   v
-Unified Controller Entry Guard（Current安全状態・§24.1）
-  +-- security error --> Security Stop
-  +-- hard limit / finalization required --> Finalization / Cleanup
-  +-- not RUNNING --> Hold（許可済み既存Recoveryのみ）
-  +-- pending execution --> Existing Recovery（新規送信なし）
-  |
-  v
 Session Refresh
   |
   v
-Current Goal / Unified Controller（上位分岐を再検証）
-  +-- achieved --> Finalization
-  +-- approval pending --> Approval Wait
-  +-- otherwise --> Contract-based Candidate Selection
+Current Goal / Unified Controller（§24.1の優先順位）
+  +-- achieved / hard limit --> FINALIZING
+  +-- pending execution --> Existing Recovery
+  +-- not_achieved / indeterminate --> Contract-based Candidate Selection
   |
   v
 Context Selector
@@ -609,11 +580,6 @@ AvailableToolSnapshot
 Planner
   |
   v
-PlannerOutput
-  +-- context_request --> Bounded Context Rebuild（同じControllerへ。Executionなし）
-  |
-  action
-  v
 ExecutionPlanProposal
   |
   v
@@ -625,11 +591,11 @@ AvailableToolSnapshot Revalidation
   v
 Policy Engine
   |
-  +------ DENY ----------------> STOP / 共通Controllerから再評価
+  +------ DENY ----------------> STOP / Session RefreshからRe-plan
   |
   +------ REQUIRE APPROVAL ----> ApprovalRequest / Human Approval
   |                                  |
-  |                             Reject / Expire --> STOP / 共通Controllerから再評価
+  |                             Reject / Expire --> STOP / Session RefreshからRe-plan
   |                                  |
   |                           ApprovalRecord
   |                                  |
@@ -651,8 +617,6 @@ Encrypted Raw Result Quarantine
   |
   v
 Secure Ingestion / ExecutionResult Normalization
-  +--> Verified Source Updates（Analyzer非依存）
-  |    Source Normalizer / Knowledge Service -> Current Knowledge / Critical Witness
   |
   v
 Analyzer Context Selector / Calculate & Persist Authorization / Context Builder
@@ -664,13 +628,20 @@ Analyzer
 Knowledge Reducer
   |
   v
-Next Iteration -> 共通Controller Entry Guard
-  (許可されたSession / Source Refresh -> Goal Evaluator -> 同じUnified Controller)
+Session Refresh
+  |
+  v
+Goal Evaluator
+  |
+  +------ ACHIEVED ----> FINALIZING ----> COMPLETED / HUMAN REVIEW
+  |
+  +------ NOT ACHIEVED ------------------> Next Iteration / Session Refresh
+  |
+  +------ INDETERMINATE -----------------> 同じUnified Controllerへ
+                                               |
+                                               +--> 登録契約から通常認可の候補を選択
+                                               +--> 既存Read待機 / 理由付きPAUSED
 ```
-
-Verified Source UpdatesはRule / Proof / Current認可を満たす根拠だけをAnalyzer開始前に独立して確定する。
-Analyzer失敗からFact保存を取り消したり、元のActionを再送したりしない。Analyzerの出力は非信頼Observation / Hypothesisの経路で扱う。
-すべてのGoal結果は共通Controllerへ戻す。ACHIEVEDからCurrent検査・未完了Execution回収を省略してCOMPLETEDへ進まない。
 
 ---
 
@@ -5349,17 +5320,12 @@ Security Stop、Hard Limit、PAUSED、既存Execution Recoveryの優先順位は
 
 ```text
 PreparePlannerInput
-  (Current Mission / Epoch / Security / Limits -> Unified Controller)
-       +-- security error -> Security Stop
-       +-- hard limit / finalization required -> FinalizeMission / Cleanup
-       +-- not RUNNING -> Hold（許可済み既存Recoveryのみ）
+  (Current Mission / Epoch / Hard Limit -> Existing Execution Recovery優先)
+  (許可されたSource Refresh -> Current Goal Evaluation -> Unified Controller)
+       +-- achieved / hard limit -> FinalizeMission
        +-- pending execution -> RecoverExistingExecution（新規送信なし）
-       +-- otherwise -> 許可されたSource Refresh -> Current Goal Evaluation
-                       -> 同じUnified Controller（上位分岐を再検証）
-                            +-- achieved -> FinalizeMission
-                            +-- approval pending -> Approval Wait
-                            +-- otherwise -> ActionContract候補化
-                            +-- 候補なし -> 期限内の既存Read待機 / 理由付きPAUSED
+       +-- not_achieved / indeterminate -> ActionContract候補化
+       +-- 候補なし -> 期限内の既存Read待機 / 理由付きPAUSED
   (Context Selection -> Authorization -> Build -> Tool / Candidate Snapshot -> Envelope)
        +-- ready -> InvokePlanner
   -> HandlePlannerOutput
@@ -8043,46 +8009,6 @@ Foundation / WitnessはPhase 0C、Goal / Context / Action前提との統合はPh
 
 # 38. 非機能要件
 
-## Implementation Strategy（既存実装の再利用・置換・新規実装）
-
-実装方針は、現行仕様を基準に既存コードを「再利用・置換・新規実装」へ分類し、変更の大きい責務を
-関連経路ごと置き換える方式とする。既存実装への互換性を理由に現行仕様を変更せず、全コード・テストの
-一括破棄も既定方針にしない。再利用は適合確認後の判断であり、既存コードや過去のPhase PASSだけで新仕様への適合を認定しない。
-
-| 区分 | 対象の基本方針 | 採用・完了条件 |
-| --- | --- | --- |
-| 再利用候補 | Canonical JSON / Digest、Strict境界検証、Scope判定、Mission / Context / Policy / Approvalの既存基盤、回帰テスト | 現行Schema・Digest定義・Current状態・認可境界と照合し、適合する処理を再利用する。不一致のあるModelや呼出し経路まで無条件に保持しない |
-| まとまった置換 | Secret配送・Version Lifecycle、監査 / Wrapped KeyのGeneration Anchor、更新可能Lease / Storage側Fencing、Result Collection / Ingestion / 消去の変更された責務 | Owner・呼出し元・内部 / 公開入口・保存形式・復旧 / Cleanup・兄弟経路を一つの変更単位として整合させる。仕様に適合する内部部品の再利用は許すが、旧権限経路や弱いFallbackを残さない |
-| 新規実装 | 共通Controller、ActionContract / 前提探索、PlannerOutput分岐、Planner / Analyzerループの未実装部分 | AI制御仕様に従って実装し、既存の認可・実行・データ保護基盤へ接続する。Policy / Executorの認可をAI側へ複製せず、正式Phase 1以降の範囲でMockから検証する |
-
-### 分類と置換の進め方
-
-1. 正式な実装Requestの入力full HEADを基準とし、設計用ブランチだけを見て実装の有無を判断しない。
-   各変更単位について、対象File / Entry Point / Owner、対応する現行仕様・受入条件・不変条件Family、
-   再利用 / 置換 / 新規の理由、依存先、保存状態・移行への影響、必要な回帰試験を記録する。
-2. 再利用候補は実コードと既存テストを現行契約へ照合する。旧仕様で動作することやテスト件数の多さだけでは採用せず、
-   失効・拒否・改ざん・競合・再起動の不足条件を追加する。分類はFile全体の固定ではなく責務・境界単位で更新できる。
-3. 置換対象は不変条件を共有する全経路を修正する。一入口だけの局所Patch、旧Resolver / Callback / Authority Loaderへの
-   迂回、互換Modeや二重の認可規則を残すことで完了としない。新旧の認可・状態解釈を混在させて通常運用を開始しない。
-4. 既存テストの安全条件と反例を保持する。旧Schema / Interfaceへの依存を変更する場合は、現行仕様・受入条件と
-   対応付け、同じ安全性を新境界でも検査する。失敗回避のための削除・Skip・期待失敗化・要求緩和は禁止する。
-5. 各単位でPositive / Negative / Failure-pathを検証し、Stateful変更にはProperty-based / State-machine試験を加える。
-   結合時は上位入口から認可・Dispatch・回収・公開・消去まで確認する。Low-level TestだけのPASSを結合完了としない。
-
-### 保存状態・Phase権限の維持
-
-作り直しは実装構造の置換であり、既存DB・Mission・未完了Task・Quarantine・鍵・監査・消費履歴の破棄許可ではない。
-保存状態の扱いは本節のSchema Migration Contractと§10.3のActivation規約に従う。新規DBへの切替え、初期化、
-旧Claim / Budgetの再発行、旧状態の暗黙Importで移行を省略しない。旧Runtimeの整理は明示Migration権限下に限定する。
-
-変更の大きい実装を置き換えても、Phase順序、Design Stop、Human Gate、単回Design Approval、Current-HEAD Requestは維持する。
-現在Phaseの範囲で安全基盤を整合させ、必要なGateの後にPhase 1のMockループ、Phase 2の実Local LLM評価へ進む。
-正式Gateで指定された全検証を実施し、過去のPASSを置換後の実装のPASSとして流用しない。
-D4実機QualificationのNOT_EVALUATEDは、再利用・新規実装のどちらを選んでも解消しない。
-
-具体的な作業順序・試験単位は[実装準備書](docs/review/ai-control-implementation-ready.md)を参照する。
-本方針は実装方法の承認であり、実装再開・データ消去・外部操作の認可ではない。
-
 ## Modularity
 
 各コンポーネントを交換可能とする。
@@ -8436,7 +8362,7 @@ D1〜D11の互換性境界も以下へ固定する。
 * 旧confirmed Findingは元のEvidence意味をArchiveに残すが、新Ruleに必要なSource / Identity / Coverage / Freshness Proofなしに新MissionのCurrent Goalへ流用しない。既存Hypothesis Proposalは新しいcreate / update / close Boundaryで検証し、欠落ID / VersionをLLM Textから補わない。
 * 旧Counter値をD10の論理Execution Outcomeへ推測変換しない。旧Missionは旧Budget履歴を保持して閉鎖し、新Missionの新Budgetを明示作成する。旧Envelope / ProfileにD8の各Attempt検証やD11の評価PASSを遡及付与しない。
 
-本仕様の実装・移行時はAI制御仕様§12に従いSchema / Digest / Critical State Catalogを同時更新し、generation-witness-policy-v5と対応させる。
+本Draft採用時はAI制御仕様§12に従いSchema / Digest / Critical State Catalogを同時更新し、generation-witness-policy-v5と対応させる。
 旧v3 / v4を同じ名前で書換えず、旧Routing Headの履歴閉鎖・Projection除外を承認済み移行へ含める。RuntimeでCurrent安全状態の欠落を補完しない。
 
 * 旧Knowledgeのconfirmed / Eligibilityに新しいKnowledgeSecurityHeadを付けるだけではF1適格にしない。旧証跡はArchiveへ保持し、新MissionのCurrent Evidenceは新Rule・Source検証・Head / Witnessを経て確定する。
@@ -8571,11 +8497,10 @@ ResumeやImplementation Requestを認可しない。
 
 # 41. Revision Summary
 
-以下は変更経緯の履歴であり、旧AIモデルの実装要件ではない。現在の規範はAI制御仕様と本書§1〜§40の整合済み本文である。
+以下は変更経緯の履歴であり、旧AIモデルの実装要件ではない。現在の規範はAI制御仕様と本書の整合済み本文である。
 旧D7 / F3 / F4等のモード・Head・集約規則を復活させない。
 
-§41.1〜§41.6の「正本未反映」「今回変更しない」等は各更新時点の状態を記録したもの。正本反映は§41.7を参照する。
-対応表は本文の規範箇所への索引であり、旧Schema名・旧State遷移を実装権限として採用しない。
+以下の表は改訂の経緯を含む。現在の規範は本文およびSection 41.2のR1〜R13対応であり、旧Schema名・旧State遷移を実装権限として採用しない。
 
 | 変更箇所 | 現行仕様の問題 | 修正内容 | 修正理由 | 影響コンポーネント | 追加Test |
 | --- | --- | --- | --- | --- | --- |
@@ -8779,37 +8704,3 @@ SystemDesign.md、関連正本、実装・テストコード、GitHub上の権�
 旧Runtimeのmode / GoalRouting Head / Confidence閾値を再導入せず、単回Dispatch・Secret・Lease / Fencingの安全機構は維持する。
 研究との対応、反例、実行した限定検査、次工程W1〜W9 / T1〜T8は
 [調査・整合レビュー](docs/review/ai-control-research-review.md)を参照する。製品実装・Phase権限・正本採用は未変更である。
-
-## 41.7 設計正本への反映（2026-09-06）
-
-ユーザー承認により、整合済みSystemDesign_update.mdの安全基盤・接続Schema・移行規約を本書へ反映し、
-AI制御仕様を必須の規範別冊として採用した。改訂は`system-design-v1-r1` / `ai-control-v1-r1`。
-SystemDesign_update.mdは反映前の比較用スナップショットとして保存し、旧レビュー報告は履歴資料へ限定する。
-
-関連するRequirements / Safety Invariants / Acceptance Criteria / Threat Model / Phase Promptを整合させた。
-特にNV Extend Digest / Genesis、用途別Task・Recovery・消去、共有Activation Lockと明示Migration、
-Current Knowledge / BudgetのCritical Witness、共通AI Controller / ActionContract、独立品質Gateを反映した。
-AI以外の単回Dispatch、Secret Versionの別Execution再利用、Lease更新 / Fencing、結果不明時の非自動再送は維持する。
-
-これは文書のローカル反映であり、実装・DB移行・PR再開・Phase PASS・Production採用ではない。
-D4実機QualificationはNOT_EVALUATED、正本変更のレビュー・マージとCurrent-HEADの正式なDesign Approvalは未完了である。
-変更範囲と実行した限定検査は[正本反映レポート](docs/review/systemdesign-canonical-adoption.md)へ記録する。
-
-## 41.8 現行正本の研究再評価・図の整合（2026-09-06）
-
-AI制御仕様を優先する既定方針の下で、今回は比較対象をSystemDesign.mdとして再確認した。
-§3 / §4.2のPlannerOutput分岐、Analyzer非依存のVerified Source Updates、§3 / §4.2 / §26の
-Current Guardと未完了Execution優先を図へ明示した。既存の判断表・Schema・安全条件は変更していない。
-規範Revisionは`system-design-v1-r1` / `ai-control-v1-r1`を維持し、比較用SystemDesign_update.mdは変更しない。
-
-一次研究と安全基盤の公開規格による評価、保証の限界、確認したPR停止記録、検証結果は
-[現行設計の研究評価](docs/review/current-design-research-assessment.md)へ、次工程と安全なMock試験の準備は
-[実装準備書](docs/review/ai-control-implementation-ready.md)へ記録する。
-文書検査は実装・正式Review・Phase PASS・D4実機Qualificationではなく、PRのDesign Stopを解除しない。
-
-## 41.9 既存実装の段階的な再利用・置換方針（2026-09-06）
-
-ユーザー承認により、§38へ再利用・まとまった置換・新規実装の分類と適合条件を記載した。
-現行仕様を正本とし、既存の安全条件・回帰テストを保持しつつ、変更の大きい責務は保存・復旧・兄弟経路まで
-一体で置き換える。全コード破棄、旧実装への仕様合わせ、移行の省略、Phase順序の変更は行わない。
-実装準備書へ分類の記録項目と引渡し条件を対応付けた。これは文書変更であり、コード置換・実装再開は未実施である。

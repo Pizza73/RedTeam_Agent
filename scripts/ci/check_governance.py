@@ -13,6 +13,7 @@ PROTECTED_FILES = frozenset(
     {
         "AGENTS.md",
         "SystemDesign.md",
+        "SystemDesign_AI_Control.md",
         "docs/acceptance-criteria.md",
         "docs/ai-development-loop.md",
         "docs/ai-loop-runbook.md",
