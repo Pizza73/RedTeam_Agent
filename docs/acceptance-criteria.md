@@ -26,7 +26,7 @@
 - Protected Filesを変更していない
 - 新規Security FindingにRegression Testがある
 - BLOCKER/HIGHが0件
-- 最新PR head SHAをCodex CloudまたはChatGPTが独立Review済み
+- 最新PR full HEAD SHAを別Fresh SessionのローカルRead-only Reviewerが独立Reviewし、`local-review-v1`をTrusted Gateが検証済み。旧Native Gateは過去のPhase Chain確認専用
 - 実C2/MCP/外部TargetへのSide EffectがCIで0件
 - Secret Leakageが0件
 - 未解決の仕様矛盾、仮実装、Security-critical TODOがない
@@ -34,17 +34,33 @@
 ## AI Loop Control Acceptance
 
 - Local OrchestratorはCurrent default-branch SHAのClean Checkoutでだけ起動する
+- `automation/local-execution-policy.json`はLocal Codex CLI実装・Fresh Read-only Local Review・無人Reviewを固定し、Cloud Task / `@codex` Trigger / Cloud Fallbackを拒否する
+- Implementationは別のScoped Workspace、Reviewは別Process / Context / Read-only Snapshotとする。
+  WorkerからGitHub Credential、親のJournal / Main Checkout、他Worker、User Plugin / MCP / 過去会話へ
+  到達できず、未知・不足Sandbox機能は起動を拒否する。Read-only違反、Credential可視、Context共有の
+  Negative / Failure-path Testを持つ
+- Workerはcommit / push / PR Evidence / Workflow Dispatchを行わない。Trusted Launcherだけが
+  Complete Phase Gate、Protected Path、Diff、Current入力権限を再検証して通常PR Commitを公開する
 - `gh`のCurrent Loginが`AI_GATE_APPROVER_LOGIN`と完全一致しなければ停止する
 - `github-actions[bot]`以外のImplementation/Ready/Phase Gate Markerを無視する
 - Implementation Request、ready/trigger marker、Trusted Phase Gate recordのUnknown Field、Duplicate JSON Keyを拒否する
 - Implementation RequestをCurrent Phase、Current HEAD SHA、Trusted Phase Promptへ固定する
-- Native Reviewを`AI_REVIEWER_LOGIN`、Current Phase、Current HEAD SHA、Expected Base SHA、ready/trigger permalink、Review中のhead不変性へ固定する
-- PASSはCodex標準no-major-issues comment、10文字以上のmatching commit prefix、botの👍、Current HEADのP0/P1/formal finding review不在をすべて要求する
-- Native Review判定はtrusted current-HEAD triggerより後のCodex出力だけを候補とし、trigger前の
-  stale/malformedな履歴は権限として使わず、trigger後のstale evidenceはFail Closedにする
+- `local-review-v1`はLauncherの`AI_GATE_APPROVER_LOGIN`本人性、Current Phase、full HEAD / Base、
+  Ready / Audit Source / Policy Digest、Unique RunとFresh Reviewer Session、Start / Resultの参照・時刻、
+  Review中のhead不変性へ固定する。`reviewer_login`はLauncherによる来歴証明であり、別のReviewer
+  AccountやCloud Botを装わない。Operator Host / Sandbox / Launcherが信頼基盤であることを明示する
+- PASSはLauncherが実際の別Review Process終了・Snapshot不変性を確認し、閉じたResult Schema、
+  全受入条件、Current CI、FindingなしをTrusted Workflowが独立検証した場合だけ認める。
+  ModelのPASS、Exit Code 0、手貼りJSON、Implementation Summary単独をGateへ昇格しない
+- Local Start / Result / Findingの偽Author、編集、Unknown Field / Duplicate JSON Key、Stale HEAD / Base /
+  Policy、Run / Session再利用、欠落・重複Result、開始前・未来・逆転時刻、Review中のHEAD変更を拒否する。
+  各拒否のRegression Testを持ち、単一Resultと全Finding Referenceの件数・順序・内容一致を検証する
+- 既存`codex-native-v1`は旧Gate Chain / Finding / Retry履歴だけに保持し、元の`AI_REVIEWER_LOGIN`、
+  Native Output / Bot Reaction / SHA / Timeline検証を弱めない。新規Local Reviewに旧Botの👍や
+  短縮Commit Prefixを要求せず、旧Evidenceを新しいLocal Runへ読み替えない
 - 全Phaseで1回の網羅Reviewを要求し、Codexは最初の指摘で停止せず、全P0/P1を同じ1件のFormal
   Reviewへ保持する。P0/P1が複数Formal Reviewへ分散した場合はFail Closedにする
-- CHANGES_REQUESTEDはCurrent HEADへ完全BindingされたCodex formal reviewと全P0/P1 inline
+- CHANGES_REQUESTEDはCurrent HEADへ完全Bindingされた単一Local Resultと全P0/P1（BLOCKER / HIGH）
   findingを要求し、root-cause keyを決定論的に導出する。Fix Requestは全Findingの件数とPermalinkを
   列挙し、Codexは`finding_key`だけでなく全件を修正する
 - 新規Policy適用後のImplementation Requestは、PhaseごとのRequired Invariant Familyを全件
@@ -85,7 +101,7 @@
   使用済みTransitionまたは後発Gateを越えたTransitionを再利用できない
 - Design Stop後の再開Recordは、停止Gate permalink、Current Phase、Current 40桁HEAD、Current default
   branchへ包含されたDesign commit、Design permalink、Policy Digestを完全Bindingし、1回だけ消費できる
-- Runnerはbase refresh、Trusted Workflow dispatchの各後、およびCodex Trigger直前に最新Gate、Current
+- Runnerはbase refresh、Trusted Workflow dispatchの各後、およびLocal Worker起動直前に最新Gate、Current
   HEAD、Stop latch、Transition消費状態を再取得し、Authority Drift時は`ai-loop-blocked`を維持する。
   Transient Lifecycle Labelの遅延・残存だけでは停止せず、Trusted Transitionで正規化する
 - Phase Cycle、同一exact Root Cause、CI Failureの自動Loop上限はすべて5回とし、設定値が5以外なら
@@ -97,6 +113,14 @@
   marker欠落、非隣接/3件以上のPhase、HEAD/state driftはFail Closedにする
 - RunnerはCurrent-HEAD Trusted RequestをTransient Labelなしでも実行対象として解決し、Requestを
   Ready markerより優先する。同じRequest/Reviewを再処理せず、停止後にGitHub Evidenceから再開できる
+- LOOP-033: 起動前のDurable Claim / Parent Journal、Timeout / CancellationとProcess Group終了、
+  Output上限を検証する。Spawn / Exit / Publication / Commit / Push結果不明はReconciliationで停止し、
+  Restart、重複Runner、失われたACKで自動Replayしない。Known-success / Negative / Crash経路を試験する
+- LOOP-034: 旧Cloud Requestの終了と出力を入力HEADへBindingしてReconcileするまで同一入力のLocal
+  Workerを起動しない。Polling停止やLabel変更は旧Task取消し証明にしない。今回Governanceの採用が
+  Product実装再開、古いDesign Approval再利用、Retry履歴削除にならないことを検証する
+- 通常Local ReviewからTrusted Phase Gate登録までは人間の都度承認なしで進み、初回Governance
+  Review / Merge、Design Approval、Phase 4/5 Provider Human Gateは従来どおり要求する
 - Phase 4/5は`ai-human-gate`中に停止し、承認済みProvider Gate遷移後だけ再開する
 - OpenAI API Keyを要求せず、GitHub CredentialをCodex Promptまたは実行環境へ渡さない
 - Active PRのCurrent Phaseは、exact phase label、`github-actions[bot]`のCurrent-HEAD

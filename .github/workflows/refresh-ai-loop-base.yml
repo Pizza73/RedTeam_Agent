@@ -70,6 +70,9 @@ jobs:
             const refreshCheckpoint = require(path.join(
               process.env.GITHUB_WORKSPACE, 'automation', 'base_refresh_checkpoint.js'
             ));
+            const localReview = require(path.join(
+              process.env.GITHUB_WORKSPACE, 'automation', 'local_review_evidence.js'
+            ));
             const isPreparation = process.env.CONFIRMATION === 'REFRESH_AI_LOOP_BASE';
             const isConfirmation =
               process.env.CONFIRMATION === 'CONFIRM_AI_LOOP_BASE_REFRESH';
@@ -310,8 +313,9 @@ jobs:
             const commonAuthorizationValid =
               (baseAuthorization || designStopAuthorization) &&
               authorization.phase === previousPhase &&
-              authorization.evidence_format === 'codex-native-v1' &&
-              authorization.reviewer_login === process.env.AI_REVIEWER_LOGIN &&
+              localReview.isTrustedGateEvidence(
+                authorization, process.env.AI_REVIEWER_LOGIN, process.env.AI_GATE_APPROVER_LOGIN
+              ) &&
               authorization.recorded_by === process.env.AI_GATE_APPROVER_LOGIN &&
               JSON.stringify(authorization.required_checks) === passingChecks;
             const isPriorPass = commonAuthorizationValid && baseAuthorization &&
@@ -340,7 +344,7 @@ jobs:
                 authorization.finding_references.length !==
                   new Set(authorization.finding_references).size ||
                 !authorization.finding_references.every((item) =>
-                  String(item).startsWith(`${expectedPrPrefix}#discussion_r`)))) {
+                  localReview.isGateFindingReference(authorization, item, expectedPrPrefix)))) {
               core.setFailed('Design-stop gate recurrence evidence is malformed.');
               return;
             }
@@ -389,8 +393,9 @@ jobs:
                     record.phase === basePhase &&
                     record.reviewed_sha === authorization.base_sha &&
                     record.verdict === 'PASS' && record.loop_state === 'PASS' &&
-                    record.evidence_format === 'codex-native-v1' &&
-                    record.reviewer_login === process.env.AI_REVIEWER_LOGIN &&
+                    localReview.isTrustedGateEvidence(
+                      record, process.env.AI_REVIEWER_LOGIN, process.env.AI_GATE_APPROVER_LOGIN
+                    ) &&
                     record.recorded_by === process.env.AI_GATE_APPROVER_LOGIN &&
                     record.finding_key === null &&
                     JSON.stringify(record.required_checks) === passingChecks) {

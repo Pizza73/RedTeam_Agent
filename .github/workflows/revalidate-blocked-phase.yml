@@ -26,7 +26,7 @@ on:
         required: true
         type: string
       finding_reference:
-        description: Trusted Codex P0/P1 finding permalink for the source phase
+        description: Historical native Codex P0/P1 finding permalink (not a local-review recovery)
         required: true
         type: string
       confirmation:
@@ -68,12 +68,19 @@ jobs:
       REVIEWED_HEAD_SHA: ${{ inputs.reviewed_head_sha }}
       SOURCE_PHASE: ${{ inputs.source_phase }}
     steps:
+      - name: Check out trusted mixed-format phase evidence helpers
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
       - name: Authorize exact current-phase recovery
         id: authorize
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
         with:
           script: |
             const crypto = require('crypto');
+            const localReview = require(`${process.env.GITHUB_WORKSPACE}/automation/local_review_evidence.js`);
+            const gateParser = require(`${process.env.GITHUB_WORKSPACE}/automation/approve_design_resume.js`);
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const pull_number = Number.parseInt(process.env.PR_NUMBER, 10);
@@ -112,13 +119,7 @@ jobs:
               const pattern = new RegExp(`<!--\\s*${name}\\s*([\\s\\S]*?)-->`, 'g');
               const matches = [...(body || '').matchAll(pattern)];
               if (matches.length !== 1) throw new Error(`${name} marker must occur exactly once.`);
-              const raw = matches[0][1].trim();
-              const keys = [...raw.matchAll(/"((?:\\.|[^"\\])*)"\\s*:/g)]
-                .map((item) => JSON.parse(`"${item[1]}"`));
-              if (new Set(keys).size !== keys.length) {
-                throw new Error(`${name} marker contains a duplicate JSON key.`);
-              }
-              return JSON.parse(raw);
+              return gateParser.strictJsonParse(matches[0][1].trim(), `${name} marker`);
             }
             function exactKeys(value, expected) {
               return value && typeof value === 'object' && !Array.isArray(value) &&
@@ -247,14 +248,16 @@ jobs:
                 record.schema_version === '1.0';
               const designStopGate = exactKeys(record, designStopGateKeys) &&
                 record.schema_version === '1.1';
-              if ((!baseGate && !designStopGate) ||
-                  record.evidence_format !== 'codex-native-v1') continue;
+              if (!baseGate && !designStopGate) continue;
               const evidence = {comment, record};
               if (record.phase === sourcePhase && record.reviewed_sha === reviewedHead &&
+                  record.evidence_format === 'codex-native-v1' &&
                   record.verdict === 'CHANGES_REQUESTED' &&
                   ['CHANGES_REQUESTED', 'BLOCKED_LIMIT'].includes(record.loop_state) &&
                   record.review_reference === review.html_url &&
-                  record.reviewer_login === process.env.AI_REVIEWER_LOGIN &&
+                  localReview.isTrustedGateEvidence(
+                    record, process.env.AI_REVIEWER_LOGIN, process.env.AI_GATE_APPROVER_LOGIN
+                  ) &&
                   record.recorded_by === process.env.AI_GATE_APPROVER_LOGIN &&
                   hasPassingRequiredChecks(record) &&
                   /^[A-Z0-9][A-Z0-9._-]{0,63}$/.test(record.finding_key)) {
@@ -262,7 +265,9 @@ jobs:
               }
               if (record.phase === priorPhase && record.verdict === 'PASS' &&
                   record.loop_state === 'PASS' && record.finding_key === null &&
-                  record.reviewer_login === process.env.AI_REVIEWER_LOGIN &&
+                  localReview.isTrustedGateEvidence(
+                    record, process.env.AI_REVIEWER_LOGIN, process.env.AI_GATE_APPROVER_LOGIN
+                  ) &&
                   record.recorded_by === process.env.AI_GATE_APPROVER_LOGIN &&
                   hasPassingRequiredChecks(record)) {
                 passCandidates.push(evidence);

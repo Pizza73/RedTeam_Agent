@@ -75,6 +75,9 @@ jobs:
             tests/unit/test_automation_validation.py \
             tests/unit/test_governance_check.py \
             tests/unit/test_phase_loop.py \
+            tests/unit/test_local_execution.py \
+            tests/unit/test_local_worker.py \
+            tests/unit/test_local_review_evidence.py \
             --strict-markers
       - name: Run application tests
         if: >-
@@ -138,7 +141,10 @@ jobs:
             scripts/ci \
             tests/unit/test_automation_validation.py \
             tests/unit/test_governance_check.py \
-            tests/unit/test_phase_loop.py
+            tests/unit/test_phase_loop.py \
+            tests/unit/test_local_execution.py \
+            tests/unit/test_local_worker.py \
+            tests/unit/test_local_review_evidence.py
       - name: Run complete phase gate
         if: steps.phase.outputs.mode == 'phase'
         shell: bash

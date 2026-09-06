@@ -2,11 +2,16 @@
 
 ## Cost and execution boundary
 
-The loop does not call the OpenAI API and does not store an `OPENAI_API_KEY` in GitHub. An operator
-starts `automation/run_phase_loop.py` once with a GitHub account linked to ChatGPT/Codex. The local
-orchestrator posts `@codex` implementation and review requests as that user. GitHub Actions performs
-deterministic validation and trusted state transitions only. Set the GitHub Actions spending limit
-to zero when the private-repository included quota must not be exceeded.
+Implementation and review execute as separate local Codex CLI processes. An operator starts
+`automation/run_phase_loop.py` once from clean current `main`; the trusted launcher runs the
+implementation worker, validates its output and publishes a normal PR commit, then starts a fresh
+read-only review worker after current-HEAD CI succeeds. Routine reviews need no per-run human
+approval. No new Codex Cloud tasks, GitHub `@codex` triggers or Cloud fallback are permitted.
+
+The repository does not call the OpenAI API or store an `OPENAI_API_KEY`. Local execution is not
+offline inference: the CLI still uses its ChatGPT account authentication and model-service network.
+GitHub Actions performs deterministic validation and trusted state transitions only. Set the
+GitHub Actions spending limit to zero when the included private-repository quota must not be exceeded.
 
 The orchestrator reads GitHub credentials only through `gh`; it never places the credential in a
 Codex prompt or process environment. Trusted machine comments / statuses and checks are the durable
@@ -56,18 +61,33 @@ provider-specific Human Gates and CI never connects to a real C2, MCP server or 
 
 | Component | Responsibility | Write access |
 |---|---|---|
-| Local phase orchestrator | Request implementation/review, record validated evidence, and perform the gated final `ai-loop` merge | PR comments, approved workflow dispatch, one atomic claim ref and one exact-SHA final merge |
-| Codex Cloud | Current-phase implementation/fix requested through GitHub | PR branch only |
-| Codex GitHub Review or ChatGPT | Fresh-context semantic/security review | PR review/comment only |
+| Local phase orchestrator / trusted launcher | Validate authority, isolate workers, validate and publish output, record provenance, and perform the gated final `ai-loop` merge | Normal PR commit/push after the gate, PR evidence, approved workflow dispatch, bounded claim refs and one exact-SHA final merge |
+| Local implementation worker | Current-phase implementation/fix in a separate local checkout | Scoped workspace files only; no GitHub credential or remote write |
+| Local review worker | Fresh-context exhaustive semantic/security review of a fixed snapshot | No source, Git, PR or gate writes; structured output to the launcher only |
 | CI | Tests, lint, type check, coverage and protected-path enforcement | Check results; ready evidence only for non-blocked HEADs |
-| Record AI Phase Review | Revalidate reviewer identity, review SHA, base SHA and actual checks | PR labels/comments/status |
+| Record AI Phase Review | Revalidate operator-authenticated local provenance, review SHA/base, all findings and actual checks | PR labels/comments/status |
 | Human | Start/restart local orchestration, approve Phase 4/5 provider governance, review/merge governance PRs | Explicit provider approval and governance UI merge |
 
-The implementer and reviewer must use separate runs and contexts. A review result is evidence only
-when its GitHub permalink resolves to native Codex content authored by `AI_REVIEWER_LOGIN`. The
-full-SHA binding is the validated chain of the current-head CI ready marker, operator-authored
-review trigger, unchanged PR timeline, current PR head, native result and required checks. The
-shortened commit ID displayed by Codex is corroborating evidence, never the sole binding.
+The implementer and reviewer use separate ephemeral runs, sessions, contexts and workspaces. The
+review snapshot is read-only and contains no implementation conversation or launcher journal. The
+launcher rejects missing sandbox capabilities, unapproved user configuration/plugins/MCP, unavailable
+authentication, or an inability to isolate GitHub credentials; it never silently downgrades isolation.
+Only the launcher holds `gh` credentials and publishes review evidence. A worker may neither
+self-issue a provenance record nor dispatch the phase-gate workflow.
+
+The review format is `local-review-v1`. The trusted workflow authenticates the launcher account
+against `AI_GATE_APPROVER_LOGIN`; `reviewer_login` records that provenance attestor, not a second
+human or a Cloud bot. The root of trust is the operator host, OS/sandbox boundary, clean-main
+launcher and GitHub account. Separate contexts prevent implementation-session self-review, but are
+not account-independent third-party authentication or protection against a compromised operator
+host. The workflow independently revalidates durable evidence and current CI; it cannot remotely
+prove that an uncompromised local process ran. Initial governance review/merge and existing Design
+and Provider Human Gates remain mandatory. No new approval is requested for each routine review.
+
+The full-SHA binding includes current-head CI ready/audit evidence, a unique launcher-authored start,
+the exact phase/base/head, source and policy digests, fresh reviewer session, unchanged PR timeline,
+and one complete result. Existing `codex-native-v1` gates are historical chain evidence only; they
+are not rewritten as local results and do not permit new Cloud work.
 
 ## State machine
 
@@ -82,12 +102,14 @@ IMPLEMENTATION_REQUESTED
        -> PREVIOUS_PHASE_REVALIDATION_REQUESTED
        -> exact-HEAD update-branch -> CI_RUNNING for the previous phase
   <- local orchestrator dispatches Start AI Loop for a Phase 0A PR and exact HEAD SHA
-  -> local orchestrator requests Codex Cloud implementation
+  -> durable local action claim -> isolated local implementation worker
+  -> launcher validates complete gate -> normal exact-input PR commit/push
   -> CI_RUNNING
        -> CI_FAILED -> FIX_REQUESTED
        -> INVARIANT_FAMILY_AUDIT -> REVIEW_READY
-  -> local orchestrator requests one exhaustive Codex/ChatGPT review for one exact SHA
-  -> local orchestrator validates and aggregates the complete native review
+  -> durable local review start -> fresh read-only local reviewer for one exact SHA
+  -> launcher publishes complete local-review-v1 evidence
+  -> local orchestrator and trusted workflow validate the complete formal review
        -> CHANGES_REQUESTED -> FIX_REQUESTED
        -> PASS -> NEXT_PHASE_REQUESTED or HUMAN_GATE or PROJECT_COMPLETE
        -> PROJECT_COMPLETE -> LOCAL_EXACT_SHA_MERGE or BLOCKED
@@ -105,8 +127,8 @@ managed projection with `ai-needs-implementation`. Conflicting fix, pass, provid
 complete projections remain rejected.
 
 `PASS` never starts an AI process inside GitHub Actions. It creates the next SHA-bound
-implementation request; the local orchestrator detects the trusted request and asks Codex Cloud to
-perform it through the ChatGPT-linked GitHub identity.
+implementation request; the local orchestrator detects the trusted request and launches an isolated
+local implementation worker after revalidating current authority.
 `BLOCKED` can be resumed for Phase 0A through Phase 3 only through the approver-restricted
 `Resume AI Loop` workflow with a repository-local resolution reference, except when the latest
 trusted gate stopped for invariant-family recurrence. A recurrence stop is
@@ -164,13 +186,59 @@ evidence.
 ### Trusted phase-gate record
 
 This marker is created only by the `Record AI Phase Review` workflow after it re-queries GitHub
-checks and validates the reviewer permalink. AI-authored markers are not accepted directly.
+checks and validates the launcher-authenticated start/result permalinks. AI-authored markers are
+not accepted directly. `reviewer_login` is the configured launcher operator for local reviews.
 
 ```html
 <!-- redteam-phase-gate
-{"schema_version":"1.0","phase":"phase-0a","reviewed_sha":"<sha>","base_sha":"<sha>","verdict":"PASS","summary":"...","evidence_format":"codex-native-v1","ready_reference":"https://github.com/...","review_trigger_reference":"https://github.com/...","review_reference":"https://github.com/...","reviewer_login":"...","recorded_by":"...","finding_key":null,"required_checks":[],"loop_state":"PASS"}
+{"schema_version":"1.0","phase":"phase-0a","reviewed_sha":"<sha>","base_sha":"<sha>","verdict":"PASS","summary":"...","evidence_format":"local-review-v1","ready_reference":"https://github.com/...","review_trigger_reference":"https://github.com/...","review_reference":"https://github.com/...","reviewer_login":"<launcher-operator>","recorded_by":"...","finding_key":null,"required_checks":[],"loop_state":"PASS"}
 -->
 ```
+
+### Local review provenance
+
+The launcher publishes the following closed-schema records through its own GitHub account; these
+are not model-authored comments and are not trusted Phase Gates by themselves:
+
+| Marker | Bound evidence |
+| --- | --- |
+| `redteam-local-review-start` | `schema_version=1.0`, phase, full `head_sha` / `base_sha`, `ready_reference`, `source_digest`, `policy_digest`, unique UUID `run_id`, trusted `started_at` |
+| `redteam-local-review-finding` | `schema_version=1.0`, the same run / phase / full head / base, and one complete structured finding |
+| `redteam-local-review-result` | The start bindings plus `start_reference`, fresh UUID `reviewer_session_id`, trusted `completed_at`, the complete `result`, and every `finding_references` permalink |
+
+`source_digest` is the canonical digest of the review-trigger source containing the trusted ready
+and invariant-audit binding, not a claim that the model computed a source-tree hash. The head/base
+identify the exact immutable Git trees; the launcher separately verifies its review snapshot stays
+unchanged. `result` uses `automation/schemas/review-result.schema.json`. Every retained P0/P1 maps
+to one `BLOCKER`/`HIGH` finding and exactly one trusted invariant-family ID. The workflow reloads
+all finding permalinks and requires exact equality, count and order with the complete result.
+Missing, duplicate, unknown, mismatched or edited records, duplicate JSON keys, invalid timestamps,
+reused sessions/runs, stale head/base/policy, or more than one result fail closed. The start replaces
+the active review-trigger role; no `@codex review`, bot reaction or shortened commit prefix is
+required for local evidence. Historical native evidence retains its original validation rules.
+
+### Local process and publication lifecycle
+
+Before any worker spawn, the trusted parent durably records and exclusively claims the exact
+request/ready identity. Implementation and review use fresh isolated local workspaces; neither
+can modify the governance checkout, credential store or parent journal. The implementation worker
+leaves file changes only. The launcher verifies protected paths, the complete current-phase gate,
+unchanged input authority and the resulting diff before creating and normally pushing the output
+commit to the existing PR branch. A model summary, a process exit code or a locally created result
+file never authorizes publication or PASS on its own.
+
+Runtime and retry limits, cancellation and process-group termination are mandatory. Parent restart
+does not erase a claim or relaunch an uncertain child. Spawn, process exit, result publication,
+commit or push outcomes that cannot be proven require reconciliation against the durable journal,
+remote PR/evidence and exact output SHA before any new action. A completed push followed by a
+lost acknowledgement must not create another implementation attempt. The existing five-cycle /
+five-exact-finding and two-family-recurrence limits remain unchanged.
+
+Before adopting local mode, reconcile every previously sent Cloud request for the current input
+HEAD and any late output. An outstanding or unknown old worker blocks local execution for that
+input; stopping local polling alone does not cancel Cloud work. Preserve old request, finding,
+gate and consumed-approval history. Merging this governance update does not itself resume product
+implementation, reissue an approval or authorize duplicate execution.
 
 ### Phase implementation request
 
@@ -194,8 +262,9 @@ implementation request with a different or missing current policy. Both implemen
 independent-review prompts require the normative `SystemDesign_AI_Control.md` companion.
 
 The existing `docs/review/<phase>-invariant-audit.json` carries an `implementation_strategy`
-object with `version=1.0` and nonempty `units`. No new authorization record or additional approval
-workflow is introduced. Each unit identifies the owner and current-phase boundary and records:
+object with `version=1.0` and nonempty `units`. No additional per-unit approval workflow is
+introduced by that classification. Local worker provenance is recorded separately as specified
+above. Each unit identifies the owner and current-phase boundary and records:
 
 | Fields | Meaning |
 | --- | --- |
@@ -298,7 +367,7 @@ fix request and label state. Labels are projections for operators, not authoriza
 After the coherent redesign is human-reviewed and merged to the default branch, a base refresh may
 incorporate it into the blocked implementation PR. That update consumes only the exact refresh
 transition. It must not remove `ai-loop-blocked`, issue a fix request, dispatch `Resume AI Loop`, or
-trigger Codex. The workflow's confirmation mode records one consumed transition identity bound to old
+launch a local worker. The workflow's confirmation mode records one consumed transition identity bound to old
 HEAD, new HEAD, target base SHA, phase and blocking gate on the new current HEAD; another update
 cannot reuse it.
 
@@ -352,7 +421,7 @@ request. Generic `HUMAN_RESUME` and post-refresh bounded Resume cannot consume i
 Immediately before any implementation trigger, the runner re-queries the current PR head, latest
 trusted gate, complete managed / stop label set, required checks, design approval and transition
 consumption. A new gate, head change, missing stop label before approval consumption, or any drift
-stops without posting a Codex trigger. The approved resume removes `ai-loop-blocked` only as part
+stops without launching a worker. The approved resume removes `ai-loop-blocked` only as part
 of the same bounded transition that writes the exact-HEAD implementation request; failure after
 either write is reconciled from GitHub evidence rather than replayed blindly.
 
@@ -360,29 +429,35 @@ either write is reconciled from GitHub evidence rather than replayed blindly.
 
 After CI posts the review-ready marker:
 
-1. The local orchestrator posts one `@codex review` only after the SHA-bound ready marker exists.
-   The same exhaustive instruction applies to every Phase.
-2. Codex reviews the complete Phase diff and supporting unchanged code across authorization and
+1. The local orchestrator validates the SHA-bound ready/audit markers, exclusively claims the
+   action, publishes one `redteam-local-review-start`, and launches one fresh read-only local
+   review session. The same exhaustive instruction applies to every Phase.
+2. The local reviewer inspects the complete Phase diff and supporting unchanged code across authorization and
    lifecycle, secrets and untrusted output, integrity/cryptography/storage/recovery/concurrency,
    every acceptance criterion, bypass path, and earlier-Phase regression. The bound pre-review
    audit is a routing checklist only; the reviewer independently verifies every required family.
-3. Codex continues after the first issue and retains every consequential finding in that one
-   native review, each in standard P0/P1 inline format with exactly one trusted invariant-family
-   ID. No-major-issues is valid only when none remains.
-4. The orchestrator validates reviewer identity, current phase/head/base, ready/trigger chain,
-   native output and absence of `synchronize` events. It aggregates every retained P0/P1 into one
-   `CHANGES_REQUESTED`; the first finding supplies only the stable retry key, not the fix scope.
-5. The resulting trusted fix request records `finding_count`, every P0/P1 permalink and each
-   finding's invariant family, and references the complete native review. Codex must fix every
-   listed finding and its sibling paths before the next review. The orchestrator then dispatches
-   `Record AI Phase Review` as `AI_GATE_APPROVER_LOGIN`.
+3. The reviewer continues after the first issue and retains every consequential P0/P1 as a
+   structured `BLOCKER`/`HIGH` finding with exactly one trusted invariant-family ID. It returns
+   one complete schema-valid result, never GitHub comments or a self-issued gate. PASS requires
+   no retained findings and all acceptance criteria satisfied; inability to verify is BLOCKED.
+4. The launcher validates actual process completion, distinct session, unchanged snapshot and
+   current phase/head/base/ready/audit/policy, then publishes every finding and the single complete
+   `redteam-local-review-result`. It does not truncate findings. The first finding supplies only
+   the stable retry key, not the fix scope.
+5. The orchestrator dispatches `Record AI Phase Review` as `AI_GATE_APPROVER_LOGIN`. The workflow
+   reloads and independently validates start/result/finding authorship, full bindings and current
+   checks, derives the verdict and emits the trusted gate. A fix request records `finding_count`,
+   every finding permalink and invariant family, plus the complete result reference. The local
+   implementer must fix every listed finding and its sibling paths before the next review.
 
-The workflow rejects a stale SHA, wrong reviewer, wrong phase base, fork PR, missing/failed checks,
-review link outside the PR, an untrusted ready/trigger link, a head change during review, ambiguous
-commit evidence, a PASS without the bot 👍, or orchestrator input that differs from the
-deterministically derived aggregate result. A formal Codex review without retained P0/P1 comments
-is fail-closed. The loop stops after five change cycles in a phase or five occurrences of the same
-root-cause key.
+The workflow rejects a stale SHA, wrong launcher account, wrong phase base, fork PR, missing/failed
+checks, a reference outside the PR, an untrusted ready/start link, head synchronization during
+review, missing/duplicate/mismatched findings, replayed/ambiguous run evidence, invalid local result,
+or orchestrator input that differs from the deterministically validated result. A model PASS alone
+is not trusted evidence. Local reviews do not require a bot reaction or native inline review.
+Historical `codex-native-v1` gates retain their native identity, reaction, finding and timeline
+validation only for the existing chain. The loop stops after five change cycles in a phase or
+five occurrences of the same root-cause key.
 The exact-finding and Phase limits remain five. Separately, if any semantic invariant family
 appears in a second formal review for the Phase, the workflow emits no new fix request and enters
 `BLOCKED_LIMIT` with `stop_reason=INVARIANT_FAMILY_RECURRENCE`. This is the
@@ -412,7 +487,7 @@ PASS comment records the phase boundary SHA; the next review must use that SHA a
 phase PASS from authorizing merge of later work.
 
 If the default branch advances between a PASS and the next implementation, the runner performs the
-bounded base-refresh transition above before sending another `@codex implement` request. It never
+bounded base-refresh transition above before launching another local implementation worker. It never
 refreshes after current-Phase code has changed or carries an old PASS across the new merge SHA. The
 base-refresh workflow never calls the final merge endpoint; only the local completion gate can.
 

@@ -12,9 +12,11 @@
 ## Trust Boundaries
 
 ```text
-PR content/comments --untrusted--> Codex/ChatGPT reviewer
-Repository files   --untrusted--> Codex implementer
+PR content/comments --untrusted--> fresh read-only local reviewer
+Repository files   --untrusted--> scoped local implementation worker
 GitHub bot markers --validated--> Local phase orchestrator
+Operator host / sandbox / clean-main launcher --TCB--> isolated local workers
+Local worker result --untrusted until validated--> launcher-authenticated local-review-v1
 Local gh identity  --trusted dispatcher--> GitHub workflow_dispatch
 GitHub Actions      --trusted controller--> PR labels, comments and status
 CI evidence         --trusted when re-queried and bound to SHA--> phase gate
@@ -27,16 +29,18 @@ External C2/MCP     --untrusted until approved/bound--> Adapter
 |---|---|
 | PR/Source prompt injection | Reviewer/implementer prompts treat repository content as data; protected governance files; sanitize structured requests |
 | Codex changes tests/spec to pass | Base-branch protected-path checker; checker self-protection; separate governance PR; independent review; local exact-SHA final merge gate |
-| Forged PASS comment | Local schema validation; gate actor check; reviewer permalink lookup; reviewer login, head SHA, phase base and actual Check Run revalidation |
+| Forged PASS comment | Closed result/schema validation; launcher actor check; unique local start/result/finding permalink lookup; full head/base/source/policy, session, timeline and actual Check Run revalidation by the trusted workflow; model output is not attestation |
 | Forged implementation/ready marker | Local orchestrator accepts only `github-actions[bot]`, exact current phase and exact current HEAD SHA |
 | Stale review applied to new code | Exact 40-char `reviewed_sha == PR head.sha` |
 | Infinite loop/cost exhaustion | Max 5 iterations per phase; same exact finding max 5; semantic family stops on its second formal-review occurrence; concurrency cancellation |
 | Fork steals secret/token | Same-repository branch check; no AI implementation workflow on forks; minimal workflow permissions |
-| Codex steals GitHub token | Orchestrator invokes Codex through GitHub comments, never a token-bearing process; CI checkout does not persist credentials |
-| Duplicate/stale local dispatch | SHA/digest trigger markers, trusted GitHub state and bounded runtime make restart idempotent and fail closed |
+| Local worker steals GitHub token or alters its own gate | Only the clean-main parent accesses `gh`; worker filesystem/process isolation excludes the GitHub credential store, parent journal and governance checkout, and disables inherited plugins/MCP/user settings; no worker commit/push/workflow tools; missing isolation blocks startup |
+| Duplicate/stale local dispatch or lost push acknowledgement | Durable exact-request/ready claim and parent journal precede spawn; full-SHA/digest evidence, bounded runtime/cancellation and current authority are revalidated; uncertain spawn/process/publication/push stops for reconciliation and never replays automatically |
+| Implementer reuses its conversation as independent review | Launcher creates a different ephemeral process/session and read-only snapshot without implementation conversation; verifies actual completion and snapshot integrity, then publishes a single complete result; model cannot self-issue provenance |
+| An old Cloud task races local cutover | No new Cloud tasks/triggers/fallback; reconcile already-sent exact-input work and late output before local consumption; stopping polling is not cancellation evidence; historical native gates and retry consumption remain |
 | OpenAI key exposed to repository code | OpenAI API use is disabled and `OPENAI_API_KEY` is not a repository secret |
 | Malicious test exfiltration | No unrelated credentials in test jobs; CI egress should be organization-restricted where possible |
-| Review actor compromised | Independent Phase-chain revalidation; audit trail; emergency stop labels/workflow disable |
+| Local launcher/operator host compromised | Host/sandbox/clean-main launcher is explicitly trusted; GitHub workflow independently revalidates durable bindings/checks but cannot attest an uncompromised local model run; audit trail and emergency stop remain; no claim of a second independent reviewer account |
 | Phase gate bypass | Ordered phase plan; label/current phase match; unique maximal incorporated adjacent PASS; required Check Runs queried from GitHub |
 | Runner observes or races a Phase transition | Keep `ai-review-passed` as a transition marker, add next before removing current, make the Runner wait on a marked single/adjacent-dual Phase state, mutate only named managed labels, and revalidate every boundary; stale full-label replacement is forbidden |
 | Stale static Phase status blocks or authorizes work | Active PR authority requires an exact label + workflow-authored current-HEAD request + unique maximal incorporated adjacent PASS; the status document is bootstrap-only |
@@ -94,6 +98,14 @@ External C2/MCP     --untrusted until approved/bound--> Adapter
 - Fixed-corpus agent results do not guarantee success or prompt-injection immunity on unseen inputs; this design does not claim CaMeL-equivalent information-flow guarantees or a complete planner.
 - D4 physical resource-erasure qualification remains NOT_EVALUATED. Documentation, simulator tests and LLM-quality results cannot establish the actual device/firmware/backup destruction guarantee.
 - An LLM reviewer can miss a flaw even with independent context.
+- Local review provenance is authenticated by the launcher's operator GitHub account. It does
+  not prove account-independent review or resist a compromised operator host/sandbox/launcher.
+  Process/context separation and closed-schema GitHub verification do not remotely attest that
+  the local process ran correctly. Routine reviews are unattended; initial governance review and
+  the existing Design/Provider Human Gates remain human boundaries.
+- Local Codex CLI execution still uses ChatGPT account authentication and model-service network.
+  The repository adds no OpenAI API-key integration, but this does not guarantee offline inference
+  or eliminate the model service from the data-handling boundary.
 - Branch protection and rulesets are unavailable on the current private-repository plan. Required
   reviews, checks, conversation resolution, and direct/force-push prohibitions are manual controls
   and are not enforced by GitHub.

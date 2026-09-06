@@ -2,6 +2,7 @@
 
 const crypto = require('crypto');
 const loopControl = require('./loop_control_state');
+const localReview = require('./local_review_evidence');
 
 const PHASES = [
   'phase-0a', 'phase-0b', 'phase-0c', 'phase-1',
@@ -349,8 +350,8 @@ async function run({github, context, core}) {
     const gate = maximal[0];
     const record = gate.payload;
     if (record.verdict !== 'CHANGES_REQUESTED' || record.loop_state !== 'BLOCKED_LIMIT' ||
-        record.evidence_format !== 'codex-native-v1' ||
-        record.reviewer_login !== reviewer || record.recorded_by !== approver ||
+        !localReview.isTrustedGateEvidence(record, reviewer, approver) ||
+        record.recorded_by !== approver ||
         !/^[A-Z0-9][A-Z0-9._-]{0,63}$/.test(record.finding_key || '') ||
         !/^[0-9a-f]{40}$/.test(record.base_sha || '') || !hasPassingChecks(record)) {
       throw new Error('Latest blocking gate is malformed or untrusted.');
@@ -362,8 +363,9 @@ async function run({github, context, core}) {
       return exactKeys(value, BASE_GATE_KEYS) && value.schema_version === '1.0' &&
         value.phase === priorPhase && value.reviewed_sha === record.base_sha &&
         value.verdict === 'PASS' && value.loop_state === 'PASS' &&
-        value.finding_key === null && value.evidence_format === 'codex-native-v1' &&
-        value.reviewer_login === reviewer && value.recorded_by === approver &&
+        value.finding_key === null &&
+        localReview.isTrustedGateEvidence(value, reviewer, approver) &&
+        value.recorded_by === approver &&
         hasPassingChecks(value);
     });
     if (basePasses.length !== 1 || !await isAncestor(record.base_sha, record.reviewed_sha)) {
@@ -414,7 +416,7 @@ async function run({github, context, core}) {
          !Array.isArray(record.finding_references) || record.finding_references.length < 1 ||
          record.finding_references.length !== new Set(record.finding_references).size ||
          !record.finding_references.every((url) =>
-           String(url).startsWith(`${pullPrefix}#discussion_r`)))) {
+           localReview.isGateFindingReference(record, url, pullPrefix)))) {
       throw new Error('Design-stop Gate extension does not match recurrence evidence.');
     }
     if (!await isAncestor(designCommitSha, defaultCommit.sha) ||
