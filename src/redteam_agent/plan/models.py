@@ -1,0 +1,164 @@
+"""Planner output and execution plan models (SystemDesign §6 / §25).
+
+The planner only ever emits a typed ``PlannerOutput``. Only its ``action``
+branch carries an ``ExecutionPlanProposal`` that may proceed to the policy
+engine; the ``context_request`` branch never yields an execution/decision/
+approval. Risk, approval and adapter are never planner-supplied. System ids are
+issued by the application, not the model.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Annotated, Literal
+
+from pydantic import Field
+
+from redteam_agent.canonical.digest_service import DigestService
+from redteam_agent.canonical.immutable import CanonicalJsonObject
+from redteam_agent.models.base import StrictImmutableBoundaryModel
+from redteam_agent.models.common import ActionContractReference, ToolRef
+from redteam_agent.policy.scope_models import TargetReference
+
+OperationalPhase = Literal[
+    "INITIAL_ACCESS",
+    "DISCOVERY",
+    "PRIVILEGE_ESCALATION",
+    "CREDENTIAL_ACCESS",
+    "LATERAL_MOVEMENT",
+    "DOMAIN_CONTROL",
+    "LINUX_PRIVILEGE_ESCALATION",
+    "OBJECTIVE",
+]
+
+
+class ExecutionPlanProposal(StrictImmutableBoundaryModel):
+    objective: str
+    phase: OperationalPhase
+    tool_ref: ToolRef
+    requested_targets: tuple[TargetReference, ...]
+    session_id: str | None
+    arguments: CanonicalJsonObject
+
+
+class RetrievalHint(StrictImmutableBoundaryModel):
+    resource_types: tuple[
+        Literal["artifact", "secret_reference", "local_artifact", "report", "internal_knowledge"], ...
+    ]
+    related_entity_refs: tuple[str, ...]
+    requested_fact_types: tuple[
+        Literal["identity", "service", "relationship", "finding", "execution_outcome"], ...
+    ]
+    recency_class: Literal["current", "recent", "any_authorized"]
+    purpose_code: Literal["verify_hypothesis", "resolve_entity", "explain_failure", "prepare_next_action"]
+
+
+class HypothesisCreateProposal(StrictImmutableBoundaryModel):
+    operation: Literal["create"] = "create"
+    statement: str
+    basis_reference_ids: tuple[str, ...]
+    next_verification_objective: str | None
+
+
+class HypothesisUpdateProposal(StrictImmutableBoundaryModel):
+    operation: Literal["update"] = "update"
+    hypothesis_id: str
+    expected_hypothesis_version: int = Field(ge=1)
+    statement: str
+    proposed_status: Literal["investigating", "supported"]
+    basis_reference_ids: tuple[str, ...]
+    next_verification_objective: str | None
+
+
+class HypothesisCloseProposal(StrictImmutableBoundaryModel):
+    operation: Literal["close"] = "close"
+    hypothesis_id: str
+    expected_hypothesis_version: int = Field(ge=1)
+    proposed_status: Literal["refuted", "abandoned"]
+    reason_code: str
+    basis_reference_ids: tuple[str, ...]
+
+
+HypothesisProposal = Annotated[
+    HypothesisCreateProposal | HypothesisUpdateProposal | HypothesisCloseProposal,
+    Field(discriminator="operation"),
+]
+
+
+class PlanThreadUpdateProposal(StrictImmutableBoundaryModel):
+    operation: Literal["continue", "replace", "abandon"]
+    objective: str
+    expected_thread_version: int | None = Field(default=None, ge=1)
+    hypothesis_updates: tuple[HypothesisProposal, ...]
+
+
+class PlannerActionOutput(StrictImmutableBoundaryModel):
+    output_type: Literal["action"] = "action"
+    proposal: ExecutionPlanProposal
+    working_state_update: PlanThreadUpdateProposal | None
+    next_iteration_hints: tuple[RetrievalHint, ...]
+
+
+class PlannerContextRequest(StrictImmutableBoundaryModel):
+    output_type: Literal["context_request"] = "context_request"
+    objective: str
+    retrieval_hints: tuple[RetrievalHint, ...]
+    working_state_update: PlanThreadUpdateProposal | None
+
+
+PlannerOutput = Annotated[
+    PlannerActionOutput | PlannerContextRequest,
+    Field(discriminator="output_type"),
+]
+
+
+class ExecutionPlan(StrictImmutableBoundaryModel):
+    plan_id: str
+    mission_id: str
+    mission_revision: int
+    observed_mission_state_version: int
+    observed_authorization_epoch: int
+    run_id: str
+    thread_id: str
+    proposal: ExecutionPlanProposal
+    proposal_digest: str
+    # Audit reference only, never an authorization basis (SystemDesign §6). Goal
+    # evaluation is a later phase; Phase 0A carries an explicit unevaluated
+    # marker rather than a fabricated result.
+    goal_evaluation_id: str
+    goal_evaluation_digest: str
+    action_contract_ref: ActionContractReference
+    execution_precondition_digest: str
+    available_tool_snapshot_id: str
+    available_tool_snapshot_digest: str
+    session_security_context_digest: str
+    adapter_capabilities_digest: str
+    sandbox_capabilities_digest: str
+    remote_mcp_trust_policy_digest: str
+    created_at: datetime
+
+
+def _target_reference_payload(reference: TargetReference) -> dict[str, object]:
+    return reference.model_dump(mode="python")
+
+
+def compute_proposal_digest(proposal: ExecutionPlanProposal, digest_service: DigestService) -> str:
+    """proposal_digest over the proposal only (SystemDesign §22.1).
+
+    ``requested_targets`` are order-independent and are sorted; ``arguments``
+    retain their (semantically meaningful) structure.
+    """
+    sorted_targets = sorted(
+        (_target_reference_payload(target) for target in proposal.requested_targets),
+        key=lambda payload: (payload.get("type", ""), str(sorted(payload.items()))),
+    )
+    payload = {
+        "schema_version": "execution-plan-proposal-v1",
+        "objective": proposal.objective,
+        "phase": proposal.phase,
+        "tool_ref": proposal.tool_ref.model_dump(mode="python"),
+        "requested_targets": sorted_targets,
+        "session_id": proposal.session_id,
+        "arguments": proposal.arguments,
+    }
+    return digest_service.compute("proposal_digest", payload)

@@ -1,0 +1,107 @@
+"""Secret argument path grammar and resolution (SystemDesign §20.1).
+
+``ToolDefinition.secret_argument_paths`` are RFC 6901 JSON Pointers in canonical
+form. The empty root pointer, wildcards, JSONPath, regex, negative/append array
+indices, parent traversal and non-standard escapes are all rejected. Each
+pointer must resolve to exactly one existing leaf in the validated arguments,
+and no pointer may be an ancestor of another (no parent/child or alias
+overlaps). Any violation is a fail-closed :class:`SecretArgumentBindingError`.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+from typing import Any
+
+from redteam_agent.canonical.json_boundary import CanonicalJsonObject
+from redteam_agent.errors import SecretArgumentBindingError
+
+
+def parse_json_pointer(pointer: str) -> tuple[str, ...]:
+    """Parse a canonical RFC 6901 JSON Pointer into reference tokens."""
+    if pointer == "":
+        raise SecretArgumentBindingError("empty root JSON Pointer is not allowed")
+    if not pointer.startswith("/"):
+        raise SecretArgumentBindingError(f"JSON Pointer must start with '/': {pointer!r}")
+    raw_tokens = pointer.split("/")[1:]
+    tokens: list[str] = []
+    for raw in raw_tokens:
+        if "*" in raw:
+            raise SecretArgumentBindingError("wildcard is not allowed in a secret path")
+        token = _unescape_token(raw)
+        if token in ("", ".", ".."):
+            raise SecretArgumentBindingError(f"invalid reference token: {raw!r}")
+        tokens.append(token)
+    return tuple(tokens)
+
+
+def _unescape_token(raw: str) -> str:
+    result: list[str] = []
+    index = 0
+    while index < len(raw):
+        char = raw[index]
+        if char == "~":
+            if index + 1 >= len(raw) or raw[index + 1] not in ("0", "1"):
+                raise SecretArgumentBindingError(f"invalid escape in token: {raw!r}")
+            result.append("~" if raw[index + 1] == "0" else "/")
+            index += 2
+            continue
+        result.append(char)
+        index += 1
+    return "".join(result)
+
+
+def _is_array_index(token: str) -> bool:
+    if token == "0":  # noqa: S105 - array index literal, not a secret
+        return True
+    return token.isdigit() and not token.startswith("0")
+
+
+def resolve_pointer(tokens: tuple[str, ...], arguments: CanonicalJsonObject) -> Any:
+    """Resolve tokens against validated arguments, failing closed if absent."""
+    current: Any = arguments
+    for token in tokens:
+        if isinstance(current, Mapping):
+            if token not in current:
+                raise SecretArgumentBindingError(f"secret path does not resolve: missing key {token!r}")
+            current = current[token]
+        elif isinstance(current, Sequence) and not isinstance(current, (str, bytes)):
+            if not _is_array_index(token):
+                raise SecretArgumentBindingError(f"invalid array index token: {token!r}")
+            idx = int(token)
+            if idx >= len(current):
+                raise SecretArgumentBindingError("secret path array index out of range")
+            current = current[idx]
+        else:
+            raise SecretArgumentBindingError("secret path descends into a scalar leaf")
+    return current
+
+
+def validate_secret_argument_paths(
+    paths: tuple[str, ...],
+    arguments: CanonicalJsonObject,
+) -> tuple[tuple[str, ...], ...]:
+    """Validate every secret path, returning parsed token tuples.
+
+    Enforces canonical grammar, unique existing leaves, and that no path is an
+    ancestor of another.
+    """
+    parsed: list[tuple[str, ...]] = [parse_json_pointer(path) for path in paths]
+    for outer in range(len(parsed)):
+        for inner in range(len(parsed)):
+            if outer == inner:
+                continue
+            if _is_ancestor(parsed[outer], parsed[inner]):
+                raise SecretArgumentBindingError("secret paths overlap (ancestor/descendant or alias)")
+    for tokens in parsed:
+        leaf = resolve_pointer(tokens, arguments)
+        if not isinstance(leaf, Mapping):
+            raise SecretArgumentBindingError("secret argument leaf must be a typed secret reference object")
+    return tuple(parsed)
+
+
+def _is_ancestor(candidate: tuple[str, ...], other: tuple[str, ...]) -> bool:
+    """True if ``candidate`` equals or is a prefix of ``other``."""
+    if len(candidate) > len(other):
+        return False
+    return other[: len(candidate)] == candidate

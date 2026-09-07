@@ -1,0 +1,141 @@
+"""Tool Registry revision, validation and digest (SystemDesign §20).
+
+A ``ToolRegistryRevision`` is an immutable, validated set of tool definitions
+pinned to a revision number. Validation enforces the registry's structural
+safety rules (timeouts, target-mode/binding-mode coherence, registered target
+extractors, secret-path grammar, sandbox requirements for high-risk
+local/MCP tools). The registry digest is order-independent over the tools.
+"""
+
+from __future__ import annotations
+
+from pydantic import Field
+
+from redteam_agent.canonical.digest_service import DigestService
+from redteam_agent.contracts.catalog import ActionContractCatalog, parameter_schema_digest
+from redteam_agent.errors import SecretArgumentBindingError, ToolRegistryValidationError
+from redteam_agent.models.base import StrictImmutableBoundaryModel
+from redteam_agent.tools.models import ToolDefinition
+from redteam_agent.tools.secret_argument_path import parse_json_pointer
+from redteam_agent.tools.target_extractors import (
+    DEFAULT_TARGET_EXTRACTOR_REGISTRY,
+    TrustedTargetExtractorRegistry,
+)
+
+
+def _validate_contract(tool: ToolDefinition, catalog: ActionContractCatalog) -> None:
+    ref = tool.action_contract_ref
+    definition = catalog.get(ref.contract_id)
+    tid = tool.tool_ref.tool_id
+    if definition is None:
+        raise ToolRegistryValidationError(f"tool {tid}: unregistered action contract {ref.contract_id!r}")
+    if definition.revision != ref.revision or definition.definition_digest != ref.digest:
+        raise ToolRegistryValidationError(f"tool {tid}: action contract revision/digest mismatch")
+    if definition.tool_id != tid or definition.registry_revision != tool.tool_ref.registry_revision:
+        raise ToolRegistryValidationError(f"tool {tid}: action contract is bound to a different ToolRef")
+    if definition.parameter_schema_digest != parameter_schema_digest(tool.parameter_schema):
+        raise ToolRegistryValidationError(f"tool {tid}: action contract parameter schema digest mismatch")
+    if definition.target_extractor_id != tool.target_extractor_id:
+        raise ToolRegistryValidationError(f"tool {tid}: action contract target extractor mismatch")
+    if tuple(definition.evidence_rule_ids) != tuple(tool.evidence_rule_ids):
+        raise ToolRegistryValidationError(f"tool {tid}: action contract evidence rules mismatch")
+    if definition.output_publication_rule_id != tool.output_publication_rule_id:
+        raise ToolRegistryValidationError(f"tool {tid}: action contract publication rule mismatch")
+    if definition.minimum_risk_level != tool.minimum_risk_level or definition.side_effect != tool.side_effect:
+        raise ToolRegistryValidationError(f"tool {tid}: action contract risk/side-effect mismatch")
+
+
+class ToolRegistryRevision(StrictImmutableBoundaryModel):
+    registry_revision: int = Field(ge=1)
+    tools: tuple[ToolDefinition, ...]
+    registry_digest: str = Field(min_length=1)
+
+    def by_ref(self, tool_id: str, registry_revision: int) -> ToolDefinition | None:
+        for tool in self.tools:
+            if tool.tool_ref.tool_id == tool_id and tool.tool_ref.registry_revision == registry_revision:
+                return tool
+        return None
+
+
+def _validate_tool(tool: ToolDefinition, revision: int, extractors: TrustedTargetExtractorRegistry) -> None:
+    if tool.tool_ref.registry_revision != revision:
+        raise ToolRegistryValidationError(
+            f"tool {tool.tool_ref.tool_id} pins registry_revision {tool.tool_ref.registry_revision}, "
+            f"not {revision}"
+        )
+    if tool.default_timeout_seconds > tool.max_timeout_seconds:
+        raise ToolRegistryValidationError(f"tool {tool.tool_ref.tool_id}: default timeout exceeds max timeout")
+
+    if tool.target_mode == "none":
+        if tool.required_target_binding_modes != frozenset({"none"}):
+            raise ToolRegistryValidationError(
+                f"tool {tool.tool_ref.tool_id}: target_mode=none requires binding modes == {{'none'}}"
+            )
+    else:
+        if not tool.required_target_binding_modes:
+            raise ToolRegistryValidationError(
+                f"tool {tool.tool_ref.tool_id}: dynamic-target tool needs at least one binding mode"
+            )
+        if "none" in tool.required_target_binding_modes:
+            raise ToolRegistryValidationError(
+                f"tool {tool.tool_ref.tool_id}: dynamic-target tool must not include 'none' binding mode"
+            )
+
+    if tool.target_mode == "required" and tool.target_extractor_id is None:
+        raise ToolRegistryValidationError(
+            f"tool {tool.tool_ref.tool_id}: target_mode=required needs a target extractor"
+        )
+    if tool.target_extractor_id is not None and not extractors.is_registered(tool.target_extractor_id):
+        raise ToolRegistryValidationError(
+            f"tool {tool.tool_ref.tool_id}: unregistered target extractor {tool.target_extractor_id!r}"
+        )
+
+    for path in tool.secret_argument_paths:
+        try:
+            parse_json_pointer(path)
+        except SecretArgumentBindingError as exc:
+            raise ToolRegistryValidationError(
+                f"tool {tool.tool_ref.tool_id}: invalid secret argument path {path!r}: {exc}"
+            ) from exc
+
+    if tool.minimum_risk_level == "high" and tool.adapter in ("local", "mcp") and tool.sandbox_requirement is None:
+        raise ToolRegistryValidationError(
+            f"tool {tool.tool_ref.tool_id}: high-risk {tool.adapter} tool requires a sandbox requirement"
+        )
+
+
+def _tool_payload(tool: ToolDefinition) -> dict[str, object]:
+    return tool.model_dump(mode="python")
+
+
+def build_tool_registry(
+    *,
+    registry_revision: int,
+    tools: tuple[ToolDefinition, ...],
+    digest_service: DigestService,
+    contract_catalog: ActionContractCatalog,
+    extractors: TrustedTargetExtractorRegistry | None = None,
+) -> ToolRegistryRevision:
+    """Validate the tools and construct a digest-bound registry revision.
+
+    Every tool must resolve to a registered action contract that matches it; an
+    unresolved or mismatched contract reference is rejected.
+    """
+    resolver = extractors if extractors is not None else DEFAULT_TARGET_EXTRACTOR_REGISTRY
+    seen: set[str] = set()
+    for tool in tools:
+        if tool.tool_ref.tool_id in seen:
+            raise ToolRegistryValidationError(f"duplicate tool_id in revision: {tool.tool_ref.tool_id}")
+        seen.add(tool.tool_ref.tool_id)
+        _validate_tool(tool, registry_revision, resolver)
+        _validate_contract(tool, contract_catalog)
+
+    ordered = tuple(sorted(tools, key=lambda t: (t.tool_ref.tool_id, t.tool_ref.registry_revision)))
+    payload = {
+        "registry_revision": registry_revision,
+        "tools": [_tool_payload(tool) for tool in ordered],
+    }
+    digest = digest_service.compute("registry_digest", payload)
+    # Tools are stored in the same canonical order that was hashed so the
+    # registry digest re-verifies as a generic object-integrity digest.
+    return ToolRegistryRevision(registry_revision=registry_revision, tools=ordered, registry_digest=digest)
