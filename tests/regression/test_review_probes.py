@@ -21,6 +21,7 @@ from redteam_agent.errors import (
     AuthorizationKernelError,
     DataAccessResourceError,
     MissionValidationError,
+    PolicyEvaluationIndeterminateError,
     SessionContextGrantStaleError,
     ToolRegistryValidationError,
 )
@@ -93,8 +94,8 @@ def test_p01_registered_schema_is_enforced() -> None:
                 "type": "object",
                 "properties": {
                     "destinations": {"type": "array", "items": {"type": "string"}},
-                    "port": {"const": 8443},
-                    "protocol": {"const": "tcp"},
+                    "port": {"type": "integer", "const": 8443},
+                    "protocol": {"type": "string", "const": "tcp"},
                 },
                 "required": ["destinations", "port", "protocol"],
                 "additionalProperties": False,
@@ -119,12 +120,19 @@ def test_p01_positive_schema_matching_arguments_allowed() -> None:
 
 
 def test_p02_artifact_without_data_grant_denied() -> None:
+    schema = {
+        "type": "object",
+        "properties": {"artifact_ids": {"type": "array", "items": {"type": "string"}}},
+        "required": ["artifact_ids"],
+        "additionalProperties": False,
+    }
     tool = support.network_tool().model_copy(
         update={
             "target_mode": "none",
             "target_extractor_id": "artifact_target_v1",
             "required_target_binding_modes": frozenset({"none"}),
             "required_data_access_types": frozenset({"artifact"}),
+            "parameter_schema": schema,
         }
     )
     kernel, seeded = _setup(tool=tool)
@@ -133,25 +141,68 @@ def test_p02_artifact_without_data_grant_denied() -> None:
     assert not result.authorized
 
 
+def test_p02_positive_artifact_is_bound_to_data_grant() -> None:
+    from redteam_agent.resources.resource_metadata import ResourceMetadata
+
+    schema = {
+        "type": "object",
+        "properties": {"artifact_ids": {"type": "array", "items": {"type": "string"}}},
+        "required": ["artifact_ids"],
+        "additionalProperties": False,
+    }
+    tool = support.network_tool().model_copy(
+        update={
+            "target_mode": "none",
+            "target_extractor_id": "artifact_target_v1",
+            "required_target_binding_modes": frozenset({"none"}),
+            "required_data_access_types": frozenset({"artifact"}),
+            "parameter_schema": schema,
+        }
+    )
+    policy = DataAccessPolicy(
+        allowed=(
+            DataAccessRule(
+                resource_type="artifact",
+                resource_pattern="exact:a1",
+                operations=frozenset({"read"}),
+            ),
+        ),
+        prohibited=(),
+    )
+    kernel, seeded = _setup(
+        tool=tool,
+        revision_transform=lambda k, r: _redigest(k, r, data_access_policy=policy),
+    )
+    kernel.resource_metadata_store.put(
+        ResourceMetadata(
+            resource_id="a1",
+            resource_type="artifact",
+            version="1",
+            metadata_digest="artifact-1",
+            classification="redacted",
+        )
+    )
+    decision, result = _gate(kernel, _plan(kernel, seeded, {"artifact_ids": ["a1"]}))
+    assert decision.decision == "ALLOW"
+    assert result.authorized
+    assert [grant.resource.resource_id for grant in decision.authorized_data_access] == ["a1"]
+
+
 # --- P03: target_mode none with no extractor still resolves no targets ---
 
 
 def test_p03_target_none_without_extractor_rejects_smuggled_destination() -> None:
-    # A no-target tool has no extractor; its closed parameter schema declares no
-    # destination field, so a smuggled destination argument is rejected up front
-    # rather than reaching an unscoped target.
+    # Preserve the original network schema and remove only the extractor.  The
+    # registry must reject this inconsistent authority declaration.
     tool = support.network_tool().model_copy(
         update={
             "target_mode": "none",
             "target_extractor_id": None,
             "required_target_binding_modes": frozenset({"none"}),
-            "parameter_schema": {"type": "object", "properties": {}, "additionalProperties": False},
         }
     )
-    kernel, seeded = _setup(tool=tool)
-    _assert_not_authorized(
-        kernel, _plan(kernel, seeded, {"destinations": ["203.0.113.1"], "port": 443, "protocol": "tcp"})
-    )
+    with pytest.raises(ToolRegistryValidationError):
+        _setup(tool=tool)
 
 
 # --- P04: snapshot cannot cross missions ---------------------------------
@@ -176,8 +227,8 @@ def test_p05_empty_precondition_digest_denied() -> None:
     kernel, seeded = _setup()
     plan = _plan(kernel, seeded).model_copy(update={"execution_precondition_digest": ""})
     plan = ExecutionPlan.from_untrusted_json(plan.model_dump_json())
-    _decision, result = _gate(kernel, plan)
-    assert not result.authorized
+    with pytest.raises(PolicyEvaluationIndeterminateError):
+        support.issue_decision(kernel, plan=plan)
 
 
 # --- P06: forged context grant model is not trusted ----------------------
@@ -544,7 +595,7 @@ def test_p22_positive_authenticated_actor_recorded_in_audit() -> None:
 def test_p23_unicode_pointer_not_array_index() -> None:
     from redteam_agent.tools.secret_argument_path import validate_secret_argument_paths
 
-    args = {"items": [{}, {"secret_version_id": "sv-1"}]}
+    args = {"items": [{}, support.secret_reference()]}
     # '/items/1' is a valid array index; an ARABIC-INDIC DIGIT ONE (U+0661) is
     # not and must not alias to index 1 (R21).
     arabic_indic_one = "١"  # noqa: RUF001 - literal ARABIC-INDIC DIGIT ONE under test
@@ -555,7 +606,7 @@ def test_p23_unicode_pointer_not_array_index() -> None:
 def test_p23_positive_ascii_array_index_accepted() -> None:
     from redteam_agent.tools.secret_argument_path import validate_secret_argument_paths
 
-    args = {"items": [{}, {"secret_version_id": "sv-1"}]}
+    args = {"items": [{}, support.secret_reference()]}
     validate_secret_argument_paths(("/items/1",), args)
 
 
@@ -633,3 +684,20 @@ def test_p25_decision_adapter_field_tamper_denied() -> None:
     # gate's adapter re-check against the registered tool deny the tamper (R23).
     result = kernel.authorization_gate.authorize_execution(decision_id=decision.decision_id, plan=plan)
     assert not result.authorized
+
+
+def test_p17_nested_tool_ref_bool_revision_rejected() -> None:
+    from redteam_agent.plan.models import compute_proposal_digest
+
+    kernel, seeded = _setup()
+    plan = _plan(kernel, seeded)
+    ref = plan.proposal.tool_ref.model_copy(update={"registry_revision": True})
+    proposal = plan.proposal.model_copy(update={"tool_ref": ref})
+    plan = plan.model_copy(
+        update={"proposal": proposal, "proposal_digest": compute_proposal_digest(proposal, kernel.digest_service)}
+    )
+    decision = support.issue_decision(kernel, plan=plan)
+    assert decision.decision == "DENY"
+    assert not kernel.authorization_gate.authorize_execution(
+        decision_id=decision.decision_id, plan=plan
+    ).authorized

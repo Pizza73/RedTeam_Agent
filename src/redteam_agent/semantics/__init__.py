@@ -24,6 +24,11 @@ class SemanticCatalog:
     finding_fact_types: frozenset[str]
     # Canonical entity references known to the (fixed test-double) entity catalog.
     registered_entity_refs: frozenset[str]
+    registered_session_refs: frozenset[str] = frozenset()
+    registered_host_refs: frozenset[str] = frozenset()
+    # (condition kind, goal rule, proof schema, source capability).  This is a
+    # fixed Phase 0A catalog binding, not runtime goal-evaluation state.
+    condition_support_bindings: frozenset[tuple[str, str, str, str]] = frozenset()
 
 
 def default_semantic_catalog() -> SemanticCatalog:
@@ -35,4 +40,28 @@ def default_semantic_catalog() -> SemanticCatalog:
         condition_kinds=frozenset({"session_established", "host_privilege", "finding_confirmed"}),
         finding_fact_types=frozenset({"identity", "service", "relationship", "finding"}),
         registered_entity_refs=frozenset({"entity:host-1", "entity:dc-01", "entity:svc-http"}),
+        registered_session_refs=frozenset({"sess-1"}),
+        registered_host_refs=frozenset({"host-1"}),
+        condition_support_bindings=frozenset(
+            {
+                (
+                    "session_established",
+                    "goal-rule:session-established-v1",
+                    "proof-schema:session-established-v1",
+                    "source-capability:session-catalog-v1",
+                ),
+                (
+                    "host_privilege",
+                    "goal-rule:host-privilege-v1",
+                    "proof-schema:host-privilege-v1",
+                    "source-capability:session-security-context-v1",
+                ),
+                (
+                    "finding_confirmed",
+                    "goal-rule:finding-confirmed-v1",
+                    "proof-schema:finding-confirmed-v1",
+                    "source-capability:knowledge-fact-v1",
+                ),
+            }
+        ),
     )

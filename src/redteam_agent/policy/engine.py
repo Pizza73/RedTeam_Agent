@@ -31,6 +31,7 @@ from redteam_agent.errors import (
     PolicyEvaluationIndeterminateError,
     TargetExtractorResolutionError,
 )
+from redteam_agent.models.base import strict_revalidate
 from redteam_agent.models.common import ResourceBinding
 from redteam_agent.plan.models import ExecutionPlan
 from redteam_agent.policy.data_access import DataAccessOperation, DataAccessPolicy, ResourceType, evaluate_data_access
@@ -49,7 +50,12 @@ from redteam_agent.resources.secret_metadata import SecretMetadataReader
 from redteam_agent.session.models import SessionSecurityContext
 from redteam_agent.tools.models import ToolDefinition
 from redteam_agent.tools.parameter_schema import validate_arguments
-from redteam_agent.tools.secret_argument_path import parse_json_pointer, resolve_pointer, validate_secret_argument_paths
+from redteam_agent.tools.secret_argument_path import (
+    parse_json_pointer,
+    resolve_pointer,
+    validate_secret_argument_paths,
+    validate_secret_reference,
+)
 from redteam_agent.tools.target_extractors import (
     DEFAULT_TARGET_EXTRACTOR_REGISTRY,
     TargetExtractionInput,
@@ -229,8 +235,11 @@ class PolicyEngine:
         requests: list[_DataAccessRequest] = []
         for path in tool.secret_argument_paths:
             leaf = resolve_pointer(parse_json_pointer(path), plan.proposal.arguments)
-            if not isinstance(leaf, Mapping):
+            try:
+                validate_secret_reference(leaf)
+            except Exception:
                 return False, [], ("SECRET_REFERENCE_INVALID",)
+            assert isinstance(leaf, Mapping)
             version_id = leaf.get("secret_version_id")
             if not isinstance(version_id, str):
                 return False, [], ("SECRET_REFERENCE_INVALID",)
@@ -242,7 +251,7 @@ class PolicyEngine:
             if metadata.expires_at is not None and now >= metadata.expires_at:
                 return False, [], ("SECRET_EXPIRED",)
             claimed_version = leaf.get("secret_version")
-            if isinstance(claimed_version, str) and claimed_version != metadata.version:
+            if claimed_version != metadata.version:
                 return False, [], ("SECRET_VERSION_MISMATCH",)
             requests.append(
                 _DataAccessRequest(
@@ -366,7 +375,7 @@ class PolicyEngine:
         # the tool's registered parameter schema before anything is trusted (R01).
         inputs_ok = True
         try:
-            type(plan).model_validate(dict(plan))
+            strict_revalidate(plan)
         except Exception:
             inputs_ok = False
             reason_codes.append("PLAN_SCHEMA_INVALID")

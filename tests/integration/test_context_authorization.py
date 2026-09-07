@@ -16,6 +16,7 @@ from redteam_agent.errors import (
     SessionContextGrantStaleError,
 )
 from redteam_agent.policy.data_access import DataAccessPolicy, DataAccessRule
+from redteam_agent.policy.scope_models import HostScopeRule, SessionScopeRule
 from redteam_agent.resources.resource_metadata import ResourceMetadata
 from redteam_agent.runtime.clock import ManualClock
 
@@ -56,10 +57,20 @@ def _kernel(clock=None):
     return build_test_kernel(clock=clock or ManualClock(support.T0))
 
 
-def _seed(kernel, *, data_access_policy=None):
+def _seed(kernel, *, data_access_policy=None, allow_context_session=True):
     tool = support.network_tool()
+    allowed_scope = support.default_scope()
+    if allow_context_session:
+        allowed_scope = (
+            *allowed_scope,
+            SessionScopeRule(type="session", session_id="sess-1"),
+            HostScopeRule(type="host", host_id="host-1"),
+        )
     revision = support.mission_revision(
-        kernel.digest_service, profile=support.make_profile(kernel.digest_service), data_access_policy=data_access_policy
+        kernel.digest_service,
+        profile=support.make_profile(kernel.digest_service),
+        data_access_policy=data_access_policy,
+        allowed_scope=allowed_scope,
     )
     return support.seed_running_mission(kernel, tool=tool, revision=revision, session_ids=("sess-1",))
 
@@ -208,3 +219,21 @@ def test_source_substitution_after_issue_rejected() -> None:
     kernel.resource_metadata_store.put(_resource_metadata(version="2", digest="artifact-digest-2"))
     with pytest.raises(DataAccessResourceError):
         kernel.context_authorization_service.verify_grant(grant_id="grant-1", mission_id=support.MISSION_ID)
+
+
+def test_scope_outside_session_rejected() -> None:
+    kernel = _kernel()
+    _seed(kernel, data_access_policy=_read_policy(), allow_context_session=False)
+    with pytest.raises(SessionContextGrantStaleError):
+        _issue(kernel, candidates=(), sessions=("sess-1",))
+
+
+def test_encrypted_raw_context_resource_rejected() -> None:
+    kernel = _kernel()
+    _seed(kernel, data_access_policy=_read_policy())
+    kernel.index_repository.save(_index_record().model_copy(update={"classification": "encrypted_raw"}))
+    kernel.resource_metadata_store.put(
+        _resource_metadata().model_copy(update={"classification": "encrypted_raw"})
+    )
+    with pytest.raises(DataAccessResourceError):
+        _issue(kernel, sessions=())

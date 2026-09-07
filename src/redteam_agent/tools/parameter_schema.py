@@ -37,23 +37,48 @@ def _is_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
+def _json_equal(left: Any, right: Any) -> bool:
+    """JSON equality with distinct boolean and number domains."""
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(_json_equal(left[key], right[key]) for key in left)
+    if isinstance(left, list):
+        return len(left) == len(right) and all(_json_equal(a, b) for a, b in zip(left, right, strict=True))
+    return bool(left == right)
+
+
+def _has_declared_type(declared_type: str, value: Any) -> bool:
+    if declared_type == "object":
+        return isinstance(value, dict)
+    if declared_type == "array":
+        return isinstance(value, list)
+    if declared_type == "string":
+        return isinstance(value, str)
+    if declared_type == "integer":
+        return _is_int(value)
+    if declared_type == "number":
+        return not isinstance(value, bool) and isinstance(value, (int, float))
+    if declared_type == "boolean":
+        return isinstance(value, bool)
+    return value is None
+
+
 def _validate(schema: Any, value: Any, path: str) -> None:
     if not isinstance(schema, dict):
         raise ParameterSchemaError(f"schema node is not an object at {path}")
     _check_keywords(schema)
 
-    if "const" in schema and value != schema["const"]:
+    declared_type = schema.get("type")
+    if declared_type not in _SUPPORTED_TYPES:
+        raise ParameterSchemaError(f"missing or unsupported schema type at {path}")
+    if "const" in schema and not _json_equal(value, schema["const"]):
         raise ParameterSchemaError(f"const mismatch at {path}")
     if "enum" in schema:
         enum = schema["enum"]
-        if not isinstance(enum, list) or value not in enum:
+        if not isinstance(enum, list) or not any(_json_equal(value, member) for member in enum):
             raise ParameterSchemaError(f"enum mismatch at {path}")
-
-    declared_type = schema.get("type")
-    if declared_type is not None:
-        if declared_type not in _SUPPORTED_TYPES:
-            raise ParameterSchemaError(f"unsupported schema type at {path}")
-        _validate_type(declared_type, schema, value, path)
+    _validate_type(declared_type, schema, value, path)
 
 
 def _validate_type(declared_type: str, schema: dict[str, Any], value: Any, path: str) -> None:
@@ -118,7 +143,9 @@ def _validate_array(schema: dict[str, Any], value: Any, path: str) -> None:
 
 def validate_arguments(parameter_schema: Any, arguments: Any) -> None:
     """Validate arguments against the tool's registered parameter schema."""
-    _validate(thaw(parameter_schema), thaw(arguments), "$")
+    schema = thaw(parameter_schema)
+    _assert_schema_supported(schema, "$")
+    _validate(schema, thaw(arguments), "$")
 
 
 def validate_schema_is_supported(parameter_schema: Any) -> None:
@@ -131,9 +158,58 @@ def _assert_schema_supported(schema: Any, path: str) -> None:
         raise ParameterSchemaError(f"schema node is not an object at {path}")
     _check_keywords(schema)
     declared_type = schema.get("type")
-    if declared_type is not None and declared_type not in _SUPPORTED_TYPES:
-        raise ParameterSchemaError(f"unsupported schema type at {path}")
-    for key, sub in schema.get("properties", {}).items():
-        _assert_schema_supported(sub, f"{path}.{key}")
-    if isinstance(schema.get("items"), dict):
+    if declared_type not in _SUPPORTED_TYPES:
+        raise ParameterSchemaError(f"missing or unsupported schema type at {path}")
+
+    object_keywords = {"properties", "required", "additionalProperties"}
+    array_keywords = {"items", "minItems"}
+    numeric_keywords = {"minimum", "maximum"}
+    if object_keywords.intersection(schema) and declared_type != "object":
+        raise ParameterSchemaError(f"object keyword on non-object schema at {path}")
+    if array_keywords.intersection(schema) and declared_type != "array":
+        raise ParameterSchemaError(f"array keyword on non-array schema at {path}")
+    if numeric_keywords.intersection(schema) and declared_type not in {"integer", "number"}:
+        raise ParameterSchemaError(f"numeric keyword on non-numeric schema at {path}")
+
+    if "const" in schema and not _has_declared_type(declared_type, schema["const"]):
+        raise ParameterSchemaError(f"const does not match declared type at {path}")
+    if "enum" in schema:
+        enum = schema["enum"]
+        if not isinstance(enum, list) or not enum:
+            raise ParameterSchemaError(f"enum must be a non-empty array at {path}")
+        if any(not _has_declared_type(declared_type, member) for member in enum):
+            raise ParameterSchemaError(f"enum member does not match declared type at {path}")
+        for index, member in enumerate(enum):
+            if any(_json_equal(member, prior) for prior in enum[:index]):
+                raise ParameterSchemaError(f"duplicate enum member at {path}")
+
+    if declared_type == "object":
+        properties = schema.get("properties", {})
+        required = schema.get("required", [])
+        additional = schema.get("additionalProperties", False)
+        if not isinstance(properties, dict):
+            raise ParameterSchemaError(f"properties must be an object at {path}")
+        if not isinstance(required, list) or any(not isinstance(item, str) for item in required):
+            raise ParameterSchemaError(f"required must be a string array at {path}")
+        if len(required) != len(set(required)) or any(item not in properties for item in required):
+            raise ParameterSchemaError(f"required must name unique declared properties at {path}")
+        if not isinstance(additional, bool):
+            raise ParameterSchemaError(f"additionalProperties must be a boolean at {path}")
+        for key, sub in properties.items():
+            if not isinstance(key, str):
+                raise ParameterSchemaError(f"property name must be a string at {path}")
+            _assert_schema_supported(sub, f"{path}.{key}")
+    elif declared_type == "array":
+        if "items" not in schema:
+            raise ParameterSchemaError(f"array schema requires items at {path}")
         _assert_schema_supported(schema["items"], f"{path}[]")
+        if "minItems" in schema and (not _is_int(schema["minItems"]) or schema["minItems"] < 0):
+            raise ParameterSchemaError(f"minItems must be a non-negative integer at {path}")
+
+    for keyword in ("minimum", "maximum"):
+        if keyword in schema and (
+            isinstance(schema[keyword], bool) or not isinstance(schema[keyword], (int, float))
+        ):
+            raise ParameterSchemaError(f"{keyword} must be numeric at {path}")
+    if "minimum" in schema and "maximum" in schema and schema["minimum"] > schema["maximum"]:
+        raise ParameterSchemaError(f"minimum exceeds maximum at {path}")

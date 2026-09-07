@@ -88,6 +88,14 @@ class ActionContractCatalog:
             self.register(definition)
 
     def register(self, definition: ActionContractDefinition) -> None:
+        # Phase 0A has no trusted predicate evaluator.  Accepting free-form
+        # predicates would turn a digest match into a fabricated proof, so the
+        # only registered contract is the explicit no-additional-preconditions
+        # form. Later phases may replace this closed rule with typed predicates.
+        if definition.preconditions or definition.observes or definition.may_change:
+            raise ToolRegistryValidationError(
+                "Phase 0A action contracts cannot declare unevaluated predicates"
+            )
         existing = self._by_id.get(definition.contract_id)
         if existing is not None and existing != definition:
             raise ToolRegistryValidationError(f"conflicting action contract: {definition.contract_id}")

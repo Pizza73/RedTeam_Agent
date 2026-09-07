@@ -45,6 +45,7 @@ from redteam_agent.mission.models import (
     MissionRevision,
     MissionState,
 )
+from redteam_agent.models.base import strict_revalidate
 from redteam_agent.policy.models import PolicyDecision
 from redteam_agent.policy.risk_policy import EffectiveRiskPolicy
 from redteam_agent.sandbox.models import SandboxCapabilities
@@ -71,8 +72,8 @@ class _BaseRepository:
         # warning echoing the offending value). The exception chain is dropped so
         # no input value leaks into a traceback (Codex #B / G).
         try:
-            validated = type(model).model_validate(dict(model))
-        except ValidationError:
+            validated = strict_revalidate(model)
+        except (ValidationError, TypeError, ValueError):
             raise RepositoryIntegrityError("model failed strict schema validation before storage") from None
         verify_object_integrity(validated, self._digests)  # write-side integrity
         return validated.model_dump_json()

@@ -9,6 +9,7 @@ the guard held only here).
 
 from __future__ import annotations
 
+from redteam_agent.contracts.catalog import ActionContractCatalog
 from redteam_agent.errors import PolicyEvaluationIndeterminateError
 from redteam_agent.plan.models import ExecutionPlan
 from redteam_agent.policy.engine import PolicyEngine, context_from_mission
@@ -40,6 +41,7 @@ class ExecutionAuthorizationService:
         clock: Clock,
         write_guard: WriteGuard,
         registry_revision: int,
+        contract_catalog: ActionContractCatalog,
     ) -> None:
         self._engine = engine
         self._resolver = context_resolver
@@ -51,6 +53,7 @@ class ExecutionAuthorizationService:
         self._clock = clock
         self._guard = write_guard
         self._registry_revision = registry_revision
+        self._contracts = contract_catalog
         decision_repository.bind_owner(write_guard)
 
     def issue(self, *, decision_id: str, plan: ExecutionPlan) -> PolicyDecision:
@@ -68,6 +71,13 @@ class ExecutionAuthorizationService:
         tool = registry.by_ref(plan.proposal.tool_ref.tool_id, plan.proposal.tool_ref.registry_revision)
         if tool is None:
             raise PolicyEvaluationIndeterminateError("proposed tool is not in the registry")
+        contract = self._contracts.get(tool.action_contract_ref.contract_id)
+        if contract is None or contract.reference() != tool.action_contract_ref:
+            raise PolicyEvaluationIndeterminateError("registered action contract is unavailable")
+        if plan.action_contract_ref != tool.action_contract_ref:
+            raise PolicyEvaluationIndeterminateError("plan action contract does not match the registered tool")
+        if plan.execution_precondition_digest != contract.execution_precondition_digest:
+            raise PolicyEvaluationIndeterminateError("plan precondition digest does not match the registered contract")
         adapter = self._adapters.get(tool.adapter_id)
         if adapter is None:
             raise PolicyEvaluationIndeterminateError("tool adapter capabilities not found")

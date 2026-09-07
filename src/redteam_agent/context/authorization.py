@@ -31,6 +31,8 @@ from redteam_agent.mission.models import MissionRevision, MissionState
 from redteam_agent.models.common import ResourceBinding
 from redteam_agent.policy.data_access import evaluate_data_access
 from redteam_agent.policy.models import DataAccessGrant, SessionContextGrant
+from redteam_agent.policy.scope_engine import evaluate_targets
+from redteam_agent.policy.scope_models import NormalizedTarget
 from redteam_agent.policy.ttl import enforce_ttl
 from redteam_agent.resources.resource_metadata import ResourceMetadataReader
 from redteam_agent.runtime.clock import Clock
@@ -46,6 +48,8 @@ from redteam_agent.storage.repositories import (
 )
 
 _VALID_SERVICE_IDENTITIES = frozenset({"planner_context", "analyzer_context"})
+_CONTEXT_SAFE_CLASSIFICATIONS = frozenset({"public", "internal", "redacted", "summary"})
+_CONTEXT_SAFE_SESSION_STATUSES = frozenset({"ok"})
 DEFAULT_MAX_CONTEXT_GRANT_TTL_SECONDS = 900
 
 
@@ -101,7 +105,9 @@ class ContextAuthorizationService:
             raise SessionContextGrantStaleError("mission is outside its validity window")
         return state, revision
 
-    def _session_digest_and_freshness(self, session_ids: tuple[str, ...], now: datetime) -> str:
+    def _session_digest_and_freshness(
+        self, session_ids: tuple[str, ...], revision: MissionRevision, now: datetime
+    ) -> str:
         contexts = []
         for session_id in session_ids:
             snap = self._sessions.get(session_id)
@@ -109,6 +115,18 @@ class ContextAuthorizationService:
                 raise SessionContextGrantStaleError("session not found for grant")
             if not (now < snap.session_fresh_until):
                 raise SessionContextGrantStaleError("session is stale (past freshness bound)")
+            if snap.context.security_status not in _CONTEXT_SAFE_SESSION_STATUSES:
+                raise SessionContextGrantStaleError("session security status is not context-safe")
+            scope = evaluate_targets(
+                revision.allowed_execution_scope,
+                revision.prohibited_execution_scope,
+                (
+                    NormalizedTarget(type="session", canonical_value=session_id, source="session"),
+                    NormalizedTarget(type="host", canonical_value=snap.context.host, source="session"),
+                ),
+            )
+            if not scope.allowed:
+                raise SessionContextGrantStaleError("session or host is outside mission scope")
             contexts.append(snap.context)
         return compute_session_security_context_digest(tuple(contexts), self._digests)
 
@@ -121,6 +139,8 @@ class ContextAuthorizationService:
             or source.metadata_digest != grant.resource.resource_digest
         ):
             raise DataAccessResourceError("granted resource version/digest changed since issuance")
+        if source.classification not in _CONTEXT_SAFE_CLASSIFICATIONS:
+            raise DataAccessResourceError("granted resource classification is not context-safe")
 
     # --- issuance ---------------------------------------------------------
 
@@ -157,6 +177,10 @@ class ContextAuthorizationService:
                 raise DataAccessResourceError("candidate origin resource not present in the source of truth")
             if record.resource_type != source.resource_type:
                 raise DataAccessResourceError("index/source resource type mismatch")
+            if record.classification != source.classification:
+                raise DataAccessResourceError("index/source resource classification mismatch")
+            if source.classification not in _CONTEXT_SAFE_CLASSIFICATIONS:
+                raise DataAccessResourceError("resource classification is not context-safe")
             if record.origin_record_version != source.version or record.origin_record_digest != source.metadata_digest:
                 raise DataAccessResourceError("index/source resource binding mismatch")
             decision = evaluate_data_access(revision.data_access_policy, source.resource_type, origin_id, "read")
@@ -187,7 +211,9 @@ class ContextAuthorizationService:
         ordered_sessions = tuple(sorted(session_ids))
         session_context = SessionContextGrant(
             authorized_session_ids=ordered_sessions,
-            session_security_context_digest=self._session_digest_and_freshness(ordered_sessions, now),
+            session_security_context_digest=self._session_digest_and_freshness(
+                ordered_sessions, revision, now
+            ),
         )
 
         expires_at = now + timedelta(seconds=ttl_seconds)
@@ -235,7 +261,7 @@ class ContextAuthorizationService:
         grant = self._grants.get(grant_id)  # authoritative, digest-verified
         if grant is None:
             raise SessionContextGrantStaleError("grant not found")
-        state, _revision = self._running_revision(mission_id, now)
+        state, revision = self._running_revision(mission_id, now)
         if grant.mission_id != mission_id or grant.mission_revision != state.mission_revision:
             raise SessionContextGrantStaleError("grant mission revision is stale")
         if grant.authorization_epoch != state.authorization_epoch:
@@ -246,7 +272,9 @@ class ContextAuthorizationService:
             raise SessionContextGrantStaleError("grant service identity is invalid")
         if not (now < grant.expires_at):
             raise SessionContextGrantStaleError("grant expired")
-        current_digest = self._session_digest_and_freshness(grant.session_context.authorized_session_ids, now)
+        current_digest = self._session_digest_and_freshness(
+            grant.session_context.authorized_session_ids, revision, now
+        )
         if current_digest != grant.session_context.session_security_context_digest:
             raise SessionContextGrantStaleError("session security context changed since grant issuance")
         for resource_grant in grant.resources:

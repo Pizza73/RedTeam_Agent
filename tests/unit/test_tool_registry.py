@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 import support
 from redteam_agent.canonical.digest_service import DigestService
+from redteam_agent.canonical.immutable import thaw
+from redteam_agent.contracts.catalog import ActionContractCatalog
 from redteam_agent.errors import ToolRegistryValidationError
 from redteam_agent.tools.registry import build_tool_registry
 
@@ -81,6 +85,58 @@ def test_invalid_secret_path_rejected() -> None:
     tool = support.network_tool(secret_paths=("no-leading-slash",))
     with pytest.raises(ToolRegistryValidationError):
         _build_invalid_tool(tool)
+
+
+def test_no_extractor_cannot_register_target_fields() -> None:
+    tool = support.network_tool().model_copy(
+        update={
+            "target_mode": "none",
+            "target_extractor_id": None,
+            "required_target_binding_modes": frozenset({"none"}),
+        }
+    )
+    with pytest.raises(ToolRegistryValidationError):
+        _build_invalid_tool(tool)
+
+
+def test_resource_fields_must_equal_declared_data_access_types() -> None:
+    schema = {
+        "type": "object",
+        "properties": {
+            "artifact_ids": {"type": "array", "items": {"type": "string"}},
+            "report_ids": {"type": "array", "items": {"type": "string"}},
+        },
+        "additionalProperties": False,
+    }
+    tool = support.network_tool().model_copy(
+        update={
+            "target_mode": "none",
+            "target_extractor_id": "artifact_target_v1",
+            "required_target_binding_modes": frozenset({"none"}),
+            "required_data_access_types": frozenset({"artifact"}),
+            "parameter_schema": schema,
+        }
+    )
+    with pytest.raises(ToolRegistryValidationError):
+        _build_invalid_tool(tool)
+
+
+def test_secret_path_requires_closed_secret_reference_schema() -> None:
+    tool = support.network_tool(secret_paths=("/credential",))
+    schema = thaw(tool.parameter_schema)
+    schema["properties"]["credential"] = {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": False,
+    }
+    with pytest.raises(ToolRegistryValidationError):
+        _build_invalid_tool(tool.model_copy(update={"parameter_schema": schema}))
+
+
+def test_phase0a_contract_rejects_unevaluated_predicates() -> None:
+    definition = replace(support.contract_for(support.network_tool()), preconditions=("unregistered=true",))
+    with pytest.raises(ToolRegistryValidationError):
+        ActionContractCatalog((definition,))
 
 
 def test_unregistered_action_contract_rejected() -> None:

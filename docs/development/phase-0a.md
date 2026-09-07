@@ -1,7 +1,7 @@
 # Phase 0A 開発記録 — Core Models / Authorization Kernel
 
 本記録は正本 `SystemDesign.md` §40.1 が要求するPhaseごとの一つの開発記録である。
-実装担当はClaude Code、独立レビューは実装セッションと分離したCodexが行う。
+実装担当はCodex、独立レビューは実装作業から分離したCodexレビュー担当が行う。
 本記録の更新自体は実装着手・Phase受入完了・独立レビュー完了の証拠ではない。
 
 ## 1. 対象
@@ -12,11 +12,10 @@
 | Phase | 0A: Core Models / Authorization Kernel |
 | 入力コミット（完全ID） | `d78d089705104d5c10c5d364b3e0048c211d15b9`（`codex/phase-0a`、設計のみのbaseline） |
 | 実装先 | Codexが用意した専用worktree `/tmp/redteam-phase0a`（ブランチ `codex/phase-0a`） |
-| 実装対象コミット | **未確定（UNDETERMINED）**。本実装はまだコミットしていない。commit/push/mergeはCodex側が行う。 |
-| 独立レビュー | **未実施（NOT PERFORMED）**。実装担当の自己確認を独立レビューとして扱わない。 |
+| 実装対象コミット | **未確定（UNDETERMINED）**。第2回レビュー指摘への修正を固定後、この欄を更新する。 |
+| 独立レビュー | 第1回 `dce65046f76526685b6ce97c651cf031b859ccd5`、第2回 `2161cc61d4e679ce10069c306d25d90b32facf8b` を実施。いずれも受入非支持。修正版の最終レビューは未実施。 |
 
-ユーザー/Codex指示によりcommit/push/merge/branch切替/Git認証設定変更・isolation無効化は行わない。
-成果物はworktreeの作業ツリーへ保存する。
+成果物はブランチ `codex/phase-0a` に固定する。リモートへのpushとmainへのmergeは別途指示があるまで行わない。
 
 ### 実装範囲（§36 Phase 0A）
 
@@ -50,7 +49,7 @@ Production能力を偽らない。
 Unit/Integration/Security PASS、ruff/mypy/compileall PASS、Branch Coverage取得、既存Test非削除、
 未承認の設計・安全条件・受入条件変更なし、新規Security FindingにRegression Test、BLOCKER/HIGH 0件、
 実C2/MCP/外部Target Side Effect 0件、Secret Leakage 0件、未解決仕様矛盾・仮実装・Security-critical TODOなし。
-「対象実装コミット固定 + 独立レビュー完了」は Codex が別セッションで行うため本記録では **未確定 / 未実施** と明記する。
+「対象実装コミット固定 + 独立レビュー完了」は、修正版コミットの固定と最終レビュー後に判定する。
 
 ### Phase 0A Blockers / High / Zero metrics
 
@@ -98,17 +97,17 @@ frozen は変更で `ValidationError`。標準 `json.loads` は重複キーを�
 
 ## 4. 試験結果
 
-対象コミット: **未確定**（未コミットの作業ツリー。Codexが後で実装コミットを固定する）。
-入力コミット `d78d089`。独立レビュー対象の候補コミットは `dce6504`（受入前、下記§5の指摘対応をこの作業ツリーで実施）。
-実行環境: worktree `/tmp/redteam-phase0a`、`.venv`（Python 3.14.6）。全て仮想環境Pythonで実行。以下はR01–R23対応後の再実行結果。
+対象コミット: **未確定**（第2回レビュー指摘への修正を含む作業ツリー。固定後に完全IDを記録する）。
+入力コミット `d78d089`。レビュー候補は第1回 `dce6504`、第2回 `2161cc6`。以下は第2回指摘N01–N11対応後の結果である。
+実行環境: worktree `/tmp/redteam-phase0a`、`.venv`（Python 3.14.6）。全て仮想環境Pythonで実行。
 
 | コマンド | 結果 |
 | --- | --- |
 | `.venv/bin/ruff check src tests` | All checks passed（0 warning） |
 | `.venv/bin/mypy`（package=redteam_agent, strict） | Success: no issues found in 77 source files |
 | `.venv/bin/python -m compileall -q src tests` | 成功（exit 0） |
-| `.venv/bin/python -m pytest`（Unit/Integration/Security/Regression/Property-StateMachine） | 236 passed（warningなし） |
-| `.venv/bin/python -m coverage run --branch -m pytest` + `coverage report/json` | line 3271/3558、branch 730/976、coverage.py combined 88.24437582708426%（display 88%） |
+| `.venv/bin/python -m pytest`（Unit/Integration/Security/Regression/Property-StateMachine） | 250 passed（warningなし） |
+| `.venv/bin/python -m coverage run --branch -m pytest` + `coverage report/json` | line 3448/3764、branch 834/1114、coverage.py combined 87.78187781877818%（display 88%） |
 | `.venv/bin/pip check` | No broken requirements found |
 | `git diff --check` | 空（whitespace/conflict marker なし） |
 | `sha256sum -c SHA256SUMS` | manifest記載の7ファイル全て OK（承認済みr3正本のHash整合を確認） |
@@ -119,24 +118,24 @@ frozen は変更で `ValidationError`。標準 `json.loads` は重複キーを�
 - Unit: canonical/digest（field-set固定含む）、json boundary（H-02重複キー・G例外非漏洩）、scope engine（B-01, IPv4-mapped対称正規化, property-based no-false-allow）、data access、secret path、risk policy、tool registry（+action contract binding）、target extractors（B-02隠しdestination）、immutable（deep）、success conditions、sandbox binding（H-04）、availability、mission validation、ttl/normalizer、git state（H-07）。
 - Integration: 認可フロー（ALLOW/REQUIRE_APPROVAL）、mission manager（B-03 lifecycle/OCC/epoch/atomic audit）、repository integrity（B-06/H-03/row-key/model_construct/dup-key）、authorization context（H-01）、context authorization grant（B-04 stale）、mission state machine（Property/State-machine）。
 - Security: forged writes（owner guard: 偽造decision/record/state/requestのraw save拒否, 未認証/未assign approver拒否）、gate negative（stale epoch/mission非RUNNING/window/decision expired/plan改変多数/approval bypass/RBAC revoked）、zero metrics（scope false-allow, prohibited full-path, unauthorized tool, secret未確認/確定SoT binding, misleading presentation）。
-- Regression（`tests/regression/test_review_probes.py`）: 独立レビュー25 Probe（P01–P25）を現行公開APIへ移植し、修正後の fail-closed 挙動をアサート。攻撃と正当要求を取り違えていたProbeには正当系の対（P01/P07/P22/P23/P24 等）を追加。
+- Regression（`tests/regression/test_review_probes.py`）: 第1回レビュー25 Probe（P01–P25）を現行公開APIへ移植し、修正後の fail-closed 挙動をアサート。正当系も対にして、拒否一辺倒になっていないことを確認。
 - Unit（追加）: parameter schema subset validator（R01: closed object/型非強制/bool≠int/enum/const/bounds/minItems/未対応keyword fail-closed）、context selector（§18: target優先ランク/新しい順/per-type cap非拡張/cross-mission fail-closed）。
 
 未実行/未達: 実LLM品質Gate（Phase 2）、TPM/`swtpm`統合（Phase 0C）、実Adapter Contract/Integration（Phase 4/5）、D4実機Qualification（`NOT_EVALUATED`）は本Phase対象外で未実施。
 
-### 受入前検査で再現し修正した事項（Codex提供の再現、正式独立レビューではない）
+### 受入前検査で再現し修正した事項
 
 いずれも修正前に公開入口から再現し、修正後にRegressionを追加した。
 
 - A（Context Authorization 未完成）: `issue_grant` が要求TTLを無視し Mission `valid_until`（172800秒）へ暗黙延長、
   停止/未来時刻/失効/他Mission/未保存/改変Grant/Session範囲外/Source差替えを検証していなかった。
   修正: `issue_grant` は Current Mission RUNNING/valid window、Current Policy Version、Service Identity、
-  Session存在+Freshness、Index候補と Resource Metadata Source-of-Truth の version/digest一致を検証し、
+  Session存在+Freshness、Mission typed scope、Session security status、Index候補と Resource Metadata Source-of-Truth の version/digest/classification一致を検証し、
   実TTLを `now+ttl_seconds` として Mission validity/固定最大/Session freshness の各上限へ**明示拒否**（ttl<=0/過大/期限）。
   `verify_grant(grant_id, mission_id)` は Repository から保存済みGrantを読み Root Clock で全Current制約を再検証し、
   caller-supplied Grantモデルや caller now を権威にしない。Regression: `tests/integration/test_context_authorization.py`（16件）。
 - B（Repository不正Model拒否時のSecret漏洩）: `_dump` が未検証Modelを先に `model_dump_json()` していたため、
-  不正値がpydantic警告・例外へ露出した。修正: 保存前に `model_validate(dict(model))` で厳格再検証し、失敗時は
+  不正値がpydantic警告・例外へ露出した。修正: 保存前に全nested modelを生のfield値へ展開して厳格再検証し、失敗時は
   内容非公開の `RepositoryIntegrityError`（例外chainなし `from None`）へ変換してから直列化。Digest field-set不一致・
   boundary検証エラーはキー名/入力値をechoせずtype件数のみ。Regression: `tests/integration/test_repository_integrity.py::test_invalid_model_rejected_without_leaking_input`（warning/例外/chainに合成Secret非出力を確認）。
 - C（再現設定）: `setuptools==80.9.0` / `wheel==0.45.1` を venv へ導入し `requirements.lock` と `pyproject.toml` の
@@ -144,10 +143,9 @@ frozen は変更で `ValidationError`。標準 `json.loads` は重複キーを�
 
 ## 5. 独立レビュー
 
-候補コミット `dce6504` に対して独立レビューが実施された（記録: `/tmp/phase0a-independent-review-1/review.md`、
+候補コミット `dce6504` に対して第1回独立レビューが実施された（記録: `/tmp/phase0a-independent-review-1/review.md`、
 再現Probe: `/tmp/phase0a-independent-review-1/probes.py`、結果: `probe-results.json`）。**受入は成立していない。**
-指摘は HIGH 17 / MEDIUM 5 / LOW 1。全指摘（R01–R23）を本作業ツリーで修正し、25 Probe を正式Regressionへ移植した。
-以下は対応内容であり、独立レビューPASSやPhase受入を意味しない（最終コミット固定・再独立レビューはCodexが別セッションで行う）。
+指摘は HIGH 17 / MEDIUM 5 / LOW 1。全指摘（R01–R23）への対応を候補コミット `2161cc6` に固定し、25 Probe を正式Regressionへ移植した。
 
 各指摘への対応（R番号はレビュー内番号）:
 
@@ -170,11 +168,24 @@ frozen は変更で `ValidationError`。標準 `json.loads` は重複キーを�
 - R21（MEDIUM, P23）: RFC6901 array index を ASCII 限定し、`str.isdigit` のUnicode digit alias を封鎖。
 - R22（MEDIUM, P24）: array index の secret pointer/presentation を list index対応。
 - R23（HIGH, P25）: Gate は Decision の resolved adapter が登録Tool固定adapterと一致することを再照合。
-- 対応の正当系（レビューが攻撃と取り違えた要求）: schema一致引数のALLOW、Context TTLの非延長発行、認証済みActorの監査記録、ASCII array index pointer、array index secret pointerでのApproval Request生成 を Regression で確認。
+- 対応の正当系: schema一致引数のALLOW、Context TTLの非延長発行、認証済みActorの監査記録、ASCII array index pointer、array index secret pointerでのApproval Request生成をRegressionで確認。
+
+候補コミット `2161cc6` に対する第2回独立レビュー（記録: `/tmp/phase0a-independent-review-2/review.md`）は
+HIGH 9 / MEDIUM 1 / LOW 1で受入を支持しなかった。N01–N11への修正は次のとおりで、最終判定は固定コミットへの再レビューで行う。
+
+- N01/N02: Target extractorとparameter schemaのclosed contractを登録時に検証する。extractorなしは`timeout_seconds`だけ、target/resource/secret fieldは宣言した型・必須性・固定shapeと一致しなければ登録を拒否する。
+- N03/N04: Context grantの発行・使用時にSession/HostのMission typed scope、Session security status、Resource/Index classificationを再検証する。
+- N05: Success conditionはcondition kindごとに固定したgoal rule、proof schema、source capabilityのbindingを要求し、登録外参照を拒否する。
+- N06: Phase 0AはAction Contractの自由形式`preconditions`/`observes`/`may_change`を受理せず、PolicyDecision発行時にも登録契約のref/digestを照合する。
+- N07: parameter schemaの全nodeに明示`type`を要求し、keyword適用先とJSON上の型を検証する。`bool`を`integer`と同一視しない。
+- N08: Secret Referenceは4つのstring fieldだけを持つclosed objectとして登録時と引数検証時に強制する。
+- N09: Repository保存前のstrict revalidationをnested modelまで行い、警告・入力値・例外chainを外へ出さずに拒否する。
+- N10: P02/P03の元Probeと正当系を正式Regressionへ追加し、resource/report不一致、target omission、正当なartifact grantを確認する。
+- N11: 本記録のテスト数・coverage・修正範囲・レビュー表現を検証結果に合わせて更新する。
 
 ## 6. 受入と残課題
 
-- Phase受入は**未成立**。本記録に受入完了・Phase PASSを記載しない。実装コミット固定と独立レビューは未完了。
+- Phase受入は**未成立**。第2回指摘の修正版コミット固定と最終独立レビューが未完了である。
 - 実施した主な安全強化（レビュー指摘対応）:
   - Executor Gateは公開入口で `decision_id + plan` だけを受け、Trusted Clock と `AuthorizationContextResolver` から
     Current情報・現在時刻を自ら取得する（caller-supplied runtime/now を受けない）。
@@ -186,20 +197,20 @@ frozen は変更で `ValidationError`。標準 `json.loads` は重複キーを�
     Mission状態遷移は UnitOfWork 内で expected version/epoch/state・legal edge を原子検証し、lifecycle event を同一Transactionで確定する。
   - Approvalは認証済みactor（Root固定 Principal Resolver）と Mission RBAC 経由でのみ生成・保存し、使用時に RBAC を再確認する。
   - Data Access（Secret）は Caller参照のHashではなく Secret Metadata Source-of-Truth から exact version/metadata digest/lifecycle head を解決し、未確認/失効/欠落/version不一致を拒否する。
-  - Repositoryは write時に strict schema 再検証（model_construct迂回拒否）、read時に digest/ID/row-key binding を検証し、
+  - Repositoryは write時にnested modelまで strict schema再検証（model_construct/model_copy迂回拒否）、read時に digest/ID/row-key binding を検証し、
     一括読出しも重複キー拒否入口を通す。未知の security family は無条件成功にせず fail closed。
   - Sandbox Capability は adapter/runtime/execution location へ binding し、他Runtimeの能力流用を拒否（H-04）。
   - CallerがTTLを指定する発行APIは範囲外を暗黙補正せず明示拒否し、使用時にも再確認する。Approval Request/Recordの期限はCaller入力ではなく Mission approval_ttl・Global最大・Decision・Mission validity から導出し、その最小へ束縛してGateで再確認する（R09）。
-  - 登録 parameter schema を認可入口で実引数へ厳格適用する安全な JSON Schema subset validator を導入（closed object・型非強制・fail-closed, R01）。
+  - 登録 parameter schema を認可入口で実引数へ厳格適用する安全な JSON Schema subset validatorを導入し、全nodeの明示型、closed object、keyword適用先、JSON型をfail-closedで検証する（R01/N07）。
   - Context Index は権威 origin record を canonical resource とし、許可IDへ禁止originをaliasする経路を封鎖（R08）。
   - Mission Lifecycle 全操作は認証済みActor（Principal Resolver + Mission RBAC）を要求し、監査actorに認証済み principal_id を記録（R18）。
   - Digest Catalog は explicit digest に included_field_paths を固定し、Field欠落/未知Fieldを検知（§32.2整合）。
-  - SuccessCondition は Discriminated Union + 登録済みSemantic Catalog照合とし、未登録/未対応ConditionのMissionを開始させない。
-  - ActionContract は exact ToolRef へ固定契約として登録され、parameter schema digest/extractor/evidence/publication/risk/side-effect の整合をTool登録時に検証する。
+  - SuccessCondition は Discriminated Union + 登録済みSemantic Catalog照合とし、condition kindごとのgoal rule/proof schema/source capability bindingを固定する。
+  - ActionContract は exact ToolRefへ固定し、parameter schema digest/extractor/resource/secret/evidence/publication/risk/side-effectの整合をTool登録時に検証する。自由形式predicateはPhase 0Aで拒否する。
 - 設計との整合メモ（矛盾ではない、適用限界の明示）:
   - `authorization_state_digest` は複数用途で可変shapeを取るため Digest Catalog の field-set 固定対象外（generic digest）。
     用途別の厳密固定は後続Phaseの Secret Lifecycle / Knowledge 実装時に細分化する。
   - Write Guard はPhase 0Aの配線的アクセス制御であり暗号署名ではない。§34.2のTPM witness/署名は後続Phase。
   - Owner Service経由でない低レベルSQLへの直接書込みをOSレベルで防ぐことは0A範囲外（正本§35.2 Production Composition/§34.2は後続）。
-- 未解決の仕様矛盾・BLOCKER/HIGH・Security-critical TODO: 現時点で認識なし。発見時は本節へ追記する。
+- 未解決の仕様矛盾・BLOCKER/HIGH・Security-critical TODO: 最終独立レビュー前のため未確定。既知の第2回指摘N01–N11は実装とRegressionへ反映済み。
 - 次Phase範囲: Phase 0B（Execution State Machine / Dispatch Claim / Secret Injection / 実行安全）。本実装では未着手。

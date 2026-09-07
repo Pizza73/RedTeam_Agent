@@ -124,7 +124,9 @@ def network_tool(
         supported_architectures=frozenset({"x86_64"}),
         required_adapter_capabilities=frozenset({"scan"}),
         required_session_capabilities=frozenset(),
-        required_data_access_types=frozenset(),
+        required_data_access_types=(
+            frozenset({"secret_reference"}) if secret_paths else frozenset()
+        ),
         required_target_binding_modes=frozenset({"exact_ip_enforced"}),
         sandbox_requirement=None,
     )

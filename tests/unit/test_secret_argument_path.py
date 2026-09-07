@@ -11,17 +11,32 @@ from redteam_agent.tools.secret_argument_path import (
     validate_secret_argument_paths,
 )
 
-_ARGS = {"credential": {"secret_version_id": "sv-1"}, "list": [{"secret_version_id": "sv-2"}]}
+_ARGS = {
+    "credential": {
+        "credential_type": "password",
+        "secret_version_id": "sv-1",
+        "secret_version": "1",
+        "principal_ref": "svc-1",
+    },
+    "list": [
+        {
+            "credential_type": "password",
+            "secret_version_id": "sv-2",
+            "secret_version": "2",
+            "principal_ref": "svc-2",
+        }
+    ],
+}
 
 
 def test_valid_pointer_parses_and_resolves() -> None:
     tokens = parse_json_pointer("/credential")
-    assert resolve_pointer(tokens, _ARGS) == {"secret_version_id": "sv-1"}
+    assert resolve_pointer(tokens, _ARGS) == _ARGS["credential"]
 
 
 def test_array_index_resolves() -> None:
     tokens = parse_json_pointer("/list/0")
-    assert resolve_pointer(tokens, _ARGS) == {"secret_version_id": "sv-2"}
+    assert resolve_pointer(tokens, _ARGS) == _ARGS["list"][0]
 
 
 def test_empty_root_rejected() -> None:

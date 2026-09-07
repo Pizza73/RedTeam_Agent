@@ -37,7 +37,7 @@ def test_host_privilege_condition_validates_with_default_catalog() -> None:
     ds = DigestService()
     profile = support.make_profile(ds)
     condition = HostPrivilegeCondition(
-        condition_id="c1", description="root", host_ref="h1", required_privilege="linux_uid0"
+        condition_id="c1", description="root", host_ref="host-1", required_privilege="linux_uid0"
     )
     revision = support.mission_revision(ds, profile=profile, success_conditions=(condition,))
     validate_mission_revision(revision, digest_service=ds, profile=profile, policy=_policy(ds))
@@ -76,3 +76,41 @@ def test_duplicate_condition_id_rejected() -> None:
     revision = support.mission_revision(ds, profile=profile, success_conditions=(c1, c2))
     with pytest.raises(MissionValidationError):
         validate_mission_revision(revision, digest_service=ds, profile=profile, policy=_policy(ds))
+
+
+def test_unregistered_host_reference_rejected() -> None:
+    ds = DigestService()
+    profile = support.make_profile(ds)
+    condition = HostPrivilegeCondition(
+        condition_id="c1",
+        description="root",
+        host_ref="unregistered-host",
+        required_privilege="linux_uid0",
+    )
+    revision = support.mission_revision(ds, profile=profile, success_conditions=(condition,))
+    with pytest.raises(MissionValidationError):
+        validate_mission_revision(revision, digest_service=ds, profile=profile, policy=_policy(ds))
+
+
+def test_condition_without_goal_proof_source_binding_rejected() -> None:
+    ds = DigestService()
+    profile = support.make_profile(ds)
+    catalog = SemanticCatalog(
+        catalog_revision="missing-support",
+        fact_types=frozenset({"finding"}),
+        selector_types=frozenset({"exact_session"}),
+        privilege_levels=frozenset({"linux_uid0"}),
+        condition_kinds=frozenset({"session_established"}),
+        finding_fact_types=frozenset({"finding"}),
+        registered_entity_refs=frozenset(),
+        registered_session_refs=frozenset({"sess-1"}),
+    )
+    condition = SessionEstablishedCondition(
+        condition_id="c1",
+        description="session",
+        selector_type="exact_session",
+        selector_value="sess-1",
+    )
+    revision = support.mission_revision(ds, profile=profile, success_conditions=(condition,))
+    with pytest.raises(MissionValidationError):
+        validate_mission_revision(revision, digest_service=ds, profile=profile, policy=_policy(ds, catalog))

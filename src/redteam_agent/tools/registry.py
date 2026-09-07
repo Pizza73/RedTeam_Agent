@@ -12,6 +12,7 @@ from __future__ import annotations
 from pydantic import Field
 
 from redteam_agent.canonical.digest_service import DigestService
+from redteam_agent.canonical.immutable import thaw
 from redteam_agent.contracts.catalog import ActionContractCatalog, RuleCatalog, parameter_schema_digest
 from redteam_agent.errors import ParameterSchemaError, SecretArgumentBindingError, ToolRegistryValidationError
 from redteam_agent.models.base import StrictImmutableBoundaryModel
@@ -22,6 +23,136 @@ from redteam_agent.tools.target_extractors import (
     DEFAULT_TARGET_EXTRACTOR_REGISTRY,
     TrustedTargetExtractorRegistry,
 )
+
+_EXTRACTOR_ARGUMENT_FIELDS: dict[str, frozenset[str]] = {
+    "network_target_v1": frozenset({"destinations", "port", "protocol", "timeout_seconds", "credential"}),
+    "host_target_v1": frozenset({"host_ids", "timeout_seconds"}),
+    "session_target_v1": frozenset({"session_ids", "timeout_seconds"}),
+    "artifact_target_v1": frozenset({"artifact_ids", "report_ids"}),
+}
+_EXTRACTOR_REQUIRED_TARGET_FIELD: dict[str, str] = {
+    "network_target_v1": "destinations",
+    "host_target_v1": "host_ids",
+    "session_target_v1": "session_ids",
+}
+_RESOURCE_ARGUMENT_FIELDS: dict[str, str] = {
+    "artifact": "artifact_ids",
+    "report": "report_ids",
+    "local_artifact": "local_artifact_ids",
+    "internal_knowledge": "internal_knowledge_ids",
+}
+_SAFE_NO_EXTRACTOR_FIELDS = frozenset({"timeout_seconds"})
+_SECRET_REFERENCE_FIELDS = frozenset(
+    {"credential_type", "secret_version_id", "secret_version", "principal_ref"}
+)
+
+
+def _schema_properties(tool: ToolDefinition) -> tuple[dict[str, object], frozenset[str]]:
+    schema = thaw(tool.parameter_schema)
+    if schema.get("type") != "object" or schema.get("additionalProperties", False) is not False:
+        raise ToolRegistryValidationError(
+            f"tool {tool.tool_ref.tool_id}: root parameter schema must be a closed object"
+        )
+    properties = schema.get("properties", {})
+    required = schema.get("required", [])
+    assert isinstance(properties, dict) and isinstance(required, list)
+    return properties, frozenset(required)
+
+
+def _schema_node_at_pointer(root: dict[str, object], tokens: tuple[str, ...]) -> dict[str, object] | None:
+    node: object = root
+    for token in tokens:
+        if not isinstance(node, dict):
+            return None
+        if node.get("type") == "object":
+            properties = node.get("properties")
+            if not isinstance(properties, dict) or token not in properties:
+                return None
+            node = properties[token]
+        elif node.get("type") == "array":
+            if not token.isascii() or not token.isdigit() or (len(token) > 1 and token.startswith("0")):
+                return None
+            node = node.get("items")
+        else:
+            return None
+    return node if isinstance(node, dict) else None
+
+
+def _is_closed_secret_reference_schema(schema: dict[str, object]) -> bool:
+    properties = schema.get("properties")
+    required = schema.get("required")
+    return bool(
+        schema.get("type") == "object"
+        and schema.get("additionalProperties", False) is False
+        and isinstance(properties, dict)
+        and frozenset(properties) == _SECRET_REFERENCE_FIELDS
+        and isinstance(required, list)
+        and frozenset(required) == _SECRET_REFERENCE_FIELDS
+        and all(
+            isinstance(properties[name], dict) and properties[name].get("type") == "string"
+            for name in _SECRET_REFERENCE_FIELDS
+        )
+    )
+
+
+def _validate_argument_contract(tool: ToolDefinition) -> None:
+    """Bind the closed parameter schema to its trusted extractor and grants."""
+    properties, required = _schema_properties(tool)
+    property_names = frozenset(properties)
+    extractor_id = tool.target_extractor_id
+    if extractor_id is None:
+        if property_names - _SAFE_NO_EXTRACTOR_FIELDS:
+            raise ToolRegistryValidationError(
+                f"tool {tool.tool_ref.tool_id}: no-extractor schema contains authority-bearing fields"
+            )
+    else:
+        allowed_fields = _EXTRACTOR_ARGUMENT_FIELDS[extractor_id]
+        if property_names - allowed_fields:
+            raise ToolRegistryValidationError(
+                f"tool {tool.tool_ref.tool_id}: parameter schema is not covered by its extractor"
+            )
+        if extractor_id == "artifact_target_v1" and tool.target_mode != "none":
+            raise ToolRegistryValidationError(
+                f"tool {tool.tool_ref.tool_id}: artifact extractor requires target_mode=none"
+            )
+        if tool.target_mode == "none" and extractor_id != "artifact_target_v1":
+            raise ToolRegistryValidationError(
+                f"tool {tool.tool_ref.tool_id}: target_mode=none requires the artifact extractor or no extractor"
+            )
+        target_field = _EXTRACTOR_REQUIRED_TARGET_FIELD.get(extractor_id)
+        if tool.target_mode == "required" and target_field not in required:
+            raise ToolRegistryValidationError(
+                f"tool {tool.tool_ref.tool_id}: required target field is not required by the schema"
+            )
+
+    declared_resource_types = frozenset(
+        resource_type
+        for resource_type, field in _RESOURCE_ARGUMENT_FIELDS.items()
+        if field in property_names
+    )
+    required_resource_types = frozenset(
+        item for item in tool.required_data_access_types if item != "secret_reference"
+    )
+    if declared_resource_types != required_resource_types:
+        raise ToolRegistryValidationError(
+            f"tool {tool.tool_ref.tool_id}: resource arguments and required data-access types differ"
+        )
+    if declared_resource_types and extractor_id != "artifact_target_v1":
+        raise ToolRegistryValidationError(
+            f"tool {tool.tool_ref.tool_id}: resource arguments require the artifact extractor"
+        )
+    if ("secret_reference" in tool.required_data_access_types) != bool(tool.secret_argument_paths):
+        raise ToolRegistryValidationError(
+            f"tool {tool.tool_ref.tool_id}: secret paths and required data-access type differ"
+        )
+
+    root = thaw(tool.parameter_schema)
+    for path in tool.secret_argument_paths:
+        node = _schema_node_at_pointer(root, parse_json_pointer(path))
+        if node is None or not _is_closed_secret_reference_schema(node):
+            raise ToolRegistryValidationError(
+                f"tool {tool.tool_ref.tool_id}: secret path must resolve to the closed Secret Reference schema"
+            )
 
 
 def _validate_contract(tool: ToolDefinition, catalog: ActionContractCatalog, rules: RuleCatalog) -> None:
@@ -117,6 +248,8 @@ def _validate_tool(
             raise ToolRegistryValidationError(
                 f"tool {tool.tool_ref.tool_id}: invalid secret argument path {path!r}: {exc}"
             ) from exc
+
+    _validate_argument_contract(tool)
 
     if tool.minimum_risk_level == "high" and tool.adapter in ("local", "mcp") and tool.sandbox_requirement is None:
         raise ToolRegistryValidationError(

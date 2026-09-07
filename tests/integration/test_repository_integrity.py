@@ -84,6 +84,32 @@ def test_invalid_model_rejected_without_leaking_input() -> None:
     assert all(marker not in str(w.message) for w in caught)
 
 
+def test_invalid_nested_model_rejected_without_serializer_warning() -> None:
+    import warnings
+
+    kernel = _kernel()
+    marker = "SYNTHETIC_NESTED_SECRET_SHOULD_NOT_LEAK"
+    snapshot = support.session_snapshot()
+    bad_context = snapshot.context.model_copy(update={"current_principal": {"value": marker}})
+    bad_snapshot = snapshot.model_copy(update={"context": bad_context})
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with pytest.raises(RepositoryIntegrityError) as exc_info:
+            kernel.session_repository.save(bad_snapshot)
+    assert kernel.database.get("session_security_context_snapshots", snapshot.session_id) is None
+    assert marker not in str(exc_info.value)
+    assert exc_info.value.__cause__ is None
+    assert all(marker not in str(item.message) for item in caught)
+
+
+def test_model_copy_nested_unknown_field_rejected() -> None:
+    kernel = _kernel()
+    snapshot = support.session_snapshot()
+    bad_context = snapshot.context.model_copy(update={"undeclared_authority": "hidden"})
+    with pytest.raises(RepositoryIntegrityError):
+        kernel.session_repository.save(snapshot.model_copy(update={"context": bad_context}))
+
+
 def test_unknown_family_fails_closed() -> None:
     class _Unregistered(StrictImmutableBoundaryModel):
         value: int

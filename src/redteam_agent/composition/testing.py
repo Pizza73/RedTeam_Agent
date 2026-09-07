@@ -241,6 +241,7 @@ def build_test_kernel(
         clock=clock,
         write_guard=guard,
         registry_revision=registry_revision,
+        contract_catalog=contract_catalog,
     )
     tool_availability_service = ToolAvailabilityService(
         state_repository=state_repo,

@@ -41,14 +41,24 @@ def _validate_success_condition(condition: object, catalog: SemanticCatalog) -> 
     kind = getattr(condition, "condition_kind", None)
     if kind not in catalog.condition_kinds:
         raise MissionValidationError(f"unregistered success condition kind: {kind}")
+    support = [binding for binding in catalog.condition_support_bindings if binding[0] == kind]
+    if len(support) != 1 or any(not value for value in support[0][1:]):
+        raise MissionValidationError("success condition lacks a unique registered goal/proof/source binding")
     if isinstance(condition, SessionEstablishedCondition):
         if condition.selector_type not in catalog.selector_types:
             raise MissionValidationError("unregistered session selector type")
         if condition.selector_value.strip() in ("", "any"):
             raise MissionValidationError("session selector value must be concrete, not empty/any")
+        if condition.selector_type == "exact_session":
+            if condition.selector_value not in catalog.registered_session_refs:
+                raise MissionValidationError("session condition references an unregistered session")
+        elif condition.selector_value not in catalog.registered_host_refs:
+            raise MissionValidationError("active-session condition references an unregistered host")
     elif isinstance(condition, HostPrivilegeCondition):
         if condition.required_privilege not in catalog.privilege_levels:
             raise MissionValidationError("unregistered privilege level")
+        if condition.host_ref not in catalog.registered_host_refs:
+            raise MissionValidationError("host privilege condition references an unregistered host")
     elif isinstance(condition, FindingConfirmedCondition):
         if condition.fact_type not in catalog.finding_fact_types:
             raise MissionValidationError("fact type is not eligible for a finding goal condition")

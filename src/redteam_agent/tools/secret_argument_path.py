@@ -22,6 +22,9 @@ from redteam_agent.errors import SecretArgumentBindingError
 # ASCII "1" and ARABIC-INDIC DIGIT ONE (U+0661) onto the same array leaf; this
 # regex forbids that.
 _ARRAY_INDEX_RE = re.compile(r"(?a)\A(0|[1-9][0-9]*)\Z")
+_SECRET_REFERENCE_FIELDS = frozenset(
+    {"credential_type", "secret_version_id", "secret_version", "principal_ref"}
+)
 
 
 def parse_json_pointer(pointer: str) -> tuple[str, ...]:
@@ -100,9 +103,16 @@ def validate_secret_argument_paths(
                 raise SecretArgumentBindingError("secret paths overlap (ancestor/descendant or alias)")
     for tokens in parsed:
         leaf = resolve_pointer(tokens, arguments)
-        if not isinstance(leaf, Mapping):
-            raise SecretArgumentBindingError("secret argument leaf must be a typed secret reference object")
+        validate_secret_reference(leaf)
     return tuple(parsed)
+
+
+def validate_secret_reference(value: Any) -> None:
+    """Require the fixed, closed Secret Reference wire shape."""
+    if not isinstance(value, Mapping) or frozenset(value) != _SECRET_REFERENCE_FIELDS:
+        raise SecretArgumentBindingError("secret argument leaf must be a closed Secret Reference")
+    if any(not isinstance(value[field], str) or not value[field] for field in _SECRET_REFERENCE_FIELDS):
+        raise SecretArgumentBindingError("Secret Reference fields must be non-empty strings")
 
 
 def _is_ancestor(candidate: tuple[str, ...], other: tuple[str, ...]) -> bool:

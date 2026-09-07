@@ -72,12 +72,12 @@ def test_array_items_and_min_items() -> None:
 
 
 def test_const_and_enum() -> None:
-    validate_arguments(_obj(v={"const": "fixed"}), {"v": "fixed"})
+    validate_arguments(_obj(v={"type": "string", "const": "fixed"}), {"v": "fixed"})
     with pytest.raises(ParameterSchemaError):
-        validate_arguments(_obj(v={"const": "fixed"}), {"v": "other"})
-    validate_arguments(_obj(v={"enum": ["a", "b"]}), {"v": "b"})
+        validate_arguments(_obj(v={"type": "string", "const": "fixed"}), {"v": "other"})
+    validate_arguments(_obj(v={"type": "string", "enum": ["a", "b"]}), {"v": "b"})
     with pytest.raises(ParameterSchemaError):
-        validate_arguments(_obj(v={"enum": ["a", "b"]}), {"v": "c"})
+        validate_arguments(_obj(v={"type": "string", "enum": ["a", "b"]}), {"v": "c"})
 
 
 def test_null_type_requires_none() -> None:
@@ -108,3 +108,15 @@ def test_supported_nested_schema_accepted() -> None:
             "additionalProperties": False,
         }
     )
+
+
+def test_type_is_required_for_every_schema_node() -> None:
+    with pytest.raises(ParameterSchemaError):
+        validate_schema_is_supported({"type": "object", "properties": {"port": {"const": 443}}})
+
+
+def test_const_and_enum_keep_boolean_distinct_from_integer() -> None:
+    with pytest.raises(ParameterSchemaError):
+        validate_schema_is_supported({"type": "integer", "const": True})
+    with pytest.raises(ParameterSchemaError):
+        validate_schema_is_supported({"type": "integer", "enum": [1, True]})
