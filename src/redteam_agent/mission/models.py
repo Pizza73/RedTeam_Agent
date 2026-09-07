@@ -69,34 +69,34 @@ EPOCH_ROTATING_EDGES: frozenset[tuple[MissionLifecycleState, MissionLifecycleSta
 )
 
 
-class SessionEstablishedCondition(StrictImmutableBoundaryModel):
-    condition_kind: Literal["session_established"] = "session_established"
-    condition_id: str = Field(min_length=1)
-    description: str = Field(min_length=1)
-    selector_type: Literal["exact_session", "active_session"]
-    selector_value: str = Field(min_length=1)
+class ExactSessionSelector(StrictImmutableBoundaryModel):
+    selector_type: Literal["exact"] = "exact"
+    session_ref: str = Field(min_length=1)
 
 
-class HostPrivilegeCondition(StrictImmutableBoundaryModel):
-    condition_kind: Literal["host_privilege"] = "host_privilege"
-    condition_id: str = Field(min_length=1)
-    description: str = Field(min_length=1)
+class ActiveSessionSelector(StrictImmutableBoundaryModel):
+    selector_type: Literal["active_match"] = "active_match"
     host_ref: str = Field(min_length=1)
-    required_privilege: Literal["linux_uid0", "windows_system", "windows_high_integrity"]
+    principal_ref: str | None = None
+    provider_id: str | None = None
 
 
-class FindingConfirmedCondition(StrictImmutableBoundaryModel):
-    condition_kind: Literal["finding_confirmed"] = "finding_confirmed"
-    condition_id: str = Field(min_length=1)
-    description: str = Field(min_length=1)
-    fact_type: Literal["identity", "service", "relationship", "finding", "execution_outcome"]
-    canonical_entity_ref: str = Field(min_length=1)
-
-
-SuccessCondition = Annotated[
-    SessionEstablishedCondition | HostPrivilegeCondition | FindingConfirmedCondition,
-    Field(discriminator="condition_kind"),
+SessionSelector = Annotated[
+    ExactSessionSelector | ActiveSessionSelector,
+    Field(discriminator="selector_type"),
 ]
+
+
+class SessionExistsCondition(StrictImmutableBoundaryModel):
+    type: Literal["session_exists"] = "session_exists"
+    condition_id: str = Field(min_length=1)
+    session_selector: SessionSelector
+
+
+# Phase 0A supports only conditions whose concrete static rule, proof model and
+# source contract are registered together. Other §24 conditions are added only
+# when those three implementations land in the same revision.
+SuccessCondition = SessionExistsCondition
 
 
 class ApprovalPolicy(StrictImmutableBoundaryModel):

@@ -2,8 +2,8 @@
 
 Each probe exercised a scenario the independent review used to demonstrate a
 bypass in the review candidate. These tests assert the *fixed*, fail-closed
-behaviour, and - where the probe conflated a legitimate request with an attack -
-add a positive counterpart proving the legitimate path still succeeds. The
+behaviour and include positive counterparts proving legitimate paths still
+succeed. The
 probes are reproduced against the current public API (authenticated lifecycle
 actors, grant-id based verification), not the pre-fix signatures.
 """
@@ -13,6 +13,7 @@ from __future__ import annotations
 from datetime import timedelta
 
 import pytest
+from pydantic import ValidationError
 
 import support
 from redteam_agent.composition.testing import build_test_kernel
@@ -25,7 +26,7 @@ from redteam_agent.errors import (
     SessionContextGrantStaleError,
     ToolRegistryValidationError,
 )
-from redteam_agent.mission.models import FindingConfirmedCondition, SessionEstablishedCondition
+from redteam_agent.mission.models import MissionRevision
 from redteam_agent.plan.models import ExecutionPlan
 from redteam_agent.policy.data_access import DataAccessPolicy, DataAccessRule
 from redteam_agent.policy.scope_models import HostScopeRule, SessionScopeRule
@@ -321,25 +322,21 @@ def test_p09_context_origin_alias_rejected() -> None:
 
 
 def test_p10_unsupported_goal_condition_rejected() -> None:
-    conditions = (
-        FindingConfirmedCondition(
-            condition_id="c", description="forbidden outcome condition", fact_type="execution_outcome",
-            canonical_entity_ref="nonexistent-entity",
-        ),
-        SessionEstablishedCondition(
-            condition_id="s", description="no host selector", selector_type="active_session", selector_value="any"
-        ),
-    )
     kernel = _kernel()
     profile = support.make_profile(kernel.digest_service)
-    kernel.profile_repository.save(profile)
-    revision = _redigest(
-        kernel, support.mission_revision(kernel.digest_service, profile=profile), success_conditions=conditions
-    )
-    support.provision_lifecycle_roles(kernel)
-    kernel.mission_manager.create_mission(revision, actor_token=support.ADMIN_ACTOR_TOKEN)
-    with pytest.raises(MissionValidationError):
-        kernel.mission_manager.validate_mission(MISSION_ID, 0, actor_token=support.OPERATOR_ACTOR_TOKEN)
+    revision = support.mission_revision(kernel.digest_service, profile=profile)
+    payload = revision.model_dump(mode="python")
+    payload["success_conditions"] = [
+        {
+            "type": "windows_token_privilege",
+            "condition_id": "unsupported",
+            "session_selector": {"selector_type": "exact", "session_ref": "sess-1"},
+            "required_privileges": ["SeDebugPrivilege"],
+            "require_enabled": True,
+        }
+    ]
+    with pytest.raises(ValidationError):
+        MissionRevision.model_validate(payload)
 
 
 # --- P11: approval TTL bounded by mission approval_ttl_seconds ------------
@@ -663,6 +660,89 @@ def test_p24_valid_array_pointer_approval_succeeds() -> None:
         approval_request_id="array", decision_id=decision.decision_id, plan=plan
     )
     assert request.approval_request_id == "array"
+
+
+def test_every_secret_in_array_requires_an_exact_declared_path() -> None:
+    from support import confirmed_secret_metadata, secret_data_access_policy, secret_reference
+
+    secret_ref_schema = {
+        "type": "object",
+        "properties": {
+            "credential_type": {"type": "string"},
+            "secret_version_id": {"type": "string"},
+            "secret_version": {"type": "string"},
+            "principal_ref": {"type": "string"},
+        },
+        "required": ["credential_type", "secret_version_id", "secret_version", "principal_ref"],
+        "additionalProperties": False,
+    }
+    schema = {
+        "type": "object",
+        "properties": {
+            "destinations": {"type": "array", "items": {"type": "string"}},
+            "credential": {
+                "type": "object",
+                "properties": {"entries": {"type": "array", "items": secret_ref_schema}},
+                "required": ["entries"],
+                "additionalProperties": False,
+            },
+        },
+        "required": ["destinations", "credential"],
+        "additionalProperties": False,
+    }
+    tool = support.network_tool(secret_paths=("/credential/entries/0",)).model_copy(
+        update={"parameter_schema": schema}
+    )
+    kernel, seeded = _setup(
+        tool=tool,
+        revision_transform=lambda k, r: _redigest(k, r, data_access_policy=secret_data_access_policy()),
+    )
+    kernel.secret_metadata_store.put(confirmed_secret_metadata(kernel.digest_service))
+    plan = _plan(
+        kernel,
+        seeded,
+        {
+            "destinations": ["10.1.2.3"],
+            "credential": {"entries": [secret_reference(), secret_reference("ungranted-secret")]},
+        },
+    )
+    _assert_not_authorized(kernel, plan)
+
+
+def test_every_session_target_contributes_its_current_host_to_scope() -> None:
+    tool = support.network_tool(requires_session=True).model_copy(
+        update={
+            "target_extractor_id": "session_target_v1",
+            "parameter_schema": {
+                "type": "object",
+                "properties": {"session_ids": {"type": "array", "items": {"type": "string"}}},
+                "required": ["session_ids"],
+                "additionalProperties": False,
+            },
+        }
+    )
+    allowed = (
+        *support.default_scope(),
+        SessionScopeRule(type="session", session_id="sess-1"),
+        SessionScopeRule(type="session", session_id="sess-2"),
+        HostScopeRule(type="host", host_id="host-1"),
+    )
+    prohibited = (HostScopeRule(type="host", host_id="host-prohibited"),)
+    kernel, seeded = _setup(
+        tool=tool,
+        sessions=("sess-1",),
+        revision_transform=lambda k, r: _redigest(
+            k, r, allowed_execution_scope=allowed, prohibited_execution_scope=prohibited
+        ),
+    )
+    other = support.session_snapshot(session_id="sess-2")
+    other = other.model_copy(
+        update={"context": other.context.model_copy(update={"host": "host-prohibited"})}
+    )
+    kernel.session_repository.save(other)
+    seeded.snapshot = kernel.tool_availability_service.publish(snapshot_id="snap-2", mission_id=MISSION_ID)
+    plan = _plan(kernel, seeded, {"session_ids": ["sess-2"]}, session_id="sess-1")
+    _assert_not_authorized(kernel, plan)
 
 
 # --- P25: decision adapter-field tamper is caught ------------------------

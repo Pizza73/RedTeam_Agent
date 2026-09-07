@@ -104,6 +104,9 @@ def validate_secret_argument_paths(
     for tokens in parsed:
         leaf = resolve_pointer(tokens, arguments)
         validate_secret_reference(leaf)
+    discovered = frozenset(_discover_secret_reference_paths(arguments))
+    if frozenset(parsed) != discovered:
+        raise SecretArgumentBindingError("secret paths do not cover every Secret Reference argument")
     return tuple(parsed)
 
 
@@ -113,6 +116,31 @@ def validate_secret_reference(value: Any) -> None:
         raise SecretArgumentBindingError("secret argument leaf must be a closed Secret Reference")
     if any(not isinstance(value[field], str) or not value[field] for field in _SECRET_REFERENCE_FIELDS):
         raise SecretArgumentBindingError("Secret Reference fields must be non-empty strings")
+
+
+def _discover_secret_reference_paths(
+    value: Any, tokens: tuple[str, ...] = ()
+) -> tuple[tuple[str, ...], ...]:
+    """Enumerate every concrete Secret Reference leaf in validated arguments.
+
+    Static JSON Pointers cannot describe every element of a variable-length
+    array.  Runtime enumeration closes that gap without adding wildcard syntax
+    or mutable authorization state.
+    """
+    if isinstance(value, Mapping):
+        if frozenset(value) == _SECRET_REFERENCE_FIELDS:
+            return (tokens,)
+        found: list[tuple[str, ...]] = []
+        for key, child in value.items():
+            if isinstance(key, str):
+                found.extend(_discover_secret_reference_paths(child, (*tokens, key)))
+        return tuple(found)
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        found = []
+        for index, child in enumerate(value):
+            found.extend(_discover_secret_reference_paths(child, (*tokens, str(index))))
+        return tuple(found)
+    return ()
 
 
 def _is_ancestor(candidate: tuple[str, ...], other: tuple[str, ...]) -> bool:

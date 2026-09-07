@@ -35,6 +35,7 @@ from redteam_agent.resources.resource_metadata import StaticResourceMetadataStor
 from redteam_agent.resources.secret_metadata import StaticSecretMetadataStore
 from redteam_agent.runtime.authorization_context import AuthorizationContextResolver
 from redteam_agent.runtime.clock import Clock, SystemUtcClock
+from redteam_agent.semantics import RepositorySessionGoalSource, default_semantic_catalog
 from redteam_agent.storage.database import Database
 from redteam_agent.storage.guard import WriteGuard
 from redteam_agent.storage.repositories import (
@@ -196,6 +197,7 @@ def build_test_kernel(
     validation_policy = MissionValidationPolicy(
         max_recovery_window_seconds=DEFAULT_MAX_RECOVERY_WINDOW_SECONDS,
         evidence_retention_policy=build_evidence_retention_policy(digest_service),
+        semantic_catalog=default_semantic_catalog(RepositorySessionGoalSource(session_repo)),
     )
     mission_manager = MissionManager(
         database=database,

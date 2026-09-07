@@ -192,13 +192,12 @@ class ExecutorAuthorizationGate:
         adapter = self._adapters.get(tool.adapter_id)
         if adapter is None:
             return GateResult(False, "ADAPTER_NOT_FOUND")
-        session_context = None
         principal_ref = None
         if plan.proposal.session_id is not None:
             snap = self._sessions.get(plan.proposal.session_id)
             if snap is not None:
-                session_context = snap.context
                 principal_ref = snap.context.current_principal
+        session_snapshots = self._sessions.all_snapshots()
 
         context = context_from_mission(mission)
         binding_ok, binding_reason = self._policy_engine.verify_authorization_binding(
@@ -207,7 +206,7 @@ class ExecutorAuthorizationGate:
             context=context,
             tool=tool,
             adapter=adapter,
-            session_context=session_context,
+            session_snapshots=session_snapshots,
             registry_digest=runtime.registry_digest,
             now=now,
         )

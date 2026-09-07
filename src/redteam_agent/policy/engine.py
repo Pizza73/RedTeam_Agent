@@ -47,7 +47,7 @@ from redteam_agent.policy.target_binding import (
 from redteam_agent.policy.ttl import enforce_ttl
 from redteam_agent.resources.resource_metadata import ResourceMetadataReader
 from redteam_agent.resources.secret_metadata import SecretMetadataReader
-from redteam_agent.session.models import SessionSecurityContext
+from redteam_agent.session.models import SessionSecurityContextSnapshot
 from redteam_agent.tools.models import ToolDefinition
 from redteam_agent.tools.parameter_schema import validate_arguments
 from redteam_agent.tools.secret_argument_path import (
@@ -146,7 +146,11 @@ class PolicyEngine:
     # --- intent resolution ------------------------------------------------
 
     def _normalized_targets(
-        self, plan: ExecutionPlan, tool: ToolDefinition, session_context: SessionSecurityContext | None
+        self,
+        plan: ExecutionPlan,
+        tool: ToolDefinition,
+        session_snapshots: Mapping[str, SessionSecurityContextSnapshot],
+        now: datetime,
     ) -> tuple[NormalizedTarget, ...]:
         if tool.target_extractor_id is None:
             targets: tuple[NormalizedTarget, ...] = ()
@@ -165,13 +169,29 @@ class PolicyEngine:
                 raise TargetExtractorResolutionError("session-required tool has no session id")
             if not any(t.type == "session" and t.canonical_value == session_id for t in targets):
                 targets = (*targets, NormalizedTarget(type="session", canonical_value=session_id, source="session"))
-            # The execution session's host is part of the affected target set, so
-            # a prohibited host cannot be reached via a session-scope allow (R03).
-            if session_context is not None:
-                targets = (
-                    *targets,
-                    NormalizedTarget(type="host", canonical_value=session_context.host, source="session"),
-                )
+        # Every referenced session contributes its trusted current host to the
+        # affected target set.  Checking only the execution session would let a
+        # second argument session reach a prohibited host (Z05).
+        host_ids: list[str] = []
+        for target in targets:
+            if target.type != "session":
+                continue
+            snapshot = session_snapshots.get(target.canonical_value)
+            if snapshot is None or not (now < snapshot.session_fresh_until):
+                raise TargetExtractorResolutionError("session target is missing or stale")
+            session = snapshot.context
+            if session.security_status != "ok":
+                raise TargetExtractorResolutionError("session target security status is not usable")
+            if session.os not in tool.supported_os or session.architecture not in tool.supported_architectures:
+                raise TargetExtractorResolutionError("session target is incompatible with the tool")
+            if not tool.required_session_capabilities <= session.session_capabilities:
+                raise TargetExtractorResolutionError("session target lacks required capabilities")
+            if session.host not in host_ids:
+                host_ids.append(session.host)
+        targets = (
+            *targets,
+            *(NormalizedTarget(type="host", canonical_value=host_id, source="session") for host_id in host_ids),
+        )
         return targets
 
     def _derive_resource_requests(
@@ -224,12 +244,12 @@ class PolicyEngine:
     def _derive_secret_requests(
         self, plan: ExecutionPlan, tool: ToolDefinition, now: datetime
     ) -> tuple[bool, list[_DataAccessRequest], tuple[str, ...]]:
-        if not tool.secret_argument_paths:
-            return True, [], ()
         try:
             validate_secret_argument_paths(tool.secret_argument_paths, plan.proposal.arguments)
         except Exception:
             return False, [], ("SECRET_PATH_INVALID",)
+        if not tool.secret_argument_paths:
+            return True, [], ()
         if self._secret_metadata is None:
             return False, [], ("SECRET_METADATA_UNAVAILABLE",)
         requests: list[_DataAccessRequest] = []
@@ -365,7 +385,7 @@ class PolicyEngine:
         context: PolicyEvaluationContext,
         tool: ToolDefinition,
         adapter: AdapterCapabilities,
-        session_context: SessionSecurityContext | None,
+        session_snapshots: Mapping[str, SessionSecurityContextSnapshot],
         registry_digest: str,
         now: datetime,
     ) -> ResolvedAuthorization:
@@ -388,7 +408,7 @@ class PolicyEngine:
 
         if inputs_ok:
             try:
-                targets = self._normalized_targets(plan, tool, session_context)
+                targets = self._normalized_targets(plan, tool, session_snapshots, now)
                 target_ok = True
             except TargetExtractorResolutionError:
                 targets, target_ok = (), False
@@ -428,7 +448,12 @@ class PolicyEngine:
         data_ok = inputs_ok and secret_ok and resource_ok and grants_ok
 
         has_secret_resolve = secret_ok and any(r.resource_type == "secret_reference" for r in secret_requests)
-        privileged = bool(tool.requires_session and session_context is not None and session_context.privileged)
+        selected_snapshot = (
+            session_snapshots.get(plan.proposal.session_id) if plan.proposal.session_id is not None else None
+        )
+        privileged = bool(
+            tool.requires_session and selected_snapshot is not None and selected_snapshot.context.privileged
+        )
         effective_risk = compute_effective_risk(
             policy=self._risk_policy,
             tool_minimum_risk=tool.minimum_risk_level,
@@ -477,13 +502,13 @@ class PolicyEngine:
         context: PolicyEvaluationContext,
         tool: ToolDefinition,
         adapter: AdapterCapabilities,
-        session_context: SessionSecurityContext | None,
+        session_snapshots: Mapping[str, SessionSecurityContextSnapshot],
         registry_digest: str,
         now: datetime,
     ) -> PolicyDecision:
         resolved = self.resolve(
             plan=plan, context=context, tool=tool, adapter=adapter,
-            session_context=session_context, registry_digest=registry_digest, now=now,
+            session_snapshots=session_snapshots, registry_digest=registry_digest, now=now,
         )
         expires_at = now + timedelta(seconds=self._decision_ttl_seconds)
         # Explicit rejection of an out-of-range TTL (no implicit clamp, §21).
@@ -505,14 +530,14 @@ class PolicyEngine:
         context: PolicyEvaluationContext,
         tool: ToolDefinition,
         adapter: AdapterCapabilities,
-        session_context: SessionSecurityContext | None,
+        session_snapshots: Mapping[str, SessionSecurityContextSnapshot],
         registry_digest: str,
         now: datetime,
     ) -> tuple[bool, str]:
         """Re-derive the authorization from current trusted inputs and compare."""
         resolved = self.resolve(
             plan=plan, context=context, tool=tool, adapter=adapter,
-            session_context=session_context, registry_digest=registry_digest, now=now,
+            session_snapshots=session_snapshots, registry_digest=registry_digest, now=now,
         )
         if resolved.decision != decision.decision:
             return False, "DECISION_KIND_MISMATCH"

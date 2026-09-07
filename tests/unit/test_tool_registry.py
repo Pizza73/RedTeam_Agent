@@ -133,6 +133,13 @@ def test_secret_path_requires_closed_secret_reference_schema() -> None:
         _build_invalid_tool(tool.model_copy(update={"parameter_schema": schema}))
 
 
+def test_secret_reference_schema_requires_declared_path_and_data_access_type() -> None:
+    schema = thaw(support.network_tool(secret_paths=("/credential",)).parameter_schema)
+    tool = support.network_tool().model_copy(update={"parameter_schema": schema})
+    with pytest.raises(ToolRegistryValidationError, match="secret schema"):
+        _build_invalid_tool(tool)
+
+
 def test_phase0a_contract_rejects_unevaluated_predicates() -> None:
     definition = replace(support.contract_for(support.network_tool()), preconditions=("unregistered=true",))
     with pytest.raises(ToolRegistryValidationError):

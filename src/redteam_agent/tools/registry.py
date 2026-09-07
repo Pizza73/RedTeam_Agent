@@ -95,6 +95,21 @@ def _is_closed_secret_reference_schema(schema: dict[str, object]) -> bool:
     )
 
 
+def _schema_contains_secret_reference(schema: object) -> bool:
+    if not isinstance(schema, dict):
+        return False
+    if _is_closed_secret_reference_schema(schema):
+        return True
+    if schema.get("type") == "object":
+        properties = schema.get("properties")
+        return isinstance(properties, dict) and any(
+            _schema_contains_secret_reference(child) for child in properties.values()
+        )
+    if schema.get("type") == "array":
+        return _schema_contains_secret_reference(schema.get("items"))
+    return False
+
+
 def _validate_argument_contract(tool: ToolDefinition) -> None:
     """Bind the closed parameter schema to its trusted extractor and grants."""
     properties, required = _schema_properties(tool)
@@ -141,12 +156,17 @@ def _validate_argument_contract(tool: ToolDefinition) -> None:
         raise ToolRegistryValidationError(
             f"tool {tool.tool_ref.tool_id}: resource arguments require the artifact extractor"
         )
-    if ("secret_reference" in tool.required_data_access_types) != bool(tool.secret_argument_paths):
+    root = thaw(tool.parameter_schema)
+    schema_has_secret = _schema_contains_secret_reference(root)
+    if not (
+        schema_has_secret
+        == bool(tool.secret_argument_paths)
+        == ("secret_reference" in tool.required_data_access_types)
+    ):
         raise ToolRegistryValidationError(
-            f"tool {tool.tool_ref.tool_id}: secret paths and required data-access type differ"
+            f"tool {tool.tool_ref.tool_id}: secret schema, paths and required data-access type differ"
         )
 
-    root = thaw(tool.parameter_schema)
     for path in tool.secret_argument_paths:
         node = _schema_node_at_pointer(root, parse_json_pointer(path))
         if node is None or not _is_closed_secret_reference_schema(node):

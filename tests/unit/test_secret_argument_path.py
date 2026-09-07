@@ -80,5 +80,15 @@ def test_leaf_must_be_object() -> None:
 
 
 def test_valid_paths_return_tokens() -> None:
-    parsed = validate_secret_argument_paths(("/credential",), _ARGS)
-    assert parsed == (("credential",),)
+    parsed = validate_secret_argument_paths(("/credential", "/list/0"), _ARGS)
+    assert parsed == (("credential",), ("list", "0"))
+
+
+def test_every_secret_reference_requires_an_exact_path() -> None:
+    with pytest.raises(SecretArgumentBindingError, match="cover every"):
+        validate_secret_argument_paths(("/credential",), _ARGS)
+
+
+def test_undeclared_secret_reference_is_rejected() -> None:
+    with pytest.raises(SecretArgumentBindingError, match="cover every"):
+        validate_secret_argument_paths((), {"credential": _ARGS["credential"]})

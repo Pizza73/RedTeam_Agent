@@ -81,10 +81,7 @@ class ExecutionAuthorizationService:
         adapter = self._adapters.get(tool.adapter_id)
         if adapter is None:
             raise PolicyEvaluationIndeterminateError("tool adapter capabilities not found")
-        session_context = None
-        if plan.proposal.session_id is not None:
-            snap = self._sessions.get(plan.proposal.session_id)
-            session_context = snap.context if snap is not None else None
+        session_snapshots = self._sessions.all_snapshots()
 
         # Re-validate the referenced snapshot against current bindings/time before
         # issuing a decision; a stale snapshot must not yield a decision (R14).
@@ -106,7 +103,7 @@ class ExecutionAuthorizationService:
             context=context_from_mission(mission),
             tool=tool,
             adapter=adapter,
-            session_context=session_context,
+            session_snapshots=session_snapshots,
             registry_digest=runtime.registry_digest,
             now=now,
         )

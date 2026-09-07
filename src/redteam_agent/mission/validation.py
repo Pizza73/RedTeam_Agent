@@ -20,14 +20,17 @@ from redteam_agent.errors import (
 from redteam_agent.llm.profile import AgentModelProfile
 from redteam_agent.mission.models import (
     EvidenceRetentionPolicy,
-    FindingConfirmedCondition,
-    HostPrivilegeCondition,
     MissionRevision,
-    SessionEstablishedCondition,
+    SessionExistsCondition,
 )
 from redteam_agent.policy.data_access import validate_policy_patterns
 from redteam_agent.policy.scope_engine import assert_scope_rules_interpretable
-from redteam_agent.semantics import SemanticCatalog, default_semantic_catalog
+from redteam_agent.semantics import (
+    SemanticCatalog,
+    SessionGoalSource,
+    SessionStateProof,
+    default_semantic_catalog,
+)
 
 
 @dataclass(frozen=True)
@@ -38,34 +41,18 @@ class MissionValidationPolicy:
 
 
 def _validate_success_condition(condition: object, catalog: SemanticCatalog) -> None:
-    kind = getattr(condition, "condition_kind", None)
-    if kind not in catalog.condition_kinds:
-        raise MissionValidationError(f"unregistered success condition kind: {kind}")
-    support = [binding for binding in catalog.condition_support_bindings if binding[0] == kind]
-    if len(support) != 1 or any(not value for value in support[0][1:]):
-        raise MissionValidationError("success condition lacks a unique registered goal/proof/source binding")
-    if isinstance(condition, SessionEstablishedCondition):
-        if condition.selector_type not in catalog.selector_types:
-            raise MissionValidationError("unregistered session selector type")
-        if condition.selector_value.strip() in ("", "any"):
-            raise MissionValidationError("session selector value must be concrete, not empty/any")
-        if condition.selector_type == "exact_session":
-            if condition.selector_value not in catalog.registered_session_refs:
-                raise MissionValidationError("session condition references an unregistered session")
-        elif condition.selector_value not in catalog.registered_host_refs:
-            raise MissionValidationError("active-session condition references an unregistered host")
-    elif isinstance(condition, HostPrivilegeCondition):
-        if condition.required_privilege not in catalog.privilege_levels:
-            raise MissionValidationError("unregistered privilege level")
-        if condition.host_ref not in catalog.registered_host_refs:
-            raise MissionValidationError("host privilege condition references an unregistered host")
-    elif isinstance(condition, FindingConfirmedCondition):
-        if condition.fact_type not in catalog.finding_fact_types:
-            raise MissionValidationError("fact type is not eligible for a finding goal condition")
-        if condition.canonical_entity_ref not in catalog.registered_entity_refs:
-            raise MissionValidationError("finding condition references an unregistered entity")
-    else:  # pragma: no cover - discriminated union is exhaustive
-        raise MissionValidationError("unknown success condition type")
+    if not isinstance(condition, SessionExistsCondition):
+        raise MissionValidationError("success condition type has no implemented Phase 0A rule")
+    rule = catalog.session_exists_rule
+    if rule is None:
+        raise MissionValidationError("session condition rule is not registered")
+    if rule.proof_schema is not SessionStateProof:
+        raise MissionValidationError("session condition proof schema is not the registered closed model")
+    if not isinstance(rule.source, SessionGoalSource):
+        raise MissionValidationError("session condition source capability is not implemented")
+    if rule.source.capability_id != rule.source_capability_id:
+        raise MissionValidationError("session condition source capability binding mismatch")
+    rule.validate_static(condition, catalog)
 
 
 def _revision_digest_payload(revision: MissionRevision) -> dict[str, object]:

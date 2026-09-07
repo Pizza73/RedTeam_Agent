@@ -8,6 +8,7 @@ fail-closed behaviour.
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -32,9 +33,10 @@ from redteam_agent.llm.profile import AgentModelProfile, mock_agent_profile
 from redteam_agent.mission.manager import MISSION_ADMIN_ROLE, MISSION_OPERATOR_ROLE
 from redteam_agent.mission.models import (
     ApprovalPolicy,
+    ExactSessionSelector,
     MissionRevision,
     MissionState,
-    SessionEstablishedCondition,
+    SessionExistsCondition,
 )
 from redteam_agent.models.common import ActionContractReference, ToolRef
 from redteam_agent.plan.models import ExecutionPlan, ExecutionPlanProposal, compute_proposal_digest
@@ -95,6 +97,9 @@ def network_tool(
     secret_paths: tuple[str, ...] = (),
     requires_session: bool = False,
 ) -> ToolDefinition:
+    parameter_schema = deepcopy(_NETWORK_PARAMETER_SCHEMA)
+    if not secret_paths:
+        del parameter_schema["properties"]["credential"]
     return ToolDefinition(
         tool_ref=ToolRef(tool_id=tool_id, registry_revision=registry_revision),
         display_name="Network Scan",
@@ -109,7 +114,7 @@ def network_tool(
         approval_rule=approval_rule,  # type: ignore[arg-type]
         side_effect=side_effect,  # type: ignore[arg-type]
         idempotency="idempotent",
-        parameter_schema=_NETWORK_PARAMETER_SCHEMA,
+        parameter_schema=parameter_schema,
         output_publication_rule_id="pub-1",
         evidence_rule_ids=("ev-1",),
         action_contract_ref=_PLACEHOLDER_CONTRACT,
@@ -302,8 +307,8 @@ def mission_revision(
     recovery_until = valid_until + timedelta(days=1)
     evidence_until = recovery_until + timedelta(days=1)
     conditions = success_conditions or (
-        SessionEstablishedCondition(
-            condition_id="c1", description="establish a session", selector_type="exact_session", selector_value="sess-1"
+        SessionExistsCondition(
+            condition_id="c1", session_selector=ExactSessionSelector(session_ref="sess-1")
         ),
     )
     stub = MissionRevision(

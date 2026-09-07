@@ -1,67 +1,117 @@
-"""Versioned semantic catalog (SystemDesign §16.2).
+"""Implemented Phase 0A goal semantics (SystemDesign §16.2/§24).
 
-Phase 0A ships a small, fixed catalog of registered semantic identifiers (fact
-types, selector types, privilege levels, success-condition kinds). Mission
-success conditions must reference only registered definitions; unregistered or
-unsupported conditions are Default Deny at validation time. This is an explicit
-test-double catalog; no new persistent authorization record is introduced.
+The catalog stores an executable static-rule object with its concrete proof
+model and source capability. Non-empty identifier strings alone never make a
+condition supported. This is immutable process wiring, not persistent state.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
+from typing import Literal, Protocol, runtime_checkable
+
+from pydantic import Field
+
+from redteam_agent.errors import MissionValidationError
+from redteam_agent.mission.models import ActiveSessionSelector, ExactSessionSelector, SessionExistsCondition
+from redteam_agent.models.base import StrictImmutableBoundaryModel
+from redteam_agent.session.models import SessionSecurityContextSnapshot
+
+
+class SessionStateProof(StrictImmutableBoundaryModel):
+    """Closed proof shape required by the registered session-exists rule."""
+
+    source_type: Literal["session"] = "session"
+    source_id: str = Field(min_length=1)
+    source_revision: str = Field(min_length=1)
+    observed_at: datetime
+    verification_state: Literal["confirmed", "contradicted", "unavailable"]
+    active: bool
+
+
+@runtime_checkable
+class SessionGoalSource(Protocol):
+    """Source capability required by ``SessionExistsGoalRule``."""
+
+    capability_id: str
+
+    def get_current_session(self, session_id: str) -> SessionSecurityContextSnapshot | None: ...
+
+    def list_current_sessions(self) -> tuple[SessionSecurityContextSnapshot, ...]: ...
+
+
+class SessionSnapshotReader(Protocol):
+    def get(self, session_id: str) -> SessionSecurityContextSnapshot | None: ...
+
+    def all_snapshots(self) -> dict[str, SessionSecurityContextSnapshot]: ...
+
+
+class EmptySessionGoalSource:
+    """Concrete empty source used by isolated validation tests."""
+
+    capability_id = "session-manager-current-active-v1"
+
+    def get_current_session(self, session_id: str) -> SessionSecurityContextSnapshot | None:
+        del session_id
+        return None
+
+    def list_current_sessions(self) -> tuple[SessionSecurityContextSnapshot, ...]:
+        return ()
+
+
+class RepositorySessionGoalSource:
+    """Adapter from the trusted Session repository to the goal source contract."""
+
+    capability_id = "session-manager-current-active-v1"
+
+    def __init__(self, repository: SessionSnapshotReader) -> None:
+        self._repository = repository
+
+    def get_current_session(self, session_id: str) -> SessionSecurityContextSnapshot | None:
+        return self._repository.get(session_id)
+
+    def list_current_sessions(self) -> tuple[SessionSecurityContextSnapshot, ...]:
+        snapshots = self._repository.all_snapshots()
+        return tuple(snapshots[key] for key in sorted(snapshots))
 
 
 @dataclass(frozen=True)
 class SemanticCatalog:
     catalog_revision: str
-    fact_types: frozenset[str]
-    selector_types: frozenset[str]
-    privilege_levels: frozenset[str]
-    condition_kinds: frozenset[str]
-    # Fact types eligible for a finding_confirmed goal condition. ``execution_outcome``
-    # is deliberately excluded: it has no direct goal correspondence (R11).
-    finding_fact_types: frozenset[str]
-    # Canonical entity references known to the (fixed test-double) entity catalog.
-    registered_entity_refs: frozenset[str]
+    session_exists_rule: SessionExistsGoalRule | None
     registered_session_refs: frozenset[str] = frozenset()
     registered_host_refs: frozenset[str] = frozenset()
-    # (condition kind, goal rule, proof schema, source capability).  This is a
-    # fixed Phase 0A catalog binding, not runtime goal-evaluation state.
-    condition_support_bindings: frozenset[tuple[str, str, str, str]] = frozenset()
 
 
-def default_semantic_catalog() -> SemanticCatalog:
+@dataclass(frozen=True)
+class SessionExistsGoalRule:
+    """Concrete static validator and its proof/source bindings."""
+
+    source: SessionGoalSource
+    rule_id: Literal["goal-rule:session-exists-v1"] = "goal-rule:session-exists-v1"
+    source_capability_id: Literal["session-manager-current-active-v1"] = (
+        "session-manager-current-active-v1"
+    )
+    proof_schema: type[SessionStateProof] = SessionStateProof
+
+    def validate_static(self, condition: SessionExistsCondition, catalog: SemanticCatalog) -> None:
+        selector = condition.session_selector
+        if isinstance(selector, ExactSessionSelector):
+            if selector.session_ref not in catalog.registered_session_refs:
+                raise MissionValidationError("session condition references an unregistered session")
+        elif isinstance(selector, ActiveSessionSelector):
+            if selector.host_ref not in catalog.registered_host_refs:
+                raise MissionValidationError("session condition references an unregistered host")
+        else:  # pragma: no cover - discriminated union is exhaustive
+            raise MissionValidationError("unsupported session selector")
+
+
+def default_semantic_catalog(source: SessionGoalSource | None = None) -> SemanticCatalog:
+    resolved_source = source if source is not None else EmptySessionGoalSource()
     return SemanticCatalog(
         catalog_revision="semantic-catalog-v1",
-        fact_types=frozenset({"identity", "service", "relationship", "finding", "execution_outcome"}),
-        selector_types=frozenset({"exact_session", "active_session"}),
-        privilege_levels=frozenset({"linux_uid0", "windows_system", "windows_high_integrity"}),
-        condition_kinds=frozenset({"session_established", "host_privilege", "finding_confirmed"}),
-        finding_fact_types=frozenset({"identity", "service", "relationship", "finding"}),
-        registered_entity_refs=frozenset({"entity:host-1", "entity:dc-01", "entity:svc-http"}),
+        session_exists_rule=SessionExistsGoalRule(source=resolved_source),
         registered_session_refs=frozenset({"sess-1"}),
         registered_host_refs=frozenset({"host-1"}),
-        condition_support_bindings=frozenset(
-            {
-                (
-                    "session_established",
-                    "goal-rule:session-established-v1",
-                    "proof-schema:session-established-v1",
-                    "source-capability:session-catalog-v1",
-                ),
-                (
-                    "host_privilege",
-                    "goal-rule:host-privilege-v1",
-                    "proof-schema:host-privilege-v1",
-                    "source-capability:session-security-context-v1",
-                ),
-                (
-                    "finding_confirmed",
-                    "goal-rule:finding-confirmed-v1",
-                    "proof-schema:finding-confirmed-v1",
-                    "source-capability:knowledge-fact-v1",
-                ),
-            }
-        ),
     )
