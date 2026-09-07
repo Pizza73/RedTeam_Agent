@@ -69,6 +69,8 @@ def test_mock_agent_loop_reaches_goal_through_real_policy_and_executor() -> None
         kernel.finalization_service.finalize(mission_id)
     published = kernel.phase0c.ingestion_service.ingest(ingestion_id=collected.ingestion_id)
     assert published.deletion_intent_id is not None
+    with pytest.raises(AgentLoopError):
+        kernel.finalization_service.finalize(mission_id)
     kernel.phase0c.eraser.run(deletion_intent_id=published.deletion_intent_id)
     result = kernel.phase0c.phase0b.result_repository.get("mock-loop-execution")
     assert result is not None and result.status == "SUCCEEDED"

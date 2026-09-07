@@ -140,6 +140,7 @@ def build_phase1_kernel(*, phase0c: Phase0CKernel | None = None) -> Phase1Kernel
         state_repository=phase0a.state_repository,
         execution_repository=phase0b.execution_repository,
         result_repository=phase0b.result_repository,
+        outcome_accounting=outcome_accounting,
         audit_store=kernel.audit_store, witness_barrier=kernel.critical_witness_barrier,
         operator_actor_token=OPERATOR_ACTOR_TOKEN,
     )

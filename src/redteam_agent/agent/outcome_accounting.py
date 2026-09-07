@@ -65,6 +65,8 @@ class ExecutionOutcomeAccountingService:
                 else:
                     break
             else:
+                if execution.result_ingestion_state != "SUCCEEDED":
+                    break
                 source_digest = self._ds.compute(
                     "execution_outcome_source_digest", result.model_dump(mode="python")
                 )
