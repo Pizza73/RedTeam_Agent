@@ -2,8 +2,8 @@
 
 以下はPhase・実装方式・Adapterに関係なく破ってはならない。
 
-設計改訂は`system-design-v1-r1`。AI固有の規約は[規範別冊](../SystemDesign_AI_Control.md)のAI-01〜12と
-併せて適用する。実装が旧方式であることを理由に本規約を弱めず、正式なPhase権限と移行手順を別途必要とする。
+設計改訂は`system-design-v1-r3`。AI固有の規約は[規範別冊](../SystemDesign_AI_Control.md)のAI-01〜12と
+併せて適用する。実装が旧方式であることを理由に製品の安全条件を弱めない。開発のPhase受入は正本§40、既存データを扱う場合の移行は正本§38に従う。
 
 ## Authorization
 
@@ -65,7 +65,13 @@
 - Raw Tool Outputは非信頼入力であり、直接Promptへ連結しない。
 - Quarantine、Classification、Secret Detection、Redactionを経たArtifactだけをLLM可視にする。
 - Caller生成Receipt、Quarantine Reference、Publication Object、Full-object compatibility loaderをSecure Ingestion権限として扱わない。
-- Secure IngestionはRepository-bound `ingestion_id`から完全なCurrent Bindingを解決する。正常公開後の消去はDurable Manifest / Projection / 全参照Resourceのread-back検証を必須とする。公開に至らないRetention Expiry / Incomplete Collection Expiryは別型のIntent / Claimと必須Evidenceで消去し、架空ManifestやExecutionResultを生成しない。
+- Secure IngestionはRepository-bound `ingestion_id`から完全なCurrent Bindingを解決する。正常公開後の消去は正本§33.2の確定済み公開証跡（Manifest / Projection / 全参照Resourceの公開時Immutable Metadata・Proof / Audit・Witness）と対象QuarantineのBinding / Key / Inventoryのread-back検証を必須とする。成果物本文の現存や消去Claim連鎖を要求しない。公開に至らないRetention Expiry / Incomplete Collection Expiryは別型のIntent / Claimと必須Evidenceで消去し、架空ManifestやExecutionResultを生成しない。
+
+- 新規成果物の生成・内部保存は認可済みExecutionに付随する既存Secure Ingestionだけが行う。Repository-bound入力、固定Rule、Current MissionのLocal処理可否、Lease / Fence、Retention、Classification / Quotaを検証し、Storeが内部保存先を決める。未生成ResourceのGrantや追加Publication認可Recordを作らず、元PolicyDecisionを変更しない。
+- 内部保存の例外を任意のCaller / Toolの新規作成、保存先指定、既存Resource上書き、Secret確認・置換に使わない。exact成果物Metadata / Manifestを確定しても閲覧・変更・Export・Secret Resolve権限を与えず、Current Data Access認可を別途要求する。
+
+- Quarantine消去とExecutionResult確定まで必要な既存Immutable検証MetadataとAudit / Witness経路を保持し、本文・Secret値・鍵のRetentionを延長しない。証跡欠落・Witness不一致・既存Integrity Stopでは消去を拒否する。過去の公開証跡はCurrent Read / Context / Goal / Secret利用の認可・有効性を代替しない。
+- Ingestion Retryは同じ入力・固定Rule / Parser ID・Code Digestだけを既存予算内で使う。MVPは変更Ruleでの既存Quarantine再処理を扱わず、ID変更による予算回避や元Action再送を許可しない。Rule利用不能・失効時は既存の失敗 / 隔離 / Human Review、期限到達時は型別消去へ進む。
 
 ## Integrity and encryption
 
@@ -95,17 +101,18 @@
 
 ## Result collection and durable ingestion
 
-- Result Collection開始時にExecutorがComposition Rootから注入されたTrusted Clockを1回読み、exact Tool Definition、`ResultTaskBinding`（`provider_task | local_capture`）、Sink、Missionの用途別期限へBindingしたDurable Authorityを作成する。同期Local Captureに架空Provider Task IDを発行せず、元の単回Submit内で取得する。Security-sensitive Collection APIはCaller supplied `now`を受け取らない。
+- Result Collection開始時にExecutorがComposition Rootから注入されたTrusted Clockを1回読み、exact Tool Definition、`ResultTaskBinding`（`provider_task | local_result`）、Sink、Missionの用途別期限へBindingしたDurable Authorityを作成する。`local_capture`のAlias受理・自動変換を禁止する。同期Local Captureに架空Provider Task IDを発行せず、元の単回Submit内で取得する。Security-sensitive Collection APIはCaller supplied `now`を受け取らない。
 - RetentionはTrusted Collection開始時刻から一度だけ計算して保存し、Execution作成時刻、Caller / Provider TimestampまたはRestart時刻から再計算しない。
 - Tool固有`max_output_bytes`はTrusted Registryから解決し、CallerまたはGlobal設定で拡大しない。
 - Result CollectionとSecure Ingestionは用途別typed Leaseを使用し、Collection / Execution / Authority / exact ResultTaskBinding / Sink / State VersionまたはIngestion / Execution / Receipt / Quarantine / State Versionを必須Bindingとする。汎用Optional FieldでBindingを省略させない。
 - Production起動または全Worker停止中の認可済みRestoreごとにTPM-backed `deployment_epoch`を進め、Fenceを`(deployment_epoch, fencing_token)`とする。Database Rollback後も旧ProcessをCurrentにせず、Release済みFenceを削除 / 再利用しない。
 - Productionは単一Host / TPM / Application DB / Composition Rootへ限定し、そのRoot配下のWorkerだけが同じDeployment Epochを共有する。Multi-host Workerを起動時に拒否する。
-- Renewal、Chunk / Cursor / Receipt / Manifest / State / Deletion Intent、Abort、Releaseを含む全Durable Mutationは、`lease_id`、Owner、Current Deployment Epoch / Fencing Token、未Release、Host Boot内共有の単調Clock上の未失効、Authority / Resource Digest、Expected State Versionの完全Predicateを同一Transactionで検証する。UTC巻戻り / 不連続は`ClockIntegrityError`で停止し、TTLを延長しない。
+- 通常Collection / Ingestion WorkerのRenewal、Chunk / Cursor / Receipt / Manifest / State / Deletion Intent、Abort、Releaseを含む全Durable Mutationは、`lease_id`、Owner、Current Deployment Epoch / Fencing Token、未Release、Host Boot内共有の単調Clock上の未失効、Authority / Resource Digest、Expected State Versionの完全Predicateを同一Transactionで検証する。UTC巻戻り / 不連続は`ClockIntegrityError`で停止し、TTLを延長しない。
+- 期限切れ確定は既存Retention Schedulerから既存Collection / Ingestion Ownerを呼ぶ経路だけが行う。Current Root / Clock / Anchor、対象処理の保存済み期限到達、Origin / Resource Binding、Expected State Version、現Lease ID / Fence / Snapshotまたは不存在をOCC照合し、既存Expiry State・型別Deletion Intent・旧Lease失効・Audit / Critical Intentを同時確定する。未失効Leaseは要求せず、Workerへ期限後更新権限を返さない。Collection期限ではABANDONED / Unresolved Item / Lease失効を確定し、固有Retention到達まで消去Intentを作らない。公開済みなら既存post_ingestion消去へ進める。新しい状態・Record種別・Serviceは追加しない。
 - Default Leaseは60秒、Heartbeatは20秒以下とし、`lease_duration >= 3 * heartbeat_interval`を強制する。Renewal失敗はCancellationを通知し、非協調Adapterが継続してもSinkが全Stale Mutationを拒否する。
 - Lease更新とRecovery Authority更新は別々にCurrent Predicateを再検証する。継続Stream / Sinkも短命Authorityの失効を検査し、Heartbeatから認可TTLやMission期限を延長しない。`valid_until`、`recovery_until`、`evidence_retention_until`を分離し、期限後の新規Action / LLM利用をRecovery名義で認可しない。
 - Filesystem / Blob Writeは`work_id/deployment_epoch/fencing_token`へStageし、Storage-side Conditional PublicationだけがCurrent Metadataへ到達可能にする。旧FenceのBytesは到達不能なGarbageであり正本にならない。
-- Quarantine Sink / Reader / Factory / Lookupは副作用を持たない。正常公開はRedacted Artifact / Secret Reference、ExecutionResultProjection、Manifest、Deletion Intent、DELETE_PENDING、Lease Releaseを同じUnit of Workで確定する。全参照の整合性を検証し、消去前にもread-back検証する。ExpiryとManifest Commitは同じExpected StateでOCC競合し、期限後Publishを許さない。
+- Quarantine Sink / Reader / Factory / Lookupは副作用を持たない。正常公開はRedacted Artifact / Secret Reference、ExecutionResultProjection、Manifest、Deletion Intent、DELETE_PENDING、Lease Releaseを同じUnit of Workで確定する。公開時は全成果物本文 / Digest / Key Bindingと保存Metadataを検証・Witnessし、消去時は確定済み公開証跡と対象Quarantineをread-back検証する。ExpiryとManifest Commitは同じExpected StateでOCC競合し、期限後Publishを許さない。
 - Secure Ingestionは`DELETE_PENDING`でLeaseをReleaseして消去Capabilityを持たない。Composition Root固定の専用Eraserだけが消去理由別のIntent / 必須Evidence / Resource Digest / Key Metadata / deterministic `erasure_id`へBindingされた単回Erasure Claimを状態遷移と同じTransactionで作成・消費して`ERASURE_CLAIMED`へ遷移する。RepositoryにはConsumed Claimだけを保存する。EraserはKey Providerへ同じ`erasure_id + key_metadata_digest`でまずReconcileし、`NOT_STARTED`だけでDestroyを開始し、`UNKNOWN`後はReconcileだけを行い、read-back検証済み`CONFIRMED`後にだけCiphertextをUnlinkする。未公開Orphan Resource Cleanupは別の限定AuthorityとCopy Inventoryを検証し、通常消去を迂回しない。
 - `INGESTED_DURABLE`以後はManifest / ExecutionResultProjectionだけからExecutionResultを再構築し、Adapter Collection、Provider照会、Quarantine復号を再実行しない。
 - Manifest Commit、Deletion Intent、Erasure Claim消費、Key破棄、Ciphertext削除、ExecutionResult確定の各Crash境界を、Provider再実行、平文Fallback、追加の未検証消去、手動File修復なしに回復する。
@@ -123,6 +130,8 @@
 - ReconciliationなしにOutcomeを推測しない。
 - Payload/Implant生成・配布・永続化機能はMVP対象外。
 
+- PAUSED / WAITING_HUMAN_REVIEWでも既存GraphのRECONCILINGからCurrent Recovery Authorityの範囲で既存Executionを照合できる。MissionをRUNNINGへ変えず、終了後はCurrent Missionに対応する状態へ戻す。通常ResumeやLLM / 新規Dispatch権限に代用しない。
+
 ## AI control
 
 - 証拠評価、登録済みActionContractによる前提検証、Policy / Approvalによる認可を分離する。Goal unknownは全ActionのDENYではないが、当該Actionの安全上の前提unknown / conflictは拒否する。
@@ -134,27 +143,15 @@
 - 検証済みFact保存後のAnalyzer失敗はFactを撤回せず、既存Local処理だけを有限に回復する。新しい提案 / Keyから結果不明の外部Actionを自動再送しない。
 - 安全性と正常時 / 攻撃下の達成能力を独立Oracleで検査する。Schema PASS、全件停止、同じLLMの自己採点をAgent品質の合格根拠にしない。
 
-## Development loop
+## Development process
 
-- Codexは自分を評価する仕様、Gate、Workflowを変更しない。
-- 実装とReviewは別々のローカルCodex CLI Process / Contextで行い、Review SnapshotはRead-onlyとする。新規Cloud Task / `@codex` Trigger / Cloud Fallbackは禁止する。
-- GitHub Credential、実行Claim / Journal、通常Commit / Push、Evidence公開とWorkflow DispatchはClean Current MainのTrusted Runnerだけが所有する。WorkerへCredential Storeや親の状態へのAccessを与えず、Model自身の出力は起動・検証の証跡にしない。
-- 独立AI Reviewは`local-review-v1`のUnique Run / Session、最新full HEAD / Base、Ready / Audit Source / Policy Digest、全FindingへBindingする。LauncherのOperator Accountが認証主体であり、Host / Sandbox / Launcherを信頼基盤とする。Operatorと独立した第三者Accountの証明を主張しない。
-- Trusted WorkflowはLauncherのStart / Result / 全Finding Evidence、本人性・一意性・TimelineとCurrent CIを独立再検証する。通常Reviewの都度人間承認は要求せず、初回Governance Review / Merge、Design Approval、Provider Human Gateは維持する。
-- 旧`codex-native-v1` Gate / Finding / Retry消費は履歴として保持し、新規Cloud起動権限へ使用しない。送信済み旧Taskやその出力が不明な同一入力でLocal Workerを起動しない。
-- Workerの起動・終了・Push・Evidence公開の結果不明はDurable Claim / JournalとRemote EvidenceのReconciliationまで再送しない。Crash / Timeout / CancellationでClaimを消さず、Sandbox不足時にCloudや権限緩和へFallbackしない。
-- Stale Reviewは無効。
-- Loop回数を制限し、同じ失敗を無限反復しない。
-- 同じInvariant Familyの2回目のFormal Reviewは`DESIGN_CHANGE_REQUIRED`として通常Resume不能にする。過去のbase-refresh / Resume Evidenceは新しいDesign Stopを越えて再利用しない。
-- Design Stop後の再開は、停止Gate、Current 40桁HEAD、Phase、承認済みDesign revisionへBindingした単回`DESIGN_APPROVED` Evidenceだけを使用する。LabelやFree-text commentを権限にしない。
-- Transient Lifecycle LabelはOperator向けProjectionであり、Implementation / Review Actionを認可しない。RunnerはCurrent-HEAD Trusted Request / Ready EvidenceからActionを決定する。
-- `ai-loop-blocked`中のCIは決定論的Checkだけを確定し、Review Readyを生成しない。Stop latchはTrusted Resume / Design Approval / Phase transitionだけが除去できる。旧`ai-needs-review` ProjectionはAuthority再検証後のDesign Approval遷移だけが正規化できる。
-- Design Stop中の各Base Refreshは、直前1 Edgeの2親Merge、Previous HEAD上のTrusted Exact-SHA Authorization、Current / Previous HEAD、認可済みDefault SHA、Phase pair、Gateを検証したbot-authored `BASE_REFRESH_APPLIED` CheckpointをCurrent HEADへ持つ。後続RefreshはCurrent HEAD上の単一Checkpointからだけ権限を継承し、自由なMerge、通常Commit、未確認Edge、欠落・改ざん・曖昧なCheckpointから継承しない。
-- Phase 4/5の外部選択はHuman Gateを通す。
-- 最終mergeは、承認済みDefault Branch上のLocal OrchestratorだけがPhase 0A～5の
-  SHA-bound PASS Chain、Current-HEAD CI/Status、Stop Label不在、Current Default Branch
-  ancestryを再検証し、Expected HEAD SHA固定で1回だけ実行する。Dispatch前に同じPR/HEAD
-  固定のRepository Git ref claimを原子的に取得し、ClaimへBindingした永続Attempt Recordを
-  保存する。その後、同じGateを再取得して不変性を確認する。Claim/Recordの既存・作成結果不明
-  または取得後Gate Drift/Unknownは明示的Reconciliationまで再送を禁止し、通常実行ではClaimを
-  削除しない。Codex、GitHub Actions、Governance PR、Fork PRはこの経路を使用できない。
+- 設計整合と独立レビューはCodex、実装はClaude Codeが担当する。製品のPlanner / Analyzerとは別の役割である。
+- 正本§40に従いPhaseごとの一つの開発記録へ対象コミット、対応要件、試験結果、独立レビュー、受入根拠・残課題を残す。Phase順序を飛ばさず、旧PASSを新実装に流用しない。
+- Codexは実装会話を引き継がない別セッションで対象コミットのRead-only Snapshotと試験Evidenceを独立に確認する。実装者の説明、モデルのPASS、終了コード0だけを受入根拠にしない。
+- 実装後の変更は対象コミット・差分・影響範囲に応じて試験と独立レビューを更新する。記録だけの追記は製品変更と区別し、コミットIDの自己参照を要求しない。
+- 未実施の試験・レビューを実施済みと記録しない。安全条件を満たす試験を失敗回避のために削除・skip・xfail化しない。
+- 設計・受入条件を合格目的で無断に緩和しない。承認済みの設計改訂は関連文書へ一貫して反映し、旧自動Design Approvalを追加要求しない。
+- BLOCKER / HIGH、未解決仕様矛盾、Security-critical TODOを残して次Phaseを受入済みとしない。同じ問題で進展しない場合は設計と関連経路を見直す。
+- 製品のScope・Policy・Approval・Secret・単回実行・Audit・移行・Production適格性は開発規約の簡素化で変更しない。Phase 4 / 5の外部選択は既存Human Gateを通す。
+- 開発・CIには実演習Secretや不要なCredentialを渡さず、実C2 / MCP / Targetへの操作を行わない。
+- 旧Launcher / Bot Marker / Workflow / 自動Merge / 開発用Claimは現行Gateではない。新しい開発状態機械や認可Tokenを追加しない。公開・Mergeは当該作業のユーザー指示に従い、Phase受入だけで自動実行しない。

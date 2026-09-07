@@ -2,9 +2,9 @@
 
 ## Specification revision and traceability
 
-`system-design-v1-r1`と規範別冊`ai-control-v1-r1`を受入対象とする。以下の正本の詳細条件も必須であり、
-この一覧は既存TestやGateを削減しない。Phase順序は維持し、後続Production機構は前Phaseの安全な型 / Test Double境界と分離する。
-過去のPASSを新仕様の成立証拠へ読み替えず、Current PhaseはTrusted GitHub Evidenceから解決する。
+`system-design-v1-r3`と規範別冊`ai-control-v1-r3`を受入対象とする。以下の正本の詳細条件も必須であり、
+この一覧は製品の安全試験・品質条件を削減しない。開発Gateは正本§40の新体制へ置き換える。Phase順序は維持し、後続Production機構は前Phaseの安全な型 / Test Double境界と分離する。
+過去のPASSを新仕様の成立証拠へ読み替えず、Current PhaseはPhaseごとの開発記録と実コード・試験・独立レビューから確認する。
 
 | 要件群 | 必須の詳細条件と検証段階 |
 | --- | --- |
@@ -23,176 +23,30 @@
 - `ruff`、`mypy`、`compileall`がPASS
 - Branch Coverageを取得できる
 - 既存Testを削除、skip、xfail化していない
-- Protected Filesを変更していない
+- 未承認の設計・安全条件・受入条件の変更がない。ユーザー承認済み改訂は関連文書と同じRevisionへ整合する
 - 新規Security FindingにRegression Testがある
 - BLOCKER/HIGHが0件
-- 最新PR full HEAD SHAを別Fresh SessionのローカルRead-only Reviewerが独立Reviewし、`local-review-v1`をTrusted Gateが検証済み。旧Native Gateは過去のPhase Chain確認専用
+- 対象実装の完全なコミットIDを固定し、実装セッションと分離したCodexがRead-only Snapshot・実コード・試験Evidenceを独立レビュー済み。後続変更は差分・影響に応じて再検証する
 - 実C2/MCP/外部TargetへのSide EffectがCIで0件
 - Secret Leakageが0件
 - 未解決の仕様矛盾、仮実装、Security-critical TODOがない
 
-## AI Loop Control Acceptance
+## Development Process Acceptance
 
-- LOOP-035: 独立設定の承認者とWorker入力が一致し、欠落・不正ID・実行Account不一致を起動前に拒否する。
-  Approval内の自己申告値を変更しても、設定上の承認者が変化しない回帰試験を持つ。
-- LOOP-036: 既知BLOCKEDの終端化、旧Journalの明示照合、公開応答喪失、重複・改ざん・HEAD競合を検査する。
-  Claimを保持し、終端化後も同HEADを再実行せず、未解決実行のままRefresh / 新HEAD実行を許可しない。
-- Governance Unit Testは実HostのCodex設定やCredentialの存在・可視性に依存せず、Synthetic設定で検査する。
-  Workerと同じ隔離下でも実行し、試験成功のためにSandboxを緩めない。
-- Base Refresh後のCI未完了は`waiting`として待機し、承認やResumeを発行しない。
-  CI失敗と未完了を区別し、Design Stop中の成功だけでは自動Design Approvalへ進まない。
-- Local OrchestratorはCurrent default-branch SHAのClean Checkoutでだけ起動する
-- `automation/local-execution-policy.json`はLocal Codex CLI実装・Fresh Read-only Local Review・無人Reviewを固定し、Cloud Task / `@codex` Trigger / Cloud Fallbackを拒否する
-- Implementationは別のScoped Workspace、Reviewは別Process / Context / Read-only Snapshotとする。
-  WorkerからGitHub Credential、親のJournal / Main Checkout、他Worker、User Plugin / MCP / 過去会話へ
-  到達できず、未知・不足Sandbox機能は起動を拒否する。Read-only違反、Credential可視、Context共有の
-  Negative / Failure-path Testを持つ
-- Workerはcommit / push / PR Evidence / Workflow Dispatchを行わない。Trusted Launcherだけが
-  Complete Phase Gate、Protected Path、Diff、Current入力権限を再検証して通常PR Commitを公開する
-- `gh`のCurrent Loginが`AI_GATE_APPROVER_LOGIN`と完全一致しなければ停止する
-- `github-actions[bot]`以外のImplementation/Ready/Phase Gate Markerを無視する
-- Implementation Request、ready/trigger marker、Trusted Phase Gate recordのUnknown Field、Duplicate JSON Keyを拒否する
-- Implementation RequestをCurrent Phase、Current HEAD SHA、Trusted Phase Promptへ固定する
-- `local-review-v1`はLauncherの`AI_GATE_APPROVER_LOGIN`本人性、Current Phase、full HEAD / Base、
-  Ready / Audit Source / Policy Digest、Unique RunとFresh Reviewer Session、Start / Resultの参照・時刻、
-  Review中のhead不変性へ固定する。`reviewer_login`はLauncherによる来歴証明であり、別のReviewer
-  AccountやCloud Botを装わない。Operator Host / Sandbox / Launcherが信頼基盤であることを明示する
-- PASSはLauncherが実際の別Review Process終了・Snapshot不変性を確認し、閉じたResult Schema、
-  全受入条件、Current CI、FindingなしをTrusted Workflowが独立検証した場合だけ認める。
-  ModelのPASS、Exit Code 0、手貼りJSON、Implementation Summary単独をGateへ昇格しない
-- Local Start / Result / Findingの偽Author、編集、Unknown Field / Duplicate JSON Key、Stale HEAD / Base /
-  Policy、Run / Session再利用、欠落・重複Result、開始前・未来・逆転時刻、Review中のHEAD変更を拒否する。
-  各拒否のRegression Testを持ち、単一Resultと全Finding Referenceの件数・順序・内容一致を検証する
-- 既存`codex-native-v1`は旧Gate Chain / Finding / Retry履歴だけに保持し、元の`AI_REVIEWER_LOGIN`、
-  Native Output / Bot Reaction / SHA / Timeline検証を弱めない。新規Local Reviewに旧Botの👍や
-  短縮Commit Prefixを要求せず、旧Evidenceを新しいLocal Runへ読み替えない
-- 全Phaseで1回の網羅Reviewを要求し、Codexは最初の指摘で停止せず、全P0/P1を同じ1件のFormal
-  Reviewへ保持する。P0/P1が複数Formal Reviewへ分散した場合はFail Closedにする
-- CHANGES_REQUESTEDはCurrent HEADへ完全Bindingされた単一Local Resultと全P0/P1（BLOCKER / HIGH）
-  findingを要求し、root-cause keyを決定論的に導出する。Fix Requestは全Findingの件数とPermalinkを
-  列挙し、Codexは`finding_key`だけでなく全件を修正する
-- 新規Policy適用後のImplementation Requestは、PhaseごとのRequired Invariant Familyを全件
-  列挙した閉じた監査JSONを要求する。CIはRequest permalink/input HEAD/action、output HEAD、
-  canonical audit digest、Family set、evidence/test pathを検証してからready markerを発行する
-- 監査対象Familyは全public entry point、caller、compatibility reader、recovery path、sibling
-  implementationを列挙し、positive/negative/failure testを持つ。変更されたStateful Familyは
-  property-basedまたはstate-machine testを持つ
-- LOOP-031/032: 新規RequestはStrategy Version 1.0を含み、Runnerは旧Policy・Unknown Field・
-  Stale HEADのRequestから実装依頼を出さない。全Phaseの実装・Review Promptは現行別冊と
-  §38のreuse / replace / new方針を引き継ぎ、同じRequestの再処理で重複依頼しない
-- 同RequestのAuditに閉じた`implementation_strategy`がない場合、CIはReview Readyを生成せず、
-  GateもそのAuditを受理しない。旧Auditが履歴として読めることを新Policy適合へ読み替えない
-- LOOP-032の履歴Preflightは、Git上のproper-ancestor Audit / 入力Request、改変されていないAudit・
-  参照Evidence・Application Source、両Revisionの旧Request要件と同一Family Policyを検証し、当時の
-  Stateful試験要件を適用する。Current PhaseのRequired Family setは維持し、結果を`PREFLIGHT_ONLY`と
-  表示する。新Policyで作られたAuditのStrategy削除、履歴改変、証拠欠落、現行Request / Output認証との
-  併用を拒否する。新規StrategyにはPreflightでも現行Stateful要件を適用する
-- CI失敗引継ぎはDefault BranchのPhase Plan読取りにJob単位の`contents: read`だけを追加し、
-  Contents write / Merge権限を付与しない。Current open PR / exact HEAD / 同一Repository / Phaseを
-  再確認し、停止Latch存在時はFix Requestを生成しない。読取り拒否・途中の停止・HEAD / Phase Driftを検証する
-- 分類単位はOwner、理由、Input / Output File、Entry Point / 兄弟経路、現行規範・Family、
-  移行影響、保持する安全試験、実行する試験と種別、変更前後を記録する。全変更Source / Test Path
-  （追加・削除を含む）と全Affected Familyを網羅し、不正Path・不存在Input File・旧設計参照・
-  重複ID / JSON Key・不明Field・不足試験をCIで拒否する。Stateful置換 / 新規にはModel-based試験が必要
-- 分類・要約を変更すると既存Audit Digestも変わる。Input Request / proper-ancestor / Output HEAD
-  のBindingは維持する。独立Reviewは分類や試験種別の自己申告を信用せず実コード・試験を照合する
-- SystemDesign_AI_Control.mdはSystemDesign.mdと同じ保護境界に置く。ai-loop PRや無Label PRでの
-  変更を拒否し、governance-changeでのHuman Reviewに限定する。Data Reset・Phase飛越しは認可しない
-- Formal Reviewは監査を自己合格証跡として扱わず、各Required Familyを独立に再検証する。
-  各P0/P1はTrusted PolicyのInvariant Familyを正確に1件保持する
-- 同じInvariant FamilyがPhase内の2回目のFormal Reviewへ再出現した場合は新しいFix Requestを
-  発行せず`DESIGN_CHANGE_REQUIRED`理由付き`BLOCKED_LIMIT`で停止し、coherent redesignを記録した
-  専用Human Design Approvalを要求する
-- `DESIGN_CHANGE_REQUIRED`の最新Gateが存在する場合、通常の`Resume AI Loop`、旧base-refresh Status、
-  過去のbounded Resume、Label変更だけではImplementation Requestを発行できない
-- Base Refresh EvidenceはExpected HEAD固定のBranch Updateを1回だけ認可し、Resume権限を含まない。
-  使用済みTransitionまたは後発Gateを越えたTransitionを再利用できない
-- Design Stop後の再開Recordは、停止Gate permalink、Current Phase、Current 40桁HEAD、Current default
-  branchへ包含されたDesign commit、Design permalink、Policy Digestを完全Bindingし、1回だけ消費できる
-- Runnerはbase refresh、Trusted Workflow dispatchの各後、およびLocal Worker起動直前に最新Gate、Current
-  HEAD、Stop latch、Transition消費状態を再取得し、Authority Drift時は`ai-loop-blocked`を維持する。
-  Transient Lifecycle Labelの遅延・残存だけでは停止せず、Trusted Transitionで正規化する
-- Phase Cycle、同一exact Root Cause、CI Failureの自動Loop上限はすべて5回とし、設定値が5以外なら
-  Fail Closedにする。Semantic Invariant Familyの再発上限は2回とし、設定値が2以外ならFail Closedにする
-- Required Check成功前にReview Gateを記録しない。`ai-loop-blocked`中のCI成功ではReview Ready marker、
-  `ai-needs-review`、review pending statusを生成せず、Design Approval用のCheck結果だけを残す
-- 自動Phase遷移は`ai-review-passed` markerを解除するまでRunnerが待機し、next追加後にcurrentを削除する。
-  各境界でfreshなopen PR、exact HEAD、marker、隣接Phaseを再検証し、無関係Labelを完全置換で消さない。
-  marker欠落、非隣接/3件以上のPhase、HEAD/state driftはFail Closedにする
-- RunnerはCurrent-HEAD Trusted RequestをTransient Labelなしでも実行対象として解決し、Requestを
-  Ready markerより優先する。同じRequest/Reviewを再処理せず、停止後にGitHub Evidenceから再開できる
-- LOOP-033: 起動前のDurable Claim / Parent Journal、Timeout / CancellationとProcess Group終了、
-  Output上限を検証する。Spawn / Exit / Publication / Commit / Push結果不明はReconciliationで停止し、
-  Restart、重複Runner、失われたACKで自動Replayしない。Known-success / Negative / Crash経路を試験する
-- LOOP-034: 旧Cloud Requestの終了と出力を入力HEADへBindingしてReconcileするまで同一入力のLocal
-  Workerを起動しない。Polling停止やLabel変更は旧Task取消し証明にしない。今回Governanceの採用が
-  Product実装再開、古いDesign Approval再利用、Retry履歴削除にならないことを検証する
-- 通常Local ReviewからTrusted Phase Gate登録までは人間の都度承認なしで進み、初回Governance
-  Review / Merge、Design Approval、Phase 4/5 Provider Human Gateは従来どおり要求する
-- Phase 4/5は`ai-human-gate`中に停止し、承認済みProvider Gate遷移後だけ再開する
-- OpenAI API Keyを要求せず、GitHub CredentialをCodex Promptまたは実行環境へ渡さない
-- Active PRのCurrent Phaseは、exact phase label、`github-actions[bot]`のCurrent-HEAD
-  Implementation Request、Current HEADへ包含された隣接Prior-Phase PASSでのみ解決する。
-  複数の包含PASSはGit祖先関係で唯一の最大候補を要求し、コメント順、Transient Lifecycle Label、
-  互いに比較不能な候補をAuthorityとして拒否する
-- 累積PRのCurrent Phaseを回復するときは、trusted current-Phase finding/gate、Phase Base、
-  reviewed HEADからcurrent HEADへの祖先関係、両HEADの同一Git tree、Current-HEAD Checkを検証し、
-  Current Phaseの完全Gateを実行してから同じPhaseのfresh reviewへ戻す。隣接Prior Phaseへは戻さない
-- Phase 0B～3の`BLOCKED_LIMIT` HEADがCurrent default branchの必須Governanceを含まない場合、
-  trusted current-Phase Gateとその唯一の隣接Base PASSを検証したStatusだけが、Phase Labelを維持した
-  exact-HEAD base refreshを認可する。取込み後は旧HEADとtarget baseの両方を祖先に持つこと、
-  Current-HEAD Check成功を要求する。Invariant Family再発以外のStopだけが同Gateへのbounded Resumeへ
-  進める。`DESIGN_CHANGE_REQUIRED`は停止Labelを維持し、専用Design Approvalを要求する
-- Default BranchをPRへ取り込む前にCurrent Phaseを1つ戻し、旧HEADのPASSを再利用せず、
-  取込み後HEADで同Phase Gateを再実行する
-- Base-refresh WorkflowのPreparation modeは旧HEAD、Current default-branch SHA、隣接Prior PASSを固定した
-  Authorization Statusだけを書き、Confirmation modeは検証済みCurrent HEADへCheckpoint Statusだけを書く。
-  どちらもPR labelを変更せず、完全置換はLocal Orchestratorが変更前後の全PR状態を再取得して実行する
-- 同じHEAD/Current Phaseにsource側とrollback済み側の複数Base-refresh遷移Identityが成立する
-  場合は、label置換とbranch updateのどちらも行わずFail Closedにする
-- Local Orchestratorはlabel置換とbranch updateの直前・直後にCurrent PR、Default Branch、
-  trusted PASS/Status遷移Snapshotを再取得し、Driftまたは競合をFail Closedにする
-- label置換後のSnapshotはrollback後Phaseの視点で旧認可Identityを再確認し、さらに下位Phaseへ
-  戻す新しいsource Identityとの競合を拒否する
-- Refresh後Phase 0AのReview BaseはReviewed HEADに実際に包含されたtrusted target SHAへ固定し、
-  Review中にDefault Branchが進んでもそのGateを記録した後、次Phase実装前に再度rollbackする
-- 複数の履歴Base-refreshがReviewed HEADに包含される場合、旧HEADとtarget baseの両方が後続候補へ
-  祖先となるPartial Orderで唯一の最大候補だけをReview Baseにし、最大候補が複数ならFail Closedにする
-- Base refreshは`expected_head_sha`とCurrent default-branch SHAへ固定し、Final merge APIを
-  呼ばない
-- Base refresh後はApprover限定WorkflowがCurrent HEADの直前1 Edgeについて、2親Mergeの第1親が
-  Previous PR HEAD、第2親が認可済みDefault SHAであり、第1親上のTrusted Base Refresh Statusが
-  同じGate / Phase / SHAをBindingすることを検証する。検証済み遷移はCurrent / Previous HEAD、
-  Default SHA、Phase pair、GateをDigest Bindingしたbot-authored `BASE_REFRESH_APPLIED` Statusとして
-  Current HEADへ記録する
-- Design Stop後にDefault Branchが再度進んだ場合、同じGateの継承はCurrent HEAD上の単一で正しい
-  `BASE_REFRESH_APPLIED` Checkpointだけを認可根拠とする。Design Approval消費前の通常Commit、親・Digest・
-  Gate不一致、欠落または曖昧なCheckpointは実装・Resume・次Refreshへ進めずFail Closedにする。単回Design
-  Approvalを消費した実装出力は通常の子CommitとしてCurrent-HEAD CIとReviewへ進めるが、そのCommitはResumeや
-  次Refreshの権限を継承しない
-- Design ApprovalはStop latch、Current Phase / HEAD、最新Blocking Gate、Required Check、Design commit
-  の包含を再検証する。Current HEADの旧`ai-needs-review`はAuthorityではないため許容して最終Label遷移で
-  除去するが、`ai-needs-fix`、`ai-review-passed`、`ai-human-gate`等の競合状態は拒否する
-- Final mergeはLocal Orchestratorだけが実行し、`phase-5`、`ai-project-complete`、
-  `ai-review-passed`、全Phase PASS Chain、Current-HEAD Check、Trusted Phase Status、
-  Current default-branch ancestryを再検証する
-- Final merge APIへCurrent 40桁HEAD SHAを渡し、不一致、競合、不確実なResponseをFail
-  Closedにして自動Retryしない
-- Final merge dispatch前に同じPR/HEADの既存Attempt Recordがないことを再確認し、Repository
-  Git ref claimを原子的に作成して1プロセスだけが所有する
-- Claim取得後、PR、HEAD、Default Branch、Phase 5 Gate、Policy Digest、Actor、Claim Ref固定の
-  Attempt Recordを永続化してからmerge APIを呼ぶ
-- Attempt Record確認後に全Phase PASS Chain、PR全状態、Default Branch SHA/ancestry、
-  Current-HEAD Checks、Trusted Phase Statusを再取得し、すべて不変かつPASSの場合だけdispatchする
-- Claim/Attempt Recordが存在する、またはClaim作成結果が不明なPR/HEADは、Live GitHub Outcomeを
-  明示的にReconcileするまで再送せず、Claim取得後のGate Drift/Unknownも同様に停止し、通常実行で
-  Claimを削除しない
-- Governance PR、Fork PR、停止Label付きPR、`ai-loop`以外を自動mergeしない
+- 実装はClaude Code、設計整合と独立レビューはCodexとし、実装会話を独立レビューのContextへ引き継がない。
+- 正本§40のPhaseごとの一つの開発記録に、設計Revision・対象Phase・入力 / 実装対象コミット、対応要件、試験Commandと結果、レビュー参照・全指摘・対応、受入根拠・残課題がある。
+- 各要件のpublic entry point、caller、recovery / compatibility / sibling経路を照合し、Positive / Negative / Failure-path、状態を扱う変更のProperty-based / State-machine Evidenceを確認する。
+- 実装者の要約、モデルのPASS文字列、終了コード0、過去のPhase PASSだけで受入を完了しない。試験未実行、失敗、未解決指摘を記録から除外しない。
+- 実装・試験・依存・設計の後続変更では対象コミット、差分と影響範囲を確認し、必要な試験・独立レビューを更新する。記録のみの追記によるコミット自己参照や無変更コードの再レビューを要求しない。
+- BLOCKER / HIGHと未解決仕様矛盾がなく、Common Gateと対象Phaseの製品条件が成立してから次Phaseへ進む。通常の実装・修正・レビューごとの追加Human Gateは要求しない。
+- Phase 4 / 5の既存Provider Human Gate、D4実機Qualification、Scope / Secret / Audit / 単回Dispatch等の製品条件を維持する。
+- 旧Launcher、GitHub Marker、Workflow、自動Merge、開発Loop用Claim / Journalを要求しない。新しい開発状態機械・認可Recordを追加しない。
+- CI / GitHubの利用は任意の試験・証跡保存手段とし、未確認の外部設定を成立済みとみなさない。公開・Mergeは当該作業のユーザー指示に従う。
 
 ## Phase 0A: Core Models / Authorization Kernel
 
-Phase 0A Gateのbootstrap既定値はNO-GO。Active PRでは、次をすべて満たしたCurrent-HEADの
-trusted PASSが存在する場合に限りPhase 0Bへ進める。
+初回実装はユーザーの実装依頼と正本§40の対象・範囲・受入条件を記した開発記録から開始する。
+Phase 0Bへ進む前に、新実装の対象コミットでCommon Gateと下記の全条件を満たし、独立レビュー結果を記録する。
 
 ### Blockers
 
@@ -242,8 +96,10 @@ External Tool Dispatch = 0
 - CallerがSecret Broker、Channel Registry、Callbackを構築できず、Claim消費後のCrashまたは
   Submit結果不明ではSecret InjectionもProvider Submitも自動再送せずReconciliationへ進む
 - Result Collection開始時にExecutor所有のTrusted Clock、exact Tool Registry / Tool Definition、
-  `ResultTaskBinding`（`provider_task | local_capture`）、SinkへBindingしたAuthorityを永続化し、Caller Timestampを受け取らず、Tool固有
+  `ResultTaskBinding`（`provider_task | local_result`）、SinkへBindingしたAuthorityを永続化し、Caller Timestampを受け取らず、Tool固有
   Output上限をCaller / Global設定で拡大しない
+- Model / Adapter / Repositoryが同じ`provider_task | local_result`型定義を参照し、有効な両分岐を受理する。
+  `local_capture`、未知の判別値、分岐に必要なField欠落、登録Modeとの不一致を拒否し、Alias変換や架空Provider Task補完を行わない
 - Quarantine RetentionはCollection開始時刻からMission Deadline内で一度だけ確定し、Restart時に再計算しない
 - External Side Effect NodeにLangGraph Automatic Retryなし
 - Raw ResultをChunk Streamingし、全量Memory保持なし
@@ -254,8 +110,14 @@ External Tool Dispatch = 0
 
 ## Phase 0C: Data Security / Audit
 
-- このRevisionで追加したSecret Continuation / Lifecycle、typed Lease / Fencing、専用Erasure、TPM Witnessは
-  Phase 0C Hardeningとして評価し、Trusted Phase 0B Base PASSを遡及的に再定義しない
+- 新しい状態・Record種別・独立Serviceなしで既存Retention SchedulerからExpiryを確定できる。期限直前 / 一致 / 直後、期限切れまたは未作成Lease、Worker停止、旧Deployment、Publicationとの競合、Commit前後Crashを検証する。
+- Retention ExpiryはCurrent Root / Clock / Anchor、Origin / Resource / Retention、Expected State、現Lease Snapshotまたは不存在をOCC照合し、既存Expiry State / 型別Intent / Lease失効 / Audit / Critical Intentを同時確定する。期限後の通常Worker Write / Publish / Abort / Releaseは拒否し、Expiry経路から本文Read / Publish / Submit / Secret Resolveを許可しない。
+- Collection期限到達時は既存ABANDONED / Unresolved Item / Collection Lease失効 / Audit / Critical Intentを確定し、固有Retention到達まで消去Intentを作らない。COMPLETEの巻戻しやLocal Ingestion Windowの短縮を拒否する。
+- 認可済みExecutionに付随する新規Artifact / Secretの内部保存は既存Ingestion契約だけで成立し、事前の未生成Resource Grant・PolicyDecision変更・追加Publication認可Recordを必要としない。
+- 内部保存はRepository-bound入力、固定Rule、Current MissionのLocal処理可否、Lease / Fence、Retention、Classification / 件数 / 容量上限、Store固定保存先を検証する。任意Callerの新規作成、別Mission / 任意Path、既存Resource上書き、Secretの暗黙確認・置換を拒否する。
+- 新規成果物と同一入力Retryを既存Metadata / Manifestで検証し、閲覧Grantなしの成果物を開示しない。valid_until / recovery_until後でも許可されたLocal Window内の処理だけ継続し、保存から外部操作・LLM・Secret利用の権限を派生させない。
+- Secret Continuation / Lifecycle、typed Lease / Fencing、専用Erasure、TPM WitnessのProduction HardeningはPhase 0Cで評価する。
+  前Phaseの要件に必要な型・安全なTest Double境界は各Phaseで実装・検証し、未実装の後続機構をPASS扱いしない
 - Secret ValueがPrompt、通常DB/Log、Exception、Traceback、Knowledge Baseへ入らない
 - Claim消費の勝者だけが同一Executor呼出し中の非直列化・単回Dispatch Continuationを取得し、
   Module-level Token、Standalone Resolver、消費済みClaimの再利用で平文を取得できない
@@ -277,7 +139,7 @@ External Tool Dispatch = 0
 - Legacy `secret_reference_id`は暗黙に集約せず決定的な1対1 Version Migrationを行い、旧MissionをRead-only Archiveとして扱う。
   移行RecordやTerminal Stateを新規DispatchでActiveとして再利用せず、新Missionではexact Versionを明示確認する。
   曖昧・欠落・Digest不一致では`SecretMigrationRequiredError`で停止する
-- Collection / Ingestionは用途別typed Leaseを使用し、`lease_id`、Owner、
+- 通常Collection / Ingestion Workerは用途別typed Leaseを使用し、`lease_id`、Owner、
   `deployment_epoch + fencing_token`、未Release、Trusted Clock上の未失効、Authority / Resource Digest、
   Expected State Versionの完全Predicateを全Durable Mutationで同じTransactionにより検証する
 - Lease期限は同一Host Boot内でProcess間共有可能な単調Clockで判定し、UTC巻戻り / 不連続では
@@ -303,10 +165,20 @@ External Tool Dispatch = 0
   Quarantine平文を取得できず、Repository-bound `ingestion_id`だけがSecure Ingestionを開始できる
 - Quarantine Sink / Reader / Factory / Lookupは副作用を持たない。正常公開はArtifact / Secret Reference、
   ExecutionResultProjection、Manifest、Deletion Intent、DELETE_PENDING、Lease Releaseを同じUnit of Workで確定する。
-  正常消去前にManifest / Projection / 全参照をread-back検証する。Retention / Incomplete Collection Expiryは
+  公開時に全成果物本文 / Digest / Key Bindingと保存Metadataを検証・Witnessする。正常消去前は正本§33.2の
+  確定済み公開証跡と対象QuarantineのBinding / Key / Copy Inventoryをread-back検証する。Retention / Incomplete Collection Expiryは
   別型の必須Evidenceで検証し、Manifestや成功Resultを捏造しない。Expiryと公開のOCC競合で期限後Publishを拒否する
 - Manifest Commit、Deletion Intent、Erasure Claim消費、Key破棄、Ciphertext削除、ExecutionResult確定の全Crash境界を
-  Provider再実行、Adapter Result再収集、Quarantine再復号、手動File修復なしに回復する
+  Provider再実行、Adapter Result再収集、公開後のQuarantine再復号、手動File修復なしに回復する
+- 成果物本文 / 鍵が固有Retentionに従って先に消去された後でも、確定済み公開証跡からQuarantine消去とResult復旧が完了する。
+  この処理は成果物本文Read / 復号、成果物ごとの消去Claim / Tombstone連鎖走査、Provider再取得を呼ばない。
+  復旧後のCurrent Read / Context / Goal / Secret利用で失効成果物を利用可能としない
+- 公開証跡の欠落・Digest改ざん・Witness不一致、対象QuarantineのKey / Inventory不一致、既存Integrity Stopを拒否する。
+  Witness Pending中の公開利用と関連Cleanupを拒否し、Commit応答不明から既存Intentを照合して二重Publicationを防ぐ。
+  消去とResult確定まで最小限の既存検証Metadataを保持し、本文・Secret・鍵のRetention延長や新しいPin / Counterを行わない
+- 同じ入力・固定Rule / Parser ID・Code DigestのRetryは既存予算内でcreate-or-verifyとなる。
+  変更Rule、同名VersionのCode差替え、利用不能・失効Ruleの代替、入力の別Executionへの付替え、ID変更での予算Resetを拒否する。
+  固定Ruleを実行できない場合も元Actionを再送せず、既存失敗 / 隔離と固有Retention到達時の型別消去へ進む
 - `INGESTED_DURABLE`以後はManifest / ExecutionResultProjectionだけからExecutionResultを再構築する
 - Context BuilderがEncrypted Raw Artifact/Secret Resolveへアクセス不可
 - Artifact Path Traversal/Symlink Escapeを拒否
@@ -421,6 +293,8 @@ External Tool Dispatch = 0
 
 ## Phase 3: Human Approval / Durable Resume
 
+- 既存Graph RECONCILINGをMission PAUSED / WAITING_HUMAN_REVIEWにも対応させ、Current Recovery Authorityの範囲だけで照合できる。MissionをRUNNINGへ変更せず、新規Dispatch / LLM呼出しは0件とする。
+- 照合後はCurrent Missionに対応するGraph状態へ戻し、開始時のSnapshotで上書きしない。WAITING_HUMAN_REVIEWの全Item解決時はMission Managerが§21.1.3に従い既存FINALIZINGへ進める。通常実行へ暗黙Resumeせず、新しい状態・Graph・Recordを追加しない。
 - Approval後のPlan/Intent変更でApprovalが無効
 - 未承認ActionはAdapterへ到達しない
 - PAUSED/Resumeでauthorization_epochが増加
@@ -460,16 +334,16 @@ Human GateでMCP Server、Protocol Revision、Transport Identity、Trust Policy�
 
 ## Project Complete
 
-Phase 5 PASS後、次を満たした場合に`ai-project-complete`とし、Local Orchestratorの最終
-merge gateへ進む。
+Phase 0A〜5について、次をすべて満たしたとき製品の受入完了を開発記録へ記載する。
 
-- Phase 0A～5の全Gate ResultがGitHub履歴に存在
-- 最新HEADで全Common GateがPASS
-- 全PhaseのBLOCKER/HIGHが0
-- Phase 4/5のHuman Gate Evidenceが存在
-- README/SystemDesign/Config/Runbookが実装と一致
-- Fresh environment setupとMock end-to-endが再現可能
-- Known limitationsと残存MEDIUM/LOWを明文化
-- Local Orchestratorが上記AI Loop Control Acceptanceを再検証し、完全HEAD SHA固定の
-  GitHub PR mergeを1回だけ実行
-- Merge未確認、Default Branch drift、競合または不明な結果は自動再試行せず停止
+- 各Phaseの対象実装コミット、対応要件、試験結果、独立レビュー・指摘対応を記録済み
+- 最終対象コミットでCommon Gateと全Phaseの製品要件が成立し、後続変更の影響を検証済み
+- 全PhaseのBLOCKER / HIGH、未解決仕様矛盾、Security-critical TODOが0件
+- Phase 4 / 5のProvider Human Gateと、Production構成に必要なD4を含む実機適格性のEvidenceがある
+- README / SystemDesign / Config / Runbookが実装と一致する
+- Fresh environment setupとMock end-to-endを再現できる
+- Known limitationsと残存MEDIUM / LOWを明文化し、未実行試験・未確認結果をPASSとしない
+
+受入完了はGitHub Label / Bot Marker / 自動Merge状態ではない。D4がNOT_EVALUATED等の未完了条件を残す場合は
+その範囲を明記し、Production採用または全製品受入完了を宣言しない。公開・Mergeは別のユーザー指示に従い、
+Phase受入だけでは実行しない。設計資料の更新を実装・Phase PASSと記録しない。

@@ -1,6 +1,6 @@
 # AI制御仕様 — 証拠・計画・認可の分離
 
-改訂: `ai-control-v1-r1` / 2026-09-06（`system-design-v1-r1`の規範別冊）
+改訂: `ai-control-v1-r3` / 2026-09-06（`system-design-v1-r3`の規範別冊）
 
 ## 0. 位置付けと適用境界
 
@@ -10,11 +10,18 @@
 図・受入条件も本書へ整合させ、旧規則は同書§41の改訂履歴に限定する。安全基盤の適用範囲も§12で限定し、
 「新しい文書だから全規則に優先する」と解釈しない。
 
-設計正本、[安全条件](docs/safety-invariants.md)、[受入条件](docs/acceptance-criteria.md)、Phase Promptへの
-文書反映は完了したが、現Phaseの正式な権限確認より前に製品コードの変更や実装再開を許可しない。
-設計採用だけでPRのDesign Stopを解除せず、残る規範間の矛盾はBLOCKEDとして解決する。
+設計正本、[安全条件](docs/safety-invariants.md)、[受入条件](docs/acceptance-criteria.md)を同じ改訂へ整合する。
+開発担当・実装開始・Phase受入は正本§40に従い、旧PRの状態や自動開発Loopを現行Gateへ使用しない。
+今回の文書更新は製品実装・試験・独立レビュー・Phase受入を完了した記録ではない。
 Phaseの並び（S1）、単一Executor既定、Secretの別認可Executionでの再利用、単回Dispatch、Lease更新 / Fencingは維持する。
 D4の実機消去Qualificationは依然`NOT_EVALUATED`であり、本書の検査からProduction採用を承認しない。
+
+本改訂では新しい製品状態・Record種別・独立Serviceを追加しない。期限切れ確定は既存Retention Scheduler
+から正本§10.3の条件で行い、新規成果物の内部保存は既存Secure Ingestion（§33.2）に限定する。
+停止中のRecoveryは既存RECONCILINGとMission状態の対応（§17.3）で表し、暗黙Resumeを行わない。
+公開時の本文検証と後日のQuarantine消去証跡を正本§33.2で分離する。保存済みResult / Proofは過去の公開を表し、
+Current Context / Goalでの利用には本書のFreshness・Source・認可条件を引き続き要求する。
+Ingestion Retryは正本§10.4の同じ入力・固定Rule / Parserに限定し、結果経路の正規値は§10.5の`local_result`へ統一する。
 
 本書の参照モデルは意味の確認用であり、実際のRepository、認可、暗号、LLM、Adapterを実装したものではない。
 コードに移す際のSchema / Catalog Revision変更と移行は§12に従う。
@@ -201,7 +208,7 @@ Bindingして内容Digestを計算する。LLM提案をこの候補の一つへ�
 | --- | --- | --- |
 | 1 | Integrity / Authorization / Anchor等のSecurity Error | Fail Closed、Security Stop通知。unknownへ丸めない |
 | 2 | 既にTerminal / FINALIZING、停止要求、Mission期限等のHard Limit | 既存Finalization / Cleanup規約。新規Planner / Dispatchなし |
-| 3 | PAUSED等で通常処理が許可されない | 現在状態を維持。許可済み既存Recovery以外なし |
+| 3 | PAUSED / WAITING_HUMAN_REVIEW等で通常処理が許可されない | Missionの停止を維持。既存RECONCILINGでCurrent Authorityが許す既存Recoveryだけを行い、Current Missionに対応するGraph状態へ戻す。通常再開は明示Resumeを必要とする |
 | 4 | 結果不明または進行中Executionがある | 同じTaskのBounded Reconciliation / Collection / Ingestion。新規Actionなし |
 | 5 | Current Goalがachieved | Finalization。Planner呼出し不要 |
 | 6 | 現在のActionが承認待ち | exact IntentのApproval待ち。新しい候補で既存Approvalを消費しない |
@@ -225,7 +232,7 @@ Bindingして内容Digestを計算する。LLM提案をこの候補の一つへ�
 5. PlannerはActionまたはContext Requestを返す。Context Requestは既存連続上限2回以内で再構築し、Executionを作らない。
 6. ApplicationがSchema、候補、Entity、契約、前提を検証する。Policy Engineが具体Target / 引数を認可する。
 7. 必要なApproval後、ExecutorがCurrent安全状態、Action前提、Goal達成による終了の要否を再確認し、既存単回Claimを通す。
-8. 結果は既存Collection / Secure Ingestionで確定する。Normalizer / Knowledge Serviceが検証済みFactを更新する。
+8. 結果は既存Collection / Secure Ingestionで確定する。新規成果物の生成・内部保存は正本§33.2の既存Ingestion契約で行い、未生成ResourceへのGrantや追加認可Recordを作らない。保存後の閲覧は別途Current Grantを要求する。Normalizer / Knowledge Serviceが検証済みFactを更新する。
 9. 新しいContext Grantの下でAnalyzerが観測候補を抽出し、Reducer / Planner State Managerが区分別に保存する。
 10. 次反復へ進む。Analyzer失敗は保存済みの検証済み事実を撤回せず、同じ外部Actionを再実行しない。
 
@@ -459,7 +466,7 @@ Statefulな変更にはProperty-based / State-machine Evidenceを要求する。
 
 1. 設計段階: §10の純粋な参照モデルで三値集約とController優先順位を列挙検査する。
    循環探索・Proof・認可・実行復旧はこのモデルの保証外として、AC Scenarioの期待遷移を人が確認する。
-2. Phase 1: 既存Phase権限の下で決定論的Planner / Analyzerと安全なAdapter Test Doubleを接続する。
+2. Phase 1: 正本§40のPhase受入条件に従い、決定論的Planner / Analyzerと安全なAdapter Test Doubleを接続する。
    Oracleはテスト側の環境状態・許可履歴・最終状態を比較し、LLMも製品のGoal Evaluatorも自己採点者にしない。
 3. Phase 2: 同じ意味のFixtureで実Local LLMを評価する。モデル、Tokenizer、Prompt、Schema、契約、Corpusを固定する。
    既存D11の10 Family × 10 Fixture × 3 Run = 300 Runと安全性 / 品質閾値を維持し、Corpus Revisionを更新する。
@@ -479,7 +486,7 @@ Schema / Cancellation Gateは別に満たす。失敗Runを除外せず、正常
 
 設計指摘は、要件 / AI不変条件、初期状態、遷移、期待と実際の差、確認方法を伴う反例として記録する。
 曖昧さなら同じ仕様から成立する二つの実装解釈を示す。反例がない懸念は調査候補として残し、自動的に必須仕様へ追加しない。
-明確な不備、未確定の製品判断、任意の改善を分ける。本規約は既存の正式PR Review要件・P0/P1対処・Design Stopを変更しない。
+明確な不備、未確定の製品判断、任意の改善を分ける。開発上の記録・独立レビュー・未解決指摘の扱いは正本§40に従い、製品の安全条件を合格目的で緩和しない。
 
 設計の確認完了は、全AI-01〜12の所有者と検査場所が一意、全AC Scenarioの期待結果が決定済み、
 境界Schema / 判断表に未解決の矛盾がないこととする。製品の受入完了には別途Phase 1 / 2の実装試験が必要である。
@@ -515,7 +522,7 @@ SystemDesign.mdのAIモデル例、略図、Phase内のAI受入記述、Digest /
 ### 12.2 移行を一つの変更単位にする
 
 実装・移行時はAI Output / Envelope / ExecutionPlan / PolicyDecisionのSchema、Action / Evidence / Digest Catalog、
-Generation Witness Policy、Corpusを同じ改訂のRequirements / Safety Invariants / Acceptance / Phase Promptへ整合させる。
+Generation Witness Policy、Corpusを同じ改訂の設計正本 / Safety Invariants / Acceptanceおよび開発記録の対象仕様へ整合させる。
 本仕様のWitness接続は`generation-witness-policy-v5`として新Revisionへ固定し、旧v4の同名書換えを禁止する。
 GoalEvaluationAggregateは評価履歴とSource OCCを所有し、Goal用の実行許可Headは持たない。
 既存Runtimeへ新しいAI規約だけをHot Swapしない。停止中の既存Migration / Activation手順を使用する。
@@ -553,11 +560,9 @@ normal、confirmed、空前提、ALLOWを補完しない。新規Actionは新Epo
 本改訂で採用したものは、AI制御仕様、設計正本との適用境界、参照モデル、AC Scenarioである。
 文書内のモデルを実行しても、AC-01〜20の製品Integration Testを実行したことにはならない。
 
-2026-09-06に次の文書検査を実行した。[検査Script](docs/review/validate_ai_control_design.py)は再実行可能な設計確認資料であり、製品・Phase CIへ組み込んでいない。
-
-```text
-.venv/bin/python docs/review/validate_ai_control_design.py
-```
+以下は2026-09-06のr1に記録された検査履歴であり、r2 / r3で再実行した結果ではない。
+旧Script `docs/review/validate_ai_control_design.py`と関連Reportは現リポジトリに未収録で、
+この履歴だけでは再実行可能性や現行実装の合格を確認できない。
 
 | 検査 | 結果 |
 | --- | --- |
@@ -566,14 +571,19 @@ normal、confirmed、空前提、ALLOWを補完しない。新規Actionは新Epo
 | Controller優先順位（7つのbool × Goal三値） | PASS。384組合せ、9分岐すべて到達 |
 | Goal unknownとnot_achievedが同じAction経路を選べること | PASS。128組合せ |
 | 参照モデルの不正入力拒否 | PASS。34件 |
-| Python記述の構文 | 実行結果は[調査・整合レビュー](docs/review/ai-control-research-review.md)へ記録 |
+| Python記述の構文 | 実行結果は調査・整合レビュー（旧資料: `docs/review/ai-control-research-review.md`、現リポジトリ未収録）へ記録 |
 | 2文書の接続Schema・旧Runtime契約の残存 | 同Reportへ記録。文書検査は製品のSchema生成や認可試験を代替しない |
 
 以上は意味の限定検査であり、Scope、Proof、OCC、前提探索、権限、Claim、Recoveryの製品実装は検査していない。
 Phase 1の実装・State-machine Test、Phase 2の実Local LLM 300 Run、実Adapterの適格性、
-D4の実機Qualification、正本変更のレビュー・マージ、正式な実装権限の確認・DB移行は別の未完了作業として残る。
+D4の実機Qualification、製品実装の独立レビュー・Phase受入、既存Runtimeを取り込む場合のDB移行は別の未完了作業として残る。
 これらを本書の作成、文書レビュー、論文の結果だけでPASSと報告しない。
 
-正本反映時に検出したAGENTS.mdの一律Manifest要件とR1の型別Expiry消去の不一致は、後続のユーザー承認により
-解消した。[追加検査と残条件](docs/review/systemdesign-canonical-adoption.md)を参照する。
-この文書上の解消はPRのDesign Stop解除・正式な実装再開権限・製品の消去試験PASSを意味しない。
+旧正本反映時のAGENTS.mdとR1の不一致・後続承認は履歴である（旧資料: `docs/review/systemdesign-canonical-adoption.md`、現リポジトリ未収録）。
+r2ではRetention Schedulerの期限切れ確定、Ingestionの新規内部保存、停止中Recoveryの対応表、
+Claude Code実装 / Codex独立レビューの開発規約を正本・関連文書へ整合する。
+新しい状態・Record種別・Serviceを追加せず、初回実装は正本§40のユーザー実装依頼から開始する。
+この設計更新で製品の消去試験、Phase受入、D4 QualificationをPASSとしない。
+
+r3では公開証跡と現在の利用可否、同じ入力・固定RuleでのRetry、結果経路の正規値を正本・関連文書へ整合した。
+根拠と適用限界は正本§41.11に記録する。AIの参照モデル・判断表・状態は変更していない。
