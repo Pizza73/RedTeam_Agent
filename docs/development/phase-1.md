@@ -5,7 +5,7 @@
 - 設計正本: `SystemDesign.md` Phase 1、`SystemDesign_AI_Control.md`、`docs/acceptance-criteria.md`
 - 基点: `0a12cf9a702303f1b9ca87c702141addb996ae87`（Phase 0C受入記録）
 - 実装範囲: 基点の次から最終実装コミットまで
-- 最終実装コミット: `6bb647642b7e351835383ff4a812fa25c9f1fc68`
+- 最終実装コミット: `28896ae5a4ab8ded665941cb5e0abd4b878f327f`
 
 ## 実装と受入要件
 
@@ -89,7 +89,7 @@ negative pathも実行する。
 PATH=/tmp/phase0c-tpm/usr/bin:$PATH \
 LD_LIBRARY_PATH=/tmp/phase0c-tpm/usr/lib/x86_64-linux-gnu:/tmp/phase0c-tpm/usr/lib/x86_64-linux-gnu/swtpm \
 PYTHONPATH=src .venv/bin/python -m pytest -q -ra
-  PASS: 566 tests（swtpm 7件を含む）
+  PASS: 567 tests（swtpm 7件を含む）
 
 .venv/bin/python -m ruff check src tests
   PASS
@@ -129,6 +129,8 @@ SQLite checkpointにはIDとrouting文字列だけを保存する。最終独立
 その再レビューで検出したcheckpoint / ExecutionPlanの非canonical thread受入は
 `6bb647642b7e351835383ff4a812fa25c9f1fc68`で修正した。Planning / Analysis / Action適用の三境界で
 Current Mission Revisionとrun / threadを照合し、別Revision・別runのcheckpoint reuseを拒否する。
+公開Context再構築を直接呼んだ場合の旧Revision retry budget先行消費は
+`28896ae5a4ab8ded665941cb5e0abd4b878f327f`で修正し、Current Revision照合を予算予約より前へ固定した。
 最終判定と固定review artifactは再レビュー完了後に`docs/reviews/`へ記録する。
 
 ## Phase 1生成的状態遷移Evidence
@@ -146,6 +148,7 @@ reconciliation消費が最大3回、予算枯渇時のexact source Unresolved ev
 | Stale Contextの上限付き再構築、再構築後EnvelopeのPlanner入力、checkpointのprimitive state | `tests/integration/test_phase1_mock_loop.py::test_stale_planner_context_is_rebuilt_before_the_model_call`、`tests/integration/test_phase1_planner_context.py::test_automatic_stale_rebuild_shares_the_lineage_retry_budget` |
 | 同一Application SQLiteへのcheckpoint永続化、通常起動時の未知schema拒否 | `tests/integration/test_phase1_mock_loop.py::test_graph_checkpoints_are_written_to_the_application_sqlite_file`、`tests/integration/test_production_composition.py::test_unknown_graph_checkpoint_schema_fails_closed_no_migration` |
 | Malformed / 別Revision / 別run threadのcheckpoint load前拒否、Action前の再検証 | `tests/integration/test_phase1_mock_loop.py::test_workflow_rejects_malformed_wrong_revision_and_reused_run_threads`、`tests/integration/test_phase1_planner_context.py::test_action_rejects_noncanonical_thread_before_consuming_context`、`tests/unit/test_thread_lifecycle.py::test_verify_run_thread_binding_rejects_reused_thread_for_another_run` |
+| 旧Mission Revisionの直接Context再構築をretry budget予約前に無変更拒否 | `tests/integration/test_phase1_planner_context.py::test_old_revision_rebuild_is_rejected_before_retry_budget_reservation` |
 | 正常 Plan→Dispatch→Ingest→Analyze→Goal→COMPLETED | `tests/integration/test_phase1_mock_loop.py::test_mock_agent_loop_reaches_goal_through_real_policy_and_executor` |
 | terminal cancel→Collection→Ingestion→Erasure→COMPLETED | `tests/integration/test_phase1_mock_loop.py::test_finalizing_cancelled_execution_collects_ingests_and_completes` |
 | FINALIZING recovery上限→Unresolved→Human Review | `tests/integration/test_phase1_mock_loop.py::test_finalizing_resume_uses_bounded_reconciliation_and_cancel` |
