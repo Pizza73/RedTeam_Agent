@@ -40,3 +40,18 @@ class KnowledgeObservation(StrictImmutableBoundaryModel):
     llm_confidence: float = Field(ge=0.0, le=1.0)
     observed_at: datetime
     observation_digest: str = Field(min_length=1)
+
+
+class AnalyzerCandidateObservation(StrictImmutableBoundaryModel):
+    """Untrusted typed Analyzer proposal; the reducer rebinds every reference."""
+
+    observation_id: str = Field(min_length=1)
+    condition_id: str = Field(min_length=1)
+    source_execution_id: str = Field(min_length=1)
+    observation_type: Literal["asset", "identity", "relationship", "finding"]
+    subject_ref: str = Field(min_length=1)
+    predicate: str = Field(min_length=1)
+    object_ref: str | None
+    attributes: CanonicalJsonObject
+    source_artifact_ids: tuple[str, ...]
+    llm_confidence: float = Field(ge=0.0, le=1.0)

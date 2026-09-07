@@ -5,11 +5,13 @@ from __future__ import annotations
 import json
 
 from redteam_agent.agent.models import (
+    ActionCandidateProjection,
     AgentCheckpoint,
     ControllerAction,
     ControllerDecision,
     ControllerReason,
 )
+from redteam_agent.agent.planner_context import ActionCandidateProjector
 from redteam_agent.canonical.digest_service import DigestService
 from redteam_agent.errors import AgentLoopError
 from redteam_agent.goal.service import GoalEvaluationService
@@ -17,9 +19,17 @@ from redteam_agent.mission.models import Mission
 from redteam_agent.runtime.authorization_context import AuthorizationContextResolver
 from redteam_agent.runtime.clock import Clock
 from redteam_agent.storage.database import Database, UnitOfWork
-from redteam_agent.storage.execution_repositories import MissionExecutionBudgetRepository
+from redteam_agent.storage.execution_repositories import (
+    ExecutionRecordRepository,
+    MissionExecutionBudgetRepository,
+)
+from redteam_agent.storage.repositories import AvailableToolSnapshotRepository
 
 _CHECKPOINT_NS = "agent_checkpoint"
+_ACTIVE_EXECUTION_STATES = frozenset({
+    "PLANNED", "AUTHORIZED", "DISPATCH_CLAIMED", "DISPATCHED", "RUNNING",
+    "CANCEL_REQUESTED", "RECONCILING",
+})
 
 
 class AgentController:
@@ -27,6 +37,9 @@ class AgentController:
         self, *, database: Database, digest_service: DigestService, clock: Clock,
         context_resolver: AuthorizationContextResolver, goal_service: GoalEvaluationService,
         budget_repository: MissionExecutionBudgetRepository,
+        execution_repository: ExecutionRecordRepository,
+        snapshot_repository: AvailableToolSnapshotRepository,
+        candidate_projector: ActionCandidateProjector,
     ) -> None:
         self._db = database
         self._ds = digest_service
@@ -34,11 +47,13 @@ class AgentController:
         self._resolver = context_resolver
         self._goals = goal_service
         self._budgets = budget_repository
+        self._executions = execution_repository
+        self._snapshots = snapshot_repository
+        self._projector = candidate_projector
 
     def step(
-        self, *, mission_id: str, operation_id: str, candidate_ids: tuple[str, ...] = (),
-        active_execution_id: str | None = None, source_refresh_pending: bool = False,
-        planning_search_limited: bool = False,
+        self, *, mission_id: str, operation_id: str,
+        projection: ActionCandidateProjection | None = None,
     ) -> ControllerDecision:
         mission = self._resolver.resolve(mission_id, now=self._clock.now()).mission
         if mission.state != "RUNNING":
@@ -47,12 +62,17 @@ class AgentController:
                 decision=ControllerDecision(
                     action="STOP", reason_code="MISSION_NOT_RUNNING", goal_evaluation_id=None,
                     candidate_ids=(),
-                ), active_execution_id=active_execution_id,
+                ), active_execution_id=None,
             )
         budget = self._budgets.get(mission_id, mission.mission_revision)
         if budget is None:
             raise AgentLoopError("mission execution budget is missing")
-        if active_execution_id is not None:
+        active = tuple(
+            item for item in self._executions.all_for_mission(mission_id)
+            if item.provider_execution_state in _ACTIVE_EXECUTION_STATES
+        )
+        if active:
+            active_execution_id = active[0].execution_id
             return self._save(
                 mission=mission, operation_id=operation_id,
                 decision=ControllerDecision(
@@ -67,14 +87,22 @@ class AgentController:
             selected: tuple[str, ...] = ()
         elif budget.consumed_dispatch_claims >= min(budget.max_dispatch_claims, mission.max_iterations):
             action, reason, selected = "PAUSE", "BUDGET_EXHAUSTED", ()
-        elif candidate_ids:
-            action, reason, selected = "PLAN", "CANDIDATES_READY", tuple(sorted(set(candidate_ids)))
-        elif source_refresh_pending:
-            action, reason, selected = "WAIT", "SOURCE_REFRESH_PENDING", ()
-        elif planning_search_limited:
-            action, reason, selected = "PAUSE", "PLANNING_SEARCH_LIMIT", ()
         else:
-            action, reason, selected = "PAUSE", "NO_ACTION_IN_SUPPORTED_MODEL", ()
+            candidates: tuple[str, ...] = ()
+            planning_search_limited = False
+            if projection is not None:
+                snapshot = self._snapshots.get(projection.available_tool_snapshot_id)
+                if snapshot is None:
+                    raise AgentLoopError("candidate projection snapshot is missing")
+                self._projector.verify(projection, snapshot=snapshot)
+                candidates = tuple(item.candidate_id for item in projection.candidates)
+                planning_search_limited = projection.search_limited
+            if candidates:
+                action, reason, selected = "PLAN", "CANDIDATES_READY", candidates
+            elif planning_search_limited:
+                action, reason, selected = "PAUSE", "PLANNING_SEARCH_LIMIT", ()
+            else:
+                action, reason, selected = "PAUSE", "NO_ACTION_IN_SUPPORTED_MODEL", ()
         return self._save(
             mission=mission, operation_id=operation_id,
             decision=ControllerDecision(

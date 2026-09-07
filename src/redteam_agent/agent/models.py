@@ -84,7 +84,7 @@ class ActionCandidateProjection(StrictImmutableBoundaryModel):
 
 class RecentExecutionSummary(StrictImmutableBoundaryModel):
     execution_id: str = Field(min_length=1)
-    outcome: str = Field(min_length=1)
+    outcome: Literal["succeeded", "failed", "blocked", "partial", "unknown"]
     result_reference_ids: tuple[str, ...]
 
 
@@ -95,6 +95,20 @@ class PlannerFeedback(StrictImmutableBoundaryModel):
     ]
     safe_summary: str
     visible_tool_ref: ToolRef | None = None
+
+    @model_validator(mode="after")
+    def _fixed_safe_summary(self) -> PlannerFeedback:
+        summaries = {
+            "POLICY_DENIED": "The proposed action was denied by current policy.",
+            "APPROVAL_REQUIRED": "The proposed action requires current human approval.",
+            "STALE_CONTEXT": "Planning context changed and must be rebuilt.",
+            "INVALID_PROPOSAL": "The proposal did not match a current action candidate.",
+            "EXECUTION_FAILED": "The authorized execution did not succeed.",
+            "NO_VALID_PROPOSAL": "No valid structured proposal was produced.",
+        }
+        if self.safe_summary != summaries[self.reason_code]:
+            raise ValueError("planner feedback summary must use the fixed redacted catalog")
+        return self
 
 
 class PlannerContextEnvelope(StrictImmutableBoundaryModel):

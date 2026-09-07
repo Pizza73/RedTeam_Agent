@@ -120,6 +120,16 @@ class ExecutionStore:
             return None
         return self._verify_keyed("executions", str(row[0]), str(row[1]), str(row[2]))
 
+    def get_executions_for_mission(self, mission_id: str) -> tuple[tuple[str, str], ...]:
+        rows = self._conn.execute(
+            "SELECT execution_id, json, row_digest FROM executions "
+            "WHERE mission_id = ? ORDER BY execution_id", (mission_id,),
+        ).fetchall()
+        return tuple(
+            self._verify_keyed("executions", str(row[0]), str(row[1]), str(row[2]))
+            for row in rows
+        )
+
     # --- dispatch claims --------------------------------------------------
 
     def insert_claim(self, *, claim_id: str, execution_id: str, claim_state: str, json_text: str) -> None:

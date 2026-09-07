@@ -12,7 +12,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Annotated, Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from redteam_agent.canonical.digest_service import DigestService
 from redteam_agent.canonical.immutable import CanonicalJsonObject
@@ -51,6 +51,20 @@ class RetrievalHint(StrictImmutableBoundaryModel):
     ]
     recency_class: Literal["current", "recent", "any_authorized"]
     purpose_code: Literal["verify_hypothesis", "resolve_entity", "explain_failure", "prepare_next_action"]
+
+    @model_validator(mode="after")
+    def _bounded_canonical_references(self) -> RetrievalHint:
+        groups = (self.resource_types, self.related_entity_refs, self.requested_fact_types)
+        if any(len(group) != len(set(group)) for group in groups):
+            raise ValueError("retrieval hint values must be unique")
+        if len(self.related_entity_refs) > 20:
+            raise ValueError("retrieval hint entity references exceed the fixed bound")
+        if any(
+            not ref or len(ref) > 128 or any(char in ref for char in ("/", "\\", "?", "\n", "\r"))
+            for ref in self.related_entity_refs
+        ):
+            raise ValueError("retrieval hint requires canonical entity references")
+        return self
 
 
 class HypothesisCreateProposal(StrictImmutableBoundaryModel):
@@ -96,13 +110,13 @@ class PlannerActionOutput(StrictImmutableBoundaryModel):
     output_type: Literal["action"] = "action"
     proposal: ExecutionPlanProposal
     working_state_update: PlanThreadUpdateProposal | None
-    next_iteration_hints: tuple[RetrievalHint, ...]
+    next_iteration_hints: tuple[RetrievalHint, ...] = Field(max_length=20)
 
 
 class PlannerContextRequest(StrictImmutableBoundaryModel):
     output_type: Literal["context_request"] = "context_request"
     objective: str
-    retrieval_hints: tuple[RetrievalHint, ...]
+    retrieval_hints: tuple[RetrievalHint, ...] = Field(max_length=20)
     working_state_update: PlanThreadUpdateProposal | None
 
 

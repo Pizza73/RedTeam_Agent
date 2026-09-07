@@ -55,7 +55,6 @@ def test_planner_context_and_action_are_exactly_bound_to_current_candidate() -> 
         context_grant_id=grant.grant_id,
         available_tool_snapshot_id=seeded.seeded.snapshot.snapshot_id,
         iteration=0,
-        authorized_context={"verified_facts": [], "observations": [], "hypotheses": []},
         operational_phase="DISCOVERY",
     )
     assert kernel.planner_context_service.revalidate(envelope.planner_context_id) == envelope
@@ -73,6 +72,16 @@ def test_planner_context_and_action_are_exactly_bound_to_current_candidate() -> 
     )
     assert matched.candidate_id == projection.candidates[0].candidate_id
 
+    transition = kernel.action_service.execute(
+        planner_context_id=envelope.planner_context_id, output=output,
+        plan_id="phase1-plan-1", run_id="phase1-run-1", thread_id="phase1-thread-1",
+        decision_id="phase1-decision-1", execution_id="phase1-execution-1",
+        task_id="phase1-task-1",
+    )
+    assert transition.decision.decision == "ALLOW"
+    assert transition.dispatch is not None
+    assert kernel.phase0c.phase0b.mock_adapter.submit_calls == 1
+
 
 def test_planner_action_cannot_select_another_target() -> None:
     kernel, seeded, _goal, _grant, projection = _inputs()
@@ -88,6 +97,36 @@ def test_planner_action_cannot_select_another_target() -> None:
         kernel.candidate_projector.match_action(output=output, projection=projection)
 
 
+def test_scope_false_action_never_reaches_mock_adapter() -> None:
+    kernel, seeded, goal, grant, projection = _inputs()
+    envelope = kernel.planner_context_service.build(
+        planner_context_id="planner-context-denied",
+        mission_id=seeded.seeded.revision.mission_id,
+        goal_evaluation_id=goal.evaluation_id,
+        projection=projection,
+        context_grant_id=grant.grant_id,
+        available_tool_snapshot_id=seeded.seeded.snapshot.snapshot_id,
+        iteration=0,
+    )
+    proposal = support.make_proposal(
+        tool=seeded.seeded.tool,
+        arguments={"destinations": ["192.168.1.1"], "port": 443, "protocol": "tcp"},
+        requested_targets=(IpTargetReference(type="ip", address="10.1.2.3"),),
+    )
+    output = PlannerActionOutput(
+        proposal=proposal, working_state_update=None, next_iteration_hints=(),
+    )
+    transition = kernel.action_service.execute(
+        planner_context_id=envelope.planner_context_id, output=output,
+        plan_id="phase1-plan-denied", run_id="phase1-run-denied",
+        thread_id="phase1-thread-denied", decision_id="phase1-decision-denied",
+        execution_id="phase1-execution-denied", task_id="phase1-task-denied",
+    )
+    assert transition.decision.decision == "DENY"
+    assert transition.dispatch is None
+    assert kernel.phase0c.phase0b.mock_adapter.submit_calls == 0
+
+
 def test_epoch_change_invalidates_planner_context_before_model_use() -> None:
     kernel, seeded, goal, grant, projection = _inputs()
     envelope = kernel.planner_context_service.build(
@@ -98,7 +137,6 @@ def test_epoch_change_invalidates_planner_context_before_model_use() -> None:
         context_grant_id=grant.grant_id,
         available_tool_snapshot_id=seeded.seeded.snapshot.snapshot_id,
         iteration=0,
-        authorized_context={},
     )
     kernel.phase0c.phase0b.phase0a.mission_manager.invalidate_authorization(
         support.MISSION_ID, expected_version=2, actor_token=support.OPERATOR_ACTOR_TOKEN
@@ -116,7 +154,6 @@ def test_context_request_is_bounded_by_envelope_lineage_without_new_counter_stat
         "context_grant_id": grant.grant_id,
         "available_tool_snapshot_id": seeded.seeded.snapshot.snapshot_id,
         "iteration": 0,
-        "authorized_context": {},
     }
     first = kernel.planner_context_service.build(planner_context_id="ctx-0", **values)
     request = PlannerContextRequest(
@@ -140,8 +177,20 @@ def test_context_request_is_bounded_by_envelope_lineage_without_new_counter_stat
     assert db.execute(
         "SELECT COUNT(*) FROM kv_store WHERE namespace = 'policy_decisions'"
     ).fetchone()[0] == before_decisions
+    with pytest.raises(PlannerContextError):
+        kernel.planner_context_service.accept_context_request(
+            planner_context_id=first.planner_context_id, output=request
+        )
     second = kernel.planner_context_service.build(
         planner_context_id="ctx-1", parent_context_id=first.planner_context_id, **values
+    )
+    with pytest.raises(PlannerContextError):
+        kernel.planner_context_service.build(
+            planner_context_id="ctx-sibling", parent_context_id=first.planner_context_id,
+            **values,
+        )
+    kernel.planner_context_service.accept_context_request(
+        planner_context_id=second.planner_context_id, output=request
     )
     third = kernel.planner_context_service.build(
         planner_context_id="ctx-2", parent_context_id=second.planner_context_id, **values

@@ -85,6 +85,15 @@ class ExecutionRecordRepository(_ExecutionRepository):
         model = load_model_from_json(ExecutionRecord, raw)
         return self._load(ExecutionRecord, raw, row_key=row_key, payload_key=model.execution_id)
 
+    def all_for_mission(self, mission_id: str) -> tuple[ExecutionRecord, ...]:
+        records = []
+        for row_key, raw in self._store.get_executions_for_mission(mission_id):
+            model = load_model_from_json(ExecutionRecord, raw)
+            records.append(self._load(
+                ExecutionRecord, raw, row_key=row_key, payload_key=model.execution_id
+            ))
+        return tuple(records)
+
 
 class DispatchClaimRepository(_ExecutionRepository):
     def create(self, claim: DispatchClaim, *, guard: WriteGuard) -> None:

@@ -56,6 +56,10 @@ class ContextSelector:
         candidate_limit: int = DEFAULT_CANDIDATE_LIMIT,
         per_type_limit: int = DEFAULT_PER_TYPE_LIMIT,
     ) -> None:
+        if not (0 < candidate_limit <= DEFAULT_CANDIDATE_LIMIT):
+            raise ContextSelectionError("candidate limit may only narrow the system maximum")
+        if not (0 < per_type_limit <= DEFAULT_PER_TYPE_LIMIT):
+            raise ContextSelectionError("per-type limit may only narrow the system maximum")
         self._reader = reader
         self._candidate_limit = candidate_limit
         self._per_type_limit = per_type_limit

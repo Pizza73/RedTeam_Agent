@@ -15,11 +15,11 @@ from redteam_agent.agent.models import (
 )
 from redteam_agent.canonical.canonical_json import canonical_dumps
 from redteam_agent.canonical.digest_service import DigestService
-from redteam_agent.canonical.immutable import CanonicalJsonObject
 from redteam_agent.context.authorization import ContextAuthorizationService
+from redteam_agent.context.builder import ContextBuilder
 from redteam_agent.context.models import RankedContextCandidate
 from redteam_agent.contracts.catalog import ActionContractCatalog
-from redteam_agent.errors import PlannerCandidateError, PlannerContextError
+from redteam_agent.errors import PlannerCandidateError, PlannerContextError, RepositoryIntegrityError
 from redteam_agent.goal.service import GoalEvaluationService
 from redteam_agent.plan.models import OperationalPhase, PlannerActionOutput, PlannerContextRequest
 from redteam_agent.policy.scope_models import TargetReference
@@ -34,6 +34,9 @@ from redteam_agent.storage.repositories import (
 from redteam_agent.tools.availability import AvailableToolSnapshot, revalidate_snapshot
 
 _ENVELOPE_NS = "planner_context_envelope"
+_CONTEXT_REQUEST_NS = "planner_context_request"
+_CONTEXT_CHILD_NS = "planner_context_child"
+_CONTEXT_ROOT_NS = "planner_context_root"
 MAX_ACTION_CANDIDATES = 32
 MAX_RANKED_METADATA = 100
 MAX_ENVELOPE_TTL_SECONDS = 300
@@ -77,6 +80,10 @@ class ActionCandidateProjector:
             contract = self._contracts.get(tool.action_contract_ref.contract_id)
             if contract is None or contract.reference() != tool.action_contract_ref:
                 raise PlannerCandidateError("candidate action contract is not exact and registered")
+            if tuple(sorted(set(seed.satisfied_precondition_refs))) != tuple(
+                sorted(contract.preconditions)
+            ):
+                raise PlannerCandidateError("candidate does not bind every registered precondition")
             targets = tuple(sorted(seed.canonical_target_binding, key=lambda item: canonical_dumps(
                 item.model_dump(mode="python")
             )))
@@ -199,6 +206,7 @@ class PlannerContextService:
         self, *, database: Database, digest_service: DigestService, clock: Clock,
         context_resolver: AuthorizationContextResolver,
         context_authorization_service: ContextAuthorizationService,
+        context_builder: ContextBuilder,
         snapshot_repository: AvailableToolSnapshotRepository,
         session_repository: SessionSecurityContextSnapshotRepository,
         goal_service: GoalEvaluationService, candidate_projector: ActionCandidateProjector,
@@ -208,6 +216,7 @@ class PlannerContextService:
         self._clock = clock
         self._resolver = context_resolver
         self._context_auth = context_authorization_service
+        self._context_builder = context_builder
         self._snapshots = snapshot_repository
         self._sessions = session_repository
         self._goals = goal_service
@@ -217,7 +226,6 @@ class PlannerContextService:
         self, *, planner_context_id: str, mission_id: str, goal_evaluation_id: str,
         projection: ActionCandidateProjection, context_grant_id: str,
         available_tool_snapshot_id: str, iteration: int,
-        authorized_context: CanonicalJsonObject,
         ranked_candidate_metadata: tuple[RankedContextCandidate, ...] = (),
         recent_execution_summaries: tuple[RecentExecutionSummary, ...] = (),
         feedback: tuple[PlannerFeedback, ...] = (), working_state_id: str | None = None,
@@ -236,6 +244,9 @@ class PlannerContextService:
         current = self._resolver.resolve(mission_id, now=now)
         goal = self._goals.verify_current(goal_evaluation_id, mission_id=mission_id)
         grant = self._context_auth.verify_grant(grant_id=context_grant_id, mission_id=mission_id)
+        authorized_context = self._context_builder.build(
+            grant_id=context_grant_id, mission_id=mission_id
+        )
         snapshot = self._snapshots.get(available_tool_snapshot_id)
         if snapshot is None:
             raise PlannerContextError("available tool snapshot not found")
@@ -292,11 +303,26 @@ class PlannerContextService:
         envelope = draft.model_copy(update={
             "envelope_digest": self._ds.compute("planner_context_envelope_digest", fields)
         })
-        with UnitOfWork(self._db):
-            self._db.occ_insert_idempotent(
-                _ENVELOPE_NS, planner_context_id, 1,
-                json.dumps(envelope.model_dump(mode="json"), sort_keys=True),
-            )
+        try:
+            with UnitOfWork(self._db):
+                if parent_context_id is None:
+                    self._db.occ_insert(
+                        _CONTEXT_ROOT_NS, f"{mission_id}:{iteration}", 1,
+                        json.dumps({"planner_context_id": planner_context_id}, sort_keys=True),
+                    )
+                else:
+                    if self._db.occ_get(_CONTEXT_REQUEST_NS, parent_context_id) is None:
+                        raise PlannerContextError("context rebuild parent has no accepted request")
+                    self._db.occ_insert(
+                        _CONTEXT_CHILD_NS, parent_context_id, 1,
+                        json.dumps({"child_context_id": planner_context_id}, sort_keys=True),
+                    )
+                self._db.occ_insert_idempotent(
+                    _ENVELOPE_NS, planner_context_id, 1,
+                    json.dumps(envelope.model_dump(mode="json"), sort_keys=True),
+                )
+        except RepositoryIntegrityError:
+            raise PlannerContextError("planner context lineage already advanced") from None
         return envelope
 
     def get(self, planner_context_id: str) -> PlannerContextEnvelope | None:
@@ -361,4 +387,12 @@ class PlannerContextService:
             raise PlannerContextError("context rebuild limit reached")
         if not output.retrieval_hints:
             raise PlannerContextError("context request must contain a typed retrieval hint")
+        try:
+            with UnitOfWork(self._db):
+                self._db.occ_insert(
+                    _CONTEXT_REQUEST_NS, planner_context_id, 1,
+                    json.dumps(output.model_dump(mode="json"), sort_keys=True),
+                )
+        except RepositoryIntegrityError:
+            raise PlannerContextError("context request already consumed") from None
         return output

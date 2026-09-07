@@ -5,8 +5,10 @@ from __future__ import annotations
 import support
 import support_phase0b as p0b
 import support_phase0c as p0c
+from redteam_agent.agent.models import ActionCandidateSeed
 from redteam_agent.composition.phase1 import build_phase1_kernel
 from redteam_agent.knowledge.models import KnowledgeObservation
+from redteam_agent.policy.scope_models import IpTargetReference
 
 
 def _running_phase1():
@@ -20,12 +22,26 @@ def _running_phase1():
     return kernel, seeded, head
 
 
+def _projection(kernel, seeded, head):
+    evaluation = kernel.goal_service.evaluate(mission_id=seeded.seeded.revision.mission_id)
+    return kernel.candidate_projector.build(
+        snapshot_id=seeded.seeded.snapshot.snapshot_id,
+        seeds=(ActionCandidateSeed(
+            tool_ref=seeded.seeded.tool.tool_ref,
+            canonical_target_binding=(IpTargetReference(type="ip", address="10.1.2.3"),),
+            satisfied_precondition_refs=(), objective_dependency_ids=("objective-0",),
+        ),),
+        source_version_digests=(evaluation.evaluation_digest, head.head_digest),
+    )
+
+
 def test_goal_controller_plans_then_finalizes_from_current_session_source() -> None:
-    kernel, seeded, _head = _running_phase1()
+    kernel, seeded, head = _running_phase1()
     mission_id = seeded.seeded.revision.mission_id
 
     first = kernel.controller.step(
-        mission_id=mission_id, operation_id="loop-1", candidate_ids=("candidate-scan",)
+        mission_id=mission_id, operation_id="loop-1",
+        projection=_projection(kernel, seeded, head),
     )
     assert first.action == "PLAN" and first.reason_code == "CANDIDATES_READY"
     assert first.goal_evaluation_id is not None
@@ -66,10 +82,9 @@ def test_unconfirmed_observation_does_not_change_goal_or_witnessed_fact_head() -
 
 def test_controller_prioritizes_existing_execution_before_goal_or_planning() -> None:
     kernel, seeded, _head = _running_phase1()
+    p0b.authorize(seeded)
     decision = kernel.controller.step(
-        mission_id=seeded.seeded.revision.mission_id,
-        operation_id="loop-recovery", active_execution_id="execution-pending",
-        candidate_ids=("candidate-new",),
+        mission_id=seeded.seeded.revision.mission_id, operation_id="loop-recovery",
     )
     assert decision.action == "RECOVER"
     assert decision.goal_evaluation_id is None
