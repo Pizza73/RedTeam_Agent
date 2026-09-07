@@ -15,6 +15,35 @@ from redteam_agent.plan.models import PlannerActionOutput
 from redteam_agent.policy.scope_models import IpTargetReference
 
 
+def test_phase1_uses_compiled_coarse_graphs_without_automatic_retry() -> None:
+    kernel, *_ = _inputs()
+    planning_nodes = set(kernel.workflow.graph.get_graph().nodes)
+    analysis_nodes = set(kernel.workflow.analysis_graph.get_graph().nodes)
+    assert {
+        "session_refresh",
+        "controller",
+        "context_selector",
+        "context_authorization",
+        "context_builder",
+        "tool_availability",
+        "planner",
+        "context_request",
+        "action_application",
+        "reconciliation",
+        "finalization",
+    } <= planning_nodes
+    assert {
+        "analyzer",
+        "knowledge_reducer",
+        "post_analysis_session_refresh",
+        "goal_evaluation",
+    } <= analysis_nodes
+    assert kernel.workflow.graph.checkpointer is None
+    assert kernel.workflow.analysis_graph.checkpointer is None
+    assert all(node.retry_policy is None for node in kernel.workflow.graph.nodes.values())
+    assert all(node.retry_policy is None for node in kernel.workflow.analysis_graph.nodes.values())
+
+
 def test_mock_agent_loop_reaches_goal_through_real_policy_and_executor() -> None:
     kernel, seeded, goal, grant, projection = _inputs()
     mission_id = seeded.seeded.revision.mission_id
@@ -273,21 +302,143 @@ def test_finalizing_resume_uses_bounded_reconciliation_and_cancel() -> None:
                 AssertionError("FINALIZING recovery must not invoke the Planner")
             ),
         )
-    with pytest.raises(AgentLoopError, match="reconciliation retry budget exhausted"):
-        kernel.workflow.run_planning_iteration(
-            envelope=envelope,
-            ids=PlanningOperationIds(
-                operation_id="finalizing-resume-exhausted", plan_id="unused-plan",
-                run_id="unused-run", thread_id="unused-thread",
-                decision_id="unused-decision", execution_id="unused-execution",
-                task_id="unused-task",
-            ),
-            invoke_planner=lambda: (_ for _ in ()).throw(
-                AssertionError("FINALIZING recovery must not invoke the Planner")
-            ),
-        )
+    exhausted = kernel.workflow.run_planning_iteration(
+        envelope=envelope,
+        ids=PlanningOperationIds(
+            operation_id="finalizing-resume-exhausted", plan_id="unused-plan",
+            run_id="unused-run", thread_id="unused-thread",
+            decision_id="unused-decision", execution_id="unused-execution",
+            task_id="unused-task",
+        ),
+        invoke_planner=lambda: (_ for _ in ()).throw(
+            AssertionError("FINALIZING recovery must not invoke the Planner")
+        ),
+    )
+    assert exhausted.controller_decision.action == "STOP"
     assert adapter.reconcile_calls == 3 and adapter.cancel_calls == 1
     retry_rows = kernel.phase0c.phase0b.phase0a.database.occ_get_all("agent_retry_budget")
     assert len(retry_rows) == 1
     state = kernel.phase0c.phase0b.phase0a.state_repository.get(mission_id)
-    assert state is not None and state.state == "FINALIZING"
+    assert state is not None and state.state == "WAITING_HUMAN_REVIEW"
+    unresolved = kernel.unresolved_items.current(mission_id)
+    assert len(unresolved) == 1
+    assert unresolved[0].reason_code == "EXECUTION_RECONCILED"
+    assert unresolved[0].status == "OPEN"
+
+
+def test_running_recovery_budget_exhaustion_converges_to_human_review() -> None:
+    kernel, seeded, goal, grant, projection = _inputs()
+    mission_id = seeded.seeded.revision.mission_id
+    envelope = kernel.planner_context_service.build(
+        planner_context_id="running-recovery-context",
+        mission_id=mission_id,
+        goal_evaluation_id=goal.evaluation_id,
+        projection=projection,
+        context_grant_id=grant.grant_id,
+        available_tool_snapshot_id=seeded.seeded.snapshot.snapshot_id,
+        iteration=0,
+    )
+    planner = MockPlanner(PlannerActionOutput(
+        proposal=support.make_proposal(
+            tool=seeded.seeded.tool,
+            arguments={"destinations": ["10.1.2.3"], "port": 443, "protocol": "tcp"},
+            requested_targets=(IpTargetReference(type="ip", address="10.1.2.3"),),
+        ),
+        working_state_update=None,
+        next_iteration_hints=(),
+    ))
+    kernel.workflow.run_planning_iteration(
+        envelope=envelope,
+        ids=PlanningOperationIds(
+            operation_id="running-plan", plan_id="running-plan", run_id="running-run",
+            thread_id="running-thread", decision_id="running-decision",
+            execution_id="running-execution", task_id="running-task",
+        ),
+        invoke_planner=lambda: planner.invoke(envelope),
+    )
+    adapter = kernel.phase0c.phase0b.mock_adapter
+    adapter._reconcile_status = "UNKNOWN"  # type: ignore[attr-defined]
+    for attempt in range(4):
+        kernel.workflow.run_planning_iteration(
+            envelope=envelope,
+            ids=PlanningOperationIds(
+                operation_id=f"running-recovery-{attempt}", plan_id="unused-plan",
+                run_id="unused-run", thread_id="unused-thread",
+                decision_id="unused-decision", execution_id="unused-execution",
+                task_id="unused-task",
+            ),
+            invoke_planner=lambda: (_ for _ in ()).throw(AssertionError("no Planner")),
+        )
+    state = kernel.phase0c.phase0b.phase0a.state_repository.get(mission_id)
+    assert state is not None and state.state == "WAITING_HUMAN_REVIEW"
+    unresolved = kernel.unresolved_items.current(mission_id)
+    assert len(unresolved) == 1
+    assert unresolved[0].source_execution_id == "running-execution"
+    assert unresolved[0].reason_code == "EXECUTION_RECONCILED"
+    assert adapter.reconcile_calls == 3
+
+
+def test_finalizing_cancelled_execution_collects_ingests_and_completes() -> None:
+    kernel, seeded, goal, grant, projection = _inputs()
+    mission_id = seeded.seeded.revision.mission_id
+    envelope = kernel.planner_context_service.build(
+        planner_context_id="finalizing-cancel-context",
+        mission_id=mission_id,
+        goal_evaluation_id=goal.evaluation_id,
+        projection=projection,
+        context_grant_id=grant.grant_id,
+        available_tool_snapshot_id=seeded.seeded.snapshot.snapshot_id,
+        iteration=0,
+    )
+    planner = MockPlanner(PlannerActionOutput(
+        proposal=support.make_proposal(
+            tool=seeded.seeded.tool,
+            arguments={"destinations": ["10.1.2.3"], "port": 443, "protocol": "tcp"},
+            requested_targets=(IpTargetReference(type="ip", address="10.1.2.3"),),
+        ),
+        working_state_update=None,
+        next_iteration_hints=(),
+    ))
+    kernel.workflow.run_planning_iteration(
+        envelope=envelope,
+        ids=PlanningOperationIds(
+            operation_id="cancel-plan", plan_id="cancel-plan", run_id="cancel-run",
+            thread_id="cancel-thread", decision_id="cancel-decision",
+            execution_id="cancel-execution", task_id="cancel-task",
+        ),
+        invoke_planner=lambda: planner.invoke(envelope),
+    )
+    kernel.phase0c.phase0b.phase0a.session_repository.save(support.session_snapshot())
+    kernel.finalization_service.begin_completion(mission_id)
+    adapter = kernel.phase0c.phase0b.mock_adapter
+    adapter._reconcile_status = "FOUND_RUNNING"  # type: ignore[attr-defined]
+    adapter._cancel_result = "CONFIRMED"  # type: ignore[attr-defined]
+    kernel.workflow.run_planning_iteration(
+        envelope=envelope,
+        ids=PlanningOperationIds(
+            operation_id="cancel-start", plan_id="unused-plan", run_id="unused-run",
+            thread_id="unused-thread", decision_id="unused-decision",
+            execution_id="unused-execution", task_id="unused-task",
+        ),
+        invoke_planner=lambda: (_ for _ in ()).throw(AssertionError("no Planner")),
+    )
+    adapter._reconcile_status = "FOUND_TERMINAL"  # type: ignore[attr-defined]
+    adapter._reconcile_provider_status = "cancelled"  # type: ignore[attr-defined]
+    adapter._collect_status = "cancelled"  # type: ignore[attr-defined]
+    adapter._collect_exit_code = None  # type: ignore[attr-defined]
+    adapter._stdout_chunks = (  # type: ignore[attr-defined]
+        b'{"host":"10.1.2.3","status":"cancelled","port":443}',
+    )
+    kernel.workflow.run_planning_iteration(
+        envelope=envelope,
+        ids=PlanningOperationIds(
+            operation_id="cancel-finish", plan_id="unused-plan", run_id="unused-run",
+            thread_id="unused-thread", decision_id="unused-decision",
+            execution_id="unused-execution", task_id="unused-task",
+        ),
+        invoke_planner=lambda: (_ for _ in ()).throw(AssertionError("no Planner")),
+    )
+    state = kernel.phase0c.phase0b.phase0a.state_repository.get(mission_id)
+    assert state is not None and state.state == "COMPLETED"
+    result = kernel.phase0c.phase0b.result_repository.get("cancel-execution")
+    assert result is not None and result.status == "CANCELLED"

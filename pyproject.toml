@@ -7,7 +7,11 @@ name = "redteam-agent"
 version = "0.0.0a1"
 description = "Authorization kernel for an authorized, isolated red-team exercise support agent (Phase 0A)."
 requires-python = ">=3.12"
-dependencies = ["pydantic==2.12.4", "cryptography==46.0.1"]
+dependencies = [
+    "pydantic==2.12.4",
+    "cryptography==46.0.1",
+    "langgraph==1.2.11",
+]
 
 [project.optional-dependencies]
 dev = [

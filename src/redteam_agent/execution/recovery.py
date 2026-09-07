@@ -56,7 +56,9 @@ _EXECUTION_STATES_BY_OPERATION: dict[RecoveryOperation, frozenset[str]] = {
         {"DISPATCH_CLAIMED", "DISPATCHED", "RUNNING", "CANCEL_REQUESTED", "RECONCILING", "OUTCOME_UNKNOWN"}
     ),
     "cancel": frozenset({"DISPATCHED", "RUNNING"}),
-    "collect_result": frozenset({"DISPATCHED", "RUNNING", "RECONCILING"}),
+    "collect_result": frozenset(
+        {"DISPATCHED", "RUNNING", "RECONCILING", "SUCCEEDED", "FAILED", "CANCELLED"}
+    ),
 }
 _RECOVERY_TTL_SECONDS = 60
 

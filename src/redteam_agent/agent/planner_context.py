@@ -17,9 +17,11 @@ from redteam_agent.agent.retry_budget import AgentRetryBudgetService
 from redteam_agent.agent.working_state import PlannerStateManager
 from redteam_agent.canonical.canonical_json import canonical_dumps
 from redteam_agent.canonical.digest_service import DigestService
+from redteam_agent.canonical.immutable import CanonicalJsonObject
 from redteam_agent.context.authorization import ContextAuthorizationService
 from redteam_agent.context.builder import ContextBuilder
-from redteam_agent.context.models import RankedContextCandidate
+from redteam_agent.context.models import ContextDataAccessGrant, RankedContextCandidate
+from redteam_agent.context.selector import ContextSelector, target_reference_value
 from redteam_agent.contracts.catalog import ActionContractCatalog
 from redteam_agent.errors import PlannerCandidateError, PlannerContextError, RepositoryIntegrityError
 from redteam_agent.goal.service import GoalEvaluationService
@@ -213,6 +215,7 @@ class PlannerContextService:
         context_resolver: AuthorizationContextResolver,
         context_authorization_service: ContextAuthorizationService,
         context_builder: ContextBuilder,
+        context_selector: ContextSelector,
         snapshot_repository: AvailableToolSnapshotRepository,
         session_repository: SessionSecurityContextSnapshotRepository,
         goal_service: GoalEvaluationService, candidate_projector: ActionCandidateProjector,
@@ -226,6 +229,7 @@ class PlannerContextService:
         self._resolver = context_resolver
         self._context_auth = context_authorization_service
         self._context_builder = context_builder
+        self._context_selector = context_selector
         self._snapshots = snapshot_repository
         self._sessions = session_repository
         self._goals = goal_service
@@ -254,6 +258,11 @@ class PlannerContextService:
                 raise PlannerContextError("context rebuild limit reached")
             context_rebuild_count = parent.context_rebuild_count + 1
         current = self._resolver.resolve(mission_id, now=now)
+        selected_metadata = self._context_selector.select(
+            mission_id, _projection_target_values(projection)
+        )
+        if ranked_candidate_metadata != selected_metadata:
+            raise PlannerContextError("ranked context metadata is not the current deterministic selection")
         mission_budget = self._mission_budgets.get(
             mission_id, current.mission.mission_revision
         )
@@ -365,17 +374,10 @@ class PlannerContextService:
         goal = self._goals.verify_current(
             envelope.goal_evaluation_id, mission_id=envelope.mission_id
         )
-        grant = self._context_auth.verify_grant(
-            grant_id=envelope.context_grant_id, mission_id=envelope.mission_id
-        )
-        snapshot = self._snapshots.get(envelope.available_tool_snapshot_id)
-        if snapshot is None:
-            raise PlannerContextError("available tool snapshot not found")
-        revalidate_snapshot(
-            snapshot, current=current.bindings,
-            session_snapshots=self._sessions.all_snapshots(), now=now,
-        )
-        self._projector.verify(envelope.action_candidate_projection, snapshot=snapshot)
+        self.revalidate_selection(planner_context_id)
+        grant = self.revalidate_authorization(planner_context_id)
+        self.revalidate_context_body(planner_context_id)
+        snapshot = self.revalidate_tool_availability(planner_context_id)
         if (
             envelope.goal_evaluation_digest != goal.evaluation_digest
             or envelope.context_grant_digest != grant.grant_digest
@@ -384,6 +386,60 @@ class PlannerContextService:
             or envelope.authorization_epoch != current.mission.authorization_epoch
         ):
             raise PlannerContextError("planner context binding drift")
+        return envelope
+
+    def revalidate_selection(self, planner_context_id: str) -> PlannerContextEnvelope:
+        """Re-run the read-only metadata selector for the stored target set."""
+        envelope = self._require(planner_context_id)
+        selected = self._context_selector.select(
+            envelope.mission_id,
+            _projection_target_values(envelope.action_candidate_projection),
+        )
+        if selected != envelope.ranked_candidate_metadata:
+            raise PlannerContextError("ranked context metadata changed")
+        return envelope
+
+    def revalidate_authorization(self, planner_context_id: str) -> ContextDataAccessGrant:
+        """Verify the persisted grant against the current mission binding."""
+        envelope = self._require(planner_context_id)
+        grant = self._context_auth.verify_grant(
+            grant_id=envelope.context_grant_id, mission_id=envelope.mission_id
+        )
+        if grant.grant_digest != envelope.context_grant_digest:
+            raise PlannerContextError("context grant binding drift")
+        return grant
+
+    def revalidate_context_body(self, planner_context_id: str) -> CanonicalJsonObject:
+        """Rebuild only the bodies named by the verified grant."""
+        envelope = self._require(planner_context_id)
+        body = self._context_builder.build(
+            grant_id=envelope.context_grant_id, mission_id=envelope.mission_id
+        )
+        if canonical_dumps(body) != canonical_dumps(envelope.authorized_context):
+            raise PlannerContextError("authorized context body changed")
+        return body
+
+    def revalidate_tool_availability(self, planner_context_id: str) -> AvailableToolSnapshot:
+        """Revalidate the persisted tool snapshot and its finite projection."""
+        envelope = self._require(planner_context_id)
+        now = self._clock.now()
+        current = self._resolver.resolve(envelope.mission_id, now=now)
+        snapshot = self._snapshots.get(envelope.available_tool_snapshot_id)
+        if snapshot is None:
+            raise PlannerContextError("available tool snapshot not found")
+        revalidate_snapshot(
+            snapshot, current=current.bindings,
+            session_snapshots=self._sessions.all_snapshots(), now=now,
+        )
+        self._projector.verify(envelope.action_candidate_projection, snapshot=snapshot)
+        return snapshot
+
+    def _require(self, planner_context_id: str) -> PlannerContextEnvelope:
+        envelope = self.get(planner_context_id)
+        if envelope is None:
+            raise PlannerContextError("planner context not found")
+        if not self._clock.now() < envelope.expires_at:
+            raise PlannerContextError("planner context expired")
         return envelope
 
     def accept_action(
@@ -478,3 +534,11 @@ def _allowed_working_state_references(envelope: PlannerContextEnvelope) -> froze
 
     collect(envelope.authorized_context)
     return frozenset(references)
+
+
+def _projection_target_values(projection: ActionCandidateProjection) -> frozenset[str]:
+    return frozenset(
+        target_reference_value(target)
+        for candidate in projection.candidates
+        for target in candidate.canonical_target_binding
+    )

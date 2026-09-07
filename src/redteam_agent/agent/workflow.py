@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from typing import TypedDict, cast
+
+from langgraph.graph import END, START, StateGraph
+from langgraph.graph.state import CompiledStateGraph
+from langgraph.runtime import Runtime
 
 from redteam_agent.agent.application import ActionTransitionResult, PlannerActionApplicationService
 from redteam_agent.agent.controller import AgentController
@@ -12,14 +17,27 @@ from redteam_agent.agent.llm_gateway import SharedLLMGateway
 from redteam_agent.agent.models import ControllerDecision, PlannerContextEnvelope
 from redteam_agent.agent.planner_context import PlannerContextService
 from redteam_agent.agent.retry_budget import AgentRetryBudgetService
+from redteam_agent.agent.unresolved import UnresolvedItemService, UnresolvedReason
 from redteam_agent.erasure.service import VerifiedQuarantineEraser
-from redteam_agent.errors import AgentLoopError
+from redteam_agent.errors import (
+    AgentLoopError,
+    OutputPublicationError,
+    RawResultQuarantineError,
+    SecureIngestionError,
+    VerifiedErasureError,
+)
+from redteam_agent.execution.adapter import ExecutionAdapter
 from redteam_agent.execution.executor import Executor
 from redteam_agent.execution.models import AdapterCollectionControl, ProviderTaskBinding
 from redteam_agent.execution.reconcile import ReconcileOutcome, ReconciliationService
 from redteam_agent.execution.recovery import ExecutionRecoveryService
+from redteam_agent.goal.service import GoalEvaluationService
 from redteam_agent.ingestion.service import SecureIngestionService
-from redteam_agent.knowledge.models import KnowledgeObservation, VerifiedFinding
+from redteam_agent.knowledge.models import (
+    AnalyzerCandidateObservation,
+    KnowledgeObservation,
+    VerifiedFinding,
+)
 from redteam_agent.knowledge.reducer import KnowledgeReducer
 from redteam_agent.knowledge.verified_facts import VerifiedFindingProjector
 from redteam_agent.mission.models import MissionState
@@ -28,6 +46,8 @@ from redteam_agent.quarantine.collection import QuarantineCollectionResult, Quar
 from redteam_agent.storage.execution_repositories import (
     CancelAttemptRepository,
     ExecutionRecordRepository,
+    RawControlMetadataRepository,
+    ResultIngestionStateRepository,
     ResultTaskBindingRepository,
 )
 
@@ -50,6 +70,36 @@ class WorkflowStepResult:
     action_transition: ActionTransitionResult | None
 
 
+class _PlanningGraphState(TypedDict, total=False):
+    goal_evaluation_id: str
+    controller_decision: ControllerDecision
+    planner_output: PlannerOutput
+    action_transition: ActionTransitionResult
+
+
+@dataclass(frozen=True)
+class _PlanningRuntime:
+    envelope: PlannerContextEnvelope
+    ids: PlanningOperationIds
+    invoke_planner: Callable[[], object]
+
+
+class _AnalysisGraphState(TypedDict, total=False):
+    candidate: AnalyzerCandidateObservation
+    observation: KnowledgeObservation
+    goal_evaluation_id: str
+
+
+@dataclass(frozen=True)
+class _AnalysisRuntime:
+    mission_id: str
+    mission_revision: int
+    operation_id: str
+    execution_id: str
+    result_digest: str
+    invoke_analyzer: Callable[[], object]
+
+
 class Phase1AgentWorkflow:
     """Runs one bounded coarse node; repositories remain the only source of truth."""
 
@@ -67,8 +117,13 @@ class Phase1AgentWorkflow:
         execution_repository: ExecutionRecordRepository,
         task_binding_repository: ResultTaskBindingRepository,
         cancel_attempt_repository: CancelAttemptRepository,
+        ingestion_repository: ResultIngestionStateRepository,
+        control_metadata_repository: RawControlMetadataRepository,
+        unresolved_items: UnresolvedItemService,
+        adapters: Mapping[str, ExecutionAdapter],
         executor: Executor,
         finalization: FinalizationService,
+        goal_service: GoalEvaluationService,
         verified_finding_projector: VerifiedFindingProjector,
     ) -> None:
         self._controller = controller
@@ -83,65 +138,312 @@ class Phase1AgentWorkflow:
         self._executions = execution_repository
         self._bindings = task_binding_repository
         self._cancel_attempts = cancel_attempt_repository
+        self._ingestion_states = ingestion_repository
+        self._control = control_metadata_repository
+        self._unresolved = unresolved_items
+        self._adapters = dict(adapters)
         self._executor = executor
         self._finalization = finalization
+        self._goals = goal_service
         self._verified_findings = verified_finding_projector
+        self.graph = self._build_planning_graph()
+        self.analysis_graph = self._build_analysis_graph()
 
     def run_planning_iteration(
         self, *, envelope: PlannerContextEnvelope, ids: PlanningOperationIds,
         invoke_planner: Callable[[], object],
     ) -> WorkflowStepResult:
-        decision = self._controller.step(
-            mission_id=envelope.mission_id, operation_id=ids.operation_id,
-            projection=envelope.action_candidate_projection,
+        state = cast(
+            _PlanningGraphState,
+            self.graph.invoke(
+                {},
+                context=_PlanningRuntime(
+                    envelope=envelope, ids=ids, invoke_planner=invoke_planner
+                ),
+            ),
         )
-        if decision.action == "RECOVER":
-            checkpoint = self._controller.checkpoint(envelope.mission_id)
-            if checkpoint is None or checkpoint.active_execution_id is None:
-                raise AgentLoopError("recovery decision has no active execution binding")
-            self._reconcile(envelope.mission_id, checkpoint.active_execution_id)
-            return WorkflowStepResult(decision, None, None)
-        if decision.action == "FINALIZE":
-            if decision.reason_code == "GOAL_ACHIEVED":
-                self._finalization.begin_completion(envelope.mission_id)
-            else:
-                self._finalization.begin_abort(envelope.mission_id)
-            self._drive_finalization(envelope.mission_id)
-            return WorkflowStepResult(decision, None, None)
-        if decision.action == "STOP":
-            if self._finalization.is_finalizing(envelope.mission_id):
-                self._drive_finalization(envelope.mission_id)
-            return WorkflowStepResult(decision, None, None)
-        if decision.action != "PLAN":
-            return WorkflowStepResult(decision, None, None)
-        output = self._gateway.invoke_planner(
-            operation_id=ids.operation_id, envelope=envelope, invoke=invoke_planner
+        decision = state.get("controller_decision")
+        if decision is None:
+            raise AgentLoopError("agent graph returned no controller decision")
+        return WorkflowStepResult(
+            decision,
+            state.get("planner_output"),
+            state.get("action_transition"),
         )
-        if isinstance(output, PlannerContextRequest):
-            self._contexts.accept_context_request(
-                planner_context_id=envelope.planner_context_id, output=output
-            )
-            return WorkflowStepResult(decision, output, None)
-        if not isinstance(output, PlannerActionOutput):
-            raise AgentLoopError("Planner returned an unsupported output type")
-        transition = self._actions.execute(
-            planner_context_id=envelope.planner_context_id, output=output,
-            plan_id=ids.plan_id, run_id=ids.run_id, thread_id=ids.thread_id,
-            decision_id=ids.decision_id, execution_id=ids.execution_id,
-            task_id=ids.task_id,
-        )
-        return WorkflowStepResult(decision, output, transition)
 
     def run_analysis(
         self, *, mission_id: str, mission_revision: int, operation_id: str,
         execution_id: str, result_digest: str, invoke_analyzer: Callable[[], object],
     ) -> KnowledgeObservation:
-        candidate = self._gateway.invoke_analyzer(
-            mission_id=mission_id, mission_revision=mission_revision,
-            operation_id=operation_id, execution_id=execution_id,
-            result_digest=result_digest, invoke=invoke_analyzer,
+        state = cast(
+            _AnalysisGraphState,
+            self.analysis_graph.invoke(
+                {},
+                context=_AnalysisRuntime(
+                    mission_id=mission_id,
+                    mission_revision=mission_revision,
+                    operation_id=operation_id,
+                    execution_id=execution_id,
+                    result_digest=result_digest,
+                    invoke_analyzer=invoke_analyzer,
+                ),
+            ),
         )
-        return self._reducer.reduce(candidate)
+        observation = state.get("observation")
+        if observation is None:
+            raise AgentLoopError("analysis graph returned no observation")
+        return observation
+
+    def _build_planning_graph(
+        self,
+    ) -> CompiledStateGraph[
+        _PlanningGraphState, _PlanningRuntime, _PlanningGraphState, _PlanningGraphState
+    ]:
+        builder = StateGraph(_PlanningGraphState, context_schema=_PlanningRuntime)
+        builder.add_node("session_refresh", self._graph_session_refresh)  # type: ignore[call-overload]
+        builder.add_node("controller", self._graph_controller)  # type: ignore[call-overload]
+        builder.add_node("context_selector", self._graph_context_selector)  # type: ignore[call-overload]
+        builder.add_node("context_authorization", self._graph_context_authorization)  # type: ignore[call-overload]
+        builder.add_node("context_builder", self._graph_context_builder)  # type: ignore[call-overload]
+        builder.add_node("tool_availability", self._graph_tool_availability)  # type: ignore[call-overload]
+        builder.add_node("planner", self._graph_planner)  # type: ignore[call-overload]
+        builder.add_node("context_request", self._graph_context_request)  # type: ignore[call-overload]
+        builder.add_node("action_application", self._graph_action_application)  # type: ignore[call-overload]
+        builder.add_node("reconciliation", self._graph_reconciliation)  # type: ignore[call-overload]
+        builder.add_node("finalization", self._graph_finalization)  # type: ignore[call-overload]
+        builder.add_edge(START, "session_refresh")
+        builder.add_edge("session_refresh", "controller")
+        builder.add_conditional_edges(
+            "controller",
+            self._planning_route,
+            {
+                "plan": "context_selector",
+                "recover": "reconciliation",
+                "finalize": "finalization",
+                "stop": "finalization",
+                "end": END,
+            },
+        )
+        builder.add_edge("context_selector", "context_authorization")
+        builder.add_edge("context_authorization", "context_builder")
+        builder.add_edge("context_builder", "tool_availability")
+        builder.add_edge("tool_availability", "planner")
+        builder.add_conditional_edges(
+            "planner",
+            self._planner_output_route,
+            {"context_request": "context_request", "action": "action_application"},
+        )
+        builder.add_edge("context_request", END)
+        builder.add_edge("action_application", END)
+        builder.add_edge("reconciliation", END)
+        builder.add_edge("finalization", END)
+        return cast(
+            CompiledStateGraph[
+                _PlanningGraphState,
+                _PlanningRuntime,
+                _PlanningGraphState,
+                _PlanningGraphState,
+            ],
+            builder.compile(),
+        )
+
+    def _build_analysis_graph(
+        self,
+    ) -> CompiledStateGraph[
+        _AnalysisGraphState, _AnalysisRuntime, _AnalysisGraphState, _AnalysisGraphState
+    ]:
+        builder = StateGraph(_AnalysisGraphState, context_schema=_AnalysisRuntime)
+        builder.add_node("analyzer", self._graph_analyzer)  # type: ignore[call-overload]
+        builder.add_node("knowledge_reducer", self._graph_knowledge_reducer)  # type: ignore[call-overload]
+        builder.add_node(  # type: ignore[call-overload]
+            "post_analysis_session_refresh", self._graph_analysis_session_refresh
+        )
+        builder.add_node("goal_evaluation", self._graph_goal_evaluation)  # type: ignore[call-overload]
+        builder.add_edge(START, "analyzer")
+        builder.add_edge("analyzer", "knowledge_reducer")
+        builder.add_edge("knowledge_reducer", "post_analysis_session_refresh")
+        builder.add_edge("post_analysis_session_refresh", "goal_evaluation")
+        builder.add_edge("goal_evaluation", END)
+        return cast(
+            CompiledStateGraph[
+                _AnalysisGraphState,
+                _AnalysisRuntime,
+                _AnalysisGraphState,
+                _AnalysisGraphState,
+            ],
+            builder.compile(),
+        )
+
+    def _graph_session_refresh(
+        self, _state: _PlanningGraphState, runtime: Runtime[_PlanningRuntime]
+    ) -> _PlanningGraphState:
+        evaluation = self._goals.evaluate(mission_id=runtime.context.envelope.mission_id)
+        return {"goal_evaluation_id": evaluation.evaluation_id}
+
+    def _graph_controller(
+        self, _state: _PlanningGraphState, runtime: Runtime[_PlanningRuntime]
+    ) -> _PlanningGraphState:
+        envelope, ids = runtime.context.envelope, runtime.context.ids
+        decision = self._controller.step(
+            mission_id=envelope.mission_id,
+            operation_id=ids.operation_id,
+            projection=envelope.action_candidate_projection,
+        )
+        return {"controller_decision": decision}
+
+    @staticmethod
+    def _planning_route(state: _PlanningGraphState) -> str:
+        decision = state["controller_decision"]
+        if decision.action == "PLAN":
+            return "plan"
+        if decision.action == "RECOVER":
+            return "recover"
+        if decision.action == "FINALIZE":
+            return "finalize"
+        if decision.action == "STOP":
+            return "stop"
+        return "end"
+
+    def _graph_context_selector(
+        self, _state: _PlanningGraphState, runtime: Runtime[_PlanningRuntime]
+    ) -> _PlanningGraphState:
+        self._contexts.revalidate_selection(runtime.context.envelope.planner_context_id)
+        return {}
+
+    def _graph_context_authorization(
+        self, _state: _PlanningGraphState, runtime: Runtime[_PlanningRuntime]
+    ) -> _PlanningGraphState:
+        self._contexts.revalidate_authorization(runtime.context.envelope.planner_context_id)
+        return {}
+
+    def _graph_context_builder(
+        self, _state: _PlanningGraphState, runtime: Runtime[_PlanningRuntime]
+    ) -> _PlanningGraphState:
+        self._contexts.revalidate_context_body(runtime.context.envelope.planner_context_id)
+        return {}
+
+    def _graph_tool_availability(
+        self, _state: _PlanningGraphState, runtime: Runtime[_PlanningRuntime]
+    ) -> _PlanningGraphState:
+        self._contexts.revalidate_tool_availability(runtime.context.envelope.planner_context_id)
+        return {}
+
+    def _graph_planner(
+        self, _state: _PlanningGraphState, runtime: Runtime[_PlanningRuntime]
+    ) -> _PlanningGraphState:
+        output = self._gateway.invoke_planner(
+            operation_id=runtime.context.ids.operation_id,
+            envelope=runtime.context.envelope,
+            invoke=runtime.context.invoke_planner,
+        )
+        return {"planner_output": output}
+
+    @staticmethod
+    def _planner_output_route(state: _PlanningGraphState) -> str:
+        output = state["planner_output"]
+        if isinstance(output, PlannerContextRequest):
+            return "context_request"
+        if isinstance(output, PlannerActionOutput):
+            return "action"
+        raise AgentLoopError("Planner returned an unsupported output type")
+
+    def _graph_context_request(
+        self, state: _PlanningGraphState, runtime: Runtime[_PlanningRuntime]
+    ) -> _PlanningGraphState:
+        output = cast(PlannerContextRequest, state["planner_output"])
+        self._contexts.accept_context_request(
+            planner_context_id=runtime.context.envelope.planner_context_id,
+            output=output,
+        )
+        return {}
+
+    def _graph_action_application(
+        self, state: _PlanningGraphState, runtime: Runtime[_PlanningRuntime]
+    ) -> _PlanningGraphState:
+        output = cast(PlannerActionOutput, state["planner_output"])
+        ids = runtime.context.ids
+        transition = self._actions.execute(
+            planner_context_id=runtime.context.envelope.planner_context_id,
+            output=output,
+            plan_id=ids.plan_id,
+            run_id=ids.run_id,
+            thread_id=ids.thread_id,
+            decision_id=ids.decision_id,
+            execution_id=ids.execution_id,
+            task_id=ids.task_id,
+        )
+        return {"action_transition": transition}
+
+    def _graph_reconciliation(
+        self, _state: _PlanningGraphState, runtime: Runtime[_PlanningRuntime]
+    ) -> _PlanningGraphState:
+        mission_id = runtime.context.envelope.mission_id
+        checkpoint = self._controller.checkpoint(mission_id)
+        if checkpoint is None or checkpoint.active_execution_id is None:
+            raise AgentLoopError("recovery decision has no active execution binding")
+        try:
+            self._reconcile(mission_id, checkpoint.active_execution_id)
+        except AgentLoopError as exc:
+            if str(exc) != "reconciliation retry budget exhausted":
+                raise
+            self._finalization.begin_abort(mission_id)
+            self._hold_for_review(
+                mission_id,
+                checkpoint.active_execution_id,
+                "EXECUTION_RECONCILED",
+            )
+        return {}
+
+    def _graph_finalization(
+        self, state: _PlanningGraphState, runtime: Runtime[_PlanningRuntime]
+    ) -> _PlanningGraphState:
+        mission_id = runtime.context.envelope.mission_id
+        decision = state["controller_decision"]
+        if decision.action == "FINALIZE":
+            if decision.reason_code == "GOAL_ACHIEVED":
+                self._finalization.begin_completion(mission_id)
+            else:
+                self._finalization.begin_abort(mission_id)
+            self._drive_finalization(mission_id)
+        elif self._finalization.is_finalizing(mission_id):
+            self._drive_finalization(mission_id)
+        return {}
+
+    def _graph_analyzer(
+        self, _state: _AnalysisGraphState, runtime: Runtime[_AnalysisRuntime]
+    ) -> _AnalysisGraphState:
+        context = runtime.context
+        candidate = self._gateway.invoke_analyzer(
+            mission_id=context.mission_id,
+            mission_revision=context.mission_revision,
+            operation_id=context.operation_id,
+            execution_id=context.execution_id,
+            result_digest=context.result_digest,
+            invoke=context.invoke_analyzer,
+        )
+        return {"candidate": candidate}
+
+    def _graph_knowledge_reducer(
+        self, state: _AnalysisGraphState, runtime: Runtime[_AnalysisRuntime]
+    ) -> _AnalysisGraphState:
+        del runtime
+        return {"observation": self._reducer.reduce(state["candidate"])}
+
+    def _graph_analysis_session_refresh(
+        self, _state: _AnalysisGraphState, runtime: Runtime[_AnalysisRuntime]
+    ) -> _AnalysisGraphState:
+        # Session state remains Session Manager-owned; this node is the explicit
+        # read boundary and never promotes an Analyzer candidate to runtime state.
+        evaluation = self._goals.evaluate(mission_id=runtime.context.mission_id)
+        return {"goal_evaluation_id": evaluation.evaluation_id}
+
+    def _graph_goal_evaluation(
+        self, state: _AnalysisGraphState, runtime: Runtime[_AnalysisRuntime]
+    ) -> _AnalysisGraphState:
+        evaluation = self._goals.verify_current(
+            state["goal_evaluation_id"], mission_id=runtime.context.mission_id
+        )
+        return {"goal_evaluation_id": evaluation.evaluation_id}
 
     def reconcile_execution(
         self, *, execution_id: str, recovery_authority_id: str | None = None,
@@ -171,9 +473,29 @@ class Phase1AgentWorkflow:
 
     def _drive_finalization(self, mission_id: str) -> None:
         for execution_id in self._finalization.active_execution_ids(mission_id):
-            outcome = self._reconcile(mission_id, execution_id)
+            try:
+                outcome = self._reconcile(mission_id, execution_id)
+            except AgentLoopError as exc:
+                if str(exc) != "reconciliation retry budget exhausted":
+                    raise
+                self._hold_for_review(
+                    mission_id, execution_id, "EXECUTION_RECONCILED"
+                )
+                return
             if outcome.provider_execution_state in {"DISPATCHED", "RUNNING"}:
                 self._cancel_for_finalization(execution_id)
+            elif (
+                outcome.provider_execution_state in {"SUCCEEDED", "FAILED", "CANCELLED"}
+                and not self._settle_result(mission_id, execution_id)
+            ):
+                return
+        for record in self._executions.all_for_mission(mission_id):
+            if (
+                record.provider_execution_state in {"SUCCEEDED", "FAILED", "CANCELLED"}
+                and record.result_ingestion_state != "SUCCEEDED"
+                and not self._settle_result(mission_id, record.execution_id)
+            ):
+                return
         if not self._finalization.active_execution_ids(mission_id):
             self._finalization.resume(mission_id)
 
@@ -225,3 +547,72 @@ class Phase1AgentWorkflow:
             recovery_authority_id=authority.authority_id,
             reason="phase1_finalization_cancel",
         )
+
+    def _settle_result(self, mission_id: str, execution_id: str) -> bool:
+        record = self._executions.get(execution_id)
+        if record is None:
+            raise AgentLoopError("finalization result execution is missing")
+        control = self._control.find_by_execution(execution_id)
+        try:
+            if control is None:
+                reserved = self._retry_budgets.reserve(
+                    mission_id=mission_id,
+                    operation_id=f"collection-{execution_id}",
+                    retry_kind="collection",
+                )
+                adapter = self._adapters.get(record.resolved_adapter_id)
+                if adapter is None:
+                    raise RawResultQuarantineError("trusted collection adapter is unavailable")
+                authority = self._recovery.issue_authority(
+                    authority_id=(
+                        f"agent-collection-{execution_id}-{reserved.consumed_attempts}"
+                    ),
+                    execution_id=execution_id,
+                    allowed_operation="collect_result",
+                    reason="phase1_finalization_collection",
+                )
+                collected = self._collection.collect_from_adapter(
+                    execution_id=execution_id,
+                    adapter=adapter,
+                    recovery_authority_id=authority.authority_id,
+                )
+                ingestion_id = collected.ingestion_id
+            else:
+                ingestion = self._ingestion_states.find_by_execution(execution_id)
+                if ingestion is None:
+                    raise SecureIngestionError("collection has no ingestion state")
+                ingestion_id = ingestion.ingestion_id
+            self._retry_budgets.reserve(
+                mission_id=mission_id,
+                operation_id=f"ingestion-{execution_id}",
+                retry_kind="ingestion",
+            )
+            published = self._ingestion.ingest(ingestion_id=ingestion_id)
+            if published.deletion_intent_id is not None:
+                self._eraser.run(deletion_intent_id=published.deletion_intent_id)
+        except RawResultQuarantineError:
+            self._hold_for_review(mission_id, execution_id, "COLLECTION_COMPLETE")
+            return False
+        except (OutputPublicationError, SecureIngestionError, VerifiedErasureError):
+            self._hold_for_review(mission_id, execution_id, "INGESTION_COMPLETE")
+            return False
+        except AgentLoopError as exc:
+            if str(exc) == "collection retry budget exhausted":
+                self._hold_for_review(mission_id, execution_id, "COLLECTION_COMPLETE")
+                return False
+            if str(exc) == "ingestion retry budget exhausted":
+                self._hold_for_review(mission_id, execution_id, "INGESTION_COMPLETE")
+                return False
+            raise
+        return True
+
+    def _hold_for_review(
+        self, mission_id: str, execution_id: str, reason_code: UnresolvedReason
+    ) -> None:
+        self._unresolved.open(
+            unresolved_id=f"unresolved-{reason_code.lower()}-{execution_id}",
+            mission_id=mission_id,
+            source_execution_id=execution_id,
+            reason_code=reason_code,
+        )
+        self._finalization.wait_for_human_review(mission_id)

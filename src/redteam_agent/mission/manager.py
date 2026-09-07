@@ -293,6 +293,18 @@ class MissionManager:
         actor = self._authorize_actor(mission_id, actor_token, MISSION_OPERATOR_ROLE)
         return self._transition(mission_id, "ABORTED", expected_version, actor=actor, reason="aborted")
 
+    def wait_for_human_review(
+        self, mission_id: str, expected_version: int, *, actor_token: str
+    ) -> MissionState:
+        actor = self._authorize_actor(mission_id, actor_token, MISSION_OPERATOR_ROLE)
+        return self._transition(
+            mission_id,
+            "WAITING_HUMAN_REVIEW",
+            expected_version,
+            actor=actor,
+            reason="unresolved_recovery",
+        )
+
     def invalidate_authorization(self, mission_id: str, expected_version: int, *, actor_token: str) -> MissionState:
         actor = self._authorize_actor(mission_id, actor_token, MISSION_OPERATOR_ROLE)
         with UnitOfWork(self._db):

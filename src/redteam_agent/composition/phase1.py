@@ -18,6 +18,7 @@ from redteam_agent.agent.working_state import PlannerStateManager
 from redteam_agent.composition.phase0c import Phase0CKernel, build_phase0c_kernel
 from redteam_agent.composition.testing import OPERATOR_ACTOR_TOKEN
 from redteam_agent.context.builder import ContextBodyStore, ContextBuilder
+from redteam_agent.context.selector import ContextSelector
 from redteam_agent.goal.service import GoalEvaluationService
 from redteam_agent.knowledge.entities import EntityResolver
 from redteam_agent.knowledge.reducer import KnowledgeReducer
@@ -127,6 +128,7 @@ def build_phase1_kernel(*, phase0c: Phase0CKernel | None = None) -> Phase1Kernel
         authorization_service=phase0a.context_authorization_service,
         body_store=context_body_store,
     )
+    context_selector = ContextSelector(phase0a.index_repository)
     planner_context = PlannerContextService(
         database=phase0a.database,
         digest_service=ds,
@@ -134,6 +136,7 @@ def build_phase1_kernel(*, phase0c: Phase0CKernel | None = None) -> Phase1Kernel
         context_resolver=phase0a.context_resolver,
         context_authorization_service=phase0a.context_authorization_service,
         context_builder=context_builder,
+        context_selector=context_selector,
         snapshot_repository=phase0a.snapshot_repository,
         session_repository=phase0a.session_repository,
         goal_service=goals,
@@ -177,7 +180,12 @@ def build_phase1_kernel(*, phase0c: Phase0CKernel | None = None) -> Phase1Kernel
         execution_repository=phase0b.execution_repository,
         task_binding_repository=phase0b.task_binding_repository,
         cancel_attempt_repository=phase0b.cancel_attempt_repository,
+        ingestion_repository=phase0b.ingestion_repository,
+        control_metadata_repository=phase0b.control_metadata_repository,
+        unresolved_items=unresolved_items,
+        adapters={phase0b.mock_adapter.identity().adapter_id: phase0b.mock_adapter},
         executor=phase0b.executor,
+        goal_service=goals,
         verified_finding_projector=verified_findings,
     )
     return Phase1Kernel(

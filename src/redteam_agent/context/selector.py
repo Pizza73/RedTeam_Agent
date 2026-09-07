@@ -30,7 +30,7 @@ class ContextIndexReader(Protocol):
     def query_by_mission(self, mission_id: str) -> tuple[ContextResourceIndexRecord, ...]: ...
 
 
-def _reference_value(reference: TargetReference) -> str:
+def target_reference_value(reference: TargetReference) -> str:
     if isinstance(reference, IpTargetReference):
         return reference.address
     if isinstance(reference, NamedTargetReference):
@@ -80,7 +80,7 @@ class ContextSelector:
                 # Index reader must return only this mission's records.
                 raise ContextSelectionError("context index returned a cross-mission record")
             target_match = any(
-                _reference_value(reference) in current_target_values
+                target_reference_value(reference) in current_target_values
                 for reference in record.target_references
             )
             reasons = ("TARGET_MATCH",) if target_match else ("MISSION_SCOPED",)

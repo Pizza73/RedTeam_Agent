@@ -182,7 +182,15 @@ class QuarantineCollectionService:
         recovery_authority_id: str | None = None,
     ) -> tuple[_CollectionContext, EncryptedStreamingQuarantineSink]:
         record = self._require_execution(execution_id)
-        if record.provider_execution_state not in ("DISPATCHED", "RUNNING", "DISPATCH_CLAIMED", "RECONCILING"):
+        if record.provider_execution_state not in (
+            "DISPATCHED",
+            "RUNNING",
+            "DISPATCH_CLAIMED",
+            "RECONCILING",
+            "SUCCEEDED",
+            "FAILED",
+            "CANCELLED",
+        ):
             raise RawResultQuarantineError("collection requires a dispatched execution")
         binding = self._bindings.find_by_execution(execution_id)
         if binding is None and local_binding is not None:
@@ -370,6 +378,13 @@ class QuarantineCollectionService:
         terminal = {"succeeded": "SUCCEEDED", "failed": "FAILED", "cancelled": "CANCELLED"}[
             control.provider_status
         ]
+        if (
+            record.provider_execution_state in {"SUCCEEDED", "FAILED", "CANCELLED"}
+            and record.provider_execution_state != terminal
+        ):
+            raise RawResultQuarantineError(
+                "collection control conflicts with the reconciled terminal outcome"
+            )
         updates: dict[str, object] = {
             "result_ingestion_state": "PENDING",
             "provider_execution_state": terminal,

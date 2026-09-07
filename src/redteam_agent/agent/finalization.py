@@ -100,6 +100,16 @@ class FinalizationService:
         state = self._states.get(mission_id)
         return state is not None and state.state == "FINALIZING"
 
+    def wait_for_human_review(self, mission_id: str) -> MissionState:
+        state = self._states.get(mission_id)
+        if state is None or state.state != "FINALIZING":
+            raise AgentLoopError("human review requires a FINALIZING mission")
+        return self._manager.wait_for_human_review(
+            mission_id,
+            expected_version=state.mission_state_version,
+            actor_token=self._operator_actor_token,
+        )
+
     def _begin(
         self,
         mission_id: str,
