@@ -12,8 +12,8 @@
 | Phase | 0A: Core Models / Authorization Kernel |
 | 入力コミット（完全ID） | `d78d089705104d5c10c5d364b3e0048c211d15b9`（`codex/phase-0a`、設計のみのbaseline） |
 | 実装先 | Codexが用意した専用worktree `/tmp/redteam-phase0a`（ブランチ `codex/phase-0a`） |
-| 実装対象コミット | **未確定（UNDETERMINED）**。第2回レビュー指摘への修正を固定後、この欄を更新する。 |
-| 独立レビュー | 第1回 `dce6504`、第2回 `2161cc6`、第3回 `bfeede8`、第4回 `403d421`、第5回 `8389da2` を実施。いずれも受入非支持。修正版の最終レビューは未実施。完全IDは各レビュー記録に保存。 |
+| 実装対象コミット | `efd7a28a750f6e6e6cdaeafb6342faa498ab1d05` |
+| 独立レビュー | 第1回 `dce6504`、第2回 `2161cc6`、第3回 `bfeede8`、第4回 `403d421`、第5回 `8389da2` は受入非支持。第6回 `efd7a28a750f6e6e6cdaeafb6342faa498ab1d05` は受入支持。 |
 
 成果物はブランチ `codex/phase-0a` に固定する。リモートへのpushとmainへのmergeは別途指示があるまで行わない。
 
@@ -49,7 +49,7 @@ Production能力を偽らない。
 Unit/Integration/Security PASS、ruff/mypy/compileall PASS、Branch Coverage取得、既存Test非削除、
 未承認の設計・安全条件・受入条件変更なし、新規Security FindingにRegression Test、BLOCKER/HIGH 0件、
 実C2/MCP/外部Target Side Effect 0件、Secret Leakage 0件、未解決仕様矛盾・仮実装・Security-critical TODOなし。
-「対象実装コミット固定 + 独立レビュー完了」は、修正版コミットの固定と最終レビュー後に判定する。
+対象実装コミットを固定し、第6回独立レビューでCommon Gateの受入を確認した。
 
 ### Phase 0A Blockers / High / Zero metrics
 
@@ -97,7 +97,7 @@ frozen は変更で `ValidationError`。標準 `json.loads` は重複キーを�
 
 ## 4. 試験結果
 
-対象コミット: **未確定**（第2回レビュー指摘への修正を含む作業ツリー。固定後に完全IDを記録する）。
+対象コミット: `efd7a28a750f6e6e6cdaeafb6342faa498ab1d05`。
 入力コミット `d78d089`。レビュー候補は第1回 `dce6504`、第2回 `2161cc6`、第3回 `bfeede8`、第4回 `403d421`、第5回 `8389da2`。以下は第5回指摘H01–H02対応後の結果である。
 実行環境: worktree `/tmp/redteam-phase0a`、`.venv`（Python 3.14.6）。全て仮想環境Pythonで実行。
 
@@ -206,9 +206,14 @@ HIGH 1 / MEDIUM 1で受入を支持しなかった。86種類のProbeとGoal関�
 - H01: Secret schemaの再帰検証を短絡評価せず全siblingへ適用する。正常なSecret schemaと予約fieldの部分集合だけを持つ不正objectが混在しても、後者を必ず登録拒否する。実引数走査も予約fieldを一つ以上含むobjectを検出対象にする。
 - H02: Rule objectをRoot登録済みの具象`SessionExistsGoalRule`型と完全一致させ、Source実装もRootの`EmptySessionGoalSource`または`RepositorySessionGoalSource`に限定する。必須methodのcallable性も検査する。
 
+固定コミット `efd7a28a750f6e6e6cdaeafb6342faa498ab1d05` に対する第6回独立レビュー
+（記録: `/tmp/phase0a-independent-review-6/review.md`）は**受入を支持**した。新規・残存指摘は
+BLOCKER 0 / HIGH 0 / MEDIUM 0 / LOW 0。独立pytest 269件、独立Probe 151ケース、Goal関連6検査を実行し、
+H01/H02の解消、F/G/N/Rの退行反例なし、Snapshot clean、承認済み正本文書不変、外部dispatch 0を確認した。
+
 ## 6. 受入と残課題
 
-- Phase受入は**未成立**。第5回指摘の修正版コミット固定と最終独立レビューが未完了である。
+- Phase 0Aは固定コミット `efd7a28a750f6e6e6cdaeafb6342faa498ab1d05` で**受入成立**。
 - 実施した主な安全強化（レビュー指摘対応）:
   - Executor Gateは公開入口で `decision_id + plan` だけを受け、Trusted Clock と `AuthorizationContextResolver` から
     Current情報・現在時刻を自ら取得する（caller-supplied runtime/now を受けない）。
@@ -235,5 +240,5 @@ HIGH 1 / MEDIUM 1で受入を支持しなかった。86種類のProbeとGoal関�
     用途別の厳密固定は後続Phaseの Secret Lifecycle / Knowledge 実装時に細分化する。
   - Write Guard はPhase 0Aの配線的アクセス制御であり暗号署名ではない。§34.2のTPM witness/署名は後続Phase。
   - Owner Service経由でない低レベルSQLへの直接書込みをOSレベルで防ぐことは0A範囲外（正本§35.2 Production Composition/§34.2は後続）。
-- 未解決の仕様矛盾・BLOCKER/HIGH・Security-critical TODO: 最終独立レビュー前のため未確定。既知の第2回N01–N11、第3回F01–F04、第4回G01–G03、第5回H01–H02は実装、Regression、記録へ反映済み。
+- 未解決の仕様矛盾・BLOCKER/HIGH・Security-critical TODO: なし。既知の第2回N01–N11、第3回F01–F04、第4回G01–G03、第5回H01–H02は実装、Regression、記録へ反映し、第6回で退行反例なしを確認した。
 - 次Phase範囲: Phase 0B（Execution State Machine / Dispatch Claim / Secret Injection / 実行安全）。本実装では未着手。
