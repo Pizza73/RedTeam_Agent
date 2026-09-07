@@ -113,6 +113,25 @@ _DEFINITIONS: tuple[DigestDefinition, ...] = (
     _obj("mission_revision_digest", "mission"),
     _obj("profile_digest", "llm"),
     _obj("sandbox_binding_digest", "sandbox"),
+    # Phase 0B execution-safety object-integrity digests. Each excludes its own
+    # digest field; the record's identity/binding fields are covered by the hash.
+    _obj("execution_record_digest", "executor", exclude_self="record_digest"),
+    _obj("dispatch_claim_digest", "executor", exclude_self="record_digest"),
+    _obj("result_task_binding_digest", "executor", exclude_self="binding_digest"),
+    _obj("result_collection_state_digest", "executor", exclude_self="record_digest"),
+    _obj("result_ingestion_state_digest", "executor", exclude_self="record_digest"),
+    _obj("raw_control_metadata_digest", "executor", exclude_self="record_digest"),
+    _obj("execution_result_projection_digest", "executor", exclude_self="projection_digest"),
+    _obj("mission_execution_budget_digest", "executor", exclude_self="record_digest"),
+    _obj("execution_recovery_authority_digest", "executor", exclude_self="authority_digest"),
+    _obj("cancel_attempt_digest", "executor", exclude_self="record_digest"),
+    # Explicit-input progress/intent digests (variable-shape payloads).
+    _explicit("raw_result_receipt_digest", "executor"),
+    _explicit("result_progress_digest", "executor"),
+    _explicit("cancel_intent_digest", "executor"),
+    _explicit("consumption_id_digest", "executor"),
+    _explicit("secret_version_bindings_digest", "executor"),
+    _explicit("secret_lifecycle_heads_digest", "executor"),
 )
 
 

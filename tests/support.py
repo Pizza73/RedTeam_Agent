@@ -365,6 +365,7 @@ def seed_running_mission(
     session_ids: tuple[str, ...] = (),
     privileged_session: bool = False,
     seed_sandbox: bool = False,
+    adapter_capability: AdapterCapabilities | None = None,
 ) -> SeededMission:
     ds = kernel.digest_service
     profile = mock_agent_profile(ds)
@@ -376,7 +377,7 @@ def seed_running_mission(
         rule_catalog=kernel.rule_catalog,
     )
     kernel.registry_repository.save(registry)
-    kernel.adapter_repository.save(adapter_capabilities())
+    kernel.adapter_repository.save(adapter_capability or adapter_capabilities())
     if seed_sandbox:
         kernel.sandbox_repository.save(sandbox_capabilities(ds))
     for session_id in session_ids:

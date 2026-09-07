@@ -22,6 +22,16 @@ def _row_digest(namespace: str, key: str, json_text: str) -> str:
     return hashlib.sha256(_ROW_DIGEST_DOMAIN + b"\x00" + body).hexdigest()
 
 
+def row_digest(namespace: str, key: str, json_text: str) -> str:
+    """Public row-integrity digest binding (namespace/table, key, json).
+
+    Phase 0B dedicated tables reuse this so a raw single-row edit that changes
+    the JSON without recomputing the digest is caught on read (same guarantee as
+    ``kv_store``).
+    """
+    return _row_digest(namespace, key, json_text)
+
+
 class Database:
     def __init__(self, path: str = ":memory:") -> None:
         # ``isolation_level=None`` gives explicit transaction control; the unit
@@ -45,6 +55,145 @@ class Database:
             )
             """
         )
+        self._create_execution_schema()
+
+    def _create_execution_schema(self) -> None:
+        # Phase 0B durable execution-safety tables. Uniqueness and OCC are
+        # enforced by the database itself: one policy decision yields at most one
+        # execution (UNIQUE policy_decision_id); at most one unconsumed dispatch
+        # claim exists per execution (partial UNIQUE index); state transitions
+        # use ``execution_state_version``/``state_version`` OCC updates. Each row
+        # also stores a row_digest binding its identity to its JSON payload.
+        statements = (
+            """
+            CREATE TABLE IF NOT EXISTS executions (
+                execution_id TEXT PRIMARY KEY,
+                policy_decision_id TEXT NOT NULL UNIQUE,
+                mission_id TEXT NOT NULL,
+                execution_state_version INTEGER NOT NULL,
+                provider_execution_state TEXT NOT NULL,
+                json TEXT NOT NULL,
+                row_digest TEXT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS dispatch_claims (
+                claim_id TEXT PRIMARY KEY,
+                execution_id TEXT NOT NULL,
+                claim_state TEXT NOT NULL,
+                json TEXT NOT NULL,
+                row_digest TEXT NOT NULL,
+                FOREIGN KEY (execution_id) REFERENCES executions(execution_id)
+            )
+            """,
+            # At most one unconsumed dispatch claim may exist for an execution.
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_dispatch_claims_unconsumed
+                ON dispatch_claims (execution_id)
+                WHERE claim_state = 'unconsumed'
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS result_collection_authorities (
+                collection_id TEXT PRIMARY KEY,
+                execution_id TEXT NOT NULL UNIQUE,
+                json TEXT NOT NULL,
+                row_digest TEXT NOT NULL,
+                FOREIGN KEY (execution_id) REFERENCES executions(execution_id)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS result_collection_states (
+                collection_state_id TEXT PRIMARY KEY,
+                collection_id TEXT NOT NULL UNIQUE,
+                execution_id TEXT NOT NULL,
+                state_version INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                json TEXT NOT NULL,
+                row_digest TEXT NOT NULL,
+                FOREIGN KEY (collection_id) REFERENCES result_collection_authorities(collection_id),
+                FOREIGN KEY (execution_id) REFERENCES executions(execution_id)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS result_task_bindings (
+                result_task_binding_id TEXT PRIMARY KEY,
+                execution_id TEXT NOT NULL UNIQUE,
+                json TEXT NOT NULL,
+                row_digest TEXT NOT NULL,
+                FOREIGN KEY (execution_id) REFERENCES executions(execution_id)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS raw_control_metadata (
+                control_record_id TEXT PRIMARY KEY,
+                execution_id TEXT NOT NULL UNIQUE,
+                json TEXT NOT NULL,
+                row_digest TEXT NOT NULL,
+                FOREIGN KEY (execution_id) REFERENCES executions(execution_id)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS result_ingestion_states (
+                ingestion_id TEXT PRIMARY KEY,
+                execution_id TEXT NOT NULL UNIQUE,
+                state_version INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                json TEXT NOT NULL,
+                row_digest TEXT NOT NULL,
+                FOREIGN KEY (execution_id) REFERENCES executions(execution_id)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS execution_result_projections (
+                projection_id TEXT PRIMARY KEY,
+                execution_id TEXT NOT NULL UNIQUE,
+                json TEXT NOT NULL,
+                row_digest TEXT NOT NULL,
+                FOREIGN KEY (execution_id) REFERENCES executions(execution_id)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS execution_results (
+                execution_id TEXT PRIMARY KEY,
+                json TEXT NOT NULL,
+                row_digest TEXT NOT NULL,
+                FOREIGN KEY (execution_id) REFERENCES executions(execution_id)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS execution_recovery_authorities (
+                authority_id TEXT PRIMARY KEY,
+                execution_id TEXT NOT NULL,
+                allowed_operation TEXT NOT NULL,
+                json TEXT NOT NULL,
+                row_digest TEXT NOT NULL,
+                FOREIGN KEY (execution_id) REFERENCES executions(execution_id)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS cancel_attempts (
+                cancel_attempt_id TEXT PRIMARY KEY,
+                execution_id TEXT NOT NULL,
+                provider_task_id TEXT NOT NULL,
+                json TEXT NOT NULL,
+                row_digest TEXT NOT NULL,
+                UNIQUE (execution_id, provider_task_id),
+                FOREIGN KEY (execution_id) REFERENCES executions(execution_id)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS mission_execution_budgets (
+                mission_id TEXT NOT NULL,
+                mission_revision INTEGER NOT NULL,
+                budget_version INTEGER NOT NULL,
+                json TEXT NOT NULL,
+                row_digest TEXT NOT NULL,
+                PRIMARY KEY (mission_id, mission_revision)
+            )
+            """,
+        )
+        for statement in statements:
+            self._conn.execute(statement)
 
     @property
     def connection(self) -> sqlite3.Connection:

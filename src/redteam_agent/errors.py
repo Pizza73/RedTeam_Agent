@@ -144,3 +144,59 @@ class MisleadingApprovalPresentationError(AuthorizationKernelError):
 
 class ExecutorAuthorizationError(AuthorizationKernelError):
     """The executor authorization gate refused to authorize an execution."""
+
+
+# --- Phase 0B: execution safety -------------------------------------------
+
+
+class ExecutionStateConflictError(AuthorizationKernelError):
+    """Optimistic concurrency control detected a stale execution_state_version."""
+
+
+class ExecutionUniquenessError(AuthorizationKernelError):
+    """A database uniqueness invariant was violated (one decision -> one execution,
+    or more than one unconsumed dispatch claim for an execution)."""
+
+
+class ExecutionRecordError(AuthorizationKernelError):
+    """An execution record or its bindings are missing or inconsistent."""
+
+
+class DispatchClaimError(AuthorizationKernelError):
+    """A dispatch claim is missing, in the wrong state, expired, or field-inconsistent."""
+
+
+class SecretInjectionError(AuthorizationKernelError):
+    """A just-in-time secret injection precondition failed (fail closed, no dispatch)."""
+
+
+class EncryptionKeyUnavailableError(AuthorizationKernelError):
+    """A secret version's key/plaintext is unavailable, revoked, or mismatched."""
+
+
+class ResultCollectionError(AuthorizationKernelError):
+    """A result-collection authority/lease/sink precondition failed."""
+
+
+class ResultTaskBindingError(AuthorizationKernelError):
+    """A result task binding is invalid, unknown-mode, or would mutate a fixed mapping."""
+
+
+class ResultIngestionError(AuthorizationKernelError):
+    """A result-ingestion state transition or retry precondition failed."""
+
+
+class ExecutionRecoveryAuthorityError(AuthorizationKernelError):
+    """An execution recovery authority is out of state/window or wrongly bound."""
+
+
+class CancelAttemptError(AuthorizationKernelError):
+    """A cancel attempt precondition (single-consume, binding, state) failed."""
+
+
+class MissionExecutionBudgetError(AuthorizationKernelError):
+    """A durable mission execution budget was exhausted or double-counted."""
+
+
+class MissionRevisionConflictError(AuthorizationKernelError):
+    """A run_id/thread_id did not match the mission id/revision it claims."""

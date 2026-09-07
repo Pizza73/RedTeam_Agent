@@ -18,6 +18,21 @@ from redteam_agent.auth.models import MissionRoleAssignment
 from redteam_agent.canonical.digest_service import DigestService
 from redteam_agent.context.models import ContextDataAccessGrant, ContextResourceIndexRecord
 from redteam_agent.errors import RepositoryIntegrityError
+from redteam_agent.execution.models import (
+    CancelAttempt,
+    DispatchClaim,
+    ExecutionRecord,
+    ExecutionRecoveryAuthority,
+    ExecutionResult,
+    ExecutionResultProjection,
+    LocalResultBinding,
+    MissionExecutionBudget,
+    ProviderTaskBinding,
+    RawControlMetadataRecord,
+    ResultCollectionAuthority,
+    ResultCollectionStateRecord,
+    ResultIngestionStateRecord,
+)
 from redteam_agent.llm.profile import AgentModelProfile
 from redteam_agent.mission.models import MissionLifecycleEvent, MissionRevision, MissionState
 from redteam_agent.policy.models import PolicyDecision
@@ -38,6 +53,18 @@ _OBJECT_INTEGRITY: dict[str, tuple[str, str]] = {
     ToolRegistryRevision.__name__: ("registry_digest", "registry_digest"),
     AgentModelProfile.__name__: ("profile_digest", "profile_digest"),
     SandboxCapabilities.__name__: ("sandbox_binding_digest", "sandbox_binding_digest"),
+    # Phase 0B execution-safety families.
+    ExecutionRecord.__name__: ("record_digest", "execution_record_digest"),
+    DispatchClaim.__name__: ("record_digest", "dispatch_claim_digest"),
+    ResultCollectionStateRecord.__name__: ("record_digest", "result_collection_state_digest"),
+    ResultIngestionStateRecord.__name__: ("record_digest", "result_ingestion_state_digest"),
+    RawControlMetadataRecord.__name__: ("record_digest", "raw_control_metadata_digest"),
+    ExecutionResultProjection.__name__: ("projection_digest", "execution_result_projection_digest"),
+    MissionExecutionBudget.__name__: ("record_digest", "mission_execution_budget_digest"),
+    CancelAttempt.__name__: ("record_digest", "cancel_attempt_digest"),
+    ExecutionRecoveryAuthority.__name__: ("authority_digest", "execution_recovery_authority_digest"),
+    ProviderTaskBinding.__name__: ("binding_digest", "result_task_binding_digest"),
+    LocalResultBinding.__name__: ("binding_digest", "result_task_binding_digest"),
 }
 
 # Families integrity-checked by id/row-key binding at the repository (no content
@@ -50,6 +77,10 @@ _ID_BOUND_FAMILIES: frozenset[str] = frozenset(
         ContextResourceIndexRecord.__name__,
         MissionRoleAssignment.__name__,
         MissionLifecycleEvent.__name__,
+        # Phase 0B records whose integrity is enforced by id/row-key binding
+        # (no self content digest field).
+        ResultCollectionAuthority.__name__,
+        ExecutionResult.__name__,
     }
 )
 
