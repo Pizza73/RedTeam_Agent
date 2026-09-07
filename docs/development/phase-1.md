@@ -3,9 +3,9 @@
 ## 対象
 
 - 設計正本: `SystemDesign.md` Phase 1、`SystemDesign_AI_Control.md`、`docs/acceptance-criteria.md`
-- 基点: `0a12cf9d790d7c81ea676fc39ba9ba337793194c`（Phase 0C受入記録）
-- 実装対象: `5884942`、`753b2fe`、`7865b2a`、`98a3bd2`、`43699ff`、`3a59791`
-- 最終実装コミット: `3a59791b7e351bd463fab3913ce07ed6ba23db5a`
+- 基点: `0a12cf9a702303f1b9ca87c702141addb996ae87`（Phase 0C受入記録）
+- 実装範囲: 基点の次から最終実装コミットまで
+- 最終実装コミット: `a22302824ff6a918d421b2c31347b6448033e6ca`
 
 ## 実装と受入要件
 
@@ -28,13 +28,52 @@
 | Finalization | Result collection、ingestion、verified erasure、unresolved item、Goal、Audit、Witnessを再検証し、`FINALIZING`から再開可能 |
 | 最大Iteration | Planner iterationをdurable dispatch budgetへ一致させ、ControllerがMission上限で停止 |
 
-## AI-01〜12 / AC-01〜20対応
+## AI-01〜12 対応
 
-閉じたPlanner Output、Application生成ID、Context非権限化、Current Snapshot再検証、Policy/Executorの独立認可、
-Observation/Hypothesis/Verified Finding分離、三値Goal、有限ActionContract探索、永続Budget、単回Dispatch、
-stale Epoch拒否、FINALIZING収束を、`test_phase1_planner_context.py`、`test_phase1_mock_loop.py`、
-`test_phase1_state_controls.py`、既存security/property/regression suiteで検証した。参照モデルの結果だけを
-受入根拠にせず、公開callerに対するreplay、stale、scope false、未取込、未消去、unknown semanticのnegative pathを含む。
+| ID | 製品経路 / 主な試験 Evidence |
+| --- | --- |
+| AI-01 | Analyzer候補を`KnowledgeObservation`へ隔離。`test_unconfirmed_observation_does_not_change_goal_or_witnessed_fact_head`、Mock loop |
+| AI-02 | Goal、前提探索、Policy/Executorを別Serviceで評価。Controller、prerequisite search、Mock loop |
+| AI-03 | Current candidate/target/scope/epochを再検証。`test_planner_action_cannot_select_another_target`、`test_scope_false_action_never_reaches_mock_adapter` |
+| AI-04 | Verified Findingはowner resultだけから生成しKnowledge headを更新。Phase 1 knowledge security tests、再投影idempotency assertion |
+| AI-05 | Context Grantと本文Digestを分離。`test_context_builder_reads_only_the_body_bound_by_verified_grant`、grantなしnegative |
+| AI-06 | 全ActionをPolicy→Executor→Claimへ接続。Mock loop、Phase 0A/0B gate negative suite |
+| AI-07 | 実Executionの取込・消去完了後だけFact投影。Mock loopのpre-ingestion/pre-erasure rejection |
+| AI-08 | RECOVERを既存ExecutionのReconciliationへ接続。Mock loop recovery assertion、crash/reconciliation suite |
+| AI-09 | Planner Context/Action/epoch/OCC binding。Planner context tests、atomic invalid→valid retry probe |
+| AI-10 | 種類別durable retry budgetとMission dispatch budget。state controls、budget suite |
+| AI-11 | Mission Manager、Goal Evaluator、Source owner、typed unresolved resolutionへ所有権を固定。Mock loop、mission lifecycle suite |
+| AI-12 | 正常Mock loopとscope/stale/replay/tamper negativeを別試験として実行。zero-metrics suite |
+
+## AC-01〜20 対応
+
+| ID | 主な試験 Evidence |
+| --- | --- |
+| AC-01 | `test_goal_controller_plans_then_finalizes_from_current_session_source`、Mock loopのPlannerなしFINALIZE |
+| AC-02 | `test_finite_prerequisite_search_uses_observer_for_unknown_predicate`、Mock loopの通常認可・結果確認 |
+| AC-03 | `test_scope_false_action_never_reaches_mock_adapter` |
+| AC-04 | prerequisite searchのunknown observer選択、Planner ContextのCurrent source再検証 |
+| AC-05 | `test_unconfirmed_observation_does_not_change_goal_or_witnessed_fact_head` |
+| AC-06 | Source owner以外からのFact更新拒否、typed unresolved owner-source resolution |
+| AC-07 | Analyzer confidenceをObservation以外のGoal/Policy入力にしない型・Reducer経路 |
+| AC-08 | Phase 1 context builder positive/negative、context authorization suite |
+| AC-09 | Mock Analyzer候補分離、semantic catalog unknown rejection、publication-rule negative suite |
+| AC-10 | Goal Evaluatorの三値集約とControllerの`not_achieved`経路、success-condition validation suite |
+| AC-11 | finite prerequisite searchの固定上限・循環key、`PLANNING_SEARCH_LIMIT`分岐 |
+| AC-12 | bounded Context Request、種類別retry budget、同一operation replay tests |
+| AC-13 | target差替え、epoch変更、snapshot/approval staleのnegative suite |
+| AC-14 | Mock loop RECOVER、`test_uncertain_submit_goes_to_reconciliation_without_resubmit`、crash suite |
+| AC-15 | Verified Finding再投影idempotency、Analyzer候補失敗がowner Factを変更しない境界 |
+| AC-16 | pause/resume epoch rotation、paused Context/Dispatch rejection |
+| AC-17 | budget claim transaction、exhaustion、OCC conflict tests |
+| AC-18 | Knowledge head tamper、selective DB rollback、swtpm rollback tests |
+| AC-19 | closed Planner schema/unknown field rejection、legacy compatibility recordsを認可入力にしないarchitecture checks |
+| AC-20 | 正常Mock loopがPlan→Dispatch→Ingestion→Goal→COMPLETEDへ到達。安全停止だけを成功扱いしない |
+
+Phase 1固有の状態遷移Evidenceは、Mock loop内の`PLAN → RECOVER → FINALIZE → FINALIZING再開 → COMPLETED`、
+`test_lifecycle_matches_reference_model`、`test_provider_edges_match_independent_oracle`を組み合わせる。参照モデルの
+PASSだけでは受入とせず、同じ公開Serviceに対するscope、stale、replay、未取込、未消去、任意unresolved解消の
+negative pathも実行する。
 
 ## 検査結果
 
@@ -49,7 +88,7 @@ PYTHONPATH=src .venv/bin/python -m pytest -q -ra
 .venv/bin/python -m ruff check src tests
   PASS
 .venv/bin/python -m mypy
-  PASS: 163 source files
+  PASS: 164 source files
 .venv/bin/python -m compileall -q src tests
   PASS
 PYTHONPATH=src .venv/bin/python scripts/verify_pydantic_contract.py
@@ -66,7 +105,7 @@ coverage run --branch -m pytest / coverage report
 
 ## レビュー
 
-独立レビューは実装と別ContextのCodexが固定コミットのfresh snapshotで実施する。初回指摘のstale Gateway、
-Action replay、未取込/未消去Finalization、Finalization再開、Verified Finding / AD Goal、Workflow caller、
-Working State消費順序を修正し、各negative pathを追加した。最終判定と固定review artifactは独立レビュー完了後に
-`docs/reviews/`へ記録する。
+独立レビューは実装と別ContextのCodexが固定コミットのfresh snapshotで実施する。`a808f11`対象の初回判定は
+BLOCKER 0 / HIGH 2 / MEDIUM 3でFAILだった。任意Unresolved解消・cross-mission付替え、Workflow未接続、
+Verified Finding再投影、古いコミット参照、要件対応表を`a22302824ff6a918d421b2c31347b6448033e6ca`で修正した。
+最終判定と固定review artifactは再レビュー完了後に`docs/reviews/`へ記録する。
