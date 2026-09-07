@@ -211,6 +211,20 @@ H-03 / H-04 / H-05、M-01、L-01の解消を確認した一方、旧サービス
 verify scripts、`git diff --check`をPASSした。Common Gateの正式判定は、この第2修正コミットを固定した後の
 独立Read-onlyレビューまで保留する。
 
+### 7.3 最終独立レビュー（2026-09-07）
+
+実装会話を引き継がない独立レビュアーが、最終固定コミット
+`0993147d98768b0f39306c96a559894f19cc9e1e`（tree
+`7eab5617f36a6bfc15d2809f69fbfd3460904050`）を新規Read-only snapshotへ展開し、再レビューした。
+
+- 判定: **Common Gate PASS / Phase 1移行可**
+- Findings: **BLOCKER 0 / HIGH 0 / MEDIUM 0 / LOW 0**
+- 独立検証: 530 tests（`swtpm` 7件、skip / xfail 0）、branch coverage 86.7439%、ruff、project / direct
+  mypy strict、compileall、verify scripts、SHA256SUMS、Git checksをすべてPASS
+- 前回残存経路: 旧参照、期限後Recovery Authority、公開破壊 / 平文API、Executor二回目bindを独立probeで拒否
+- 証跡: `docs/reviews/phase-0c-common-gate-0993147.md`（原本SHA256
+  `4f0df36abf635dfe0c8e38f77299b383bcda555bff47883d4382269661da03e0`）
+
 ## 8. 受入と残課題
 
 - Phase 0Cの製品コードとUnit / Integration / Security / Architecture / Property-State-machine試験を実装し、
@@ -222,20 +236,18 @@ verify scripts、`git diff --check`をPASSした。Common Gateの正式判定は
 - 2026-09-07レビュー修正: Current Critical Binding集合の世代継承 / Current DB照合、全Result Ingestion遷移と
   Cancel結果のWitness、Secret Lifecycle Head、初回300秒Batch、Production Root固定、SQLite FULL、危険NV属性拒否、
   Recovery Authorization Root再照合、Runtime RBAC直接変更拒否。
-- **未実行 / 未達（Phase受入の残条件）**:
-  - **独立再レビュー未実施**: 初回指摘修正後の固定コミットに対するRead-only差分再レビューを行っていない。
+- **未実行 / 未達（Production採用条件）**:
   - **D4 実機Resource REK消去 = `NOT_EVALUATED`**（正本§34.1.1）: 本Phaseは対象外。swtpm / 文書検査を実機PASSと
     しない。PASS前はProduction採用不可。
 - `encrypted_raw` Artifactの暗号化保存 / Bound AADと、Grant / private authorityなしの平文取得拒否、Ciphertextへの平文非出現を追加検証済み。
-- 第2修正時点で既知の仕様矛盾とSecurity-critical実装残作業は解消済み。独立再レビューの正式判定は未確定。
+- **未解決の仕様矛盾: 0**。**Security-critical実装残作業: 0**。
 - 実C2 / MCP / 外部Targetへの操作は行っていない。全試験はTest Double / 実AES-GCM / `swtpm`だけで実施した。
-- 次段階: 指摘修正コミットを固定し、実装会話から分離したCodexの独立差分再レビューを実施する。
+- 次段階: Common Gate通過済みの固定コミットを基点にPhase 1を実装する。
 
 ## 9. Phase 1移行判定
 
-- Phase 0C製品実装の既知のBLOCKER / HIGHと仕様矛盾は、第2修正後0件。正式件数は独立再レビューで確定する。
+- Phase 0C製品実装のBLOCKER / HIGHと仕様矛盾は、最終独立レビューで0件と確定した。
 - Phase 1が実装する`knowledge_evidence_head`と`KNOWLEDGE_EVIDENCE_CHANGED`をPhase 0Cの閉じたCritical State /
   Witness Policyへ登録済み。Phase 1ではKnowledge Owner RepositoryからCurrent Projection Resolverを接続する。
   接続前のKnowledge EventはFail Closedし、未WitnessのGoal / Context採用へ進まない。
-- Phase 1の実装開始に必要な技術的境界は整った。ただしCommon Gateの正式なPhase遷移は、固定した実装対象コミットに対する
-  実装会話から分離したCodexのRead-only独立レビューを完了するまで保留する。
+- 固定コミット`0993147d98768b0f39306c96a559894f19cc9e1e`はCommon Gateを通過したため、Phase 1の実装を開始できる。
