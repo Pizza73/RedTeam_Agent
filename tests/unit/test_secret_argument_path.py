@@ -92,3 +92,9 @@ def test_every_secret_reference_requires_an_exact_path() -> None:
 def test_undeclared_secret_reference_is_rejected() -> None:
     with pytest.raises(SecretArgumentBindingError, match="cover every"):
         validate_secret_argument_paths((), {"credential": _ARGS["credential"]})
+
+
+def test_secret_reference_with_extra_field_is_still_discovered() -> None:
+    credential = {**_ARGS["credential"], "note": "must not hide authority"}
+    with pytest.raises(SecretArgumentBindingError, match="cover every"):
+        validate_secret_argument_paths((), {"credential": credential})

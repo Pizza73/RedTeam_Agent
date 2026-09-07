@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 import pytest
+from pydantic import ValidationError
 
 import support
 from redteam_agent.canonical.digest_service import DigestService
@@ -77,6 +78,26 @@ def test_unregistered_host_reference_rejected() -> None:
         _validate(condition)
 
 
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("principal_ref", "unknown-principal", "unregistered principal"),
+        ("provider_id", "unknown-provider", "unregistered provider"),
+    ],
+)
+def test_unregistered_active_selector_references_rejected(field: str, value: str, message: str) -> None:
+    selector = ActiveSessionSelector(host_ref="host-1", **{field: value})
+    condition = SessionExistsCondition(condition_id="c1", session_selector=selector)
+    with pytest.raises(MissionValidationError, match=message):
+        _validate(condition)
+
+
+@pytest.mark.parametrize("field", ["principal_ref", "provider_id"])
+def test_empty_optional_selector_reference_rejected(field: str) -> None:
+    with pytest.raises(ValidationError):
+        ActiveSessionSelector(host_ref="host-1", **{field: ""})
+
+
 def test_rule_binds_closed_proof_model_and_concrete_source() -> None:
     catalog = default_semantic_catalog()
     rule = catalog.session_exists_rule
@@ -107,4 +128,52 @@ def test_source_capability_id_mismatch_rejected() -> None:
         condition_id="c1", session_selector=ExactSessionSelector(session_ref="sess-1")
     )
     with pytest.raises(MissionValidationError, match="binding mismatch"):
+        _validate(condition, catalog=catalog)
+
+
+def test_self_consistent_unregistered_source_id_rejected() -> None:
+    class UnknownSource:
+        capability_id = "unknown-source"
+
+        def get_current_session(self, session_id: str):
+            del session_id
+            return None
+
+        def list_current_sessions(self):
+            return ()
+
+    catalog = default_semantic_catalog()
+    assert catalog.session_exists_rule is not None
+    altered = replace(
+        catalog.session_exists_rule,
+        source=UnknownSource(),
+        source_capability_id="unknown-source",  # type: ignore[arg-type]
+    )
+    condition = SessionExistsCondition(
+        condition_id="c1", session_selector=ExactSessionSelector(session_ref="sess-1")
+    )
+    with pytest.raises(MissionValidationError, match="source capability id"):
+        _validate(condition, catalog=replace(catalog, session_exists_rule=altered))
+
+
+def test_unregistered_rule_id_rejected() -> None:
+    catalog = default_semantic_catalog()
+    assert catalog.session_exists_rule is not None
+    altered = replace(
+        catalog.session_exists_rule,
+        rule_id="unknown-rule",  # type: ignore[arg-type]
+    )
+    condition = SessionExistsCondition(
+        condition_id="c1", session_selector=ExactSessionSelector(session_ref="sess-1")
+    )
+    with pytest.raises(MissionValidationError, match="rule id"):
+        _validate(condition, catalog=replace(catalog, session_exists_rule=altered))
+
+
+def test_unregistered_catalog_revision_rejected() -> None:
+    catalog = replace(default_semantic_catalog(), catalog_revision="unknown-catalog")
+    condition = SessionExistsCondition(
+        condition_id="c1", session_selector=ExactSessionSelector(session_ref="sess-1")
+    )
+    with pytest.raises(MissionValidationError, match="catalog revision"):
         _validate(condition, catalog=catalog)

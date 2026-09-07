@@ -18,6 +18,10 @@ from redteam_agent.mission.models import ActiveSessionSelector, ExactSessionSele
 from redteam_agent.models.base import StrictImmutableBoundaryModel
 from redteam_agent.session.models import SessionSecurityContextSnapshot
 
+SESSION_EXISTS_RULE_ID = "goal-rule:session-exists-v1"
+SESSION_GOAL_SOURCE_CAPABILITY_ID = "session-manager-current-active-v1"
+SEMANTIC_CATALOG_REVISION = "semantic-catalog-v1"
+
 
 class SessionStateProof(StrictImmutableBoundaryModel):
     """Closed proof shape required by the registered session-exists rule."""
@@ -82,6 +86,8 @@ class SemanticCatalog:
     session_exists_rule: SessionExistsGoalRule | None
     registered_session_refs: frozenset[str] = frozenset()
     registered_host_refs: frozenset[str] = frozenset()
+    registered_principal_refs: frozenset[str] = frozenset()
+    registered_provider_ids: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -103,6 +109,13 @@ class SessionExistsGoalRule:
         elif isinstance(selector, ActiveSessionSelector):
             if selector.host_ref not in catalog.registered_host_refs:
                 raise MissionValidationError("session condition references an unregistered host")
+            if (
+                selector.principal_ref is not None
+                and selector.principal_ref not in catalog.registered_principal_refs
+            ):
+                raise MissionValidationError("session condition references an unregistered principal")
+            if selector.provider_id is not None and selector.provider_id not in catalog.registered_provider_ids:
+                raise MissionValidationError("session condition references an unregistered provider")
         else:  # pragma: no cover - discriminated union is exhaustive
             raise MissionValidationError("unsupported session selector")
 
@@ -110,8 +123,10 @@ class SessionExistsGoalRule:
 def default_semantic_catalog(source: SessionGoalSource | None = None) -> SemanticCatalog:
     resolved_source = source if source is not None else EmptySessionGoalSource()
     return SemanticCatalog(
-        catalog_revision="semantic-catalog-v1",
+        catalog_revision=SEMANTIC_CATALOG_REVISION,
         session_exists_rule=SessionExistsGoalRule(source=resolved_source),
         registered_session_refs=frozenset({"sess-1"}),
         registered_host_refs=frozenset({"host-1"}),
+        registered_principal_refs=frozenset({"user", "root"}),
+        registered_provider_ids=frozenset({"c2-main"}),
     )

@@ -77,8 +77,8 @@ class ExactSessionSelector(StrictImmutableBoundaryModel):
 class ActiveSessionSelector(StrictImmutableBoundaryModel):
     selector_type: Literal["active_match"] = "active_match"
     host_ref: str = Field(min_length=1)
-    principal_ref: str | None = None
-    provider_id: str | None = None
+    principal_ref: str | None = Field(default=None, min_length=1)
+    provider_id: str | None = Field(default=None, min_length=1)
 
 
 SessionSelector = Annotated[

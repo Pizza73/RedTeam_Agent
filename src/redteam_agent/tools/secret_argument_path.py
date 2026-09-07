@@ -128,7 +128,7 @@ def _discover_secret_reference_paths(
     or mutable authorization state.
     """
     if isinstance(value, Mapping):
-        if frozenset(value) == _SECRET_REFERENCE_FIELDS:
+        if frozenset(value) >= _SECRET_REFERENCE_FIELDS:
             return (tokens,)
         found: list[tuple[str, ...]] = []
         for key, child in value.items():

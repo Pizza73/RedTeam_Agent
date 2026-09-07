@@ -13,7 +13,7 @@
 | 入力コミット（完全ID） | `d78d089705104d5c10c5d364b3e0048c211d15b9`（`codex/phase-0a`、設計のみのbaseline） |
 | 実装先 | Codexが用意した専用worktree `/tmp/redteam-phase0a`（ブランチ `codex/phase-0a`） |
 | 実装対象コミット | **未確定（UNDETERMINED）**。第2回レビュー指摘への修正を固定後、この欄を更新する。 |
-| 独立レビュー | 第1回 `dce65046f76526685b6ce97c651cf031b859ccd5`、第2回 `2161cc61d4e679ce10069c306d25d90b32facf8b`、第3回 `bfeede8415985049e0b33e5c2e58ebec5ecffd96` を実施。いずれも受入非支持。修正版の最終レビューは未実施。 |
+| 独立レビュー | 第1回 `dce6504`、第2回 `2161cc6`、第3回 `bfeede8`、第4回 `403d421` を実施。いずれも受入非支持。修正版の最終レビューは未実施。完全IDは各レビュー記録に保存。 |
 
 成果物はブランチ `codex/phase-0a` に固定する。リモートへのpushとmainへのmergeは別途指示があるまで行わない。
 
@@ -98,7 +98,7 @@ frozen は変更で `ValidationError`。標準 `json.loads` は重複キーを�
 ## 4. 試験結果
 
 対象コミット: **未確定**（第2回レビュー指摘への修正を含む作業ツリー。固定後に完全IDを記録する）。
-入力コミット `d78d089`。レビュー候補は第1回 `dce6504`、第2回 `2161cc6`、第3回 `bfeede8`。以下は第3回指摘F01–F04対応後の結果である。
+入力コミット `d78d089`。レビュー候補は第1回 `dce6504`、第2回 `2161cc6`、第3回 `bfeede8`、第4回 `403d421`。以下は第4回指摘G01–G03対応後の結果である。
 実行環境: worktree `/tmp/redteam-phase0a`、`.venv`（Python 3.14.6）。全て仮想環境Pythonで実行。
 
 | コマンド | 結果 |
@@ -106,8 +106,8 @@ frozen は変更で `ValidationError`。標準 `json.loads` は重複キーを�
 | `.venv/bin/ruff check src tests` | All checks passed（0 warning） |
 | `.venv/bin/mypy`（package=redteam_agent, strict） | Success: no issues found in 77 source files |
 | `.venv/bin/python -m compileall -q src tests` | 成功（exit 0） |
-| `.venv/bin/python -m pytest`（Unit/Integration/Security/Regression/Property-StateMachine） | 256 passed（warningなし） |
-| `.venv/bin/python -m coverage run --branch -m pytest` + `coverage report/json` | line 3512/3831、branch 859/1136、coverage.py combined 88.00080531507953%（display 88%） |
+| `.venv/bin/python -m pytest`（Unit/Integration/Security/Regression/Property-StateMachine） | 265 passed（warningなし） |
+| `.venv/bin/python -m coverage run --branch -m pytest` + `coverage report/json` | line 3541/3861、branch 880/1158、coverage.py combined 88.08527595138474%（display 88%） |
 | `.venv/bin/pip check` | No broken requirements found |
 | `git diff --check` | 空（whitespace/conflict marker なし） |
 | `sha256sum -c SHA256SUMS` | manifest記載の7ファイル全て OK（承認済みr3正本のHash整合を確認） |
@@ -192,9 +192,17 @@ HIGH 3 / LOW 1で受入を支持しなかった。53種類の独立Probeで、�
 - F03: 旧簡略`HostPrivilegeCondition`/`FindingConfirmedCondition`を受理対象から除外した。Phase 0AのSuccessConditionはtyped `SessionSelector`を持つ`SessionExistsCondition`に限定し、実行可能な静的Rule object、closed `SessionStateProof` model、`SessionGoalSource` ProtocolとRepository adapterのbindingをValidationする。
 - F04: Context Authorizationの局所試験件数を17件へ訂正し、全体試験数とcoverageを再計測した。
 
+候補コミット `403d421` に対する第4回独立レビュー（記録: `/tmp/phase0a-independent-review-4/review.md`）は
+HIGH 2 / MEDIUM 1で受入を支持しなかった。既存53種類と追加17種類のProbeによりF02/F04の解消、単一・複数Secretと
+複数Sessionの正当系を確認したうえで、G01–G03を検出した。対応は次のとおりである。
+
+- G01: Secret Referenceの予約fieldを一つでも持つobject schemaは、固定closed shape以外を登録拒否する。実引数の防御的走査では固定4 fieldを含むobjectを余分なfieldの有無にかかわらず検出し、未宣言なら拒否する。
+- G02: `ActiveSessionSelector.principal_ref/provider_id`の空文字をschema境界で拒否し、指定時はRoot catalogの登録済みprincipal/providerへ一致させる。
+- G03: Semantic Catalog Revision、Goal Rule ID、Source Capability IDをRoot固定値へ照合する。RuleとSourceの両IDを同じ未知値へ改変した自己整合入力も拒否する。
+
 ## 6. 受入と残課題
 
-- Phase受入は**未成立**。第3回指摘の修正版コミット固定と最終独立レビューが未完了である。
+- Phase受入は**未成立**。第4回指摘の修正版コミット固定と最終独立レビューが未完了である。
 - 実施した主な安全強化（レビュー指摘対応）:
   - Executor Gateは公開入口で `decision_id + plan` だけを受け、Trusted Clock と `AuthorizationContextResolver` から
     Current情報・現在時刻を自ら取得する（caller-supplied runtime/now を受けない）。
@@ -221,5 +229,5 @@ HIGH 3 / LOW 1で受入を支持しなかった。53種類の独立Probeで、�
     用途別の厳密固定は後続Phaseの Secret Lifecycle / Knowledge 実装時に細分化する。
   - Write Guard はPhase 0Aの配線的アクセス制御であり暗号署名ではない。§34.2のTPM witness/署名は後続Phase。
   - Owner Service経由でない低レベルSQLへの直接書込みをOSレベルで防ぐことは0A範囲外（正本§35.2 Production Composition/§34.2は後続）。
-- 未解決の仕様矛盾・BLOCKER/HIGH・Security-critical TODO: 最終独立レビュー前のため未確定。既知の第2回N01–N11と第3回F01–F04は実装、Regression、記録へ反映済み。
+- 未解決の仕様矛盾・BLOCKER/HIGH・Security-critical TODO: 最終独立レビュー前のため未確定。既知の第2回N01–N11、第3回F01–F04、第4回G01–G03は実装、Regression、記録へ反映済み。
 - 次Phase範囲: Phase 0B（Execution State Machine / Dispatch Claim / Secret Injection / 実行安全）。本実装では未着手。
