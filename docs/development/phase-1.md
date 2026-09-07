@@ -5,7 +5,7 @@
 - 設計正本: `SystemDesign.md` Phase 1、`SystemDesign_AI_Control.md`、`docs/acceptance-criteria.md`
 - 基点: `0a12cf9a702303f1b9ca87c702141addb996ae87`（Phase 0C受入記録）
 - 実装範囲: 基点の次から最終実装コミットまで
-- 最終実装コミット: `c9a52ce301942e939414b4181067acac1e652d3f`
+- 最終実装コミット: `6bb647642b7e351835383ff4a812fa25c9f1fc68`
 
 ## 実装と受入要件
 
@@ -19,6 +19,7 @@
 | Bounded Context Request / typed Retrieval Hint | Envelope lineage、durable context retry budget、Pydantic closed union tests |
 | Stale Context再構築 | Planning Graphの`context_rebuild`でCurrent Goal / Tool Snapshot / Context Selection / Grant / Bodyを所有Serviceから再構築。Context Requestと同じ系譜別の永続2回上限を共有し、再構築後EnvelopeをPlanner callbackへ直接渡す |
 | Durable Graph checkpoint | `langgraph-checkpoint-sqlite==3.1.1`を固定し、Planning / Analysis Graphを同一Application SQLiteの専用接続へ保存。checkpoint stateはOperation / Repository Record IDとrouting文字列だけに限定し、業務RecordやContext本文を保存しない。checkpoint schemaは明示provisioning対象とし、通常起動時の暗黙migrationを拒否 |
+| Canonical run / thread binding | Planning / Analysisのcheckpoint load前とAction適用前に、Current Mission Revision、Application `run_id`、`thread_id = mission_id:mission_revision:run_id`を照合。Malformed、別Revision、別runからの再利用を副作用前に拒否 |
 | Plan Thread / Working Hypothesis OCC | `PlannerStateManager`、`test_phase1_state_controls.py` |
 | Strong-key Entity解決 / Alias candidate | `EntityResolver`、`test_phase1_state_controls.py` |
 | Analyzer再Binding / Observation分離 | `KnowledgeReducer`、`test_phase1_mock_loop.py`、`test_phase1_knowledge.py` |
@@ -88,7 +89,7 @@ negative pathも実行する。
 PATH=/tmp/phase0c-tpm/usr/bin:$PATH \
 LD_LIBRARY_PATH=/tmp/phase0c-tpm/usr/lib/x86_64-linux-gnu:/tmp/phase0c-tpm/usr/lib/x86_64-linux-gnu/swtpm \
 PYTHONPATH=src .venv/bin/python -m pytest -q -ra
-  PASS: 563 tests（swtpm 7件を含む）
+  PASS: 566 tests（swtpm 7件を含む）
 
 .venv/bin/python -m ruff check src tests
   PASS
@@ -125,6 +126,9 @@ LangGraph型境界のdirect `mypy --strict src`も`5332515e69b7e1e4fdc095d342188
 残ったMedium指摘のStale Envelope再構築とGraph checkpoint未永続化は
 `c9a52ce301942e939414b4181067acac1e652d3f`で修正した。再構築は既存Context retry budgetを共有し、
 SQLite checkpointにはIDとrouting文字列だけを保存する。最終独立判定はこの固定コミットを対象に実施する。
+その再レビューで検出したcheckpoint / ExecutionPlanの非canonical thread受入は
+`6bb647642b7e351835383ff4a812fa25c9f1fc68`で修正した。Planning / Analysis / Action適用の三境界で
+Current Mission Revisionとrun / threadを照合し、別Revision・別runのcheckpoint reuseを拒否する。
 最終判定と固定review artifactは再レビュー完了後に`docs/reviews/`へ記録する。
 
 ## Phase 1生成的状態遷移Evidence
@@ -141,6 +145,7 @@ reconciliation消費が最大3回、予算枯渇時のexact source Unresolved ev
 | compiled Graph、node接続、side-effect自動retryなし | `tests/integration/test_phase1_mock_loop.py::test_phase1_uses_compiled_coarse_graphs_without_automatic_retry` |
 | Stale Contextの上限付き再構築、再構築後EnvelopeのPlanner入力、checkpointのprimitive state | `tests/integration/test_phase1_mock_loop.py::test_stale_planner_context_is_rebuilt_before_the_model_call`、`tests/integration/test_phase1_planner_context.py::test_automatic_stale_rebuild_shares_the_lineage_retry_budget` |
 | 同一Application SQLiteへのcheckpoint永続化、通常起動時の未知schema拒否 | `tests/integration/test_phase1_mock_loop.py::test_graph_checkpoints_are_written_to_the_application_sqlite_file`、`tests/integration/test_production_composition.py::test_unknown_graph_checkpoint_schema_fails_closed_no_migration` |
+| Malformed / 別Revision / 別run threadのcheckpoint load前拒否、Action前の再検証 | `tests/integration/test_phase1_mock_loop.py::test_workflow_rejects_malformed_wrong_revision_and_reused_run_threads`、`tests/integration/test_phase1_planner_context.py::test_action_rejects_noncanonical_thread_before_consuming_context`、`tests/unit/test_thread_lifecycle.py::test_verify_run_thread_binding_rejects_reused_thread_for_another_run` |
 | 正常 Plan→Dispatch→Ingest→Analyze→Goal→COMPLETED | `tests/integration/test_phase1_mock_loop.py::test_mock_agent_loop_reaches_goal_through_real_policy_and_executor` |
 | terminal cancel→Collection→Ingestion→Erasure→COMPLETED | `tests/integration/test_phase1_mock_loop.py::test_finalizing_cancelled_execution_collects_ingests_and_completes` |
 | FINALIZING recovery上限→Unresolved→Human Review | `tests/integration/test_phase1_mock_loop.py::test_finalizing_resume_uses_bounded_reconciliation_and_cancel` |
