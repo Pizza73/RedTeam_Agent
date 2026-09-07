@@ -313,3 +313,27 @@ class ArchitectureViolationError(AuthorizationKernelError):
 class SchemaMigrationRequiredError(AuthorizationKernelError):
     """Normal startup found an unknown/missing schema; it must not auto-migrate. An
     explicit stopped-worker migration under the same activation lock is required."""
+
+
+class KnowledgeStateIntegrityError(AuthorizationKernelError):
+    """A Knowledge current head, projection, source binding, or witness is invalid."""
+
+
+class GoalEvaluationError(AuthorizationKernelError):
+    """A goal cannot be evaluated from the current mission and trusted sources."""
+
+
+class GoalEvaluationConflictError(GoalEvaluationError):
+    """A source changed while a goal evaluation was being committed."""
+
+
+class AgentLoopError(AuthorizationKernelError):
+    """The bounded Phase 1 controller or its checkpoint contract was violated."""
+
+
+class PlannerContextError(AuthorizationKernelError):
+    """A planner context envelope or its current-source binding is invalid."""
+
+
+class PlannerCandidateError(AuthorizationKernelError):
+    """An action candidate projection or planner selection is invalid."""

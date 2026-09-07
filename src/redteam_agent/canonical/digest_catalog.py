@@ -193,6 +193,14 @@ _DEFINITIONS: tuple[DigestDefinition, ...] = (
     _obj("critical_witness_intent_digest", "logging", exclude_self="intent_digest"),
     _obj("trust_recovery_approval_digest", "logging", exclude_self="approval_digest"),
     _obj("trust_recovery_consumption_digest", "logging", exclude_self="consumption_digest"),
+    # --- Phase 1: knowledge, goal evaluation and bounded workflow --------
+    _obj("knowledge_security_head_digest", "knowledge", exclude_self="head_digest"),
+    _obj("knowledge_observation_digest", "knowledge", exclude_self="observation_digest"),
+    _obj("goal_evaluation_digest", "goal", exclude_self="evaluation_digest"),
+    _explicit("goal_source_snapshot_digest", "goal", ("sessions",)),
+    _obj("agent_checkpoint_digest", "agent", exclude_self="checkpoint_digest"),
+    _obj("planner_context_envelope_digest", "agent", exclude_self="envelope_digest"),
+    _explicit("action_candidate_digest", "agent"),
 )
 
 

@@ -35,6 +35,7 @@ from redteam_agent.ingestion.artifact_store import ArtifactReference, ArtifactSt
 from redteam_agent.ingestion.manifest import SecureIngestionManifest
 from redteam_agent.ingestion.publication_rule import OutputPublicationParser, OutputPublicationRuleCatalog
 from redteam_agent.ingestion.service import SecureIngestionService
+from redteam_agent.knowledge.models import KnowledgeSecurityHead
 from redteam_agent.leases.models import LeasePolicy
 from redteam_agent.leases.service import DeploymentEpochService, LeaseService
 from redteam_agent.quarantine.blob_store import InMemoryQuarantineBlobStore
@@ -421,11 +422,22 @@ def build_phase0c_kernel(
                 None,
             )
             return None if event is None else (event.sequence_number, event.event_digest)
-        # Phase 1 installs the Knowledge owner read path before it can emit the
-        # already-catalogued KNOWLEDGE_EVIDENCE_CHANGED event. Until then, any
-        # attempted use fails closed through the None result.
+        # The record type is fixed in Phase 0C; Phase 1 may create the explicit
+        # head, after which this generic owner read path verifies it.
         if binding.record_type == "knowledge_evidence_head":
-            return None
+            row = db.occ_get("knowledge_security_head", binding.record_id)
+            if row is None:
+                return None
+            head = KnowledgeSecurityHead.model_validate_json(row[1])
+            fields = head.model_dump(mode="python")
+            ds.verify(
+                "knowledge_security_head_digest",
+                {k: v for k, v in fields.items() if k != "head_digest"},
+                head.head_digest,
+            )
+            if head.mission_id != binding.record_id or head.security_version != row[0]:
+                return None
+            return head.security_version, head.head_digest
         return None
 
     critical_barrier = CriticalWitnessBarrier(
