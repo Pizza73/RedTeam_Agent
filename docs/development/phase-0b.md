@@ -1,8 +1,9 @@
 # Phase 0B 開発記録 — Execution Safety
 
 本記録は正本 `SystemDesign.md` §40.1 が要求するPhaseごとの一つの開発記録である。
-実装担当はClaude Code、独立レビューは実装作業から分離したCodexレビュー担当が行う。
-本記録の更新自体は実装着手・Phase受入完了・独立レビュー完了の証拠ではない。**独立レビューは未実施であり、Phase受入は未成立。**
+主要実装と一次修正はClaude Code、Claude Codeの利用上限到達後に残った局所修正と試験追加はCodex、
+独立レビューはClaude Codeの実装プロセスから分離したCodexが担当した。本記録の結果は実コード、固定コミット、
+再実行した試験結果と合わせて判定する。**固定コミットに対する独立レビューを完了し、Phase 0Bの受入条件は成立した。**
 
 ## 1. 対象
 
@@ -10,10 +11,10 @@
 | --- | --- |
 | 設計Revision | `system-design-v1-r3` / `ai-control-v1-r3` |
 | Phase | 0B: Execution Safety |
-| 入力コミット（完全ID） | `d2e52ca`（`codex/phase-0b`、Phase 0A受入記録済みbaseline） |
+| 入力コミット（完全ID） | `d2e52ca1b844fcba471e828e0e51b75d85c0c90c`（Phase 0A受入記録済みbaseline） |
 | 実装先 | 現checkout（ブランチ `codex/phase-0b`） |
-| 実装対象コミット | 未固定（コミット・pushは監督レビュアーが実施） |
-| 独立レビュー | 未実施 |
+| 実装対象コミット | `1a7178862fb8aece6ef29788798181bccc0eca4c` |
+| 独立レビュー | Codex、対象 `1a7178862fb8aece6ef29788798181bccc0eca4c`、2026-09-07完了 |
 
 成果物はブランチ `codex/phase-0b` に置く。リモートへのpush・mainへのmergeは別途指示があるまで行わない。
 
@@ -53,7 +54,7 @@ Phase 0Bは**実外部Dispatchゼロ**（Mock Adapterのみ）。Phase 0Aの認�
 - `execution/secret_binding.py` — 直列化 / Copy / Pickle不可・redactする`_EphemeralSecretBinding`とzeroize。
 - `execution/secret_source.py` — Composition所有の`open_version`のみ持つ`TrustedSecretSource`（汎用resolveなし）。
 - `execution/dispatch_port.py` — 固定`TrustedAdapterDispatchPort`と`DispatchResultCapture`（非直列化TCB Capability）。
-- `execution/secret_injection.py` — Claim消費勝者だけが得る単回`ClaimConsumptionToken`ゲート付き`SecretDispatchTransaction`。
+- `execution/secret_injection.py` — Durable Claim消費勝者だけに開くmodule-private・単回・非直列化Continuation。
 - `execution/executor.py` — create（PLANNED→AUTHORIZED）、dispatch（pre-dispatch再検証、BLOCKED、Claim、消費、JIT注入）。
 - `execution/collection.py` — Trusted Clock固定Authority、Streaming、状態機械、Ingestion開始、metadata-only recovery。
 - `execution/ingestion.py` — 独立Ingestion状態、INGESTED_DURABLE Milestone、固定Rule create-or-verify、Retry予算。
@@ -86,10 +87,10 @@ Phase 0Bは**実外部Dispatchゼロ**（Mock Adapterのみ）。Phase 0Aの認�
 | コマンド | 結果 |
 | --- | --- |
 | `.venv/bin/ruff check src tests scripts` | All checks passed |
-| `PYTHONPATH=src .venv/bin/mypy`（package=redteam_agent, strict） | Success: no issues found in 97 source files |
+| `PYTHONPATH=src .venv/bin/mypy`（package=redteam_agent, strict） | Success: no issues found in 98 source files |
 | `.venv/bin/python -m compileall -q src tests` | exit 0 |
-| `PYTHONPATH=src:tests .venv/bin/python -m pytest` | 365 passed（Phase 0A 269 + Phase 0B 96、warningなし） |
-| `coverage run --branch -m pytest` + `coverage json` | line 5379/5859、branch 1114/1486、combined 88.4% |
+| `PYTHONPATH=src:tests .venv/bin/python -m pytest -q` | 384 passed（Phase 0A 269 + Phase 0B 115、warningなし） |
+| `coverage run --branch -m pytest -q` + `coverage json` | line 5641/6175、branch 1223/1658、combined 87.6% |
 | `scripts/verify_pydantic_contract.py` / `scripts/verify_wire_and_immutable.py` | いずれも exit 0 |
 | `sha256sum -c SHA256SUMS` | 承認済みr3正本・別冊・受入 / 安全 / 脅威モデル文書・LICENSE・README すべて OK（無変更） |
 
@@ -125,16 +126,35 @@ Phase 0Bは**実外部Dispatchゼロ**（Mock Adapterのみ）。Phase 0Aの認�
 | ABANDONEDからProvider Result再取得せず終端 | `test_result_collection.py::test_abandon_from_streaming_is_terminal` |
 | Durable Mission Execution Budget（OCC） | `execution/budget.py`、`test_budget.py` |
 
+## 5. 独立レビュー
+
+Codexは固定コミット`1a7178862fb8aece6ef29788798181bccc0eca4c`を対象に、正本§36 / §40.1、
+受入条件、実コード、Repository制約、Positive / Negative / Failure-path / Property試験を照合した。
+最初の指摘で打ち切らず、Claude Codeの初期実装に対して次の全指摘を記録し、固定前に修正と回帰試験を行った。
+
+| 重要度 | 指摘 | 対応結果 |
+| --- | --- | --- |
+| BLOCKER | Callerが構築可能なClaim tokenと公開Secret source / dispatch surfaceからContinuationを偽造できた | 公開token / transactionを廃止し、Repository上のconsumed Claim、exact Consumption ID、Execution Version、Secret集合を再検証するprivate単回Continuationへ変更。CompositionはSecret source / portを公開しない |
+| BLOCKER | `local_result`がCaptureを永続Bindingへ結合せず、Inline結果をCollectionへ渡せなかった | Dispatch前にLocal Binding / Authority / Sinkを固定し、同じ`capture_id`でStreaming・Control metadata commit・Ingestion開始まで通す。Crash後は保存済みmetadataだけで再開する試験を追加 |
+| HIGH | Durable Mission BudgetがDispatch Claim transactionへ接続されず、未設定時に無制限実行できた | Budget予約をClaim作成と同一Unit of Workへ移し、未設定・枯渇時はいずれもExecutionを`AUTHORIZED`に保ったままClaim / Provider callなしで停止 |
+| HIGH | valid / recovery windowとRecovery Authorityのexact binding検証が不足していた | Mission / Revision / Epoch / Origin authorization / Adapter / Idempotency key / Expected Execution Version / Task / Operation / TTLを再取得して完全照合し、境界時刻とcross-binding試験を追加 |
+| HIGH | Result resume / cancellation bindingがExecution・Sink・Modeを横断して再利用できた | Resume cursor / cancellationをexact Execution、Collection、Task digest、Sink、Delivery modeへBindingし、cross-sink / cross-execution拒否試験を追加 |
+| HIGH | Adapter submit / reconcile結果のIdentity・Mode・Task・Normalization rule検証が不足していた | 固定Adapter identity、Provider identity、Task ID、Delivery mode、Provider task、Execution ID、Task digest、登録Normalization ruleを状態変更前に検証 |
+| HIGH | Model組合せ不変条件とDB参照整合が不足していた | Pydanticの相互Field validatorとExecution配下テーブルのForeign Keyを追加し、無効な状態組合せ・不正Union・Row tamperのNegative試験を追加 |
+
+修正後の再レビューではBLOCKER / HIGH 0、未解決仕様矛盾 0、Security-critical TODO 0を確認した。
+実C2 / MCP / Targetへの外部操作はなく、全試験はMock Adapterだけで実施した。
+
 ### Common Gate / 安全不変条件
 
 Unit / Integration / Security / Property-State-machine PASS、ruff / mypy / compileall PASS、Branch Coverage取得、
-既存Test非削除、BLOCKER / HIGH 0（自己評価。独立レビュー未実施）、実C2 / MCP / 外部Target Side Effect 0（Mock Adapterのみ）、
+既存Test非削除、独立レビュー後BLOCKER / HIGH 0、実C2 / MCP / 外部Target Side Effect 0（Mock Adapterのみ）、
 Secret Leakage 0（`test_execution_negative.py::test_secret_plaintext_absent_from_all_durable_rows`、
 `test_secret_injection.py::test_no_plaintext_in_adapter_records_or_repository`）。
 Owner限定書込（`test_execution_negative.py::test_forged_execution_write_without_owner_guard_rejected`）、
 Row Integrity（`::test_row_tamper_detected_on_read`）、非直列化Capability（`::test_capabilities_are_not_serializable`）。
 
-## 5. 設計との整合メモ（矛盾ではない、適用限界の明示）
+## 6. 設計との整合メモ（矛盾ではない、適用限界の明示）
 
 - **Sinkは同期実装**: 正本§10のRawResultSink / Adapter Protocolは`async def`で示されるが、Phase 0A〜0Bの
   カーネルは同期で、Event Loopを持たない。Phase 0BはChunk Streaming・全量非Buffer・Idempotent Commitという
@@ -147,18 +167,18 @@ Row Integrity（`::test_row_tamper_detected_on_read`）、非直列化Capability
   `LeaseFence`）は安全境界として置くが、`ClockIntegrityError`・Deployment Epoch・Fencing・Heartbeat再認可は
   前倒ししない。Phase 0BのCollection所有はTrusted Clock固定Authority＋Collection State OCCで表現する。
 - **pre-dispatchのSecret失効はGateが先に捕捉し得る**: Secret Revocation時はGateの認可再導出が失敗し
-  `DIGEST_INTEGRITY_FAILURE`でBLOCKEDになる（Provider Call・Claム・ExecutionResultなし）。Executor固有の
+  `DIGEST_INTEGRITY_FAILURE`でBLOCKEDになる（Provider Call・Claim・ExecutionResultなし）。Executor固有の
   `SECRET_VERSION_STALE`は主にClaim消費時のRevocation Race（`dispatch_attempts=1`＋`invalidated` Claim）で用いる
   （`test_secret_injection.py::test_secret_head_change_at_consumption_blocks_with_invalidated_claim`）。
 - **thread_id Lifecycleはヘルパとして提供**: Revisionごとのrun_id / thread_id生成と照合Fail Closedを実装。
   実際のGraph / Checkpoint統合はPhase 1。
 
-## 6. 受入と残課題
+## 7. 受入と残課題
 
 - Phase 0Bの製品コードとUnit / Integration / Security / Property-State-machine試験を実装し、ruff / mypy /
   compileall / branch coverage / verify scripts / sha256sumを実行済み。
-- **独立レビューは未実施であり、実装コミットの固定と正式なPhase受入は未完了。** 監督レビュアーがコミットを固定し、
-  Read-only Snapshot・実コード・試験Evidenceを独立レビューする。
+- 実装コミットを固定し、Claude Code実装プロセスから分離したCodexがRead-only Snapshot・実コード・試験Evidenceを
+  正本と照合した。全指摘を修正し、Phase 0Bの必須受入条件は成立した。
 - 未実行 / 未達（対象外）: Production暗号 / TPM / `swtpm`統合、実Erasure、Lease / Fencing Production Hardening、
   実Adapter Contract / Integration（Phase 4 / 5）、実LLM品質Gate（Phase 2）、D4実機Qualification（`NOT_EVALUATED`）。
 - 未解決の仕様矛盾・仮実装・Security-critical TODO: なし（0C以降の機構は明示的に範囲外とし、PASS扱いしていない）。
