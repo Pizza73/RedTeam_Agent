@@ -1,7 +1,7 @@
 # Phase 0C 開発記録 — Data Security / Audit
 
-**STATUS: 実装レビュー・修正完了 / 現行試験PASS / 独立レビュー未実施。** Phase 0Cの実装と再現可能な検証は完了した。
-Common Gateの正式受入は、実装コミットを固定した後の独立レビュー完了まで保留する。
+**STATUS: 実装コミット固定済み / 現行試験PASS / 独立レビュー未実施。** Phase 0Cの実装と再現可能な検証は完了した。
+Common Gateの正式受入は、固定した実装コミットに対する独立レビュー完了まで保留する。
 本記録は実コード・固定コミット・再実行した試験結果と合わせて判定する。記録の更新自体は受入完了の証拠ではない。
 Codexによる独立レビューは未実施。TPM/`swtpm`のProduction Witness Integration Testは、隔離展開した
 `swtpm 0.10.2` / `tpm2-tools 5.7`を用いて必須経路とNV Public Area不一致経路を実行し、全件PASSした。
@@ -13,8 +13,8 @@ Codexによる独立レビューは未実施。TPM/`swtpm`のProduction Witness 
 | 設計Revision | `system-design-v1-r3` / `ai-control-v1-r3` |
 | Phase | 0C: Data Security / Audit |
 | 入力コミット（完全ID） | `85f3b50e5d169230cfb4f3a9cb59953b65616a91`（Phase 0B受入記録済みbaseline、`codex/phase-0c`） |
-| 実装先 | 現checkout（ブランチ `codex/phase-0c`）。ユーザー指示によりcommit / push / mergeは未実施（作業ツリー上） |
-| 実装対象コミット | 未固定（未commit）。独立レビュー時に固定する |
+| 実装先 | ブランチ `codex/phase-0c`。push / mergeは未実施 |
+| 実装対象コミット | `a6d48e8572fb18db4b3fef70f9d57f67d5b2640a` |
 | 独立レビュー | 未実施 |
 | 実装担当 | Claude Codeによる初期実装後、ユーザー指示によりCodexが受入修正と検証を完了 |
 
@@ -193,7 +193,7 @@ Generation Commit順序、Offline Recovery、Production Compositionをpublic ent
 - `encrypted_raw` Artifactの暗号化保存 / Bound AAD復号Round-tripと、Ciphertextへの平文非出現も追加検証済み。
 - **未解決の仕様矛盾**: なし。**Security-critical実装残作業**: なし。
 - 実C2 / MCP / 外部Targetへの操作は行っていない。全試験はTest Double / 実AES-GCM / `swtpm`だけで実施した。
-- 次段階: 実装対象コミット固定、実装会話から分離したCodex独立レビュー。
+- 次段階: 固定コミットを対象に、実装会話から分離したCodex独立レビュー。
 
 ## 9. Phase 1移行判定
 
@@ -201,5 +201,5 @@ Generation Commit順序、Offline Recovery、Production Compositionをpublic ent
 - Phase 1が実装する`knowledge_evidence_head`と`KNOWLEDGE_EVIDENCE_CHANGED`をPhase 0Cの閉じたCritical State /
   Witness Policyへ登録済み。Phase 1ではKnowledge Owner RepositoryからCurrent Projection Resolverを接続する。
   接続前のKnowledge EventはFail Closedし、未WitnessのGoal / Context採用へ進まない。
-- Phase 1の実装開始に必要な技術的境界は整った。ただしCommon Gateの正式なPhase遷移は、未commitの実装対象を固定し、
+- Phase 1の実装開始に必要な技術的境界は整った。ただしCommon Gateの正式なPhase遷移は、固定した実装対象コミットに対する
   実装会話から分離したCodexのRead-only独立レビューを完了するまで保留する。
