@@ -14,7 +14,7 @@ Codexによる初回独立レビューは実施済みでFAIL。TPM/`swtpm`のPro
 | Phase | 0C: Data Security / Audit |
 | 入力コミット（完全ID） | `85f3b50e5d169230cfb4f3a9cb59953b65616a91`（Phase 0B受入記録済みbaseline、`codex/phase-0c`） |
 | 実装先 | ブランチ `codex/phase-0c`。push / mergeは未実施 |
-| 実装対象コミット | 初回 `a6d48e8572fb18db4b3fef70f9d57f67d5b2640a`。指摘修正コミットは本記録の次回更新で固定する |
+| 実装対象コミット | `807cc022db8c098a18e42a865acd99964d9a33dc`（初回対象 `a6d48e8572fb18db4b3fef70f9d57f67d5b2640a`への指摘修正を含む） |
 | 独立レビュー | 初回FAIL（証跡SHA-256 `54e7386b6344a09e1182ff66df6305f632c5cb5f05ef7d6261be9a92544135e6`）。修正差分の再レビュー待ち |
 | 実装担当 | Claude Codeによる初期実装後、ユーザー指示によりCodexが受入修正と検証を完了 |
 
