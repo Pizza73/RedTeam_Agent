@@ -229,10 +229,10 @@ class Phase1AgentWorkflow:
         builder.add_node("context_builder", self._graph_context_builder)  # type: ignore[call-overload]
         builder.add_node("tool_availability", self._graph_tool_availability)  # type: ignore[call-overload]
         builder.add_node("planner", self._graph_planner)  # type: ignore[call-overload]
-        builder.add_node("context_request", self._graph_context_request)  # type: ignore[call-overload]
-        builder.add_node("action_application", self._graph_action_application)  # type: ignore[call-overload]
+        builder.add_node("context_request", self._graph_context_request)
+        builder.add_node("action_application", self._graph_action_application)
         builder.add_node("reconciliation", self._graph_reconciliation)  # type: ignore[call-overload]
-        builder.add_node("finalization", self._graph_finalization)  # type: ignore[call-overload]
+        builder.add_node("finalization", self._graph_finalization)
         builder.add_edge(START, "session_refresh")
         builder.add_edge("session_refresh", "controller")
         builder.add_conditional_edges(
@@ -277,16 +277,16 @@ class Phase1AgentWorkflow:
         builder = StateGraph(_AnalysisGraphState, context_schema=_AnalysisRuntime)
         builder.add_node("analysis_source_binding", self._graph_analysis_source_binding)  # type: ignore[call-overload]
         builder.add_node("analyzer_context_selector", self._graph_analyzer_context_selector)  # type: ignore[call-overload]
-        builder.add_node(  # type: ignore[call-overload]
+        builder.add_node(
             "analyzer_context_authorization", self._graph_analyzer_context_authorization
         )
         builder.add_node("analyzer_context_builder", self._graph_analyzer_context_builder)  # type: ignore[call-overload]
-        builder.add_node("analyzer", self._graph_analyzer)  # type: ignore[call-overload]
-        builder.add_node("knowledge_reducer", self._graph_knowledge_reducer)  # type: ignore[call-overload]
+        builder.add_node("analyzer", self._graph_analyzer)
+        builder.add_node("knowledge_reducer", self._graph_knowledge_reducer)
         builder.add_node(  # type: ignore[call-overload]
             "post_analysis_session_refresh", self._graph_analysis_session_refresh
         )
-        builder.add_node("goal_evaluation", self._graph_goal_evaluation)  # type: ignore[call-overload]
+        builder.add_node("goal_evaluation", self._graph_goal_evaluation)
         builder.add_edge(START, "analysis_source_binding")
         builder.add_edge("analysis_source_binding", "analyzer_context_selector")
         builder.add_edge("analyzer_context_selector", "analyzer_context_authorization")
