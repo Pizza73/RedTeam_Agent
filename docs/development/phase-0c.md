@@ -204,9 +204,10 @@ H-03 / H-04 / H-05、M-01、L-01の解消を確認した一方、旧サービス
 | H-01 Secure compatibility facadeが`recovery_authority_id`を捨てる | Phase 0C Collection全入口で正本と同じMission / Execution / Task Binding / TTL / State Version bindingを検証。`valid_until`以後はexact authority必須、`recovery_until`以後は常に拒否 |
 | H-02 公開Storeのprivate bearer authorityを読み取ると平文を取得できる | bearer authorityを廃止。公開KernelからStoreを除き、Quarantine / Secret / Artifactはmetadata-only viewだけを公開。平文読出しはSecure Ingestion / Executor内部Owner portへ限定 |
 | 新規HIGH 公開KernelのStore / Key Providerから専用Eraserを迂回して暗号文・鍵を破壊できる | 公開KernelからBlob Store / Quarantine Store / Key Providerを除去。unlinkはEraser内部Owner portのみ。公開面にdestroy / unlink / confirm操作がないことを回帰試験で固定 |
+| 新規HIGH Phase 0C構成後に公開GuardでExecutor依存を再bindできる | ExecutorのPhase 0C dependency bindを一度だけ成功する不可逆操作に変更。構成後のcaller coordinator / secret source差替えを拒否 |
 | M-02 `docs/implementation-plan.md`不在 | 当該ファイルは正本にもCommon Gate必須文書にも存在せず、初回レビュー依頼の誤指定。受入判定は`docs/acceptance-criteria.md`の正本一覧で実施 |
 
-第2修正後は実`swtpm` 7件を含む全529試験、branch coverage 87%、ruff、mypy strict、compileall、
+第2修正後は実`swtpm` 7件を含む全530試験、branch coverage 87%、ruff、mypy strict、compileall、
 verify scripts、`git diff --check`をPASSした。Common Gateの正式判定は、この第2修正コミットを固定した後の
 独立Read-onlyレビューまで保留する。
 
@@ -214,7 +215,7 @@ verify scripts、`git diff --check`をPASSした。Common Gateの正式判定は
 
 - Phase 0Cの製品コードとUnit / Integration / Security / Architecture / Property-State-machine試験を実装し、
   ruff / mypy(strict) / compileall / branch coverage / verify scripts / git diff --check / sha256sums を実行済み。
-  `swtpm`を含む現行チェックはPASS（529 passed, 0 skipped）。
+  `swtpm`を含む現行チェックはPASS（530 passed, 0 skipped）。
 - Codex完了時の主な受入修正: seeded test providerのKEK / DEK独立性、消去のterminal replayでのProvider再照合、
   Destroy後のread-back `CONFIRMED`、Ciphertext unlink後のinventory再読、swtpm TCTIの連続data/control port、
   未WRITTEN NV Extend / Counterの仕様どおりの初期値処理、TPM必須経路とPublic Area不一致の実試験。

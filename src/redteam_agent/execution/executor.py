@@ -173,6 +173,7 @@ class Executor:
         self._ds = digest_service
         self._guard = write_guard
         self._registry_revision = registry_revision
+        self._phase0c_dependencies_bound = False
         # Repository ownership is bound once by the composition root (the same
         # guard is shared by every execution-safety service), so no service binds
         # ownership in its constructor.
@@ -184,9 +185,12 @@ class Executor:
         """Replace Phase 0B test-only plaintext paths at the Phase 0C composition root."""
         if guard is not self._guard:
             raise ExecutionRecordError("Phase 0C dependency replacement is composition-owned")
+        if self._phase0c_dependencies_bound:
+            raise ExecutionRecordError("Phase 0C dependencies are already bound")
         self._collection = collection_coordinator
         self._secret_source = secret_source
         self._secret_metadata = secret_metadata_reader
+        self._phase0c_dependencies_bound = True
 
     # --- create (PLANNED -> AUTHORIZED) -----------------------------------
 

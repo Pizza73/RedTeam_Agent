@@ -14,6 +14,7 @@ import support_phase0c as p0c
 from redteam_agent.audit.models import ImmutableGenerationBlob
 from redteam_agent.composition.phase0c import build_phase0c_kernel
 from redteam_agent.errors import (
+    ExecutionRecordError,
     GenerationWitnessError,
     LeaseError,
     RawResultQuarantineError,
@@ -111,6 +112,17 @@ def test_phase0c_kernel_exposes_only_metadata_views() -> None:
     assert not hasattr(kernel.quarantine_metadata, "unlink_ciphertext")
     assert not hasattr(kernel.secret_metadata, "open_version")
     assert not hasattr(kernel.secret_metadata, "confirm")
+
+
+def test_executor_phase0c_dependencies_cannot_be_rebound() -> None:
+    kernel = p0c.make_phase0c()
+    with pytest.raises(ExecutionRecordError, match="already bound"):
+        kernel.phase0b.executor.bind_phase0c_dependencies(
+            guard=kernel.phase0b.execution_guard,
+            collection_coordinator=kernel.phase0b.collection_coordinator,
+            secret_source=object(),  # type: ignore[arg-type]
+            secret_metadata_reader=kernel.secret_metadata,
+        )
 
 
 def test_measured_epoch_mismatch_stops_leases_and_scheduler() -> None:
