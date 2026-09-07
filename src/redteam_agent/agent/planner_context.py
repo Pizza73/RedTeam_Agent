@@ -40,6 +40,7 @@ _ENVELOPE_NS = "planner_context_envelope"
 _CONTEXT_REQUEST_NS = "planner_context_request"
 _CONTEXT_CHILD_NS = "planner_context_child"
 _CONTEXT_ROOT_NS = "planner_context_root"
+_CONTEXT_ACTION_NS = "planner_context_action"
 MAX_ACTION_CANDIDATES = 32
 MAX_RANKED_METADATA = 100
 MAX_ENVELOPE_TTL_SECONDS = 300
@@ -393,6 +394,14 @@ class PlannerContextService:
         candidate = self._projector.match_action(
             output=output, projection=envelope.action_candidate_projection
         )
+        try:
+            with UnitOfWork(self._db):
+                self._db.occ_insert(
+                    _CONTEXT_ACTION_NS, planner_context_id, 1,
+                    json.dumps(output.model_dump(mode="json"), sort_keys=True),
+                )
+        except RepositoryIntegrityError:
+            raise PlannerContextError("planner action context already consumed") from None
         if output.working_state_update is not None:
             self._planner_state.apply(
                 mission_id=envelope.mission_id, proposal=output.working_state_update,

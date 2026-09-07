@@ -124,6 +124,7 @@ def build_phase1_kernel(*, phase0c: Phase0CKernel | None = None) -> Phase1Kernel
         retry_budget_service=retry_budgets,
         mission_budget_repository=phase0b.budget_repository,
     )
+    llm_gateway.bind_planner_context_revalidator(planner_context.revalidate)
     prerequisite_search = FinitePrerequisiteSearch(catalog=phase0a.contract_catalog, digest_service=ds)
     action_service = PlannerActionApplicationService(
         planner_context_service=planner_context, goal_service=goals,
@@ -138,6 +139,7 @@ def build_phase1_kernel(*, phase0c: Phase0CKernel | None = None) -> Phase1Kernel
         goal_service=goals, mission_manager=phase0a.mission_manager,
         state_repository=phase0a.state_repository,
         execution_repository=phase0b.execution_repository,
+        result_repository=phase0b.result_repository,
         audit_store=kernel.audit_store, witness_barrier=kernel.critical_witness_barrier,
         operator_actor_token=OPERATOR_ACTOR_TOKEN,
     )

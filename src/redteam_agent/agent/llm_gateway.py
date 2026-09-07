@@ -27,14 +27,27 @@ class SharedLLMGateway:
 
     def __init__(self, *, database: Database, digest_service: DigestService, clock: Clock) -> None:
         self._db, self._ds, self._clock = database, digest_service, clock
+        self._planner_context_revalidator: Callable[[str], PlannerContextEnvelope] | None = None
+
+    def bind_planner_context_revalidator(
+        self, revalidator: Callable[[str], PlannerContextEnvelope]
+    ) -> None:
+        if self._planner_context_revalidator is not None:
+            raise AgentLoopError("Planner context revalidator is already bound")
+        self._planner_context_revalidator = revalidator
 
     def invoke_planner(
         self, *, operation_id: str, envelope: PlannerContextEnvelope,
         invoke: Callable[[], object],
     ) -> PlannerOutput:
+        if self._planner_context_revalidator is None:
+            raise AgentLoopError("Planner context revalidator is not bound")
+        current = self._planner_context_revalidator(envelope.planner_context_id)
+        if current.envelope_digest != envelope.envelope_digest:
+            raise AgentLoopError("Planner context input differs from its current stored envelope")
         raw = self._invoke(
-            mission_id=envelope.mission_id, mission_revision=envelope.mission_revision,
-            operation_id=operation_id, role="planner", input_payload=envelope.model_dump(mode="python"),
+            mission_id=current.mission_id, mission_revision=current.mission_revision,
+            operation_id=operation_id, role="planner", input_payload=current.model_dump(mode="python"),
             invoke=invoke, adapter=_PLANNER,
         )
         return _PLANNER.validate_json(json.dumps(raw, sort_keys=True))

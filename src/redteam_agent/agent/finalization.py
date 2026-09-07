@@ -8,7 +8,7 @@ from redteam_agent.errors import AgentLoopError
 from redteam_agent.goal.service import GoalEvaluationService
 from redteam_agent.mission.manager import MissionManager
 from redteam_agent.mission.models import MissionState
-from redteam_agent.storage.execution_repositories import ExecutionRecordRepository
+from redteam_agent.storage.execution_repositories import ExecutionRecordRepository, ExecutionResultRepository
 from redteam_agent.storage.repositories import MissionStateRepository
 
 _ACTIVE = frozenset({
@@ -22,6 +22,7 @@ class FinalizationService:
         self, *, goal_service: GoalEvaluationService, mission_manager: MissionManager,
         state_repository: MissionStateRepository,
         execution_repository: ExecutionRecordRepository,
+        result_repository: ExecutionResultRepository,
         audit_store: AuditStore, witness_barrier: CriticalWitnessBarrier,
         operator_actor_token: str,
     ) -> None:
@@ -29,6 +30,7 @@ class FinalizationService:
         self._manager = mission_manager
         self._states = state_repository
         self._executions = execution_repository
+        self._results = result_repository
         self._audit = audit_store
         self._witness = witness_barrier
         self._operator_actor_token = operator_actor_token
@@ -37,11 +39,11 @@ class FinalizationService:
         goal = self._goals.evaluate(mission_id=mission_id)
         if goal.status.status != "achieved":
             raise AgentLoopError("mission cannot finalize before its current goal is achieved")
-        if any(
-            item.provider_execution_state in _ACTIVE
-            for item in self._executions.all_for_mission(mission_id)
-        ):
-            raise AgentLoopError("mission cannot finalize with an active execution")
+        for item in self._executions.all_for_mission(mission_id):
+            if item.provider_execution_state in _ACTIVE:
+                raise AgentLoopError("mission cannot finalize with an active execution")
+            if item.provider_execution_state != "BLOCKED" and self._results.get(item.execution_id) is None:
+                raise AgentLoopError("mission cannot finalize before result ingestion completes")
         state = self._states.get(mission_id)
         if state is None or state.state != "RUNNING":
             raise AgentLoopError("mission is not ready to enter FINALIZING")

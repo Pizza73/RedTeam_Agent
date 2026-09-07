@@ -67,11 +67,6 @@ def test_planner_context_and_action_are_exactly_bound_to_current_candidate() -> 
     output = PlannerActionOutput(
         proposal=proposal, working_state_update=None, next_iteration_hints=(),
     )
-    matched = kernel.planner_context_service.accept_action(
-        planner_context_id=envelope.planner_context_id, output=output
-    )
-    assert matched.candidate_id == projection.candidates[0].candidate_id
-
     transition = kernel.action_service.execute(
         planner_context_id=envelope.planner_context_id, output=output,
         plan_id="phase1-plan-1", run_id="phase1-run-1", thread_id="phase1-thread-1",
@@ -79,7 +74,16 @@ def test_planner_context_and_action_are_exactly_bound_to_current_candidate() -> 
         task_id="phase1-task-1",
     )
     assert transition.decision.decision == "ALLOW"
+    assert transition.plan.action_contract_ref == projection.candidates[0].action_contract_ref
     assert transition.dispatch is not None
+    assert kernel.phase0c.phase0b.mock_adapter.submit_calls == 1
+    with pytest.raises(PlannerContextError):
+        kernel.action_service.execute(
+            planner_context_id=envelope.planner_context_id, output=output,
+            plan_id="phase1-plan-replay", run_id="phase1-run-replay",
+            thread_id="phase1-thread-replay", decision_id="phase1-decision-replay",
+            execution_id="phase1-execution-replay", task_id="phase1-task-replay",
+        )
     assert kernel.phase0c.phase0b.mock_adapter.submit_calls == 1
 
 
@@ -143,6 +147,18 @@ def test_epoch_change_invalidates_planner_context_before_model_use() -> None:
     )
     with pytest.raises(GoalEvaluationConflictError):
         kernel.planner_context_service.revalidate(envelope.planner_context_id)
+    invoked = False
+
+    def invoke() -> object:
+        nonlocal invoked
+        invoked = True
+        return {}
+
+    with pytest.raises(GoalEvaluationConflictError):
+        kernel.llm_gateway.invoke_planner(
+            operation_id="stale-planner", envelope=envelope, invoke=invoke
+        )
+    assert not invoked
 
 
 def test_context_request_is_bounded_by_lineage_and_durable_retry_budget() -> None:

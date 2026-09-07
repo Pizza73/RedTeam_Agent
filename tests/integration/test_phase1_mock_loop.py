@@ -64,6 +64,9 @@ def test_mock_agent_loop_reaches_goal_through_real_policy_and_executor() -> None
             status_normalization_rule_id="status-normalization-v1",
         ),
     )
+    kernel.phase0c.phase0b.phase0a.session_repository.save(support.session_snapshot())
+    with pytest.raises(AgentLoopError):
+        kernel.finalization_service.finalize(mission_id)
     published = kernel.phase0c.ingestion_service.ingest(ingestion_id=collected.ingestion_id)
     assert published.deletion_intent_id is not None
     kernel.phase0c.eraser.run(deletion_intent_id=published.deletion_intent_id)
@@ -87,11 +90,10 @@ def test_mock_agent_loop_reaches_goal_through_real_policy_and_executor() -> None
     )
     observation = kernel.knowledge_reducer.reduce(analyzed)
     assert observation.object_ref == "sess-1" and analyzer.call_count == 1
-    assert kernel.goal_service.evaluate(mission_id=mission_id).status.status == "not_achieved"
+    assert kernel.goal_service.evaluate(mission_id=mission_id).status.status == "achieved"
 
     # Runtime state changes only through the trusted Session Manager repository,
     # never from the Analyzer candidate itself.
-    kernel.phase0c.phase0b.phase0a.session_repository.save(support.session_snapshot())
     final = kernel.controller.step(mission_id=mission_id, operation_id="mock-loop-final")
     assert final.action == "FINALIZE" and final.reason_code == "GOAL_ACHIEVED"
     completed = kernel.finalization_service.finalize(mission_id)
