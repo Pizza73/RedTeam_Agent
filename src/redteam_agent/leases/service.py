@@ -12,6 +12,8 @@ writer's mutation fails the predicate.
 from __future__ import annotations
 
 import json
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 
 from redteam_agent.audit.generation import AuthenticatedGenerationCoordinator
@@ -114,6 +116,7 @@ class LeaseService:
         digest_service: DigestService,
         clock_guard: ClockIntegrityGuard,
         epoch_service: DeploymentEpochService,
+        anchor_verifier: Callable[[], DeploymentEpochMirror],
         write_guard: WriteGuard,
         policy: LeasePolicy | None = None,
     ) -> None:
@@ -121,6 +124,7 @@ class LeaseService:
         self._ds = digest_service
         self._guard_clock = clock_guard
         self._epoch = epoch_service
+        self._anchor_verifier = anchor_verifier
         self._guard = write_guard
         self._policy = policy if policy is not None else LeasePolicy()
 
@@ -131,10 +135,17 @@ class LeaseService:
     # --- fence / deadline helpers ----------------------------------------
 
     def _mirror(self) -> DeploymentEpochMirror:
-        mirror = self._epoch.current()
+        try:
+            mirror = self._anchor_verifier()
+        except DeploymentEpochError as exc:
+            raise LeaseError("deployment epoch is not anchored to the TPM") from exc
         if mirror is None:
             raise LeaseError("no deployment epoch mirror; cannot issue leases")
         return mirror
+
+    def verify_current_epoch(self) -> DeploymentEpochMirror:
+        """Verify the authenticated DB mirror against the measured TPM counter."""
+        return self._mirror()
 
     def _next_fence(self, previous: LeaseFence | None) -> LeaseFence:
         mirror = self._mirror()
@@ -169,48 +180,46 @@ class LeaseService:
         task_binding: ResultTaskBinding, sink_id: str, owner_id: str,
         expected_execution_state_version: int, caps: tuple[datetime, ...],
     ) -> ResultCollectionLease:
-        previous = self.get_collection_lease(collection_id)
-        if previous is not None and previous.released_at is None and not self._is_expired(previous):
-            raise LeaseError("collection lease is held by a live owner; cannot acquire")
-        fence = self._next_fence(previous.fence if previous is not None else None)
-        expires, deadline_ns = self._deadline(caps=caps)
-        reading_utc = self._guard_clock.read().utc
-        lease = self._finalize_collection(ResultCollectionLease(
-            collection_id=collection_id, execution_id=execution_id, authority_digest=authority_digest,
-            task_binding=task_binding, sink_id=sink_id, owner_id=owner_id,
-            lease_id=f"lease-{collection_id}-{fence.deployment_epoch}-{fence.fencing_token}", fence=fence,
-            expected_execution_state_version=expected_execution_state_version, acquired_at=reading_utc,
-            lease_expires_at=expires, lease_deadline_monotonic_ns=deadline_ns, released_at=None,
-            updated_at=reading_utc, record_digest="pending",
-        ))
-        self._store_collection(collection_id, lease)
-        return lease
+        with self._serialized_write():
+            previous = self.get_collection_lease(collection_id)
+            if previous is not None and previous.released_at is None and not self._is_expired(previous):
+                raise LeaseError("collection lease is held by a live owner; cannot acquire")
+            fence = self._next_fence(previous.fence if previous is not None else None)
+            expires, deadline_ns = self._deadline(caps=caps)
+            reading_utc = self._guard_clock.read().utc
+            lease = self._finalize_collection(ResultCollectionLease(
+                collection_id=collection_id, execution_id=execution_id, authority_digest=authority_digest,
+                task_binding=task_binding, sink_id=sink_id, owner_id=owner_id,
+                lease_id=f"lease-{collection_id}-{fence.deployment_epoch}-{fence.fencing_token}", fence=fence,
+                expected_execution_state_version=expected_execution_state_version, acquired_at=reading_utc,
+                lease_expires_at=expires, lease_deadline_monotonic_ns=deadline_ns, released_at=None,
+                updated_at=reading_utc, record_digest="pending",
+            ))
+            self._store_collection(collection_id, lease)
+            return lease
 
     def renew_collection_lease(
         self, *, collection_id: str, owner_id: str, caps: tuple[datetime, ...]
     ) -> ResultCollectionLease:
-        current = self.get_collection_lease(collection_id)
-        if current is None or current.released_at is not None or current.owner_id != owner_id:
-            raise LeaseError("cannot renew a released/foreign/absent collection lease")
-        if self._is_expired(current):
-            raise LeaseError("cannot renew an expired collection lease")
-        expires, deadline_ns = self._deadline(caps=caps)
-        # Renewal advances only the deadline and audit fields, never authority/state/fence.
-        renewed = self._finalize_collection(current.model_copy(update={
-            "lease_expires_at": expires, "lease_deadline_monotonic_ns": deadline_ns,
-            "updated_at": self._guard_clock.read().utc, "record_digest": "pending",
-        }))
-        self._store_collection(collection_id, renewed)
-        return renewed
+        with self._serialized_write():
+            current = self.get_collection_lease(collection_id)
+            if current is None or current.released_at is not None or current.owner_id != owner_id:
+                raise LeaseError("cannot renew a released/foreign/absent collection lease")
+            if self._is_expired(current):
+                raise LeaseError("cannot renew an expired collection lease")
+            expires, deadline_ns = self._deadline(caps=caps)
+            renewed = self._finalize_collection(current.model_copy(update={
+                "lease_expires_at": expires, "lease_deadline_monotonic_ns": deadline_ns,
+                "updated_at": self._guard_clock.read().utc, "record_digest": "pending",
+            }))
+            self._store_collection(collection_id, renewed)
+            return renewed
 
     def takeover_collection_lease(
         self, *, collection_id: str, execution_id: str, authority_digest: str,
         task_binding: ResultTaskBinding, sink_id: str, new_owner_id: str,
         expected_execution_state_version: int, caps: tuple[datetime, ...],
     ) -> ResultCollectionLease:
-        previous = self.get_collection_lease(collection_id)
-        if previous is not None and previous.released_at is None and not self._is_expired(previous):
-            raise LeaseError("cannot take over a live collection lease")
         return self.acquire_collection_lease(
             collection_id=collection_id, execution_id=execution_id, authority_digest=authority_digest,
             task_binding=task_binding, sink_id=sink_id, owner_id=new_owner_id,
@@ -218,14 +227,22 @@ class LeaseService:
         )
 
     def release_collection_lease(self, *, collection_id: str, owner_id: str) -> None:
-        current = self.get_collection_lease(collection_id)
-        if current is None or current.owner_id != owner_id:
-            raise LeaseError("cannot release a foreign/absent collection lease")
-        released = self._finalize_collection(current.model_copy(update={
-            "released_at": self._guard_clock.read().utc, "updated_at": self._guard_clock.read().utc,
-            "record_digest": "pending",
-        }))
-        self._store_collection(collection_id, released)
+        with self._serialized_write():
+            current = self.get_collection_lease(collection_id)
+            if current is None or current.owner_id != owner_id or current.released_at is not None:
+                raise LeaseError("cannot release a foreign/absent/already released collection lease")
+            self._validate_common(
+                current=current, owner_id=owner_id, lease_id=current.lease_id, fence=current.fence,
+                authority_digest=current.authority_digest,
+                expected_authority_digest=current.authority_digest,
+                expected_state_version=current.expected_execution_state_version,
+                current_state_version=current.expected_execution_state_version,
+            )
+            now = self._guard_clock.read().utc
+            released = self._finalize_collection(current.model_copy(update={
+                "released_at": now, "updated_at": now, "record_digest": "pending",
+            }))
+            self._store_collection(collection_id, released)
 
     def validate_collection_lease(
         self, *, collection_id: str, owner_id: str, lease_id: str, fence: LeaseFence,
@@ -243,6 +260,23 @@ class LeaseService:
         assert current is not None
         return current
 
+    def run_collection_mutation(
+        self, *, collection_id: str, owner_id: str, lease_id: str, fence: LeaseFence,
+        authority_digest: str, expected_execution_state_version: int,
+        mutation: Callable[[], None],
+    ) -> None:
+        """Run one sink mutation while the full lease predicate holds the DB write lock."""
+        with self._serialized_write():
+            self.validate_collection_lease(
+                collection_id=collection_id,
+                owner_id=owner_id,
+                lease_id=lease_id,
+                fence=fence,
+                authority_digest=authority_digest,
+                expected_execution_state_version=expected_execution_state_version,
+            )
+            mutation()
+
     # --- ingestion leases -------------------------------------------------
 
     def get_ingestion_lease(self, ingestion_id: str) -> SecureIngestionLease | None:
@@ -258,32 +292,41 @@ class LeaseService:
         evidence_retention_until: datetime, owner_id: str, expected_ingestion_state_version: int,
         caps: tuple[datetime, ...],
     ) -> SecureIngestionLease:
-        previous = self.get_ingestion_lease(ingestion_id)
-        if previous is not None and previous.released_at is None and not self._is_expired(previous):
-            raise LeaseError("ingestion lease is held by a live owner; cannot acquire")
-        fence = self._next_fence(previous.fence if previous is not None else None)
-        expires, deadline_ns = self._deadline(caps=(*caps, evidence_retention_until))
-        reading_utc = self._guard_clock.read().utc
-        lease = self._finalize_ingestion(SecureIngestionLease(
-            ingestion_id=ingestion_id, execution_id=execution_id, receipt_digest=receipt_digest,
-            quarantine_digest=quarantine_digest, evidence_retention_until=evidence_retention_until,
-            owner_id=owner_id, lease_id=f"ilease-{ingestion_id}-{fence.deployment_epoch}-{fence.fencing_token}",
-            fence=fence, expected_ingestion_state_version=expected_ingestion_state_version,
-            acquired_at=reading_utc, lease_expires_at=expires, lease_deadline_monotonic_ns=deadline_ns,
-            released_at=None, updated_at=reading_utc, record_digest="pending",
-        ))
-        self._store_ingestion(ingestion_id, lease)
-        return lease
+        with self._serialized_write():
+            previous = self.get_ingestion_lease(ingestion_id)
+            if previous is not None and previous.released_at is None and not self._is_expired(previous):
+                raise LeaseError("ingestion lease is held by a live owner; cannot acquire")
+            fence = self._next_fence(previous.fence if previous is not None else None)
+            expires, deadline_ns = self._deadline(caps=(*caps, evidence_retention_until))
+            reading_utc = self._guard_clock.read().utc
+            lease = self._finalize_ingestion(SecureIngestionLease(
+                ingestion_id=ingestion_id, execution_id=execution_id, receipt_digest=receipt_digest,
+                quarantine_digest=quarantine_digest, evidence_retention_until=evidence_retention_until,
+                owner_id=owner_id, lease_id=f"ilease-{ingestion_id}-{fence.deployment_epoch}-{fence.fencing_token}",
+                fence=fence, expected_ingestion_state_version=expected_ingestion_state_version,
+                acquired_at=reading_utc, lease_expires_at=expires, lease_deadline_monotonic_ns=deadline_ns,
+                released_at=None, updated_at=reading_utc, record_digest="pending",
+            ))
+            self._store_ingestion(ingestion_id, lease)
+            return lease
 
     def release_ingestion_lease(self, *, ingestion_id: str, owner_id: str) -> None:
-        current = self.get_ingestion_lease(ingestion_id)
-        if current is None or current.owner_id != owner_id:
-            raise LeaseError("cannot release a foreign/absent ingestion lease")
-        released = self._finalize_ingestion(current.model_copy(update={
-            "released_at": self._guard_clock.read().utc, "updated_at": self._guard_clock.read().utc,
-            "record_digest": "pending",
-        }))
-        self._store_ingestion(ingestion_id, released)
+        with self._serialized_write():
+            current = self.get_ingestion_lease(ingestion_id)
+            if current is None or current.owner_id != owner_id or current.released_at is not None:
+                raise LeaseError("cannot release a foreign/absent/already released ingestion lease")
+            self._validate_common(
+                current=current, owner_id=owner_id, lease_id=current.lease_id, fence=current.fence,
+                authority_digest=current.quarantine_digest,
+                expected_authority_digest=current.quarantine_digest,
+                expected_state_version=current.expected_ingestion_state_version,
+                current_state_version=current.expected_ingestion_state_version,
+            )
+            now = self._guard_clock.read().utc
+            released = self._finalize_ingestion(current.model_copy(update={
+                "released_at": now, "updated_at": now, "record_digest": "pending",
+            }))
+            self._store_ingestion(ingestion_id, released)
 
     def invalidate_ingestion_lease(self, *, ingestion_id: str) -> None:
         """Retention-scheduler authority: mark the current ingestion lease released.
@@ -291,24 +334,26 @@ class LeaseService:
         Unlike a worker release, this does not require the caller to be the owner; the
         fence is preserved (never deleted/reused) so a stale worker still fails validate.
         """
-        current = self.get_ingestion_lease(ingestion_id)
-        if current is None or current.released_at is not None:
-            return
-        released = self._finalize_ingestion(current.model_copy(update={
-            "released_at": self._guard_clock.read().utc, "updated_at": self._guard_clock.read().utc,
-            "record_digest": "pending",
-        }))
-        self._store_ingestion(ingestion_id, released)
+        with self._serialized_write():
+            current = self.get_ingestion_lease(ingestion_id)
+            if current is None or current.released_at is not None:
+                return
+            now = self._guard_clock.read().utc
+            released = self._finalize_ingestion(current.model_copy(update={
+                "released_at": now, "updated_at": now, "record_digest": "pending",
+            }))
+            self._store_ingestion(ingestion_id, released)
 
     def invalidate_collection_lease(self, *, collection_id: str) -> None:
-        current = self.get_collection_lease(collection_id)
-        if current is None or current.released_at is not None:
-            return
-        released = self._finalize_collection(current.model_copy(update={
-            "released_at": self._guard_clock.read().utc, "updated_at": self._guard_clock.read().utc,
-            "record_digest": "pending",
-        }))
-        self._store_collection(collection_id, released)
+        with self._serialized_write():
+            current = self.get_collection_lease(collection_id)
+            if current is None or current.released_at is not None:
+                return
+            now = self._guard_clock.read().utc
+            released = self._finalize_collection(current.model_copy(update={
+                "released_at": now, "updated_at": now, "record_digest": "pending",
+            }))
+            self._store_collection(collection_id, released)
 
     def invalidate_all_in_txn(self, *, released_at: datetime) -> tuple[int, int]:
         """Invalidate every old-epoch lease during stopped-worker trust recovery."""
@@ -401,7 +446,7 @@ class LeaseService:
     def _upsert(self, namespace: str, key: str, text: str) -> None:
         own_txn = not self._db.in_transaction
         if own_txn:
-            self._db.connection.execute("BEGIN")
+            self._db.connection.execute("BEGIN IMMEDIATE")
         try:
             existing = self._db.occ_get(namespace, key)
             if existing is None:
@@ -415,6 +460,22 @@ class LeaseService:
             raise
         if own_txn:
             self._db.connection.commit()
+
+    @contextmanager
+    def _serialized_write(self) -> Iterator[None]:
+        """Serialize the lease predicate and OCC mutation across DB connections."""
+        own_txn = not self._db.in_transaction
+        if own_txn:
+            self._db.connection.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+        except BaseException:
+            if own_txn:
+                self._db.connection.rollback()
+            raise
+        else:
+            if own_txn:
+                self._db.connection.commit()
 
     def _verify_digest(self, model_payload: dict[str, object], digest_name: str, expected: str) -> None:
         payload = {k: v for k, v in model_payload.items() if k != "record_digest"}

@@ -33,10 +33,16 @@ def test_quarantine_ciphertext_tamper_detected_on_readback() -> None:
     kernel.quarantine_blobs.put(handles[0], b'{"encryption_metadata_id": "x", "key_domain": "raw_result_quarantine",'
                                             b' "algorithm_id": "aes_256_gcm_v1", "nonce": "00", "ciphertext": "00",'
                                             b' "aad_digest": "00", "ciphertext_digest": "deadbeef"}')
-    reader = kernel.quarantine_store.open_reader(f"q-{d.execution_id}")
     with pytest.raises(RawResultQuarantineError):
-        reader.verify_ciphertext_digest()
-    reader.close()
+        kernel.ingestion_service.ingest(ingestion_id=f"ingestion-{d.execution_id}")
+
+
+def test_quarantine_plaintext_requires_internal_ingestion_authority() -> None:
+    kernel = s.make_phase0c()
+    d = s.seed_dispatched(kernel)
+    s.collect(kernel, execution_id=d.execution_id)
+    with pytest.raises(RawResultQuarantineError):
+        kernel.quarantine_store.open_reader(f"q-{d.execution_id}", authority=object())
 
 
 def test_secret_plaintext_absent_from_audit_and_normal_db() -> None:

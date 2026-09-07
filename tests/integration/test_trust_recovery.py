@@ -119,8 +119,13 @@ def test_recovery_consumes_exact_approval_and_invalidates_old_leases() -> None:
     assert after_mission.mission_state_version == before_mission.mission_state_version + 1
     recovery_witness = coordinator.current("audit_head")
     assert recovery_witness is not None and recovery_witness.generation == 1
-    assert recovery_witness.state_digest == consumed.consumption_digest
     recovery_content = json.loads(coordinator.record_content(recovery_witness))
+    assert recovery_witness.state_digest == kernel.phase0b.phase0a.digest_service.compute(
+        "security_projection_digest", {
+            "trust_recovery_consumption_digest": consumed.consumption_digest,
+            "audit_head_state": recovery_content,
+        },
+    )
     assert recovery_content["recovered"] == "audit"
     assert recovery_content["trust_recovery_consumption"]["consumption_digest"] == (
         consumed.consumption_digest
@@ -183,7 +188,13 @@ def test_recovery_replay_completes_consumption_witness_after_commit_crash() -> N
     )
     current = coordinator.current("audit_head")
     assert current is not None and current.generation == 1
-    assert current.state_digest == recovered.consumption_digest
+    recovery_content = json.loads(coordinator.record_content(current))
+    assert current.state_digest == kernel.phase0b.phase0a.digest_service.compute(
+        "security_projection_digest", {
+            "trust_recovery_consumption_digest": recovered.consumption_digest,
+            "audit_head_state": recovery_content,
+        },
+    )
 
 
 def test_recovery_rejects_unapproved_adopted_content_before_genesis() -> None:

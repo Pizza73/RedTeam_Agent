@@ -93,6 +93,8 @@ class AuthenticatedGenerationCoordinator:
         blob = self._store.get_blob(record.immutable_blob_id)
         if blob is None:
             raise AnchorRecoveryRequiredError("generation record content blob is missing")
+        if blob.namespace != record.namespace:
+            raise AnchorRecoveryRequiredError("generation record references a cross-namespace blob")
         return blob.content
 
     def witness_identity(self, role: NvRole) -> ProvisionedNvIdentity:

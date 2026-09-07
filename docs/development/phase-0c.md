@@ -1,9 +1,9 @@
 # Phase 0C 開発記録 — Data Security / Audit
 
-**STATUS: 実装コミット固定済み / 現行試験PASS / 独立レビュー未実施。** Phase 0Cの実装と再現可能な検証は完了した。
-Common Gateの正式受入は、固定した実装コミットに対する独立レビュー完了まで保留する。
+**STATUS: 初回独立レビューFAILの修正完了 / 現行試験PASS / 独立再レビュー待ち。** 初回固定コミットへの独立レビューで
+HIGH 5件を検出し、実装・回帰試験を修正した。Common Gateの正式受入は、修正コミット固定後の独立再レビューまで保留する。
 本記録は実コード・固定コミット・再実行した試験結果と合わせて判定する。記録の更新自体は受入完了の証拠ではない。
-Codexによる独立レビューは未実施。TPM/`swtpm`のProduction Witness Integration Testは、隔離展開した
+Codexによる初回独立レビューは実施済みでFAIL。TPM/`swtpm`のProduction Witness Integration Testは、隔離展開した
 `swtpm 0.10.2` / `tpm2-tools 5.7`を用いて必須経路とNV Public Area不一致経路を実行し、全件PASSした。
 
 ## 1. 対象
@@ -14,8 +14,8 @@ Codexによる独立レビューは未実施。TPM/`swtpm`のProduction Witness 
 | Phase | 0C: Data Security / Audit |
 | 入力コミット（完全ID） | `85f3b50e5d169230cfb4f3a9cb59953b65616a91`（Phase 0B受入記録済みbaseline、`codex/phase-0c`） |
 | 実装先 | ブランチ `codex/phase-0c`。push / mergeは未実施 |
-| 実装対象コミット | `a6d48e8572fb18db4b3fef70f9d57f67d5b2640a` |
-| 独立レビュー | 未実施 |
+| 実装対象コミット | 初回 `a6d48e8572fb18db4b3fef70f9d57f67d5b2640a`。指摘修正コミットは本記録の次回更新で固定する |
+| 独立レビュー | 初回FAIL（証跡SHA-256 `54e7386b6344a09e1182ff66df6305f632c5cb5f05ef7d6261be9a92544135e6`）。修正差分の再レビュー待ち |
 | 実装担当 | Claude Codeによる初期実装後、ユーザー指示によりCodexが受入修正と検証を完了 |
 
 正本 `SystemDesign.md` / `SystemDesign_AI_Control.md` / `docs/acceptance-criteria.md` / `docs/safety-invariants.md` /
@@ -173,13 +173,30 @@ Generation Commit順序、Offline Recovery、Production Compositionをpublic ent
 | HIGH | Offline Recovery replayがWitnessとMirrorだけを照合し、回復後Mission Authorizationの選択Rollbackを検出しなかった | 消費RecordのAuthorization RootをCurrent Mission Stateから再構築して照合する試験を追加 |
 | HIGH | Phase 0C起動後もRepository直呼びでRBAC Mappingを変更でき、Mission Witnessを迂回できた | 初期Provisioning後の直接変更を拒否。将来の変更はMission Authorization OwnerのWitness済みCommandだけに限定 |
 
-修正後、上表に対応する試験と全517試験、静的検査、実`swtpm`障害経路を再実行し、未解決のBLOCKER / HIGHは0件。
+修正後、上表に対応する試験と全527試験、静的検査、実`swtpm`障害経路を再実行し、未解決のBLOCKER / HIGHは0件。
+
+### 7.1 分離Codex初回独立レビューと修正（2026-09-07）
+
+実装会話を引き継がないCodexが固定コミット`a6d48e8572fb18db4b3fef70f9d57f67d5b2640a`を`/tmp`のRead-only
+Snapshotへ展開し、全試験と独立negative probeを実行した。判定はBLOCKER 0 / HIGH 5 / MEDIUM 2 / LOW 1でFAIL。
+指摘を次のとおり修正し、専用回帰試験`tests/security/test_phase0c_review_regressions.py`等へ固定した。
+
+| 初回指摘 | 修正 / Evidence |
+| --- | --- |
+| H-01 旧Collection / Ingestion sibling経路がEncrypted Quarantineを迂回 | Phase 0C Compositionで旧公開callerとExecutor local captureをSecure Collection / Ingestion facadeへ置換。Provider / Local双方を暗号化Quarantineへ収束 |
+| H-02 IDだけでQuarantine / Secret / Artifact平文を取得可能 | Composition-private identity authorityを必須化。Secretはcurrent CONFIRMED active version、Artifactはexact DataAccessGrant bindingも検証 |
+| H-03 Lease取得競合とstale sink mutation | `BEGIN IMMEDIATE`内でlive predicate・fence割当・OCC書込を直列化。各ciphertext chunk mutationを完全Lease predicateと同じDB lock内で実行し、takeover時は新fence prefixへmetadataを再公開 |
+| H-04 TPM実測epoch不一致でもLease / Scheduler更新可能 | Lease全mutationとScheduler入口がauthenticated mirrorをTPM counter / trust epochへ照合。stale epochを回帰試験で拒否 |
+| H-05 TPM-bound immutable blob IDとcontent-address未照合 | row key / model ID / namespace / content kind / recomputed content-addressを全照合。Recovery generationのstate digestをConsumptionだけでなくfull canonical contentへbinding |
+| M-01 Collection / Ingestionの全量buffer | Collectionは1 MiB以下へ分割し、Provider / Local adapter chunkを直接暗号化。UTF-8 / NDJSON境界対応のincremental bounded parserへ変更 |
+| M-02 指定された`docs/implementation-plan.md`不在 | 正本・Common Gateが要求する文書一覧には存在せず、レビュー依頼時の誤指定と確認。代替文書を正本扱いしない |
+| L-01 補助`mypy --strict`のunused ignore 4件 | 不要ignoreを削除し、project gateと直接`--strict`の双方をPASS |
 
 ## 8. 受入と残課題
 
 - Phase 0Cの製品コードとUnit / Integration / Security / Architecture / Property-State-machine試験を実装し、
   ruff / mypy(strict) / compileall / branch coverage / verify scripts / git diff --check / sha256sums を実行済み。
-  `swtpm`を含む現行チェックはPASS（517 passed, 0 skipped）。
+  `swtpm`を含む現行チェックはPASS（527 passed, 0 skipped）。
 - Codex完了時の主な受入修正: seeded test providerのKEK / DEK独立性、消去のterminal replayでのProvider再照合、
   Destroy後のread-back `CONFIRMED`、Ciphertext unlink後のinventory再読、swtpm TCTIの連続data/control port、
   未WRITTEN NV Extend / Counterの仕様どおりの初期値処理、TPM必須経路とPublic Area不一致の実試験。
@@ -187,13 +204,13 @@ Generation Commit順序、Offline Recovery、Production Compositionをpublic ent
   Cancel結果のWitness、Secret Lifecycle Head、初回300秒Batch、Production Root固定、SQLite FULL、危険NV属性拒否、
   Recovery Authorization Root再照合、Runtime RBAC直接変更拒否。
 - **未実行 / 未達（Phase受入の残条件）**:
-  - **独立レビュー未実施**: 実装セッションから分離したCodexによるRead-only Snapshotの独立レビューは行っていない。
+  - **独立再レビュー未実施**: 初回指摘修正後の固定コミットに対するRead-only差分再レビューを行っていない。
   - **D4 実機Resource REK消去 = `NOT_EVALUATED`**（正本§34.1.1）: 本Phaseは対象外。swtpm / 文書検査を実機PASSと
     しない。PASS前はProduction採用不可。
-- `encrypted_raw` Artifactの暗号化保存 / Bound AAD復号Round-tripと、Ciphertextへの平文非出現も追加検証済み。
+- `encrypted_raw` Artifactの暗号化保存 / Bound AADと、Grant / private authorityなしの平文取得拒否、Ciphertextへの平文非出現を追加検証済み。
 - **未解決の仕様矛盾**: なし。**Security-critical実装残作業**: なし。
 - 実C2 / MCP / 外部Targetへの操作は行っていない。全試験はTest Double / 実AES-GCM / `swtpm`だけで実施した。
-- 次段階: 固定コミットを対象に、実装会話から分離したCodex独立レビュー。
+- 次段階: 指摘修正コミットを固定し、実装会話から分離したCodexの独立差分再レビューを実施する。
 
 ## 9. Phase 1移行判定
 

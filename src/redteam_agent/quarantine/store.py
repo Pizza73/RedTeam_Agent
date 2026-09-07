@@ -14,7 +14,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import datetime
 from typing import Literal
 
@@ -44,7 +44,8 @@ class EncryptedStreamingQuarantineSink:
         self, *, sink_id: str, quarantine_id: str, execution_id: str, mission_id: str,
         task_binding_digest: str, storage_handle: str, key_handle: OpaqueKeyHandle,
         encryption_metadata_id: str, blob_store: QuarantineBlobStore, max_output_bytes: int,
-        committed_at: datetime, max_single_chunk_bytes: int = 1024 * 1024,
+        committed_at: datetime, authorize_mutation: Callable[[Callable[[], None]], None],
+        max_single_chunk_bytes: int = 1024 * 1024,
     ) -> None:
         self._sink_id = sink_id
         self._quarantine_id = quarantine_id
@@ -57,6 +58,7 @@ class EncryptedStreamingQuarantineSink:
         self._blobs = blob_store
         self._max_output_bytes = max_output_bytes
         self._committed_at = committed_at
+        self._authorize_mutation = authorize_mutation
         self._max_single_chunk_bytes = max_single_chunk_bytes
         self._hasher = hashlib.sha256(_CIPHERTEXT_DOMAIN)
         self._counts = {"stdout": 0, "stderr": 0}
@@ -98,7 +100,8 @@ class EncryptedStreamingQuarantineSink:
                         "quarantine_id": self._quarantine_id, "stream": stream, "sequence": sequence},
         )
         handle = chunk_handle(self._prefix, stream, sequence)
-        self._blobs.put(handle, json.dumps(envelope.model_dump(mode="json"), sort_keys=True).encode("utf-8"))
+        encoded = json.dumps(envelope.model_dump(mode="json"), sort_keys=True).encode("utf-8")
+        self._authorize_mutation(lambda: self._blobs.put(handle, encoded))
         self._hasher.update(bytes.fromhex(envelope.ciphertext_digest))
         self._chunk_count += 1
 
@@ -120,6 +123,7 @@ class EncryptedStreamingQuarantineSink:
         if self._receipt is not None:
             return self._receipt
         self._require_open()
+        self._authorize_mutation(lambda: None)
         self._receipt = RawResultReceipt(
             receipt_id=f"receipt-{self._execution_id}", execution_id=self._execution_id,
             quarantine_id=self._quarantine_id, task_binding_digest=self._task_binding_digest,
@@ -142,6 +146,7 @@ class EncryptedStreamingQuarantineSink:
     def abort(self) -> None:
         if self._state == "COMMITTED":
             raise RawResultQuarantineError("cannot abort a committed quarantine sink")
+        self._authorize_mutation(lambda: None)
         self._state = "ABORTED"
         self._handle.close()
 
@@ -188,12 +193,14 @@ class EncryptedQuarantineStore:
     def __init__(
         self, *, database: Database, blob_store: QuarantineBlobStore,
         key_provider: EncryptionKeyProvider, digest_service: DigestService, clock: Clock,
+        read_authority: object,
     ) -> None:
         self._db = database
         self._blobs = blob_store
         self._keys = key_provider
         self._ds = digest_service
         self._clock = clock
+        self._read_authority = read_authority
 
     # --- metadata ---------------------------------------------------------
 
@@ -255,32 +262,55 @@ class EncryptedQuarantineStore:
         self, *, quarantine_id: str, mission_id: str, mission_revision: int, execution_id: str,
         task_binding: ResultTaskBinding, deployment_epoch: int, fencing_token: int, retention_until: datetime,
     ) -> RawResultQuarantineMetadata:
-        if self.get_metadata(quarantine_id) is not None:
-            existing = self.get_metadata(quarantine_id)
-            assert existing is not None
-            return existing
+        expected_prefix = staging_prefix(quarantine_id, deployment_epoch, fencing_token)
+        existing = self.get_metadata(quarantine_id)
+        if existing is not None:
+            if (
+                existing.execution_id != execution_id
+                or existing.task_binding.binding_digest != task_binding.binding_digest
+            ):
+                raise RawResultQuarantineError("existing quarantine binding mismatch")
+            if existing.storage_handle == expected_prefix:
+                return existing
+            if existing.status not in ("OPEN", "STREAMING", "RECOVERY_REQUIRED", "ABORTED"):
+                raise RawResultQuarantineError("committed quarantine cannot be rebound to a new fence")
+            restaged = self._finalize(existing.model_copy(update={
+                "storage_handle": expected_prefix,
+                "ciphertext_digest": "",
+                "size_bytes": 0,
+                "chunk_count": 0,
+                "committed_at": None,
+                "status": "OPEN",
+                "metadata_digest": "pending",
+            }))
+            self._store_metadata(restaged)
+            return restaged
         enc = self._keys.create_resource_key(
             domain="raw_result_quarantine", resource_binding_type="quarantine_id", resource_binding_id=quarantine_id
         )
         self._db.occ_insert_idempotent(
             _ENCRYPTION_NS, quarantine_id, 1, json.dumps(enc.model_dump(mode="json"), sort_keys=True)
         )
-        prefix = staging_prefix(quarantine_id, deployment_epoch, fencing_token)
         metadata = self._finalize(RawResultQuarantineMetadata(
             quarantine_id=quarantine_id, mission_id=mission_id, mission_revision=mission_revision,
             execution_id=execution_id, task_binding=task_binding, encryption_metadata_id=enc.resource_key_id,
-            storage_handle=prefix, ciphertext_digest="", size_bytes=0, chunk_count=0, committed_at=None,
+            storage_handle=expected_prefix, ciphertext_digest="", size_bytes=0, chunk_count=0, committed_at=None,
             retention_until=retention_until, status="OPEN", metadata_digest="pending",
         ))
         self._store_metadata(metadata)
         return metadata
 
     def open_writer(
-        self, quarantine_id: str, *, sink_id: str, task_binding_digest: str, max_output_bytes: int
+        self, quarantine_id: str, *, sink_id: str, task_binding_digest: str, max_output_bytes: int,
+        deployment_epoch: int, fencing_token: int,
+        authorize_mutation: Callable[[Callable[[], None]], None],
     ) -> EncryptedStreamingQuarantineSink:
         metadata = self.get_metadata(quarantine_id)
         if metadata is None:
             raise RawResultQuarantineError("quarantine not found")
+        expected_prefix = staging_prefix(quarantine_id, deployment_epoch, fencing_token)
+        if metadata.storage_handle != expected_prefix or metadata.status != "OPEN":
+            raise RawResultQuarantineError("quarantine writer fence does not own the current staging prefix")
         enc = self._encryption_metadata(quarantine_id)
         handle = self._keys.open_resource_key_handle(metadata=enc, operation="encrypt")
         return EncryptedStreamingQuarantineSink(
@@ -289,6 +319,7 @@ class EncryptedQuarantineStore:
             storage_handle=metadata.storage_handle, key_handle=handle,
             encryption_metadata_id=enc.resource_key_id, blob_store=self._blobs,
             max_output_bytes=max_output_bytes, committed_at=self._clock.now(),
+            authorize_mutation=authorize_mutation,
         )
 
     def set_status(self, quarantine_id: str, status: RawResultQuarantineStatus) -> RawResultQuarantineMetadata:
@@ -312,7 +343,9 @@ class EncryptedQuarantineStore:
         self._store_metadata(updated)
         return updated
 
-    def open_reader(self, quarantine_id: str) -> EncryptedQuarantineReader:
+    def open_reader(self, quarantine_id: str, *, authority: object) -> EncryptedQuarantineReader:
+        if authority is not self._read_authority:
+            raise RawResultQuarantineError("quarantine plaintext requires ingestion authority")
         metadata = self.get_metadata(quarantine_id)
         if metadata is None:
             raise RawResultQuarantineError("quarantine not found")

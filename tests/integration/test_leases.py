@@ -2,15 +2,22 @@
 
 from __future__ import annotations
 
+import threading
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 
 import support_phase0c as s
+from redteam_agent.canonical.digest_service import DigestService
 from redteam_agent.errors import ClockIntegrityError, LeaseError
 from redteam_agent.execution.models import ProviderTaskBinding
 from redteam_agent.execution.records import finalize_provider_task_binding
-from redteam_agent.runtime.clock import ManualMonotonicClock
+from redteam_agent.leases.models import LeasePolicy
+from redteam_agent.leases.service import DeploymentEpochService, LeaseService
+from redteam_agent.runtime.clock import ClockIntegrityGuard, ManualMonotonicClock
+from redteam_agent.storage.database import Database
+from redteam_agent.storage.guard import WriteGuard
 
 T0 = datetime(2026, 1, 15, 12, 0, 0, tzinfo=UTC)
 
@@ -129,6 +136,56 @@ def test_authority_and_state_version_mismatch_rejected() -> None:
         )
     with pytest.raises(LeaseError):
         kernel.lease_service.validate_collection_lease(
-            collection_id="c1", owner_id="w1", lease_id=lease.lease_id, fence=lease.fence, authority_digest="ad",
-            expected_execution_state_version=99,
+            collection_id="c1", owner_id="w1", lease_id=lease.lease_id, fence=lease.fence,
+            authority_digest="ad", expected_execution_state_version=99,
         )
+
+
+def test_concurrent_acquire_has_exactly_one_live_owner(tmp_path: Path) -> None:
+    path = str(tmp_path / "leases.sqlite")
+    setup_db = Database(path)
+    setup_ds = DigestService()
+    setup_guard = WriteGuard()
+    epoch = DeploymentEpochService(setup_db, setup_ds, setup_guard)
+    epoch.establish(
+        guard=setup_guard, trust_epoch=1, deployment_epoch=1,
+        nv_identity_digest="nv-id", provider_identity="test",
+        established_at_iso="2026-01-15T12:00:00Z",
+    )
+    setup_db.close()
+    binding = _binding(setup_ds)
+    barrier = threading.Barrier(2)
+    results: list[str] = []
+
+    def acquire(owner: str) -> None:
+        db = Database(path, create_schema=False)
+        ds = DigestService()
+        guard = WriteGuard()
+        local_epoch = DeploymentEpochService(db, ds, guard)
+        leases = LeaseService(
+            database=db, digest_service=ds,
+            clock_guard=ClockIntegrityGuard(ManualMonotonicClock(T0)),
+            epoch_service=local_epoch, anchor_verifier=lambda: local_epoch.current(),
+            write_guard=guard, policy=LeasePolicy(),
+        )
+        barrier.wait()
+        try:
+            leases.acquire_collection_lease(
+                collection_id="concurrent", execution_id="exec-1", authority_digest="ad",
+                task_binding=binding, sink_id="sink", owner_id=owner,
+                expected_execution_state_version=3, caps=_caps(),
+            )
+        except LeaseError:
+            results.append("rejected")
+        else:
+            results.append(owner)
+        finally:
+            db.close()
+
+    threads = [threading.Thread(target=acquire, args=(owner,)) for owner in ("a", "b")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert sorted(results).count("rejected") == 1
+    assert len(results) == 2

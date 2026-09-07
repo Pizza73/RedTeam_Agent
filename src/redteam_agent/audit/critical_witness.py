@@ -243,10 +243,16 @@ class CriticalWitnessBarrier:
         bindings = tuple(SecurityStateBinding.model_validate(item) for item in raw_bindings)
         recovery = content.get("trust_recovery_consumption")
         if recovery is not None:
-            if not isinstance(recovery, dict) or record.state_digest != recovery.get(
-                "consumption_digest"
-            ):
+            if not isinstance(recovery, dict) or not isinstance(recovery.get("consumption_digest"), str):
                 raise AnchorRecoveryRequiredError("audit-head recovery consumption is invalid")
+            expected = self._ds.compute("security_projection_digest", {
+                "trust_recovery_consumption_digest": recovery["consumption_digest"],
+                "audit_head_state": content,
+            })
+            if record.state_digest != expected:
+                raise AnchorRecoveryRequiredError(
+                    "audit-head recovery state digest does not bind its full content"
+                )
         elif record.generation > 0 and record.state_digest != self._state_digest_for_content(content):
             raise AnchorRecoveryRequiredError("audit-head state digest does not bind its full content")
         for binding in bindings:

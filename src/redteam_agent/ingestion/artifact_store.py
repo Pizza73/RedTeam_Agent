@@ -20,6 +20,7 @@ from redteam_agent.crypto.key_provider import EncryptionKeyProvider
 from redteam_agent.crypto.models import EncryptionMetadata, EnvelopeCiphertext
 from redteam_agent.errors import SecureIngestionError
 from redteam_agent.models.base import StrictImmutableBoundaryModel
+from redteam_agent.policy.models import DataAccessGrant
 from redteam_agent.quarantine.blob_store import QuarantineBlobStore
 from redteam_agent.storage.database import Database
 
@@ -57,11 +58,13 @@ class ArtifactStore:
     def __init__(
         self, *, database: Database, blob_store: QuarantineBlobStore, key_provider: EncryptionKeyProvider,
         digest_service: DigestService,
+        read_authority: object,
     ) -> None:
         self._db = database
         self._blobs = blob_store
         self._keys = key_provider
         self._ds = digest_service
+        self._read_authority = read_authority
 
     def _artifact_digest(self, fields: dict[str, object]) -> str:
         return self._ds.compute("artifact_digest", {k: v for k, v in fields.items() if k != "artifact_digest"})
@@ -132,10 +135,23 @@ class ArtifactStore:
                                        json.dumps(ref.model_dump(mode="json"), sort_keys=True))
         self._blobs.put(blob_handle, blob_bytes)
 
-    def read_body(self, artifact_id: str, *, execution_id: str) -> bytes:
+    def read_body(
+        self, artifact_id: str, *, execution_id: str, grant: DataAccessGrant, authority: object,
+    ) -> bytes:
+        if authority is not self._read_authority:
+            raise SecureIngestionError("artifact body requires an authorized reader")
         ref = self.get(artifact_id)
         if ref is None:
             raise SecureIngestionError("artifact not found")
+        if (
+            grant.resource_type != "artifact"
+            or "read" not in grant.operations
+            or grant.resource.resource_id != artifact_id
+            or grant.resource.resource_version != ref.sha256
+            or grant.resource.resource_digest != ref.artifact_digest
+            or grant.authorization_state_digest != ref.artifact_digest
+        ):
+            raise SecureIngestionError("artifact DataAccessGrant does not bind the current artifact")
         blob = self._blobs.get(self._blob_handle(ref.mission_id, artifact_id))
         if not ref.encrypted:
             return blob

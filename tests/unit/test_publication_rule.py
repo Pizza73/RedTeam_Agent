@@ -68,3 +68,22 @@ def test_unregistered_rule_fails_closed() -> None:
     catalog = OutputPublicationRuleCatalog(DigestService())
     with pytest.raises(OutputPublicationError):
         catalog.get("nope")
+
+
+def test_ndjson_parser_streams_across_utf8_and_record_boundaries() -> None:
+    catalog = OutputPublicationRuleCatalog(DigestService())
+    rule = catalog.register(
+        rule_id="ndjson", parser_id="ndjson_v1",
+        public_field_types={"host": "string", "status": "string", "port": "integer"},
+        secret_field_pointers=("/credential",),
+    )
+    raw = (
+        '{"host":"café","status":"open","port":1,"credential":"s1"}\n'
+        '{"host":"二","status":"closed","port":2,"credential":"s2"}'
+    ).encode()
+    split = raw.index("é".encode()) + 1
+    parsed = OutputPublicationParser().parse_chunks(
+        rule, (raw[:split], raw[split:split + 7], raw[split + 7:])
+    )
+    assert [record["host"] for record in parsed.redacted_records] == ["café", "二"]
+    assert [secret.value for secret in parsed.detected_secrets] == [b"s1", b"s2"]

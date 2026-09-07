@@ -80,6 +80,7 @@ class SecretLifecycleStore:
         audit_store: AuditStore,
         key_provider: EncryptionKeyProvider,
         secret_blob_store: QuarantineBlobStore,
+        read_authority: object,
         fault_injector: FaultInjector | None = None,
     ) -> None:
         self._db = database
@@ -88,6 +89,7 @@ class SecretLifecycleStore:
         self._audit = audit_store
         self._keys = key_provider
         self._blobs = secret_blob_store
+        self._read_authority = read_authority
         self._fault = fault_injector if fault_injector is not None else NoFaultInjector()
 
     # --- digests ----------------------------------------------------------
@@ -158,13 +160,24 @@ class SecretLifecycleStore:
             state=event.event_type, expires_at=record.expires_at,
         )
 
+    def get(self, secret_version_id: str) -> SecretMetadataView | None:
+        """SecretMetadataReader boundary used by policy and the executor."""
+        return self.metadata_view(secret_version_id)
+
     # --- value source (executor-owned) ------------------------------------
 
-    def open_version(self, secret_version_id: str) -> bytearray:
+    def open_version(self, secret_version_id: str, *, authority: object) -> bytearray:
+        if authority is not self._read_authority:
+            raise SecretLifecycleError("secret plaintext requires the executor continuation authority")
         record = self.get_version(secret_version_id)
+        if record is None or self.current_state(secret_version_id) != "CONFIRMED":
+            raise SecretLifecycleError("only the current CONFIRMED secret version is readable")
+        active = self.active_head(record.secret_id)
+        if active is None or active.active_version_id != secret_version_id:
+            raise SecretLifecycleError("secret version is not the current active version")
         enc_row = self._db.occ_get(_ENC_NS, secret_version_id)
         blob_handle = f"secret/{secret_version_id}"
-        if record is None or enc_row is None or not self._blobs.exists(blob_handle):
+        if enc_row is None or not self._blobs.exists(blob_handle):
             raise EncryptionKeyUnavailableError("secret version value is unavailable")
         enc = EncryptionMetadata.model_validate_json(enc_row[1])
         envelope = EnvelopeCiphertext.model_validate_json(self._blobs.get(blob_handle).decode("utf-8"))
@@ -476,7 +489,7 @@ class SecretLifecycleStore:
 
 def _dump(model: object) -> str:
     assert hasattr(model, "model_dump")
-    return json.dumps(model.model_dump(mode="json"), sort_keys=True)  # type: ignore[attr-defined]
+    return json.dumps(model.model_dump(mode="json"), sort_keys=True)
 
 
 def _iso(value: datetime) -> str:

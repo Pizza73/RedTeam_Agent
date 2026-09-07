@@ -131,6 +131,14 @@ class GenerationRecordStore:
         recomputed = hashlib.sha256(f"gen-blob-v1\x00{blob.content}".encode()).hexdigest()
         if not hmac.compare_digest(recomputed, blob.blob_digest):
             raise GenerationWitnessError("generation blob digest mismatch")
+        if not hmac.compare_digest(blob.blob_id, blob_id):
+            raise GenerationWitnessError("generation blob row key / model id mismatch")
+        expected_id = blob_id_for(blob.namespace, recomputed)
+        if not hmac.compare_digest(expected_id, blob_id):
+            raise GenerationWitnessError("generation blob content-address mismatch")
+        expected_kind = "audit_head_set" if blob.namespace == "audit_head" else "wrapped_key_state"
+        if blob.content_kind != expected_kind:
+            raise GenerationWitnessError("generation blob namespace / content kind mismatch")
         return blob
 
     def latest_generation(self, namespace: GenerationNamespace, trust_epoch: int) -> int | None:

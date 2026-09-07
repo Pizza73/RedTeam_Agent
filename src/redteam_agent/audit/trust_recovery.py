@@ -258,11 +258,25 @@ class OfflineTrustRecoveryService:
             if existing is not None:
                 if adoption.namespace == "wrapped_key_state" and current.generation != 0:
                     raise TrustRecoveryError("recovered wrapped-key witness advanced outside the approval")
-                if adoption.namespace == "audit_head" and (
-                    current.generation not in (0, 1)
-                    or (current.generation == 1 and current.state_digest != existing.consumption_digest)
-                ):
-                    raise TrustRecoveryError("recovered audit witness advanced outside the approval")
+                if adoption.namespace == "audit_head":
+                    if current.generation not in (0, 1):
+                        raise TrustRecoveryError("recovered audit witness advanced outside the approval")
+                    if current.generation == 1:
+                        try:
+                            recovery_content = json.loads(new_coordinator.record_content(current))
+                        except (TypeError, ValueError) as exc:
+                            raise TrustRecoveryError("recovered audit witness content is invalid") from exc
+                        embedded = recovery_content.get("trust_recovery_consumption")
+                        expected_state = self._ds.compute("security_projection_digest", {
+                            "trust_recovery_consumption_digest": existing.consumption_digest,
+                            "audit_head_state": recovery_content,
+                        })
+                        if (
+                            not isinstance(embedded, dict)
+                            or embedded.get("consumption_digest") != existing.consumption_digest
+                            or current.state_digest != expected_state
+                        ):
+                            raise TrustRecoveryError("recovered audit witness advanced outside the approval")
             if (
                 genesis.generation != 0
                 or genesis.state_digest != adoption.adopted_state_digest
@@ -386,9 +400,13 @@ class OfflineTrustRecoveryService:
         adopted_state["trust_recovery_consumption"] = consumption.model_dump(mode="json")
         adopted_state["audit_discontinuity_digest"] = consumption.audit_discontinuity_digest
         content = canonical_dumps(adopted_state).decode("utf-8")
+        recovery_state_digest = self._ds.compute("security_projection_digest", {
+            "trust_recovery_consumption_digest": consumption.consumption_digest,
+            "audit_head_state": adopted_state,
+        })
         record = coordinator.commit(
             "audit_head",
-            new_state_digest=consumption.consumption_digest,
+            new_state_digest=recovery_state_digest,
             new_content=content,
             operation_id=f"trust-recovery-consumption-witness-{consumption.approval_id}",
         )
@@ -396,6 +414,6 @@ class OfflineTrustRecoveryService:
         if (
             current is None
             or current.witness_digest != record.witness_digest
-            or record.state_digest != consumption.consumption_digest
+            or record.state_digest != recovery_state_digest
         ):
             raise TrustRecoveryError("recovery approval consumption witness read-back failed")

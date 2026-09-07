@@ -43,7 +43,8 @@ class LeaseFencingMachine(RuleBasedStateMachine):
         epoch.establish(guard=guard, trust_epoch=1, deployment_epoch=7, nv_identity_digest="id",
                         provider_identity="tpm2_nv", established_at_iso="2026-01-15T12:00:00Z")
         self._leases = LeaseService(database=db, digest_service=ds, clock_guard=ClockIntegrityGuard(self._clock),
-                                    epoch_service=epoch, write_guard=guard, policy=LeasePolicy())
+                                    epoch_service=epoch, anchor_verifier=lambda: epoch.current(),
+                                    write_guard=guard, policy=LeasePolicy())
         self._binding = finalize_provider_task_binding(
             ProviderTaskBinding(task_id="t", execution_id="e", adapter_identity_digest="a",
                                 provider_identity_digest="p", provider_task_id="pt", dispatch_claim_id="c",

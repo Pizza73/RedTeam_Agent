@@ -12,6 +12,7 @@ real adapter and nothing is dispatched externally. The production composition ro
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import cast
 
 from redteam_agent.audit.critical_witness import CriticalWitnessBarrier
 from redteam_agent.audit.generation import AuthenticatedGenerationCoordinator
@@ -26,6 +27,10 @@ from redteam_agent.crypto.key_provider import InMemoryEnvelopeKeyProvider
 from redteam_agent.crypto.models import EnvelopeCiphertext
 from redteam_agent.erasure.models import QuarantineDeletionIntent, QuarantineErasureClaim
 from redteam_agent.erasure.service import VerifiedQuarantineEraser
+from redteam_agent.execution.adapter import ExecutionAdapter
+from redteam_agent.execution.collection import ResultCollectionCoordinator
+from redteam_agent.execution.ingestion import ResultIngestionCoordinator
+from redteam_agent.execution.secret_source import TrustedSecretSource
 from redteam_agent.ingestion.artifact_store import ArtifactStore
 from redteam_agent.ingestion.manifest import SecureIngestionManifest
 from redteam_agent.ingestion.publication_rule import OutputPublicationParser, OutputPublicationRuleCatalog
@@ -43,6 +48,84 @@ from redteam_agent.storage.database import CriticalMutation
 from redteam_agent.storage.guard import WriteGuard
 
 DEFAULT_QUARANTINE_RETENTION_SECONDS = 14 * 24 * 3600
+
+
+@dataclass(frozen=True)
+class _SecureCollectionStart:
+    collection_id: str
+    execution_id: str
+    sink_id: str
+
+
+class _SecureCollectionFacade:
+    """Compatibility surface that converges every Phase 0C caller on encrypted collection."""
+
+    def __init__(
+        self, service: QuarantineCollectionService, phase0b: Phase0BKernel,
+        adapters: dict[str, ExecutionAdapter],
+    ) -> None:
+        self._service = service
+        self._phase0b = phase0b
+        self._adapters = adapters
+
+    def start_collection(
+        self, *, execution_id: str, recovery_authority_id: str | None = None,
+    ) -> _SecureCollectionStart:
+        del recovery_authority_id
+        record = self._phase0b.execution_repository.get(execution_id)
+        binding = self._phase0b.task_binding_repository.find_by_execution(execution_id)
+        if record is None or binding is None or record.resolved_adapter_id not in self._adapters:
+            raise RuntimeError("secure collection prerequisites are unavailable")
+        return _SecureCollectionStart(
+            collection_id=f"collection-{execution_id}", execution_id=execution_id,
+            sink_id=f"sink-{execution_id}",
+        )
+
+    def collect(self, *, execution_id: str, recovery_authority_id: str | None = None) -> object:
+        self.start_collection(execution_id=execution_id, recovery_authority_id=recovery_authority_id)
+        record = self._phase0b.execution_repository.get(execution_id)
+        assert record is not None
+        return self._service.collect_from_adapter(
+            execution_id=execution_id, adapter=self._adapters[record.resolved_adapter_id]
+        )
+
+    def prepare_local_collection(self, *, execution_id: str, binding: object) -> tuple[object, object]:
+        return self._service.prepare_local_collection(
+            execution_id=execution_id, binding=binding  # type: ignore[arg-type]
+        )
+
+    def finalize_local_collection(self, *, execution_id: str, sink: object, control: object) -> object:
+        return self._service.finalize_local_collection(
+            execution_id=execution_id, sink=sink, control=control  # type: ignore[arg-type]
+        )
+
+    def abandon(self, *, execution_id: str, reason: str) -> object:
+        del execution_id, reason
+        raise RuntimeError("Phase 0C collection expiry must use the retention scheduler")
+
+
+class _SecureIngestionFacade:
+    def __init__(self, service: SecureIngestionService, phase0b: Phase0BKernel) -> None:
+        self._service = service
+        self._phase0b = phase0b
+
+    def ingest(self, *, execution_id: str) -> object:
+        state = self._phase0b.ingestion_repository.find_by_execution(execution_id)
+        if state is None:
+            raise RuntimeError("secure ingestion state is unavailable")
+        return self._service.ingest(ingestion_id=state.ingestion_id)
+
+    def retry(self, *, execution_id: str) -> object:
+        return self.ingest(execution_id=execution_id)
+
+
+class _SecretLifecycleSource:
+    def __init__(self, store: SecretLifecycleStore, authority: object) -> None:
+        self._store = store
+        self._authority = authority
+
+    def open_version(self, secret_version_id: str) -> bytearray:
+        return self._store.open_version(secret_version_id, authority=self._authority)
 
 
 @dataclass
@@ -93,6 +176,9 @@ def build_phase0c_kernel(
     guard = WriteGuard()
     kernel.phase0a.mission_manager.bind_trust_recovery_guard(guard)
     clock_guard = ClockIntegrityGuard(clock)
+    quarantine_read_authority = object()
+    secret_read_authority = object()
+    artifact_read_authority = object()
 
     key_provider = InMemoryEnvelopeKeyProvider(digest_service=ds)
     quarantine_blobs = InMemoryQuarantineBlobStore()
@@ -111,16 +197,22 @@ def build_phase0c_kernel(
     epoch_service = DeploymentEpochService(db, ds, guard)
     lease_service = LeaseService(
         database=db, digest_service=ds, clock_guard=clock_guard, epoch_service=epoch_service,
+        anchor_verifier=lambda: epoch_service.verify_against_tpm(coordinator),
         write_guard=guard, policy=LeasePolicy(),
     )
     quarantine_store = EncryptedQuarantineStore(
         database=db, blob_store=quarantine_blobs, key_provider=key_provider, digest_service=ds, clock=clock,
+        read_authority=quarantine_read_authority,
     )
     secret_store = SecretLifecycleStore(
         database=db, digest_service=ds, clock=clock, audit_store=audit_store, key_provider=key_provider,
         secret_blob_store=secret_blobs,
+        read_authority=secret_read_authority,
     )
-    artifact_store = ArtifactStore(database=db, blob_store=artifact_blobs, key_provider=key_provider, digest_service=ds)
+    artifact_store = ArtifactStore(
+        database=db, blob_store=artifact_blobs, key_provider=key_provider, digest_service=ds,
+        read_authority=artifact_read_authority,
+    )
     rule_catalog = OutputPublicationRuleCatalog(ds)
     rule_catalog.register(
         rule_id="pub-1", parser_id="json_object_v1",
@@ -147,6 +239,7 @@ def build_phase0c_kernel(
         registry_repository=kernel.phase0a.registry_repository, registry_revision=kernel.phase0a.registry_revision,
         quarantine_store=quarantine_store, secret_store=secret_store, artifact_store=artifact_store,
         rule_catalog=rule_catalog, parser=parser, lease_service=lease_service, audit_store=audit_store,
+        quarantine_read_authority=quarantine_read_authority,
     )
     eraser = VerifiedQuarantineEraser(
         database=db, digest_service=ds, clock=clock, exec_guard=kernel.execution_guard,
@@ -353,6 +446,20 @@ def build_phase0c_kernel(
         nv_identity_digest=witness.identity("deployment_epoch").identity_digest,
         provider_identity=key_provider.provider_identity, established_at_iso="2026-01-15T12:00:00Z",
     )
+    adapters: dict[str, ExecutionAdapter] = {
+        kernel.mock_adapter.identity().adapter_id: kernel.mock_adapter,
+    }
+    collection_facade = _SecureCollectionFacade(collection_service, kernel, adapters)
+    ingestion_facade = _SecureIngestionFacade(ingestion_service, kernel)
+    secret_source = _SecretLifecycleSource(secret_store, secret_read_authority)
+    kernel.executor.bind_phase0c_dependencies(
+        guard=kernel.execution_guard,
+        collection_coordinator=cast(ResultCollectionCoordinator, collection_facade),
+        secret_source=cast(TrustedSecretSource, secret_source),
+        secret_metadata_reader=secret_store,
+    )
+    kernel.collection_coordinator = cast(ResultCollectionCoordinator, collection_facade)
+    kernel.ingestion_coordinator = cast(ResultIngestionCoordinator, ingestion_facade)
     return Phase0CKernel(
         phase0b=kernel, monotonic_clock=clock, clock_guard=clock_guard, data_guard=guard,
         key_provider=key_provider, nv_witness=witness, generation_coordinator=coordinator,

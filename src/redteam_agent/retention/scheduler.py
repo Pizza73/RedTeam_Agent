@@ -74,8 +74,10 @@ class LocalRetentionScheduler:
         return self._guard_clock.read().utc
 
     def _anchor_ok(self) -> None:
-        if self._epoch.current() is None:
-            raise ResultIngestionError("no deployment epoch mirror; scheduler cannot run")
+        try:
+            self._leases.verify_current_epoch()
+        except Exception as exc:
+            raise ResultIngestionError("deployment epoch anchor verification failed") from exc
 
     # --- evidence-retention expiry (committed quarantine, unpublished ingestion) ---
 
@@ -242,7 +244,7 @@ class LocalRetentionScheduler:
 
 def _dump(model: object) -> str:
     assert hasattr(model, "model_dump")
-    return json.dumps(model.model_dump(mode="json"), sort_keys=True)  # type: ignore[attr-defined]
+    return json.dumps(model.model_dump(mode="json"), sort_keys=True)
 
 
 def _iso(value: datetime) -> str:

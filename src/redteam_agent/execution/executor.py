@@ -177,6 +177,17 @@ class Executor:
         # guard is shared by every execution-safety service), so no service binds
         # ownership in its constructor.
 
+    def bind_phase0c_dependencies(
+        self, *, guard: WriteGuard, collection_coordinator: ResultCollectionCoordinator,
+        secret_source: TrustedSecretSource, secret_metadata_reader: SecretMetadataReader,
+    ) -> None:
+        """Replace Phase 0B test-only plaintext paths at the Phase 0C composition root."""
+        if guard is not self._guard:
+            raise ExecutionRecordError("Phase 0C dependency replacement is composition-owned")
+        self._collection = collection_coordinator
+        self._secret_source = secret_source
+        self._secret_metadata = secret_metadata_reader
+
     # --- create (PLANNED -> AUTHORIZED) -----------------------------------
 
     def create_execution(

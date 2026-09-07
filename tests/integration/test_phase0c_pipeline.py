@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 import support_phase0c as s
-from redteam_agent.errors import RawResultQuarantineError
+from redteam_agent.errors import RawResultQuarantineError, SecureIngestionError
 from redteam_agent.storage.unit_of_work import ApplicationUnitOfWork
 
 
@@ -34,7 +34,7 @@ def test_full_pipeline_publishes_and_erases() -> None:
     # Quarantine is DELETED and its ciphertext is undecryptable.
     assert kernel.quarantine_store.get_metadata(f"q-{d.execution_id}").status == "DELETED"
     with pytest.raises(RawResultQuarantineError):
-        kernel.quarantine_store.open_reader(f"q-{d.execution_id}")
+        kernel.quarantine_store.open_reader(f"q-{d.execution_id}", authority=object())
     kernel.audit_store.verify_chain(d.mission_id)
 
 
@@ -75,7 +75,7 @@ def test_no_plaintext_in_application_db_or_blob_after_collection() -> None:
         assert b"leakcanary" not in blobs.get(handle)
 
 
-def test_encrypted_raw_artifact_round_trip_uses_bound_aad() -> None:
+def test_encrypted_raw_artifact_is_not_readable_without_bound_grant_authority() -> None:
     kernel = s.make_phase0c()
     body = b"raw-artifact-secret"
     ref, handle, ciphertext, encryption = kernel.artifact_store.build_encrypted_raw(
@@ -100,4 +100,7 @@ def test_encrypted_raw_artifact_round_trip_uses_bound_aad() -> None:
             encryption=encryption,
         )
         uow.record_result(ref.artifact_digest)
-    assert kernel.artifact_store.read_body("raw-artifact-1", execution_id="execution-1") == body
+    with pytest.raises(SecureIngestionError):
+        kernel.artifact_store.read_body(
+            "raw-artifact-1", execution_id="execution-1", grant=object(), authority=object()  # type: ignore[arg-type]
+        )

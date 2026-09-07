@@ -413,7 +413,7 @@ class VerifiedQuarantineEraser:
 
 def _dump(model: object) -> str:
     assert hasattr(model, "model_dump")
-    return json.dumps(model.model_dump(mode="json"), sort_keys=True)  # type: ignore[attr-defined]
+    return json.dumps(model.model_dump(mode="json"), sort_keys=True)
 
 
 def _iso(value: datetime) -> str:

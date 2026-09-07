@@ -10,6 +10,8 @@ caller/LLM cannot pick the parser or the public fields.
 
 from __future__ import annotations
 
+import codecs
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -128,15 +130,51 @@ class OutputPublicationParser:
     """Bounded JSON/NDJSON parser applying the fixed rule (no caller-selected code)."""
 
     def parse(self, rule: OutputPublicationRule, raw: bytes) -> ParsedOutput:
+        return self.parse_chunks(rule, (raw,))
+
+    def parse_chunks(self, rule: OutputPublicationRule, chunks: Iterable[bytes]) -> ParsedOutput:
+        """Incrementally decode records while retaining at most one bounded record."""
+        decoder = codecs.getincrementaldecoder("utf-8")("strict")
+        pending = ""
+        records: tuple[str, ...]
         try:
-            text = raw.decode("utf-8")
+            decoded_chunks: list[str] = []
+            if rule.parser_id == "json_object_v1":
+                byte_count = 0
+                for chunk in chunks:
+                    byte_count += len(chunk)
+                    if byte_count > rule.max_record_bytes:
+                        raise OutputPublicationError("record exceeds the rule byte limit; not publishable")
+                    decoded_chunks.append(decoder.decode(chunk, final=False))
+                decoded_chunks.append(decoder.decode(b"", final=True))
+                records = ("".join(decoded_chunks),)
+            else:
+                records_list: list[str] = []
+                for chunk in chunks:
+                    pending += decoder.decode(chunk, final=False)
+                    while "\n" in pending:
+                        line, pending = pending.split("\n", 1)
+                        line = line.removesuffix("\r")
+                        if line.strip():
+                            if len(line.encode("utf-8")) > rule.max_record_bytes:
+                                raise OutputPublicationError("record exceeds the rule byte limit; not publishable")
+                            records_list.append(line)
+                            if len(records_list) > rule.max_public_artifacts:
+                                raise OutputPublicationError("too many public records for the rule quota")
+                    if len(pending.encode("utf-8")) > rule.max_record_bytes:
+                        raise OutputPublicationError("record exceeds the rule byte limit; not publishable")
+                pending += decoder.decode(b"", final=True)
+                if pending.strip():
+                    if len(pending.encode("utf-8")) > rule.max_record_bytes:
+                        raise OutputPublicationError("record exceeds the rule byte limit; not publishable")
+                    records_list.append(pending)
+                records = tuple(records_list)
         except UnicodeDecodeError as exc:
             raise OutputPublicationError("output is not valid UTF-8; not publishable") from exc
-        lines = [text] if rule.parser_id == "json_object_v1" else [ln for ln in text.splitlines() if ln.strip()]
         redacted_records: list[dict[str, Any]] = []
         detected: list[DetectedSecretValue] = []
         redaction_count = 0
-        for line in lines:
+        for line in records:
             if len(line.encode("utf-8")) > rule.max_record_bytes:
                 raise OutputPublicationError("record exceeds the rule byte limit; not publishable")
             try:
