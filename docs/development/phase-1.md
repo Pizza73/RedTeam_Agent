@@ -5,13 +5,14 @@
 - 設計正本: `SystemDesign.md` Phase 1、`SystemDesign_AI_Control.md`、`docs/acceptance-criteria.md`
 - 基点: `0a12cf9a702303f1b9ca87c702141addb996ae87`（Phase 0C受入記録）
 - 実装範囲: 基点の次から最終実装コミットまで
-- 最終実装コミット: `6eb667966620139eb027874408d59d50935fed82`
+- 最終実装コミット: `0b95281e5dc4d8780c4a74ebf28b1e05818a580e`
 
 ## 実装と受入要件
 
 | 要件 | 実装 / Evidence |
 | --- | --- |
-| Mission→Planner→Policy→Executor→Analyzer→Goal | `Phase1AgentWorkflow`、`test_phase1_mock_loop.py` |
+| Mission→Planner→Policy→Executor→Analyzer→Goal | `Phase1AgentWorkflow`のcompiled LangGraph、`tests/integration/test_phase1_mock_loop.py::test_mock_agent_loop_reaches_goal_through_real_policy_and_executor` |
+| Coarse Agent Graph / retry境界 | `tests/integration/test_phase1_mock_loop.py::test_phase1_uses_compiled_coarse_graphs_without_automatic_retry`。Planning 11 node、Analysis 4 nodeを実経路に接続し、LangGraph automatic retryは全nodeで未設定 |
 | Context Grant / Tool Snapshot前後検証 | `PlannerContextService`、`test_phase1_planner_context.py`、`test_phase1_context_builder.py` |
 | Scope外・UnavailableのProvider到達拒否 | `PlannerActionApplicationService`、Phase 0A/0B Policy・Executor negative suite |
 | Bounded Context Request / typed Retrieval Hint | Envelope lineage、durable context retry budget、Pydantic closed union tests |
@@ -25,7 +26,8 @@
 | D10 failure accounting | `ExecutionOutcomeAccountingService`、Execution作成順・取込完了後・一度だけ適用 |
 | retry境界分離 | context / persistent commit / dispatch / collection / ingestion / reconciliationの永続Budgetを別Keyで管理 |
 | AD Principal Context Goal | Current Active Session、exact principal、Session Managerが確認した登録済みAD Group SIDを同時要求。Group証明なしを拒否 |
-| Finalization | 終了理由を固定し、期限到達は`ABORTED`、Goal達成は`COMPLETED`へ収束。`FINALIZING`から予算付きReconciliation、必要時Cancel、Final Session/Goal Refreshを再開 |
+| Finalization | 終了理由を固定し、期限到達は`ABORTED`、Goal達成は`COMPLETED`へ収束。`tests/integration/test_phase1_mock_loop.py::test_finalizing_cancelled_execution_collects_ingests_and_completes`と`::test_finalizing_resume_uses_bounded_reconciliation_and_cancel` |
+| 有限Recovery停止 | RUNNING/FINALIZINGの予算枯渇をexact Execution固定のUnresolved Itemと`WAITING_HUMAN_REVIEW`へ収束。`tests/integration/test_phase1_mock_loop.py::test_running_recovery_budget_exhaustion_converges_to_human_review` |
 | 最大Iteration | Planner iterationをdurable dispatch budgetへ一致させ、ControllerがMission上限で停止 |
 
 ## AI-01〜12 対応
@@ -83,7 +85,7 @@ negative pathも実行する。
 PATH=/tmp/phase0c-tpm/usr/bin:$PATH \
 LD_LIBRARY_PATH=/tmp/phase0c-tpm/usr/lib/x86_64-linux-gnu:/tmp/phase0c-tpm/usr/lib/x86_64-linux-gnu/swtpm \
 PYTHONPATH=src .venv/bin/python -m pytest -q -ra
-  PASS: 555 tests（swtpm 7件を含む）
+  PASS: 559 tests（swtpm 7件を含む）
 
 .venv/bin/python -m ruff check src tests
   PASS
@@ -109,5 +111,27 @@ coverage run --branch -m pytest / coverage report
 BLOCKER 0 / HIGH 2 / MEDIUM 3でFAILだった。任意Unresolved解消・cross-mission付替え、Workflow未接続、
 Verified Finding再投影、古いコミット参照、要件対応表を`a22302824ff6a918d421b2c31347b6448033e6ca`で修正した。
 再レビューで残ったexact Execution未固定、監査Event不足、期限/FINALIZING回復未収束を
-`6eb667966620139eb027874408d59d50935fed82`で修正した。
+`6eb667966620139eb027874408d59d50935fed82`で修正した。terminal cancelの収集・取込・消去、RUNNING/
+FINALIZING recovery予算枯渇のHuman Review収束、実LangGraph接続、Phase 1生成的状態遷移Evidenceを
+`0b95281e5dc4d8780c4a74ebf28b1e05818a580e`で追加した。
 最終判定と固定review artifactは再レビュー完了後に`docs/reviews/`へ記録する。
+
+## Phase 1生成的状態遷移Evidence
+
+`tests/property/test_phase1_agent_state_machine.py::TestPhase1AgentStateMachine::runTest`は、公開Workflowを
+`plan_once`、`reconcile_uncertain_execution`、`reach_hard_limit`、`resume_finalization`、
+`stale_working_state_update_is_atomic`の規則で生成的に駆動する。独立Oracleは、Provider submitが最大1回、
+reconciliation消費が最大3回、予算枯渇時のexact source Unresolved eventが1件、Missionが
+`WAITING_HUMAN_REVIEW`へ収束、stale Working State失敗時にrow不変、Graph checkpointerが永続Objectを
+保持しないことを検査する。これを次の固定node IDと組み合わせてAI/ACの状態変更Evidenceとする。
+
+| Oracle | 固定pytest node ID |
+| --- | --- |
+| compiled Graph、node接続、side-effect自動retryなし | `tests/integration/test_phase1_mock_loop.py::test_phase1_uses_compiled_coarse_graphs_without_automatic_retry` |
+| 正常 Plan→Dispatch→Ingest→Analyze→Goal→COMPLETED | `tests/integration/test_phase1_mock_loop.py::test_mock_agent_loop_reaches_goal_through_real_policy_and_executor` |
+| terminal cancel→Collection→Ingestion→Erasure→COMPLETED | `tests/integration/test_phase1_mock_loop.py::test_finalizing_cancelled_execution_collects_ingests_and_completes` |
+| FINALIZING recovery上限→Unresolved→Human Review | `tests/integration/test_phase1_mock_loop.py::test_finalizing_resume_uses_bounded_reconciliation_and_cancel` |
+| RUNNING recovery上限→Finalization Intent→Human Review | `tests/integration/test_phase1_mock_loop.py::test_running_recovery_budget_exhaustion_converges_to_human_review` |
+| Controller/Finalization/Unresolved/Working State生成系列 | `tests/property/test_phase1_agent_state_machine.py::TestPhase1AgentStateMachine::runTest` |
+| Context grant/body/current snapshot negative | `tests/security/test_phase1_context_builder.py::test_context_builder_cannot_read_body_without_stored_grant`、`tests/integration/test_phase1_planner_context.py::test_epoch_change_invalidates_planner_context_before_model_use` |
+| uncertain submit/reconcileで再送なし | `tests/integration/test_reconciliation.py::test_uncertain_submit_goes_to_reconciliation_without_resubmit` |
