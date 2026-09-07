@@ -75,6 +75,18 @@ class Phase1AgentWorkflow:
             mission_id=envelope.mission_id, operation_id=ids.operation_id,
             projection=envelope.action_candidate_projection,
         )
+        if decision.action == "RECOVER":
+            checkpoint = self._controller.checkpoint(envelope.mission_id)
+            if checkpoint is None or checkpoint.active_execution_id is None:
+                raise AgentLoopError("recovery decision has no active execution binding")
+            self._reconciliation.reconcile(execution_id=checkpoint.active_execution_id)
+            return WorkflowStepResult(decision, None, None)
+        if decision.action == "FINALIZE":
+            self._finalization.finalize(envelope.mission_id)
+            return WorkflowStepResult(decision, None, None)
+        if decision.action == "STOP":
+            self._finalization.resume_completion(envelope.mission_id)
+            return WorkflowStepResult(decision, None, None)
         if decision.action != "PLAN":
             return WorkflowStepResult(decision, None, None)
         output = self._gateway.invoke_planner(

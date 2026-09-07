@@ -116,6 +116,8 @@ def test_ad_principal_discovery_requires_current_matching_session_context() -> N
     )
     assert kernel.goal_service.evaluate(mission_id=revision.mission_id).status.status == "not_achieved"
     session = support.session_snapshot(privileged=True)
+    phase0a.session_repository.save(session)
+    assert kernel.goal_service.evaluate(mission_id=revision.mission_id).status.status == "not_achieved"
     session = session.model_copy(update={
         "context": session.context.model_copy(update={
             "verified_ad_group_sids": frozenset({"S-1-5-21-512"})

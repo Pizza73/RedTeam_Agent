@@ -59,6 +59,23 @@ def test_mock_agent_loop_reaches_goal_through_real_policy_and_executor() -> None
     assert transition is not None
     assert transition.dispatch is not None and planner.call_count == 1
 
+    adapter = kernel.phase0c.phase0b.mock_adapter
+    adapter._reconcile_status = "FOUND_RUNNING"  # type: ignore[attr-defined]
+    recovery = kernel.workflow.run_planning_iteration(
+        envelope=envelope,
+        ids=PlanningOperationIds(
+            operation_id="mock-loop-recover", plan_id="unused-plan",
+            run_id="unused-run", thread_id="unused-thread",
+            decision_id="unused-decision", execution_id="unused-execution",
+            task_id="unused-task",
+        ),
+        invoke_planner=lambda: (_ for _ in ()).throw(
+            AssertionError("recovery must not invoke the Planner")
+        ),
+    )
+    assert recovery.controller_decision.action == "RECOVER"
+    assert adapter.reconcile_calls == 1
+
     collected = kernel.phase0c.collection_service.collect(
         execution_id="mock-loop-execution",
         stdout=b'{"host":"10.1.2.3","status":"open","port":443}', stderr=b"",
@@ -70,7 +87,20 @@ def test_mock_agent_loop_reaches_goal_through_real_policy_and_executor() -> None
     )
     kernel.phase0c.phase0b.phase0a.session_repository.save(support.session_snapshot())
     with pytest.raises(AgentLoopError):
-        kernel.finalization_service.finalize(mission_id)
+        kernel.workflow.run_planning_iteration(
+            envelope=envelope,
+            ids=PlanningOperationIds(
+                operation_id="mock-loop-enter-finalization", plan_id="unused-plan",
+                run_id="unused-run", thread_id="unused-thread",
+                decision_id="unused-decision", execution_id="unused-execution",
+                task_id="unused-task",
+            ),
+            invoke_planner=lambda: (_ for _ in ()).throw(
+                AssertionError("finalization must not invoke the Planner")
+            ),
+        )
+    finalizing = kernel.phase0c.phase0b.phase0a.state_repository.get(mission_id)
+    assert finalizing is not None and finalizing.state == "FINALIZING"
     published = kernel.phase0c.ingestion_service.ingest(ingestion_id=collected.ingestion_id)
     assert published.deletion_intent_id is not None
     with pytest.raises(AgentLoopError):
@@ -80,6 +110,7 @@ def test_mock_agent_loop_reaches_goal_through_real_policy_and_executor() -> None
     assert result is not None and result.status == "SUCCEEDED"
     verified = kernel.workflow.project_verified_execution("mock-loop-execution")
     assert verified.verification_state == "confirmed"
+    assert kernel.workflow.project_verified_execution("mock-loop-execution") == verified
 
     analyzer = MockAnalyzer(AnalyzerCandidateObservation(
         observation_id="mock-loop-observation", condition_id="c1",
@@ -102,23 +133,36 @@ def test_mock_agent_loop_reaches_goal_through_real_policy_and_executor() -> None
     # Runtime state changes only through the trusted Session Manager repository,
     # never from the Analyzer candidate itself.
     final = kernel.controller.step(mission_id=mission_id, operation_id="mock-loop-final")
-    assert final.action == "FINALIZE" and final.reason_code == "GOAL_ACHIEVED"
+    assert final.action == "STOP" and final.reason_code == "MISSION_NOT_RUNNING"
     kernel.unresolved_items.open(
         unresolved_id="item-1", mission_id=mission_id,
-        reason_code="FINAL_REVIEW", evidence_digest="pending-evidence",
+        reason_code="INGESTION_COMPLETE", evidence_digest="pending-evidence",
     )
     with pytest.raises(AgentLoopError):
+        kernel.unresolved_items.open(
+            unresolved_id="item-1", mission_id="another-mission",
+            reason_code="INGESTION_COMPLETE", evidence_digest="replacement-evidence",
+        )
+    with pytest.raises(AgentLoopError):
         kernel.workflow.finalize(mission_id)
-    kernel.unresolved_items.resolve(
-        unresolved_id="item-1", evidence_digest="resolved-evidence"
+    kernel.unresolved_items.resolve_from_execution(
+        unresolved_id="item-1", execution_id="mock-loop-execution"
     )
-    state = kernel.phase0c.phase0b.phase0a.state_repository.get(mission_id)
-    assert state is not None
-    kernel.phase0c.phase0b.phase0a.mission_manager.begin_finalization(
-        mission_id, expected_version=state.mission_state_version,
-        actor_token=support.OPERATOR_ACTOR_TOKEN,
+    completed_step = kernel.workflow.run_planning_iteration(
+        envelope=envelope,
+        ids=PlanningOperationIds(
+            operation_id="mock-loop-finalize", plan_id="unused-plan",
+            run_id="unused-run", thread_id="unused-thread",
+            decision_id="unused-decision", execution_id="unused-execution",
+            task_id="unused-task",
+        ),
+        invoke_planner=lambda: (_ for _ in ()).throw(
+            AssertionError("finalization must not invoke the Planner")
+        ),
     )
-    completed = kernel.workflow.finalize(mission_id)
+    assert completed_step.controller_decision.action == "STOP"
+    completed = kernel.phase0c.phase0b.phase0a.state_repository.get(mission_id)
+    assert completed is not None
     assert completed.state == "COMPLETED"
     outcomes = kernel.phase0c.phase0b.phase0a.database.connection.execute(
         "SELECT COUNT(*) FROM occ_store WHERE namespace = 'execution_budget_outcome'"

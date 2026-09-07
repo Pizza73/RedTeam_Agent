@@ -74,7 +74,6 @@ def build_phase1_kernel(*, phase0c: Phase0CKernel | None = None) -> Phase1Kernel
     verified_findings = VerifiedFindingProjector(
         knowledge_service=knowledge, execution_repository=phase0b.execution_repository,
         result_repository=phase0b.result_repository, digest_service=ds,
-        clock=kernel.monotonic_clock,
     )
     reducer = KnowledgeReducer(
         knowledge_service=knowledge,
@@ -116,7 +115,11 @@ def build_phase1_kernel(*, phase0c: Phase0CKernel | None = None) -> Phase1Kernel
         database=phase0a.database, digest_service=ds, clock=kernel.monotonic_clock
     )
     unresolved_items = UnresolvedItemService(
-        database=phase0a.database, digest_service=ds, clock=kernel.monotonic_clock
+        database=phase0a.database, digest_service=ds, clock=kernel.monotonic_clock,
+        execution_repository=phase0b.execution_repository,
+        result_repository=phase0b.result_repository,
+        control_metadata_repository=phase0b.control_metadata_repository,
+        ingestion_repository=phase0b.ingestion_repository,
     )
     context_body_store = ContextBodyStore(ds)
     context_builder = ContextBuilder(

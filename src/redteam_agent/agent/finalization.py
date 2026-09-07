@@ -50,9 +50,34 @@ class FinalizationService:
         self._operator_actor_token = operator_actor_token
 
     def finalize(self, mission_id: str) -> MissionState:
+        self.begin(mission_id)
+        return self._finish(mission_id)
+
+    def resume_completion(self, mission_id: str) -> MissionState | None:
+        state = self._states.get(mission_id)
+        if state is None or state.state != "FINALIZING":
+            return None
+        return self._finish(mission_id)
+
+    def begin(self, mission_id: str) -> MissionState:
         goal = self._goals.evaluate(mission_id=mission_id)
         if goal.status.status != "achieved":
             raise AgentLoopError("mission cannot finalize before its current goal is achieved")
+        state = self._states.get(mission_id)
+        if state is None or state.state not in {"RUNNING", "PAUSED", "FINALIZING"}:
+            raise AgentLoopError("mission is not ready to enter FINALIZING")
+        if state.state == "FINALIZING":
+            return state
+        return self._manager.begin_finalization(
+            mission_id,
+            expected_version=state.mission_state_version,
+            actor_token=self._operator_actor_token,
+        )
+
+    def _finish(self, mission_id: str) -> MissionState:
+        goal = self._goals.evaluate(mission_id=mission_id)
+        if goal.status.status != "achieved":
+            raise AgentLoopError("mission cannot complete before its current goal is achieved")
         executions = self._executions.all_for_mission(mission_id)
         for item in executions:
             if item.provider_execution_state in _ACTIVE:
@@ -68,17 +93,12 @@ class FinalizationService:
         if any(item.status != "RESOLVED" for item in self._unresolved.current(mission_id)):
             raise AgentLoopError("mission cannot finalize with unresolved items")
         state = self._states.get(mission_id)
-        if state is None or state.state not in {"RUNNING", "FINALIZING"}:
-            raise AgentLoopError("mission is not ready to enter FINALIZING")
+        if state is None or state.state != "FINALIZING":
+            raise AgentLoopError("mission finalization was not started")
         self._outcomes.reconcile(
             mission_id=mission_id, mission_revision=state.mission_revision
         )
         finalizing = state
-        if state.state == "RUNNING":
-            finalizing = self._manager.begin_finalization(
-                mission_id, expected_version=state.mission_state_version,
-                actor_token=self._operator_actor_token,
-            )
         refreshed_goal = self._goals.evaluate(mission_id=mission_id)
         if refreshed_goal.status.status != "achieved":
             raise AgentLoopError("mission goal changed while entering FINALIZING")
@@ -98,10 +118,11 @@ class FinalizationService:
         )
         self._audit.verify_chain(mission_id)
         self._witness.verify_current_security_state()
-        completed = self._manager.complete_mission(
-            mission_id, expected_version=finalizing.mission_state_version,
+        terminal = self._manager.complete_mission(
+            mission_id,
+            expected_version=finalizing.mission_state_version,
             actor_token=self._operator_actor_token,
         )
         self._audit.verify_chain(mission_id)
         self._witness.verify_current_security_state()
-        return completed
+        return terminal

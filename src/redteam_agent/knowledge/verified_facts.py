@@ -6,7 +6,6 @@ from redteam_agent.canonical.digest_service import DigestService
 from redteam_agent.errors import KnowledgeStateIntegrityError
 from redteam_agent.knowledge.models import VerifiedFinding
 from redteam_agent.knowledge.service import KnowledgeService
-from redteam_agent.runtime.clock import Clock
 from redteam_agent.storage.execution_repositories import (
     ExecutionRecordRepository,
     ExecutionResultRepository,
@@ -18,11 +17,11 @@ class VerifiedFindingProjector:
         self, *, knowledge_service: KnowledgeService,
         execution_repository: ExecutionRecordRepository,
         result_repository: ExecutionResultRepository,
-        digest_service: DigestService, clock: Clock,
+        digest_service: DigestService,
     ) -> None:
         self._knowledge = knowledge_service
         self._executions, self._results = execution_repository, result_repository
-        self._ds, self._clock = digest_service, clock
+        self._ds = digest_service
 
     def project_success(self, execution_id: str) -> VerifiedFinding:
         execution = self._executions.get(execution_id)
@@ -43,7 +42,7 @@ class VerifiedFindingProjector:
             "subject_ref": execution_id, "predicate": "execution_succeeded",
             "value": "SUCCEEDED", "source_execution_id": execution_id,
             "source_record_digest": source_digest, "verification_state": "confirmed",
-            "finding_version": 1, "recorded_at": self._clock.now(),
+            "finding_version": 1, "recorded_at": result.finished_at,
         }
         finding = VerifiedFinding.model_validate({
             **fields,
