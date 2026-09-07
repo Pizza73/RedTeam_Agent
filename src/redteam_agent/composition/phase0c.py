@@ -304,7 +304,7 @@ def build_phase0c_kernel(
         "mission_authorization", "dispatch_claim", "cancel_attempt", "mission_execution_budget",
         "result_task_binding", "result_ingestion_state", "secure_ingestion_manifest",
         "secret_lifecycle_head", "quarantine_deletion_intent", "quarantine_erasure_claim",
-        "knowledge_evidence_head", "audit_chain_head",
+        "knowledge_evidence_head", "audit_chain_head", "unresolved_item",
     })
     policy_fields = {
         "policy_revision": "generation-witness-policy-v5",

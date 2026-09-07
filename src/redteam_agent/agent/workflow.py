@@ -11,10 +11,13 @@ from redteam_agent.agent.finalization import FinalizationService
 from redteam_agent.agent.llm_gateway import SharedLLMGateway
 from redteam_agent.agent.models import ControllerDecision, PlannerContextEnvelope
 from redteam_agent.agent.planner_context import PlannerContextService
+from redteam_agent.agent.retry_budget import AgentRetryBudgetService
 from redteam_agent.erasure.service import VerifiedQuarantineEraser
 from redteam_agent.errors import AgentLoopError
-from redteam_agent.execution.models import AdapterCollectionControl
+from redteam_agent.execution.executor import Executor
+from redteam_agent.execution.models import AdapterCollectionControl, ProviderTaskBinding
 from redteam_agent.execution.reconcile import ReconcileOutcome, ReconciliationService
+from redteam_agent.execution.recovery import ExecutionRecoveryService
 from redteam_agent.ingestion.service import SecureIngestionService
 from redteam_agent.knowledge.models import KnowledgeObservation, VerifiedFinding
 from redteam_agent.knowledge.reducer import KnowledgeReducer
@@ -22,6 +25,11 @@ from redteam_agent.knowledge.verified_facts import VerifiedFindingProjector
 from redteam_agent.mission.models import MissionState
 from redteam_agent.plan.models import PlannerActionOutput, PlannerContextRequest, PlannerOutput
 from redteam_agent.quarantine.collection import QuarantineCollectionResult, QuarantineCollectionService
+from redteam_agent.storage.execution_repositories import (
+    CancelAttemptRepository,
+    ExecutionRecordRepository,
+    ResultTaskBindingRepository,
+)
 
 
 @dataclass(frozen=True)
@@ -54,6 +62,12 @@ class Phase1AgentWorkflow:
         ingestion_service: SecureIngestionService,
         eraser: VerifiedQuarantineEraser,
         reconciliation: ReconciliationService,
+        recovery_service: ExecutionRecoveryService,
+        retry_budget_service: AgentRetryBudgetService,
+        execution_repository: ExecutionRecordRepository,
+        task_binding_repository: ResultTaskBindingRepository,
+        cancel_attempt_repository: CancelAttemptRepository,
+        executor: Executor,
         finalization: FinalizationService,
         verified_finding_projector: VerifiedFindingProjector,
     ) -> None:
@@ -64,6 +78,12 @@ class Phase1AgentWorkflow:
         self._reducer = knowledge_reducer
         self._collection, self._ingestion = collection_service, ingestion_service
         self._eraser, self._reconciliation = eraser, reconciliation
+        self._recovery = recovery_service
+        self._retry_budgets = retry_budget_service
+        self._executions = execution_repository
+        self._bindings = task_binding_repository
+        self._cancel_attempts = cancel_attempt_repository
+        self._executor = executor
         self._finalization = finalization
         self._verified_findings = verified_finding_projector
 
@@ -79,13 +99,18 @@ class Phase1AgentWorkflow:
             checkpoint = self._controller.checkpoint(envelope.mission_id)
             if checkpoint is None or checkpoint.active_execution_id is None:
                 raise AgentLoopError("recovery decision has no active execution binding")
-            self._reconciliation.reconcile(execution_id=checkpoint.active_execution_id)
+            self._reconcile(envelope.mission_id, checkpoint.active_execution_id)
             return WorkflowStepResult(decision, None, None)
         if decision.action == "FINALIZE":
-            self._finalization.finalize(envelope.mission_id)
+            if decision.reason_code == "GOAL_ACHIEVED":
+                self._finalization.begin_completion(envelope.mission_id)
+            else:
+                self._finalization.begin_abort(envelope.mission_id)
+            self._drive_finalization(envelope.mission_id)
             return WorkflowStepResult(decision, None, None)
         if decision.action == "STOP":
-            self._finalization.resume_completion(envelope.mission_id)
+            if self._finalization.is_finalizing(envelope.mission_id):
+                self._drive_finalization(envelope.mission_id)
             return WorkflowStepResult(decision, None, None)
         if decision.action != "PLAN":
             return WorkflowStepResult(decision, None, None)
@@ -143,3 +168,60 @@ class Phase1AgentWorkflow:
 
     def project_verified_execution(self, execution_id: str) -> VerifiedFinding:
         return self._verified_findings.project_success(execution_id)
+
+    def _drive_finalization(self, mission_id: str) -> None:
+        for execution_id in self._finalization.active_execution_ids(mission_id):
+            outcome = self._reconcile(mission_id, execution_id)
+            if outcome.provider_execution_state in {"DISPATCHED", "RUNNING"}:
+                self._cancel_for_finalization(execution_id)
+        if not self._finalization.active_execution_ids(mission_id):
+            self._finalization.resume(mission_id)
+
+    def _reconcile(self, mission_id: str, execution_id: str) -> ReconcileOutcome:
+        current = self._executions.get(execution_id)
+        if current is None:
+            raise AgentLoopError("recovery execution is missing")
+        if current.provider_execution_state == "AUTHORIZED":
+            blocked = self._executor.abandon_pre_dispatch(execution_id=execution_id)
+            return ReconcileOutcome(
+                execution_id, blocked.provider_execution_state, "PRE_DISPATCH_ABANDONED"
+            )
+        if current.provider_execution_state == "PLANNED":
+            raise AgentLoopError(
+                "durable PLANNED execution violates the create transaction boundary"
+            )
+        reserved = self._retry_budgets.reserve(
+            mission_id=mission_id,
+            operation_id=f"reconcile-{execution_id}",
+            retry_kind="reconciliation",
+        )
+        authority = self._recovery.issue_authority(
+            authority_id=f"agent-reconcile-{execution_id}-{reserved.consumed_attempts}",
+            execution_id=execution_id,
+            allowed_operation="reconcile",
+            reason="phase1_existing_execution_recovery",
+        )
+        return self._reconciliation.reconcile(
+            execution_id=execution_id,
+            recovery_authority_id=authority.authority_id,
+        )
+
+    def _cancel_for_finalization(self, execution_id: str) -> None:
+        record = self._executions.get(execution_id)
+        binding = self._bindings.find_by_execution(execution_id)
+        if record is None or not isinstance(binding, ProviderTaskBinding):
+            return
+        if self._cancel_attempts.find(execution_id, binding.provider_task_id) is not None:
+            return
+        authority = self._recovery.issue_authority(
+            authority_id=f"agent-cancel-{execution_id}-v{record.execution_state_version}",
+            execution_id=execution_id,
+            allowed_operation="cancel",
+            reason="phase1_finalization_cancel",
+        )
+        self._recovery.request_cancel(
+            cancel_attempt_id=f"agent-cancel-{execution_id}",
+            execution_id=execution_id,
+            recovery_authority_id=authority.authority_id,
+            reason="phase1_finalization_cancel",
+        )

@@ -32,6 +32,7 @@ _ORACLE_PROVIDER_LEGAL = frozenset(
         ("RUNNING", "SUCCEEDED"),
         ("RUNNING", "OUTCOME_UNKNOWN"),
         ("RECONCILING", "OUTCOME_UNKNOWN"),
+        ("OUTCOME_UNKNOWN", "RECONCILING"),
     }
 )
 # Independent oracle: transitions that must be illegal (no shortcut / no revive).

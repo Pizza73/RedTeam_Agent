@@ -89,6 +89,10 @@ class GoalEvaluationService:
             )
         return record
 
+    def refresh_for_finalization(self, *, mission_id: str) -> GoalEvaluationRecord:
+        """Re-read the exact current owner sources for the finalization boundary."""
+        return self.evaluate(mission_id=mission_id)
+
     def _source_snapshot_digest(self) -> str:
         snapshots = self._sessions.all_snapshots()
         ordered = [

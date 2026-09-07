@@ -120,6 +120,7 @@ def build_phase1_kernel(*, phase0c: Phase0CKernel | None = None) -> Phase1Kernel
         result_repository=phase0b.result_repository,
         control_metadata_repository=phase0b.control_metadata_repository,
         ingestion_repository=phase0b.ingestion_repository,
+        audit_store=kernel.audit_store,
     )
     context_body_store = ContextBodyStore(ds)
     context_builder = ContextBuilder(
@@ -162,7 +163,7 @@ def build_phase1_kernel(*, phase0c: Phase0CKernel | None = None) -> Phase1Kernel
         database=phase0a.database,
         unresolved_items=unresolved_items,
         audit_store=kernel.audit_store, witness_barrier=kernel.critical_witness_barrier,
-        operator_actor_token=OPERATOR_ACTOR_TOKEN,
+        operator_actor_token=OPERATOR_ACTOR_TOKEN, digest_service=ds,
     )
     workflow = Phase1AgentWorkflow(
         controller=controller, llm_gateway=llm_gateway,
@@ -171,6 +172,12 @@ def build_phase1_kernel(*, phase0c: Phase0CKernel | None = None) -> Phase1Kernel
         collection_service=kernel.collection_service,
         ingestion_service=kernel.ingestion_service, eraser=kernel.eraser,
         reconciliation=phase0b.reconciliation, finalization=finalization,
+        recovery_service=phase0b.recovery_service,
+        retry_budget_service=retry_budgets,
+        execution_repository=phase0b.execution_repository,
+        task_binding_repository=phase0b.task_binding_repository,
+        cancel_attempt_repository=phase0b.cancel_attempt_repository,
+        executor=phase0b.executor,
         verified_finding_projector=verified_findings,
     )
     return Phase1Kernel(

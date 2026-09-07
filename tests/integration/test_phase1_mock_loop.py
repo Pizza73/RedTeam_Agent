@@ -85,6 +85,19 @@ def test_mock_agent_loop_reaches_goal_through_real_policy_and_executor() -> None
             status_normalization_rule_id="status-normalization-v1",
         ),
     )
+    kernel.unresolved_items.open(
+        unresolved_id="item-1",
+        mission_id=mission_id,
+        source_execution_id="mock-loop-execution",
+        reason_code="INGESTION_COMPLETE",
+    )
+    with pytest.raises(AgentLoopError):
+        kernel.unresolved_items.open(
+            unresolved_id="item-1",
+            mission_id="another-mission",
+            source_execution_id="mock-loop-execution",
+            reason_code="INGESTION_COMPLETE",
+        )
     kernel.phase0c.phase0b.phase0a.session_repository.save(support.session_snapshot())
     with pytest.raises(AgentLoopError):
         kernel.workflow.run_planning_iteration(
@@ -134,20 +147,19 @@ def test_mock_agent_loop_reaches_goal_through_real_policy_and_executor() -> None
     # never from the Analyzer candidate itself.
     final = kernel.controller.step(mission_id=mission_id, operation_id="mock-loop-final")
     assert final.action == "STOP" and final.reason_code == "MISSION_NOT_RUNNING"
-    kernel.unresolved_items.open(
-        unresolved_id="item-1", mission_id=mission_id,
-        reason_code="INGESTION_COMPLETE", evidence_digest="pending-evidence",
-    )
-    with pytest.raises(AgentLoopError):
-        kernel.unresolved_items.open(
-            unresolved_id="item-1", mission_id="another-mission",
-            reason_code="INGESTION_COMPLETE", evidence_digest="replacement-evidence",
-        )
     with pytest.raises(AgentLoopError):
         kernel.workflow.finalize(mission_id)
-    kernel.unresolved_items.resolve_from_execution(
-        unresolved_id="item-1", execution_id="mock-loop-execution"
+    kernel.unresolved_items.resolve_from_execution(unresolved_id="item-1")
+    resolved = kernel.unresolved_items.current(mission_id)
+    assert len(resolved) == 1
+    assert resolved[0].source_execution_id == "mock-loop-execution"
+    assert resolved[0].status == "RESOLVED"
+    item_events = kernel.phase0c.phase0b.phase0a.database.occ_get_all(
+        "unresolved_item_event"
     )
+    assert len(item_events) == 2
+    audit_events = kernel.phase0c.audit_store.events(mission_id)
+    assert sum(event.event_type == "UNRESOLVED_ITEM_CHANGED" for event in audit_events) == 2
     completed_step = kernel.workflow.run_planning_iteration(
         envelope=envelope,
         ids=PlanningOperationIds(
@@ -168,3 +180,114 @@ def test_mock_agent_loop_reaches_goal_through_real_policy_and_executor() -> None
         "SELECT COUNT(*) FROM occ_store WHERE namespace = 'execution_budget_outcome'"
     ).fetchone()[0]
     assert outcomes == 1
+
+
+def test_hard_limit_aborts_without_planner_or_goal_rewrite() -> None:
+    kernel, seeded, goal, grant, projection = _inputs()
+    mission_id = seeded.seeded.revision.mission_id
+    envelope = kernel.planner_context_service.build(
+        planner_context_id="hard-limit-context",
+        mission_id=mission_id,
+        goal_evaluation_id=goal.evaluation_id,
+        projection=projection,
+        context_grant_id=grant.grant_id,
+        available_tool_snapshot_id=seeded.seeded.snapshot.snapshot_id,
+        iteration=0,
+    )
+    kernel.phase0c.monotonic_clock.advance(seconds=2 * 24 * 3600 + 1)
+    step = kernel.workflow.run_planning_iteration(
+        envelope=envelope,
+        ids=PlanningOperationIds(
+            operation_id="hard-limit", plan_id="unused-plan", run_id="unused-run",
+            thread_id="unused-thread", decision_id="unused-decision",
+            execution_id="unused-execution", task_id="unused-task",
+        ),
+        invoke_planner=lambda: (_ for _ in ()).throw(
+            AssertionError("hard limit must not invoke the Planner")
+        ),
+    )
+    assert step.controller_decision.reason_code == "HARD_LIMIT"
+    state = kernel.phase0c.phase0b.phase0a.state_repository.get(mission_id)
+    assert state is not None and state.state == "ABORTED"
+
+
+def test_finalizing_resume_uses_bounded_reconciliation_and_cancel() -> None:
+    kernel, seeded, goal, grant, projection = _inputs()
+    mission_id = seeded.seeded.revision.mission_id
+    envelope = kernel.planner_context_service.build(
+        planner_context_id="finalizing-recovery-context",
+        mission_id=mission_id,
+        goal_evaluation_id=goal.evaluation_id,
+        projection=projection,
+        context_grant_id=grant.grant_id,
+        available_tool_snapshot_id=seeded.seeded.snapshot.snapshot_id,
+        iteration=0,
+    )
+    planner = MockPlanner(PlannerActionOutput(
+        proposal=support.make_proposal(
+            tool=seeded.seeded.tool,
+            arguments={"destinations": ["10.1.2.3"], "port": 443, "protocol": "tcp"},
+            requested_targets=(IpTargetReference(type="ip", address="10.1.2.3"),),
+        ),
+        working_state_update=None,
+        next_iteration_hints=(),
+    ))
+    kernel.workflow.run_planning_iteration(
+        envelope=envelope,
+        ids=PlanningOperationIds(
+            operation_id="finalizing-plan", plan_id="finalizing-plan", run_id="finalizing-run",
+            thread_id="finalizing-thread", decision_id="finalizing-decision",
+            execution_id="finalizing-execution", task_id="finalizing-task",
+        ),
+        invoke_planner=lambda: planner.invoke(envelope),
+    )
+    kernel.phase0c.phase0b.phase0a.session_repository.save(support.session_snapshot())
+    kernel.finalization_service.begin_completion(mission_id)
+    adapter = kernel.phase0c.phase0b.mock_adapter
+    adapter._reconcile_status = "FOUND_RUNNING"  # type: ignore[attr-defined]
+    adapter._cancel_result = "CONFIRMED"  # type: ignore[attr-defined]
+    resumed = kernel.workflow.run_planning_iteration(
+        envelope=envelope,
+        ids=PlanningOperationIds(
+            operation_id="finalizing-resume", plan_id="unused-plan", run_id="unused-run",
+            thread_id="unused-thread", decision_id="unused-decision",
+            execution_id="unused-execution", task_id="unused-task",
+        ),
+        invoke_planner=lambda: (_ for _ in ()).throw(
+            AssertionError("FINALIZING recovery must not invoke the Planner")
+        ),
+    )
+    assert resumed.controller_decision.action == "STOP"
+    assert adapter.reconcile_calls == 1 and adapter.cancel_calls == 1
+    adapter._reconcile_status = "UNKNOWN"  # type: ignore[attr-defined]
+    for attempt in (2, 3):
+        kernel.workflow.run_planning_iteration(
+            envelope=envelope,
+            ids=PlanningOperationIds(
+                operation_id=f"finalizing-resume-{attempt}", plan_id="unused-plan",
+                run_id="unused-run", thread_id="unused-thread",
+                decision_id="unused-decision", execution_id="unused-execution",
+                task_id="unused-task",
+            ),
+            invoke_planner=lambda: (_ for _ in ()).throw(
+                AssertionError("FINALIZING recovery must not invoke the Planner")
+            ),
+        )
+    with pytest.raises(AgentLoopError, match="reconciliation retry budget exhausted"):
+        kernel.workflow.run_planning_iteration(
+            envelope=envelope,
+            ids=PlanningOperationIds(
+                operation_id="finalizing-resume-exhausted", plan_id="unused-plan",
+                run_id="unused-run", thread_id="unused-thread",
+                decision_id="unused-decision", execution_id="unused-execution",
+                task_id="unused-task",
+            ),
+            invoke_planner=lambda: (_ for _ in ()).throw(
+                AssertionError("FINALIZING recovery must not invoke the Planner")
+            ),
+        )
+    assert adapter.reconcile_calls == 3 and adapter.cancel_calls == 1
+    retry_rows = kernel.phase0c.phase0b.phase0a.database.occ_get_all("agent_retry_budget")
+    assert len(retry_rows) == 1
+    state = kernel.phase0c.phase0b.phase0a.state_repository.get(mission_id)
+    assert state is not None and state.state == "FINALIZING"

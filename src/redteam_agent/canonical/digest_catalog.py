@@ -215,7 +215,10 @@ _DEFINITIONS: tuple[DigestDefinition, ...] = (
     _explicit("execution_budget_outcome_digest", "agent"),
     _explicit("execution_outcome_budget_digest", "agent"),
     _obj("unresolved_item_digest", "agent", exclude_self="item_digest"),
+    _obj("unresolved_item_event_digest", "agent", exclude_self="event_digest"),
+    _explicit("unresolved_open_evidence_digest", "agent"),
     _explicit("unresolved_resolution_evidence_digest", "agent"),
+    _obj("mission_finalization_intent_digest", "mission", exclude_self="intent_digest"),
 )
 
 

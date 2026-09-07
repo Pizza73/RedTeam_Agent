@@ -47,6 +47,7 @@ PROVIDER_EXECUTION_EDGES: frozenset[tuple[ProviderExecutionState, ProviderExecut
         ("RECONCILING", "FAILED"),
         ("RECONCILING", "CANCELLED"),
         ("RECONCILING", "OUTCOME_UNKNOWN"),
+        ("OUTCOME_UNKNOWN", "RECONCILING"),
     }
 )
 

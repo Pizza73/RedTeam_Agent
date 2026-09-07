@@ -222,6 +222,15 @@ class Executor:
 
     # --- dispatch ---------------------------------------------------------
 
+    def abandon_pre_dispatch(
+        self, *, execution_id: str, reason: PreDispatchBlockReason = "POLICY_STALE"
+    ) -> ExecutionRecord:
+        """Close a crash-left AUTHORIZED record without a provider call or claim."""
+        record = self._require_execution(execution_id)
+        if record.provider_execution_state != "AUTHORIZED":
+            raise ExecutionRecordError("pre-dispatch abandonment requires AUTHORIZED")
+        return self._block(record, reason=reason)
+
     def dispatch(self, *, execution_id: str, plan: ExecutionPlan) -> DispatchOutcome:
         record = self._require_execution(execution_id)
         if record.provider_execution_state != "AUTHORIZED":
