@@ -10,6 +10,7 @@ from pydantic import TypeAdapter, ValidationError
 
 from redteam_agent.agent.models import PlannerContextEnvelope
 from redteam_agent.canonical.digest_service import DigestService
+from redteam_agent.canonical.immutable import CanonicalJsonObject
 from redteam_agent.errors import AgentLoopError
 from redteam_agent.knowledge.models import AnalyzerCandidateObservation
 from redteam_agent.plan.models import PlannerOutput
@@ -54,12 +55,21 @@ class SharedLLMGateway:
 
     def invoke_analyzer(
         self, *, mission_id: str, mission_revision: int, operation_id: str,
-        execution_id: str, result_digest: str, invoke: Callable[[], object],
+        execution_id: str, result_digest: str,
+        context_grant_id: str, context_grant_digest: str,
+        authorized_context: CanonicalJsonObject,
+        invoke: Callable[[], object],
     ) -> AnalyzerCandidateObservation:
         raw = self._invoke(
             mission_id=mission_id, mission_revision=mission_revision,
             operation_id=operation_id, role="analyzer",
-            input_payload={"execution_id": execution_id, "result_digest": result_digest},
+            input_payload={
+                "execution_id": execution_id,
+                "result_digest": result_digest,
+                "context_grant_id": context_grant_id,
+                "context_grant_digest": context_grant_digest,
+                "authorized_context": authorized_context,
+            },
             invoke=invoke, adapter=_ANALYZER,
         )
         return _ANALYZER.validate_json(json.dumps(raw, sort_keys=True))

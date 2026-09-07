@@ -19,6 +19,7 @@ from redteam_agent.agent.planner_context import PlannerContextService
 from redteam_agent.agent.retry_budget import AgentRetryBudgetService
 from redteam_agent.agent.unresolved import UnresolvedItemService, UnresolvedReason
 from redteam_agent.canonical.digest_service import DigestService
+from redteam_agent.canonical.immutable import CanonicalJsonObject
 from redteam_agent.context.authorization import ContextAuthorizationService
 from redteam_agent.context.builder import ContextBuilder
 from redteam_agent.context.selector import ContextSelector
@@ -91,6 +92,8 @@ class _PlanningRuntime:
 
 class _AnalysisGraphState(TypedDict, total=False):
     selected_resource_ids: tuple[str, ...]
+    context_grant_digest: str
+    authorized_context: CanonicalJsonObject
     candidate: AnalyzerCandidateObservation
     observation: KnowledgeObservation
     goal_evaluation_id: str
@@ -347,17 +350,17 @@ class Phase1AgentWorkflow:
         granted = frozenset(item.resource.resource_id for item in grant.resources)
         if not granted <= selected:
             raise AgentLoopError("Analyzer grant contains a resource outside current selection")
-        return {}
+        return {"context_grant_digest": grant.grant_digest}
 
     def _graph_analyzer_context_builder(
         self, _state: _AnalysisGraphState, runtime: Runtime[_AnalysisRuntime]
     ) -> _AnalysisGraphState:
         context = runtime.context
-        self._context_builder.build(
+        body = self._context_builder.build(
             grant_id=context.context_grant_id,
             mission_id=context.mission_id,
         )
-        return {}
+        return {"authorized_context": body}
 
     def _graph_session_refresh(
         self, _state: _PlanningGraphState, runtime: Runtime[_PlanningRuntime]
@@ -495,7 +498,7 @@ class Phase1AgentWorkflow:
         return {}
 
     def _graph_analyzer(
-        self, _state: _AnalysisGraphState, runtime: Runtime[_AnalysisRuntime]
+        self, state: _AnalysisGraphState, runtime: Runtime[_AnalysisRuntime]
     ) -> _AnalysisGraphState:
         context = runtime.context
         candidate = self._gateway.invoke_analyzer(
@@ -504,6 +507,9 @@ class Phase1AgentWorkflow:
             operation_id=context.operation_id,
             execution_id=context.execution_id,
             result_digest=context.result_digest,
+            context_grant_id=context.context_grant_id,
+            context_grant_digest=state["context_grant_digest"],
+            authorized_context=state["authorized_context"],
             invoke=context.invoke_analyzer,
         )
         if candidate.source_execution_id != context.execution_id:
