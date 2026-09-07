@@ -402,6 +402,13 @@ class PlannerContextService:
         parent = self.get(planner_context_id)
         if parent is None:
             raise PlannerContextError("planner context not found")
+        current_revision = self._resolver.resolve(
+            parent.mission_id, now=self._clock.now()
+        ).mission.mission_revision
+        if parent.mission_revision != current_revision:
+            raise MissionRevisionConflictError(
+                "planner context rebuild cannot cross a mission revision"
+            )
         try:
             self.revalidate(planner_context_id)
         except _REBUILDABLE_CONTEXT_ERRORS:

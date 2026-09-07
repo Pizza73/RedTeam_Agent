@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -322,3 +323,31 @@ def test_automatic_stale_rebuild_shares_the_lineage_retry_budget() -> None:
     rows = kernel.phase0c.phase0b.phase0a.database.occ_get_all("agent_retry_budget")
     assert len(rows) == 1
     assert json.loads(rows[0][2])["consumed_attempts"] == 2
+
+
+def test_old_revision_rebuild_is_rejected_before_retry_budget_reservation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kernel, seeded, goal, grant, projection = _inputs()
+    envelope = kernel.planner_context_service.build(
+        planner_context_id="old-revision-rebuild-context",
+        mission_id=seeded.seeded.revision.mission_id,
+        goal_evaluation_id=goal.evaluation_id,
+        projection=projection,
+        context_grant_id=grant.grant_id,
+        available_tool_snapshot_id=seeded.seeded.snapshot.snapshot_id,
+        iteration=0,
+    )
+    monkeypatch.setattr(
+        kernel.planner_context_service._resolver,  # type: ignore[attr-defined]
+        "resolve",
+        lambda _mission_id, *, now: SimpleNamespace(
+            mission=SimpleNamespace(mission_revision=envelope.mission_revision + 1)
+        ),
+    )
+
+    database = kernel.phase0c.phase0b.phase0a.database
+    before = database.occ_get_all("agent_retry_budget")
+    with pytest.raises(MissionRevisionConflictError, match="cannot cross"):
+        kernel.planner_context_service.rebuild_stale(envelope.planner_context_id)
+    assert database.occ_get_all("agent_retry_budget") == before
