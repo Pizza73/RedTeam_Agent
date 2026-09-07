@@ -48,6 +48,7 @@ class PlannerStateManager:
     def apply(
         self, *, mission_id: str, proposal: PlanThreadUpdateProposal,
         allowed_reference_ids: frozenset[str] = frozenset(),
+        use_existing_transaction: bool = False,
     ) -> PlanThreadSnapshot:
         mission = self._resolver.resolve(mission_id, now=self._clock.now()).mission
         row = self._db.occ_get("plan_thread", mission_id)
@@ -162,7 +163,7 @@ class PlannerStateManager:
             **fields, "thread_digest": self._ds.compute("plan_thread_digest", fields)
         })
         text = json.dumps(snapshot.model_dump(mode="json"), sort_keys=True)
-        with UnitOfWork(self._db):
+        def persist() -> None:
             if row is None:
                 self._db.occ_insert("plan_thread", mission_id, 1, text)
             else:
@@ -173,4 +174,11 @@ class PlannerStateManager:
             self._db.occ_insert(
                 "plan_thread_snapshot", f"{mission_id}:{version}", version, text
             )
+        if use_existing_transaction:
+            if not self._db.in_transaction:
+                raise AgentLoopError("Plan Thread joined write requires an active transaction")
+            persist()
+        else:
+            with UnitOfWork(self._db):
+                persist()
         return snapshot

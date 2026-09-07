@@ -396,13 +396,15 @@ class PlannerContextService:
         )
         if self._db.occ_get(_CONTEXT_ACTION_NS, planner_context_id) is not None:
             raise PlannerContextError("planner action context already consumed") from None
-        if output.working_state_update is not None:
-            self._planner_state.apply(
-                mission_id=envelope.mission_id, proposal=output.working_state_update,
-                allowed_reference_ids=_allowed_working_state_references(envelope),
-            )
         try:
             with UnitOfWork(self._db):
+                if output.working_state_update is not None:
+                    self._planner_state.apply(
+                        mission_id=envelope.mission_id,
+                        proposal=output.working_state_update,
+                        allowed_reference_ids=_allowed_working_state_references(envelope),
+                        use_existing_transaction=True,
+                    )
                 self._db.occ_insert(
                     _CONTEXT_ACTION_NS, planner_context_id, 1,
                     json.dumps(output.model_dump(mode="json"), sort_keys=True),
