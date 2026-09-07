@@ -394,6 +394,13 @@ class PlannerContextService:
         candidate = self._projector.match_action(
             output=output, projection=envelope.action_candidate_projection
         )
+        if self._db.occ_get(_CONTEXT_ACTION_NS, planner_context_id) is not None:
+            raise PlannerContextError("planner action context already consumed") from None
+        if output.working_state_update is not None:
+            self._planner_state.apply(
+                mission_id=envelope.mission_id, proposal=output.working_state_update,
+                allowed_reference_ids=_allowed_working_state_references(envelope),
+            )
         try:
             with UnitOfWork(self._db):
                 self._db.occ_insert(
@@ -402,11 +409,6 @@ class PlannerContextService:
                 )
         except RepositoryIntegrityError:
             raise PlannerContextError("planner action context already consumed") from None
-        if output.working_state_update is not None:
-            self._planner_state.apply(
-                mission_id=envelope.mission_id, proposal=output.working_state_update,
-                allowed_reference_ids=_allowed_working_state_references(envelope),
-            )
         return candidate
 
     def accept_context_request(

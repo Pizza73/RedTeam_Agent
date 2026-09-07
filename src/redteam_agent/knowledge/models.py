@@ -60,3 +60,18 @@ class AnalyzerCandidateObservation(StrictImmutableBoundaryModel):
     subject_entity_type: EntityType | None = None
     subject_strong_key_type: str | None = None
     subject_strong_key_value: str | None = None
+
+
+class VerifiedFinding(StrictImmutableBoundaryModel):
+    finding_id: str = Field(min_length=1)
+    mission_id: str = Field(min_length=1)
+    finding_type: Literal["execution_outcome"]
+    subject_ref: str = Field(min_length=1)
+    predicate: Literal["execution_succeeded"]
+    value: Literal["SUCCEEDED"]
+    source_execution_id: str = Field(min_length=1)
+    source_record_digest: str = Field(min_length=1)
+    verification_state: Literal["confirmed"] = "confirmed"
+    finding_version: int = Field(ge=1)
+    recorded_at: datetime
+    finding_digest: str = Field(min_length=1)

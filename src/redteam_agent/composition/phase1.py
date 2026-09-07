@@ -12,6 +12,7 @@ from redteam_agent.agent.outcome_accounting import ExecutionOutcomeAccountingSer
 from redteam_agent.agent.planner_context import ActionCandidateProjector, PlannerContextService
 from redteam_agent.agent.prerequisites import FinitePrerequisiteSearch
 from redteam_agent.agent.retry_budget import AgentRetryBudgetService
+from redteam_agent.agent.workflow import Phase1AgentWorkflow
 from redteam_agent.agent.working_state import PlannerStateManager
 from redteam_agent.composition.phase0c import Phase0CKernel, build_phase0c_kernel
 from redteam_agent.composition.testing import OPERATOR_ACTOR_TOKEN
@@ -21,6 +22,7 @@ from redteam_agent.knowledge.entities import EntityResolver
 from redteam_agent.knowledge.reducer import KnowledgeReducer
 from redteam_agent.knowledge.semantic_catalog import SemanticCatalog, build_phase1_semantic_catalog
 from redteam_agent.knowledge.service import KnowledgeService
+from redteam_agent.knowledge.verified_facts import VerifiedFindingProjector
 
 
 @dataclass(frozen=True)
@@ -42,6 +44,8 @@ class Phase1Kernel:
     llm_gateway: SharedLLMGateway
     outcome_accounting: ExecutionOutcomeAccountingService
     prerequisite_search: FinitePrerequisiteSearch
+    workflow: Phase1AgentWorkflow
+    verified_finding_projector: VerifiedFindingProjector
 
 
 def build_phase1_kernel(*, phase0c: Phase0CKernel | None = None) -> Phase1Kernel:
@@ -65,6 +69,11 @@ def build_phase1_kernel(*, phase0c: Phase0CKernel | None = None) -> Phase1Kernel
     )
     entity_resolver = EntityResolver(database=phase0a.database, digest_service=ds)
     semantic_catalog = build_phase1_semantic_catalog(ds)
+    verified_findings = VerifiedFindingProjector(
+        knowledge_service=knowledge, execution_repository=phase0b.execution_repository,
+        result_repository=phase0b.result_repository, digest_service=ds,
+        clock=kernel.monotonic_clock,
+    )
     reducer = KnowledgeReducer(
         knowledge_service=knowledge,
         execution_repository=phase0b.execution_repository,
@@ -141,8 +150,15 @@ def build_phase1_kernel(*, phase0c: Phase0CKernel | None = None) -> Phase1Kernel
         execution_repository=phase0b.execution_repository,
         result_repository=phase0b.result_repository,
         outcome_accounting=outcome_accounting,
+        control_metadata_repository=phase0b.control_metadata_repository,
+        database=phase0a.database,
         audit_store=kernel.audit_store, witness_barrier=kernel.critical_witness_barrier,
         operator_actor_token=OPERATOR_ACTOR_TOKEN,
+    )
+    workflow = Phase1AgentWorkflow(
+        controller=controller, llm_gateway=llm_gateway,
+        planner_context_service=planner_context, action_service=action_service,
+        knowledge_reducer=reducer,
     )
     return Phase1Kernel(
         phase0c=kernel, knowledge_service=knowledge, goal_service=goals, controller=controller,
@@ -157,4 +173,6 @@ def build_phase1_kernel(*, phase0c: Phase0CKernel | None = None) -> Phase1Kernel
         llm_gateway=llm_gateway,
         outcome_accounting=outcome_accounting,
         prerequisite_search=prerequisite_search,
+        workflow=workflow,
+        verified_finding_projector=verified_findings,
     )

@@ -93,10 +93,21 @@ class SessionExistsCondition(StrictImmutableBoundaryModel):
     session_selector: SessionSelector
 
 
+class ADPrincipalContextCondition(StrictImmutableBoundaryModel):
+    type: Literal["ad_principal_context"] = "ad_principal_context"
+    condition_id: str = Field(min_length=1)
+    session_selector: SessionSelector
+    principal_ref: str = Field(min_length=1)
+    required_group_sid: str | None = Field(default=None, min_length=1)
+
+
 # Phase 0A supports only conditions whose concrete static rule, proof model and
 # source contract are registered together. Other §24 conditions are added only
 # when those three implementations land in the same revision.
-SuccessCondition = SessionExistsCondition
+SuccessCondition = Annotated[
+    SessionExistsCondition | ADPrincipalContextCondition,
+    Field(discriminator="type"),
+]
 
 
 class ApprovalPolicy(StrictImmutableBoundaryModel):

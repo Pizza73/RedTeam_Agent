@@ -15,7 +15,12 @@ from redteam_agent.goal.models import (
     GoalStatus,
 )
 from redteam_agent.knowledge.service import KnowledgeService
-from redteam_agent.mission.models import ActiveSessionSelector, ExactSessionSelector, SessionExistsCondition
+from redteam_agent.mission.models import (
+    ActiveSessionSelector,
+    ADPrincipalContextCondition,
+    ExactSessionSelector,
+    SessionExistsCondition,
+)
 from redteam_agent.runtime.authorization_context import AuthorizationContextResolver
 from redteam_agent.runtime.clock import Clock
 from redteam_agent.storage.database import Database, UnitOfWork
@@ -45,7 +50,7 @@ class GoalEvaluationService:
         if head.mission_revision != mission.mission_revision:
             raise GoalEvaluationError("Knowledge head is stale for the current mission revision")
         source_snapshot_digest = self._source_snapshot_digest()
-        evaluations = tuple(self._evaluate_session(item, now=now) for item in mission.success_conditions)
+        evaluations = tuple(self._evaluate_condition(item, now=now) for item in mission.success_conditions)
         status = _aggregate(evaluations, mission.success_mode)
         status_payload = status.model_dump(mode="python")
         fields = {
@@ -164,6 +169,33 @@ class GoalEvaluationService:
             )
             return _condition(condition.condition_id, "indeterminate", "SESSION_REFRESH_FAILED", refs)
         return _condition(condition.condition_id, "not_achieved", "CONDITION_ABSENT", ())
+
+    def _evaluate_condition(
+        self, condition: SessionExistsCondition | ADPrincipalContextCondition, *, now: datetime,
+    ) -> ConditionEvaluation:
+        if isinstance(condition, SessionExistsCondition):
+            return self._evaluate_session(condition, now=now)
+        base = self._evaluate_session(
+            SessionExistsCondition(
+                condition_id=condition.condition_id,
+                session_selector=condition.session_selector,
+            ),
+            now=now,
+        )
+        if base.status != "achieved":
+            return base
+        source_ids = {item.source_id for item in base.evidence_references}
+        sessions = [self._sessions.get(source_id) for source_id in source_ids]
+        if any(
+            session is not None
+            and session.context.current_principal == condition.principal_ref
+            for session in sessions
+        ):
+            return base
+        return _condition(
+            condition.condition_id, "not_achieved", "CONDITION_ABSENT",
+            base.evidence_references,
+        )
 
 
 def _session_reference(

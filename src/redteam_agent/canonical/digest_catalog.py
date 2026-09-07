@@ -196,6 +196,7 @@ _DEFINITIONS: tuple[DigestDefinition, ...] = (
     # --- Phase 1: knowledge, goal evaluation and bounded workflow --------
     _obj("knowledge_security_head_digest", "knowledge", exclude_self="head_digest"),
     _obj("knowledge_observation_digest", "knowledge", exclude_self="observation_digest"),
+    _obj("verified_finding_digest", "knowledge", exclude_self="finding_digest"),
     _obj("goal_evaluation_digest", "goal", exclude_self="evaluation_digest"),
     _explicit("goal_source_snapshot_digest", "goal", ("sessions",)),
     _obj("agent_checkpoint_digest", "agent", exclude_self="checkpoint_digest"),

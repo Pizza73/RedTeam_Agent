@@ -318,6 +318,18 @@ class ExecutionStore:
             return None
         return self._verify("result_collection_states", collection_state_id, str(row[0]), str(row[1]))
 
+    def find_collection_state_by_execution(self, execution_id: str) -> tuple[str, str] | None:
+        row = self._conn.execute(
+            "SELECT collection_state_id, json, row_digest FROM result_collection_states "
+            "WHERE execution_id = ?",
+            (execution_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._verify_keyed(
+            "result_collection_states", str(row[0]), str(row[1]), str(row[2])
+        )
+
     # --- result ingestion states (OCC) ------------------------------------
 
     def insert_ingestion_state(

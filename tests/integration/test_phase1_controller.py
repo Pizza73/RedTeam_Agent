@@ -8,6 +8,7 @@ import support_phase0c as p0c
 from redteam_agent.agent.models import ActionCandidateSeed
 from redteam_agent.composition.phase1 import build_phase1_kernel
 from redteam_agent.knowledge.models import KnowledgeObservation
+from redteam_agent.mission.models import ADPrincipalContextCondition, ExactSessionSelector
 from redteam_agent.policy.scope_models import IpTargetReference
 
 
@@ -89,3 +90,30 @@ def test_controller_prioritizes_existing_execution_before_goal_or_planning() -> 
     )
     assert decision.action == "RECOVER"
     assert decision.goal_evaluation_id is None
+
+
+def test_ad_principal_discovery_requires_current_matching_session_context() -> None:
+    phase0c = p0c.make_phase0c()
+    phase0a = phase0c.phase0b.phase0a
+    revision = support.mission_revision(
+        phase0a.digest_service, profile=support.make_profile(phase0a.digest_service),
+        success_conditions=(ADPrincipalContextCondition(
+            condition_id="ad-context", session_selector=ExactSessionSelector(session_ref="sess-1"),
+            principal_ref="root",
+        ),),
+    )
+    support.seed_running_mission(
+        phase0a, tool=support.network_tool(), revision=revision
+    )
+    phase0c.phase0b.budget_service.create_budget(
+        mission_id=revision.mission_id, mission_revision=revision.mission_revision,
+        max_dispatch_claims=revision.max_iterations,
+    )
+    kernel = build_phase1_kernel(phase0c=phase0c)
+    kernel.knowledge_service.initialize_mission(
+        mission_id=revision.mission_id, mission_revision=revision.mission_revision,
+        recorded_at=support.T0,
+    )
+    assert kernel.goal_service.evaluate(mission_id=revision.mission_id).status.status == "not_achieved"
+    phase0a.session_repository.save(support.session_snapshot(privileged=True))
+    assert kernel.goal_service.evaluate(mission_id=revision.mission_id).status.status == "achieved"

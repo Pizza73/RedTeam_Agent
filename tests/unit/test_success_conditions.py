@@ -11,7 +11,12 @@ import support
 from redteam_agent.canonical.digest_service import DigestService
 from redteam_agent.composition.testing import build_evidence_retention_policy
 from redteam_agent.errors import MissionValidationError
-from redteam_agent.mission.models import ActiveSessionSelector, ExactSessionSelector, SessionExistsCondition
+from redteam_agent.mission.models import (
+    ActiveSessionSelector,
+    ADPrincipalContextCondition,
+    ExactSessionSelector,
+    SessionExistsCondition,
+)
 from redteam_agent.mission.validation import MissionValidationPolicy, validate_mission_revision
 from redteam_agent.semantics import (
     SESSION_EXISTS_RULE_ID,
@@ -51,6 +56,21 @@ def test_registered_active_session_condition_validates() -> None:
             condition_id="c1", session_selector=ActiveSessionSelector(host_ref="host-1")
         )
     )
+
+
+def test_registered_ad_principal_context_condition_validates() -> None:
+    _validate(ADPrincipalContextCondition(
+        condition_id="c1", session_selector=ExactSessionSelector(session_ref="sess-1"),
+        principal_ref="root",
+    ))  # type: ignore[arg-type]
+
+
+def test_ad_group_requirement_without_source_contract_is_rejected() -> None:
+    with pytest.raises(MissionValidationError, match="source contract"):
+        _validate(ADPrincipalContextCondition(
+            condition_id="c1", session_selector=ExactSessionSelector(session_ref="sess-1"),
+            principal_ref="root", required_group_sid="S-1-5-21-512",
+        ))  # type: ignore[arg-type]
 
 
 def test_missing_concrete_rule_rejected() -> None:

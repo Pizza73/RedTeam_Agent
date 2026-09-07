@@ -193,6 +193,17 @@ class ResultCollectionStateRepository(_ExecutionRepository):
             ResultCollectionStateRecord, raw, row_key=collection_state_id, payload_key=model.collection_state_id
         )
 
+    def find_by_execution(self, execution_id: str) -> ResultCollectionStateRecord | None:
+        found = self._store.find_collection_state_by_execution(execution_id)
+        if found is None:
+            return None
+        row_key, raw = found
+        model = load_model_from_json(ResultCollectionStateRecord, raw)
+        return self._load(
+            ResultCollectionStateRecord, raw,
+            row_key=row_key, payload_key=model.collection_state_id,
+        )
+
 
 class ResultTaskBindingRepository(_ExecutionRepository):
     """Immutable result-task-binding mapping. A changed mapping is an integrity stop

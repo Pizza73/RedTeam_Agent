@@ -7,6 +7,7 @@ from test_phase1_planner_context import _inputs
 
 import support
 from redteam_agent.agent.mock_agents import MockAnalyzer, MockPlanner
+from redteam_agent.agent.workflow import PlanningOperationIds
 from redteam_agent.errors import AgentLoopError
 from redteam_agent.execution.models import AdapterCollectionControl
 from redteam_agent.knowledge.models import AnalyzerCandidateObservation
@@ -32,10 +33,17 @@ def test_mock_agent_loop_reaches_goal_through_real_policy_and_executor() -> None
         working_state_update=None, next_iteration_hints=(),
     )
     planner = MockPlanner(output)
-    planned = kernel.llm_gateway.invoke_planner(
-        operation_id="mock-loop-planner", envelope=envelope,
-        invoke=lambda: planner.invoke(envelope),
+    step = kernel.workflow.run_planning_iteration(
+        envelope=envelope,
+        ids=PlanningOperationIds(
+            operation_id="mock-loop-planner", plan_id="mock-loop-plan",
+            run_id="mock-loop-run", thread_id="mock-loop-thread",
+            decision_id="mock-loop-decision", execution_id="mock-loop-execution",
+            task_id="mock-loop-task",
+        ),
+        invoke_planner=lambda: planner.invoke(envelope),
     )
+    planned = step.planner_output
     assert isinstance(planned, PlannerActionOutput)
     replayed = kernel.llm_gateway.invoke_planner(
         operation_id="mock-loop-planner", envelope=envelope,
@@ -47,12 +55,8 @@ def test_mock_agent_loop_reaches_goal_through_real_policy_and_executor() -> None
             operation_id="budget-reset", envelope=envelope,
             invoke=lambda: planner.invoke(envelope),
         )
-    transition = kernel.action_service.execute(
-        planner_context_id=envelope.planner_context_id, output=planned,
-        plan_id="mock-loop-plan", run_id="mock-loop-run", thread_id="mock-loop-thread",
-        decision_id="mock-loop-decision", execution_id="mock-loop-execution",
-        task_id="mock-loop-task",
-    )
+    transition = step.action_transition
+    assert transition is not None
     assert transition.dispatch is not None and planner.call_count == 1
 
     collected = kernel.phase0c.collection_service.collect(
@@ -74,6 +78,8 @@ def test_mock_agent_loop_reaches_goal_through_real_policy_and_executor() -> None
     kernel.phase0c.eraser.run(deletion_intent_id=published.deletion_intent_id)
     result = kernel.phase0c.phase0b.result_repository.get("mock-loop-execution")
     assert result is not None and result.status == "SUCCEEDED"
+    verified = kernel.verified_finding_projector.project_success("mock-loop-execution")
+    assert verified.verification_state == "confirmed"
 
     analyzer = MockAnalyzer(AnalyzerCandidateObservation(
         observation_id="mock-loop-observation", condition_id="c1",
@@ -82,15 +88,14 @@ def test_mock_agent_loop_reaches_goal_through_real_policy_and_executor() -> None
         attributes={"status": "candidate"}, source_artifact_ids=result.redacted_artifact_ids,
         llm_confidence=1.0,
     ))
-    analyzed = kernel.llm_gateway.invoke_analyzer(
+    observation = kernel.workflow.run_analysis(
         mission_id=mission_id, mission_revision=envelope.mission_revision,
         operation_id="mock-loop-analyzer", execution_id="mock-loop-execution",
         result_digest=kernel.phase0c.phase0b.phase0a.digest_service.compute(
             "execution_outcome_source_digest", result.model_dump(mode="python")
         ),
-        invoke=lambda: analyzer.invoke(execution_id="mock-loop-execution"),
+        invoke_analyzer=lambda: analyzer.invoke(execution_id="mock-loop-execution"),
     )
-    observation = kernel.knowledge_reducer.reduce(analyzed)
     assert observation.object_ref == "sess-1" and analyzer.call_count == 1
     assert kernel.goal_service.evaluate(mission_id=mission_id).status.status == "achieved"
 
@@ -98,6 +103,12 @@ def test_mock_agent_loop_reaches_goal_through_real_policy_and_executor() -> None
     # never from the Analyzer candidate itself.
     final = kernel.controller.step(mission_id=mission_id, operation_id="mock-loop-final")
     assert final.action == "FINALIZE" and final.reason_code == "GOAL_ACHIEVED"
+    state = kernel.phase0c.phase0b.phase0a.state_repository.get(mission_id)
+    assert state is not None
+    kernel.phase0c.phase0b.phase0a.mission_manager.begin_finalization(
+        mission_id, expected_version=state.mission_state_version,
+        actor_token=support.OPERATOR_ACTOR_TOKEN,
+    )
     completed = kernel.finalization_service.finalize(mission_id)
     assert completed.state == "COMPLETED"
     outcomes = kernel.phase0c.phase0b.phase0a.database.connection.execute(

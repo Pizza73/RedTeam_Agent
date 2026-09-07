@@ -19,6 +19,7 @@ from redteam_agent.errors import (
 )
 from redteam_agent.llm.profile import AgentModelProfile
 from redteam_agent.mission.models import (
+    ADPrincipalContextCondition,
     EvidenceRetentionPolicy,
     MissionRevision,
     SessionExistsCondition,
@@ -48,8 +49,10 @@ class MissionValidationPolicy:
 def _validate_success_condition(condition: object, catalog: SemanticCatalog) -> None:
     if catalog.catalog_revision != SEMANTIC_CATALOG_REVISION:
         raise MissionValidationError("semantic catalog revision is not registered")
-    if not isinstance(condition, SessionExistsCondition):
+    if not isinstance(condition, (SessionExistsCondition, ADPrincipalContextCondition)):
         raise MissionValidationError("success condition type has no implemented Phase 0A rule")
+    if isinstance(condition, ADPrincipalContextCondition) and condition.required_group_sid is not None:
+        raise MissionValidationError("AD group source contract is not implemented")
     rule = catalog.session_exists_rule
     if rule is None or type(rule) is not SessionExistsGoalRule:
         raise MissionValidationError("session condition rule is not registered")
@@ -65,7 +68,16 @@ def _validate_success_condition(condition: object, catalog: SemanticCatalog) -> 
         raise MissionValidationError("session condition source capability methods are not callable")
     if rule.source.capability_id != SESSION_GOAL_SOURCE_CAPABILITY_ID:
         raise MissionValidationError("session condition source capability binding mismatch")
-    rule.validate_static(condition, catalog)
+    selector = condition.session_selector
+    rule.validate_static(
+        SessionExistsCondition(condition_id=condition.condition_id, session_selector=selector),
+        catalog,
+    )
+    if (
+        isinstance(condition, ADPrincipalContextCondition)
+        and condition.principal_ref not in catalog.registered_principal_refs
+    ):
+        raise MissionValidationError("AD principal context references an unregistered principal")
 
 
 def _revision_digest_payload(revision: MissionRevision) -> dict[str, object]:

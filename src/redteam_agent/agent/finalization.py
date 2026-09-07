@@ -9,7 +9,12 @@ from redteam_agent.errors import AgentLoopError
 from redteam_agent.goal.service import GoalEvaluationService
 from redteam_agent.mission.manager import MissionManager
 from redteam_agent.mission.models import MissionState
-from redteam_agent.storage.execution_repositories import ExecutionRecordRepository, ExecutionResultRepository
+from redteam_agent.storage.database import Database
+from redteam_agent.storage.execution_repositories import (
+    ExecutionRecordRepository,
+    ExecutionResultRepository,
+    RawControlMetadataRepository,
+)
 from redteam_agent.storage.repositories import MissionStateRepository
 
 _ACTIVE = frozenset({
@@ -25,6 +30,8 @@ class FinalizationService:
         execution_repository: ExecutionRecordRepository,
         result_repository: ExecutionResultRepository,
         outcome_accounting: ExecutionOutcomeAccountingService,
+        control_metadata_repository: RawControlMetadataRepository,
+        database: Database,
         audit_store: AuditStore, witness_barrier: CriticalWitnessBarrier,
         operator_actor_token: str,
     ) -> None:
@@ -34,6 +41,8 @@ class FinalizationService:
         self._executions = execution_repository
         self._results = result_repository
         self._outcomes = outcome_accounting
+        self._control = control_metadata_repository
+        self._db = database
         self._audit = audit_store
         self._witness = witness_barrier
         self._operator_actor_token = operator_actor_token
@@ -50,16 +59,24 @@ class FinalizationService:
                 raise AgentLoopError("mission cannot finalize before result ingestion completes")
             if item.provider_execution_state != "BLOCKED" and item.result_ingestion_state != "SUCCEEDED":
                 raise AgentLoopError("mission cannot finalize before verified erasure completes")
+            if item.provider_execution_state != "BLOCKED":
+                control = self._control.find_by_execution(item.execution_id)
+                if control is None:
+                    raise AgentLoopError("mission cannot finalize before result collection completes")
+        if self._db.occ_get_all("unresolved_item_current"):
+            raise AgentLoopError("mission cannot finalize with unresolved items")
         state = self._states.get(mission_id)
-        if state is None or state.state != "RUNNING":
+        if state is None or state.state not in {"RUNNING", "FINALIZING"}:
             raise AgentLoopError("mission is not ready to enter FINALIZING")
         self._outcomes.reconcile(
             mission_id=mission_id, mission_revision=state.mission_revision
         )
-        finalizing = self._manager.begin_finalization(
-            mission_id, expected_version=state.mission_state_version,
-            actor_token=self._operator_actor_token,
-        )
+        finalizing = state
+        if state.state == "RUNNING":
+            finalizing = self._manager.begin_finalization(
+                mission_id, expected_version=state.mission_state_version,
+                actor_token=self._operator_actor_token,
+            )
         refreshed_goal = self._goals.evaluate(mission_id=mission_id)
         if refreshed_goal.status.status != "achieved":
             raise AgentLoopError("mission goal changed while entering FINALIZING")
@@ -72,6 +89,8 @@ class FinalizationService:
             for item in self._executions.all_for_mission(mission_id)
         ):
             raise AgentLoopError("mission execution state changed while entering FINALIZING")
+        if self._db.occ_get_all("unresolved_item_current"):
+            raise AgentLoopError("unresolved items changed while entering FINALIZING")
         self._outcomes.reconcile(
             mission_id=mission_id, mission_revision=finalizing.mission_revision
         )

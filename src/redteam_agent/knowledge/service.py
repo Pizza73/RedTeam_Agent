@@ -7,11 +7,12 @@ from datetime import UTC, datetime
 
 from redteam_agent.canonical.digest_service import DigestService
 from redteam_agent.errors import KnowledgeStateIntegrityError
-from redteam_agent.knowledge.models import KnowledgeObservation, KnowledgeSecurityHead
+from redteam_agent.knowledge.models import KnowledgeObservation, KnowledgeSecurityHead, VerifiedFinding
 from redteam_agent.storage.database import CriticalMutation, Database, UnitOfWork
 
 _HEAD_NS = "knowledge_security_head"
 _OBSERVATION_NS = "knowledge_observation"
+_FINDING_NS = "verified_finding"
 
 
 class KnowledgeService:
@@ -105,6 +106,52 @@ class KnowledgeService:
                 result.append(observation)
         return tuple(sorted(result, key=lambda item: item.observation_id))
 
+    def record_verified_finding(self, finding: VerifiedFinding) -> VerifiedFinding:
+        payload = finding.model_dump(mode="python")
+        expected = payload.pop("finding_digest")
+        self._ds.verify("verified_finding_digest", payload, expected)
+        existing = self._db.occ_get(_FINDING_NS, finding.finding_id)
+        if existing is not None:
+            stored = VerifiedFinding.model_validate_json(existing[1])
+            if stored != finding or existing[0] != finding.finding_version:
+                raise KnowledgeStateIntegrityError("verified finding identity conflict")
+            return stored
+        head = self.verify_current_head(finding.mission_id)
+        next_version = head.security_version + 1
+        fact_root = self._ds.compute("security_projection_digest", {
+            "previous_root": head.fact_state_root_digest,
+            "finding_id": finding.finding_id,
+            "finding_digest": finding.finding_digest,
+        })
+        fields = {
+            "head_id": head.head_id, "mission_id": head.mission_id,
+            "mission_revision": head.mission_revision, "security_version": next_version,
+            "previous_head_digest": head.head_digest, "fact_state_root_digest": fact_root,
+            "entity_state_root_digest": head.entity_state_root_digest,
+            "source_state_root_digest": head.source_state_root_digest,
+            "evidence_rule_catalog_digest": head.evidence_rule_catalog_digest,
+            "recorded_at": finding.recorded_at,
+        }
+        next_head = KnowledgeSecurityHead.model_validate({
+            **fields,
+            "head_digest": self._ds.compute("knowledge_security_head_digest", fields),
+        })
+        with UnitOfWork(self._db):
+            self._db.occ_insert_idempotent(
+                _FINDING_NS, finding.finding_id, finding.finding_version, _dump(finding)
+            )
+            self._db.occ_update(
+                _HEAD_NS, finding.mission_id, expected_version=head.security_version,
+                new_version=next_version, json_text=_dump(next_head),
+            )
+            self._db.record_critical_mutation(CriticalMutation(
+                mission_id=finding.mission_id, event_type="KNOWLEDGE_EVIDENCE_CHANGED",
+                actor_id="verified-finding-projector", occurred_at_iso=finding.recorded_at.isoformat(),
+                record_type="knowledge_evidence_head", record_id=finding.mission_id,
+                state_version=next_version, security_projection_digest=next_head.head_digest,
+            ))
+        return finding
 
-def _dump(value: KnowledgeSecurityHead | KnowledgeObservation) -> str:
+
+def _dump(value: KnowledgeSecurityHead | KnowledgeObservation | VerifiedFinding) -> str:
     return json.dumps(value.model_dump(mode="json"), sort_keys=True)
