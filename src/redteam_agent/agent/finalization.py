@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from redteam_agent.agent.outcome_accounting import ExecutionOutcomeAccountingService
+from redteam_agent.agent.unresolved import UnresolvedItemService
 from redteam_agent.audit.critical_witness import CriticalWitnessBarrier
 from redteam_agent.audit.hash_chain import AuditStore
 from redteam_agent.errors import AgentLoopError
@@ -31,7 +32,7 @@ class FinalizationService:
         result_repository: ExecutionResultRepository,
         outcome_accounting: ExecutionOutcomeAccountingService,
         control_metadata_repository: RawControlMetadataRepository,
-        database: Database,
+        database: Database, unresolved_items: UnresolvedItemService,
         audit_store: AuditStore, witness_barrier: CriticalWitnessBarrier,
         operator_actor_token: str,
     ) -> None:
@@ -43,6 +44,7 @@ class FinalizationService:
         self._outcomes = outcome_accounting
         self._control = control_metadata_repository
         self._db = database
+        self._unresolved = unresolved_items
         self._audit = audit_store
         self._witness = witness_barrier
         self._operator_actor_token = operator_actor_token
@@ -63,7 +65,7 @@ class FinalizationService:
                 control = self._control.find_by_execution(item.execution_id)
                 if control is None:
                     raise AgentLoopError("mission cannot finalize before result collection completes")
-        if self._db.occ_get_all("unresolved_item_current"):
+        if any(item.status != "RESOLVED" for item in self._unresolved.current(mission_id)):
             raise AgentLoopError("mission cannot finalize with unresolved items")
         state = self._states.get(mission_id)
         if state is None or state.state not in {"RUNNING", "FINALIZING"}:
@@ -89,7 +91,7 @@ class FinalizationService:
             for item in self._executions.all_for_mission(mission_id)
         ):
             raise AgentLoopError("mission execution state changed while entering FINALIZING")
-        if self._db.occ_get_all("unresolved_item_current"):
+        if any(item.status != "RESOLVED" for item in self._unresolved.current(mission_id)):
             raise AgentLoopError("unresolved items changed while entering FINALIZING")
         self._outcomes.reconcile(
             mission_id=mission_id, mission_revision=finalizing.mission_revision

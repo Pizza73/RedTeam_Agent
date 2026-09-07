@@ -34,6 +34,7 @@ class SessionSecurityContext(StrictImmutableBoundaryModel):
     os: Literal["windows", "linux", "macos", "other"]
     architecture: str = Field(min_length=1)
     current_principal: str = Field(min_length=1)
+    verified_ad_group_sids: frozenset[str] = frozenset()
     effective_privilege_context: PrivilegeContext
     session_capabilities: frozenset[str]
     network_context: str
@@ -66,6 +67,7 @@ def _context_payload(context: SessionSecurityContext) -> dict[str, object]:
         "os": context.os,
         "architecture": context.architecture,
         "current_principal": context.current_principal,
+        "verified_ad_group_sids": sorted(context.verified_ad_group_sids),
         "effective_privilege_context": context.effective_privilege_context,
         "session_capabilities": sorted(context.session_capabilities),
         "network_context": context.network_context,

@@ -61,15 +61,15 @@ def test_registered_active_session_condition_validates() -> None:
 def test_registered_ad_principal_context_condition_validates() -> None:
     _validate(ADPrincipalContextCondition(
         condition_id="c1", session_selector=ExactSessionSelector(session_ref="sess-1"),
-        principal_ref="root",
+        principal_ref="root", required_group_sid="S-1-5-21-512",
     ))  # type: ignore[arg-type]
 
 
 def test_ad_group_requirement_without_source_contract_is_rejected() -> None:
-    with pytest.raises(MissionValidationError, match="source contract"):
+    with pytest.raises(MissionValidationError, match="group source"):
         _validate(ADPrincipalContextCondition(
             condition_id="c1", session_selector=ExactSessionSelector(session_ref="sess-1"),
-            principal_ref="root", required_group_sid="S-1-5-21-512",
+            principal_ref="root",
         ))  # type: ignore[arg-type]
 
 

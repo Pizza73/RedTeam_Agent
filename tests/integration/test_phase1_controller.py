@@ -99,7 +99,7 @@ def test_ad_principal_discovery_requires_current_matching_session_context() -> N
         phase0a.digest_service, profile=support.make_profile(phase0a.digest_service),
         success_conditions=(ADPrincipalContextCondition(
             condition_id="ad-context", session_selector=ExactSessionSelector(session_ref="sess-1"),
-            principal_ref="root",
+            principal_ref="root", required_group_sid="S-1-5-21-512",
         ),),
     )
     support.seed_running_mission(
@@ -115,5 +115,11 @@ def test_ad_principal_discovery_requires_current_matching_session_context() -> N
         recorded_at=support.T0,
     )
     assert kernel.goal_service.evaluate(mission_id=revision.mission_id).status.status == "not_achieved"
-    phase0a.session_repository.save(support.session_snapshot(privileged=True))
+    session = support.session_snapshot(privileged=True)
+    session = session.model_copy(update={
+        "context": session.context.model_copy(update={
+            "verified_ad_group_sids": frozenset({"S-1-5-21-512"})
+        })
+    })
+    phase0a.session_repository.save(session)
     assert kernel.goal_service.evaluate(mission_id=revision.mission_id).status.status == "achieved"

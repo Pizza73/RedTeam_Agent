@@ -189,6 +189,8 @@ class GoalEvaluationService:
         if any(
             session is not None
             and session.context.current_principal == condition.principal_ref
+            and condition.required_group_sid is not None
+            and condition.required_group_sid in session.context.verified_ad_group_sids
             for session in sessions
         ):
             return base

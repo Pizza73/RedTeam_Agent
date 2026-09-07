@@ -88,6 +88,7 @@ class SemanticCatalog:
     registered_host_refs: frozenset[str] = frozenset()
     registered_principal_refs: frozenset[str] = frozenset()
     registered_provider_ids: frozenset[str] = frozenset()
+    registered_ad_group_sids: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -129,4 +130,5 @@ def default_semantic_catalog(source: SessionGoalSource | None = None) -> Semanti
         registered_host_refs=frozenset({"host-1"}),
         registered_principal_refs=frozenset({"user", "root"}),
         registered_provider_ids=frozenset({"c2-main"}),
+        registered_ad_group_sids=frozenset({"S-1-5-21-512"}),
     )

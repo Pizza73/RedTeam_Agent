@@ -78,7 +78,7 @@ def test_mock_agent_loop_reaches_goal_through_real_policy_and_executor() -> None
     kernel.phase0c.eraser.run(deletion_intent_id=published.deletion_intent_id)
     result = kernel.phase0c.phase0b.result_repository.get("mock-loop-execution")
     assert result is not None and result.status == "SUCCEEDED"
-    verified = kernel.verified_finding_projector.project_success("mock-loop-execution")
+    verified = kernel.workflow.project_verified_execution("mock-loop-execution")
     assert verified.verification_state == "confirmed"
 
     analyzer = MockAnalyzer(AnalyzerCandidateObservation(
@@ -103,13 +103,22 @@ def test_mock_agent_loop_reaches_goal_through_real_policy_and_executor() -> None
     # never from the Analyzer candidate itself.
     final = kernel.controller.step(mission_id=mission_id, operation_id="mock-loop-final")
     assert final.action == "FINALIZE" and final.reason_code == "GOAL_ACHIEVED"
+    kernel.unresolved_items.open(
+        unresolved_id="item-1", mission_id=mission_id,
+        reason_code="FINAL_REVIEW", evidence_digest="pending-evidence",
+    )
+    with pytest.raises(AgentLoopError):
+        kernel.workflow.finalize(mission_id)
+    kernel.unresolved_items.resolve(
+        unresolved_id="item-1", evidence_digest="resolved-evidence"
+    )
     state = kernel.phase0c.phase0b.phase0a.state_repository.get(mission_id)
     assert state is not None
     kernel.phase0c.phase0b.phase0a.mission_manager.begin_finalization(
         mission_id, expected_version=state.mission_state_version,
         actor_token=support.OPERATOR_ACTOR_TOKEN,
     )
-    completed = kernel.finalization_service.finalize(mission_id)
+    completed = kernel.workflow.finalize(mission_id)
     assert completed.state == "COMPLETED"
     outcomes = kernel.phase0c.phase0b.phase0a.database.connection.execute(
         "SELECT COUNT(*) FROM occ_store WHERE namespace = 'execution_budget_outcome'"

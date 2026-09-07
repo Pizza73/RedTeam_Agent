@@ -7,13 +7,21 @@ from dataclasses import dataclass
 
 from redteam_agent.agent.application import ActionTransitionResult, PlannerActionApplicationService
 from redteam_agent.agent.controller import AgentController
+from redteam_agent.agent.finalization import FinalizationService
 from redteam_agent.agent.llm_gateway import SharedLLMGateway
 from redteam_agent.agent.models import ControllerDecision, PlannerContextEnvelope
 from redteam_agent.agent.planner_context import PlannerContextService
+from redteam_agent.erasure.service import VerifiedQuarantineEraser
 from redteam_agent.errors import AgentLoopError
-from redteam_agent.knowledge.models import KnowledgeObservation
+from redteam_agent.execution.models import AdapterCollectionControl
+from redteam_agent.execution.reconcile import ReconcileOutcome, ReconciliationService
+from redteam_agent.ingestion.service import SecureIngestionService
+from redteam_agent.knowledge.models import KnowledgeObservation, VerifiedFinding
 from redteam_agent.knowledge.reducer import KnowledgeReducer
+from redteam_agent.knowledge.verified_facts import VerifiedFindingProjector
+from redteam_agent.mission.models import MissionState
 from redteam_agent.plan.models import PlannerActionOutput, PlannerContextRequest, PlannerOutput
+from redteam_agent.quarantine.collection import QuarantineCollectionResult, QuarantineCollectionService
 
 
 @dataclass(frozen=True)
@@ -42,12 +50,22 @@ class Phase1AgentWorkflow:
         planner_context_service: PlannerContextService,
         action_service: PlannerActionApplicationService,
         knowledge_reducer: KnowledgeReducer,
+        collection_service: QuarantineCollectionService,
+        ingestion_service: SecureIngestionService,
+        eraser: VerifiedQuarantineEraser,
+        reconciliation: ReconciliationService,
+        finalization: FinalizationService,
+        verified_finding_projector: VerifiedFindingProjector,
     ) -> None:
         self._controller = controller
         self._gateway = llm_gateway
         self._contexts = planner_context_service
         self._actions = action_service
         self._reducer = knowledge_reducer
+        self._collection, self._ingestion = collection_service, ingestion_service
+        self._eraser, self._reconciliation = eraser, reconciliation
+        self._finalization = finalization
+        self._verified_findings = verified_finding_projector
 
     def run_planning_iteration(
         self, *, envelope: PlannerContextEnvelope, ids: PlanningOperationIds,
@@ -87,3 +105,29 @@ class Phase1AgentWorkflow:
             result_digest=result_digest, invoke=invoke_analyzer,
         )
         return self._reducer.reduce(candidate)
+
+    def reconcile_execution(
+        self, *, execution_id: str, recovery_authority_id: str | None = None,
+    ) -> ReconcileOutcome:
+        return self._reconciliation.reconcile(
+            execution_id=execution_id, recovery_authority_id=recovery_authority_id
+        )
+
+    def collect_ingest_and_erase(
+        self, *, execution_id: str, stdout: bytes, stderr: bytes,
+        control: AdapterCollectionControl,
+    ) -> QuarantineCollectionResult:
+        collected = self._collection.collect(
+            execution_id=execution_id, stdout=stdout, stderr=stderr, control=control
+        )
+        published = self._ingestion.ingest(ingestion_id=collected.ingestion_id)
+        if published.deletion_intent_id is None:
+            raise AgentLoopError("secure ingestion did not issue a deletion intent")
+        self._eraser.run(deletion_intent_id=published.deletion_intent_id)
+        return collected
+
+    def finalize(self, mission_id: str) -> MissionState:
+        return self._finalization.finalize(mission_id)
+
+    def project_verified_execution(self, execution_id: str) -> VerifiedFinding:
+        return self._verified_findings.project_success(execution_id)

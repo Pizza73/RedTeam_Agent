@@ -51,8 +51,11 @@ def _validate_success_condition(condition: object, catalog: SemanticCatalog) -> 
         raise MissionValidationError("semantic catalog revision is not registered")
     if not isinstance(condition, (SessionExistsCondition, ADPrincipalContextCondition)):
         raise MissionValidationError("success condition type has no implemented Phase 0A rule")
-    if isinstance(condition, ADPrincipalContextCondition) and condition.required_group_sid is not None:
-        raise MissionValidationError("AD group source contract is not implemented")
+    if isinstance(condition, ADPrincipalContextCondition) and (
+        condition.required_group_sid is None
+        or condition.required_group_sid not in catalog.registered_ad_group_sids
+    ):
+        raise MissionValidationError("AD principal context requires a registered group source")
     rule = catalog.session_exists_rule
     if rule is None or type(rule) is not SessionExistsGoalRule:
         raise MissionValidationError("session condition rule is not registered")

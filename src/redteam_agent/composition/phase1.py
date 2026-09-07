@@ -12,6 +12,7 @@ from redteam_agent.agent.outcome_accounting import ExecutionOutcomeAccountingSer
 from redteam_agent.agent.planner_context import ActionCandidateProjector, PlannerContextService
 from redteam_agent.agent.prerequisites import FinitePrerequisiteSearch
 from redteam_agent.agent.retry_budget import AgentRetryBudgetService
+from redteam_agent.agent.unresolved import UnresolvedItemService
 from redteam_agent.agent.workflow import Phase1AgentWorkflow
 from redteam_agent.agent.working_state import PlannerStateManager
 from redteam_agent.composition.phase0c import Phase0CKernel, build_phase0c_kernel
@@ -46,6 +47,7 @@ class Phase1Kernel:
     prerequisite_search: FinitePrerequisiteSearch
     workflow: Phase1AgentWorkflow
     verified_finding_projector: VerifiedFindingProjector
+    unresolved_items: UnresolvedItemService
 
 
 def build_phase1_kernel(*, phase0c: Phase0CKernel | None = None) -> Phase1Kernel:
@@ -113,6 +115,9 @@ def build_phase1_kernel(*, phase0c: Phase0CKernel | None = None) -> Phase1Kernel
     llm_gateway = SharedLLMGateway(
         database=phase0a.database, digest_service=ds, clock=kernel.monotonic_clock
     )
+    unresolved_items = UnresolvedItemService(
+        database=phase0a.database, digest_service=ds, clock=kernel.monotonic_clock
+    )
     context_body_store = ContextBodyStore(ds)
     context_builder = ContextBuilder(
         authorization_service=phase0a.context_authorization_service,
@@ -152,6 +157,7 @@ def build_phase1_kernel(*, phase0c: Phase0CKernel | None = None) -> Phase1Kernel
         outcome_accounting=outcome_accounting,
         control_metadata_repository=phase0b.control_metadata_repository,
         database=phase0a.database,
+        unresolved_items=unresolved_items,
         audit_store=kernel.audit_store, witness_barrier=kernel.critical_witness_barrier,
         operator_actor_token=OPERATOR_ACTOR_TOKEN,
     )
@@ -159,6 +165,10 @@ def build_phase1_kernel(*, phase0c: Phase0CKernel | None = None) -> Phase1Kernel
         controller=controller, llm_gateway=llm_gateway,
         planner_context_service=planner_context, action_service=action_service,
         knowledge_reducer=reducer,
+        collection_service=kernel.collection_service,
+        ingestion_service=kernel.ingestion_service, eraser=kernel.eraser,
+        reconciliation=phase0b.reconciliation, finalization=finalization,
+        verified_finding_projector=verified_findings,
     )
     return Phase1Kernel(
         phase0c=kernel, knowledge_service=knowledge, goal_service=goals, controller=controller,
@@ -175,4 +185,5 @@ def build_phase1_kernel(*, phase0c: Phase0CKernel | None = None) -> Phase1Kernel
         prerequisite_search=prerequisite_search,
         workflow=workflow,
         verified_finding_projector=verified_findings,
+        unresolved_items=unresolved_items,
     )
