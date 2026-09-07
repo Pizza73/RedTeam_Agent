@@ -82,8 +82,12 @@ def parameter_schema_digest(parameter_schema: object) -> str:
 class ActionContractCatalog:
     """A Root-provisioned registry of action contracts, keyed by contract id."""
 
-    def __init__(self, definitions: tuple[ActionContractDefinition, ...] = ()) -> None:
+    def __init__(
+        self, definitions: tuple[ActionContractDefinition, ...] = (), *,
+        allow_typed_predicates: bool = False,
+    ) -> None:
         self._by_id: dict[str, ActionContractDefinition] = {}
+        self._allow_typed_predicates = allow_typed_predicates
         for definition in definitions:
             self.register(definition)
 
@@ -92,10 +96,13 @@ class ActionContractCatalog:
         # predicates would turn a digest match into a fabricated proof, so the
         # only registered contract is the explicit no-additional-preconditions
         # form. Later phases may replace this closed rule with typed predicates.
-        if definition.preconditions or definition.observes or definition.may_change:
+        predicates = (*definition.preconditions, *definition.observes, *definition.may_change)
+        if predicates and not self._allow_typed_predicates:
             raise ToolRegistryValidationError(
                 "Phase 0A action contracts cannot declare unevaluated predicates"
             )
+        if any(not item for item in predicates) or len(predicates) != len(set(predicates)):
+            raise ToolRegistryValidationError("action contract predicate bindings must be non-empty and unique")
         existing = self._by_id.get(definition.contract_id)
         if existing is not None and existing != definition:
             raise ToolRegistryValidationError(f"conflicting action contract: {definition.contract_id}")
@@ -103,6 +110,17 @@ class ActionContractCatalog:
 
     def get(self, contract_id: str) -> ActionContractDefinition | None:
         return self._by_id.get(contract_id)
+
+    def all(self) -> tuple[ActionContractDefinition, ...]:
+        return tuple(self._by_id[key] for key in sorted(self._by_id))
+
+    def enable_typed_predicates(self) -> None:
+        if any(
+            item.preconditions or item.observes or item.may_change
+            for item in self._by_id.values()
+        ):
+            raise ToolRegistryValidationError("existing predicate contracts require a fresh catalog")
+        self._allow_typed_predicates = True
 
 
 class RuleCatalog:

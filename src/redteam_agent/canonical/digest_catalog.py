@@ -201,6 +201,18 @@ _DEFINITIONS: tuple[DigestDefinition, ...] = (
     _obj("agent_checkpoint_digest", "agent", exclude_self="checkpoint_digest"),
     _obj("planner_context_envelope_digest", "agent", exclude_self="envelope_digest"),
     _explicit("action_candidate_digest", "agent"),
+    _obj("agent_retry_budget_digest", "agent", exclude_self="record_digest"),
+    _obj("plan_thread_digest", "agent", exclude_self="thread_digest"),
+    _obj("working_hypothesis_digest", "agent", exclude_self="hypothesis_digest"),
+    _obj("canonical_entity_digest", "knowledge", exclude_self="record_digest"),
+    _obj("entity_resolution_candidate_digest", "knowledge", exclude_self="candidate_digest"),
+    _explicit("semantic_catalog_digest", "knowledge"),
+    _explicit("llm_gateway_input_digest", "agent"),
+    _explicit("llm_gateway_attempt_digest", "agent"),
+    _explicit("llm_gateway_operation_digest", "agent"),
+    _explicit("execution_outcome_source_digest", "agent"),
+    _explicit("execution_budget_outcome_digest", "agent"),
+    _explicit("execution_outcome_budget_digest", "agent"),
 )
 
 

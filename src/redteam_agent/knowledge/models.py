@@ -8,6 +8,7 @@ from typing import Literal
 from pydantic import Field
 
 from redteam_agent.canonical.immutable import CanonicalJsonObject
+from redteam_agent.knowledge.entities import EntityType
 from redteam_agent.models.base import StrictImmutableBoundaryModel
 
 
@@ -33,6 +34,7 @@ class KnowledgeObservation(StrictImmutableBoundaryModel):
     source_execution_id: str = Field(min_length=1)
     observation_type: Literal["asset", "identity", "relationship", "finding"]
     subject_ref: str = Field(min_length=1)
+    subject_entity_version: int | None = Field(default=None, ge=1)
     predicate: str = Field(min_length=1)
     object_ref: str | None
     attributes: CanonicalJsonObject
@@ -55,3 +57,6 @@ class AnalyzerCandidateObservation(StrictImmutableBoundaryModel):
     attributes: CanonicalJsonObject
     source_artifact_ids: tuple[str, ...]
     llm_confidence: float = Field(ge=0.0, le=1.0)
+    subject_entity_type: EntityType | None = None
+    subject_strong_key_type: str | None = None
+    subject_strong_key_value: str | None = None

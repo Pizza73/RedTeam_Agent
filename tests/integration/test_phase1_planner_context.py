@@ -145,7 +145,7 @@ def test_epoch_change_invalidates_planner_context_before_model_use() -> None:
         kernel.planner_context_service.revalidate(envelope.planner_context_id)
 
 
-def test_context_request_is_bounded_by_envelope_lineage_without_new_counter_state() -> None:
+def test_context_request_is_bounded_by_lineage_and_durable_retry_budget() -> None:
     kernel, seeded, goal, grant, projection = _inputs()
     values = {
         "mission_id": seeded.seeded.revision.mission_id,
@@ -192,6 +192,10 @@ def test_context_request_is_bounded_by_envelope_lineage_without_new_counter_stat
     kernel.planner_context_service.accept_context_request(
         planner_context_id=second.planner_context_id, output=request
     )
+    budget_rows = db.execute(
+        "SELECT COUNT(*) FROM occ_store WHERE namespace = 'agent_retry_budget'"
+    ).fetchone()[0]
+    assert budget_rows == 1
     third = kernel.planner_context_service.build(
         planner_context_id="ctx-2", parent_context_id=second.planner_context_id, **values
     )

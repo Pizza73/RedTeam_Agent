@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import pytest
 from test_phase1_planner_context import _inputs
 
 import support
 from redteam_agent.agent.mock_agents import MockAnalyzer, MockPlanner
+from redteam_agent.errors import AgentLoopError
 from redteam_agent.execution.models import AdapterCollectionControl
 from redteam_agent.knowledge.models import AnalyzerCandidateObservation
 from redteam_agent.plan.models import PlannerActionOutput
@@ -30,8 +32,21 @@ def test_mock_agent_loop_reaches_goal_through_real_policy_and_executor() -> None
         working_state_update=None, next_iteration_hints=(),
     )
     planner = MockPlanner(output)
-    planned = planner.invoke(envelope)
+    planned = kernel.llm_gateway.invoke_planner(
+        operation_id="mock-loop-planner", envelope=envelope,
+        invoke=lambda: planner.invoke(envelope),
+    )
     assert isinstance(planned, PlannerActionOutput)
+    replayed = kernel.llm_gateway.invoke_planner(
+        operation_id="mock-loop-planner", envelope=envelope,
+        invoke=lambda: (_ for _ in ()).throw(AssertionError("must not reinvoke")),
+    )
+    assert replayed == planned and planner.call_count == 1
+    with pytest.raises(AgentLoopError):
+        kernel.llm_gateway.invoke_planner(
+            operation_id="budget-reset", envelope=envelope,
+            invoke=lambda: planner.invoke(envelope),
+        )
     transition = kernel.action_service.execute(
         planner_context_id=envelope.planner_context_id, output=planned,
         plan_id="mock-loop-plan", run_id="mock-loop-run", thread_id="mock-loop-thread",
@@ -62,9 +77,15 @@ def test_mock_agent_loop_reaches_goal_through_real_policy_and_executor() -> None
         attributes={"status": "candidate"}, source_artifact_ids=result.redacted_artifact_ids,
         llm_confidence=1.0,
     ))
-    observation = kernel.knowledge_reducer.reduce(
-        analyzer.invoke(execution_id="mock-loop-execution")
+    analyzed = kernel.llm_gateway.invoke_analyzer(
+        mission_id=mission_id, mission_revision=envelope.mission_revision,
+        operation_id="mock-loop-analyzer", execution_id="mock-loop-execution",
+        result_digest=kernel.phase0c.phase0b.phase0a.digest_service.compute(
+            "execution_outcome_source_digest", result.model_dump(mode="python")
+        ),
+        invoke=lambda: analyzer.invoke(execution_id="mock-loop-execution"),
     )
+    observation = kernel.knowledge_reducer.reduce(analyzed)
     assert observation.object_ref == "sess-1" and analyzer.call_count == 1
     assert kernel.goal_service.evaluate(mission_id=mission_id).status.status == "not_achieved"
 
@@ -75,3 +96,7 @@ def test_mock_agent_loop_reaches_goal_through_real_policy_and_executor() -> None
     assert final.action == "FINALIZE" and final.reason_code == "GOAL_ACHIEVED"
     completed = kernel.finalization_service.finalize(mission_id)
     assert completed.state == "COMPLETED"
+    outcomes = kernel.phase0c.phase0b.phase0a.database.connection.execute(
+        "SELECT COUNT(*) FROM occ_store WHERE namespace = 'execution_budget_outcome'"
+    ).fetchone()[0]
+    assert outcomes == 1

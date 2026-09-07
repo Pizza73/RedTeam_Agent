@@ -64,7 +64,8 @@ def test_unconfirmed_observation_does_not_change_goal_or_witnessed_fact_head() -
     fields = {
         "observation_id": "observation-1", "mission_id": mission_id,
         "source_execution_id": "execution-1", "observation_type": "finding",
-        "subject_ref": "host-1", "predicate": "session_exists", "object_ref": "sess-fake",
+        "subject_ref": "host-1", "subject_entity_version": None,
+        "predicate": "session_exists", "object_ref": "sess-fake",
         "attributes": {"claim": "root session exists"}, "source_artifact_ids": (),
         "llm_confidence": 1.0, "observed_at": support.T0,
     }

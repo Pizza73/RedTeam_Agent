@@ -13,7 +13,7 @@ from redteam_agent.storage.repositories import MissionStateRepository
 
 _ACTIVE = frozenset({
     "PLANNED", "AUTHORIZED", "DISPATCH_CLAIMED", "DISPATCHED", "RUNNING",
-    "CANCEL_REQUESTED", "RECONCILING",
+    "CANCEL_REQUESTED", "RECONCILING", "OUTCOME_UNKNOWN",
 })
 
 

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from redteam_agent.canonical.digest_service import DigestService
 from redteam_agent.errors import KnowledgeStateIntegrityError
+from redteam_agent.knowledge.entities import EntityResolver
 from redteam_agent.knowledge.models import AnalyzerCandidateObservation, KnowledgeObservation
+from redteam_agent.knowledge.semantic_catalog import SemanticCatalog
 from redteam_agent.knowledge.service import KnowledgeService
 from redteam_agent.runtime.authorization_context import AuthorizationContextResolver
 from redteam_agent.runtime.clock import Clock
@@ -21,6 +23,8 @@ class KnowledgeReducer:
         result_repository: ExecutionResultRepository,
         context_resolver: AuthorizationContextResolver,
         digest_service: DigestService, clock: Clock,
+        entity_resolver: EntityResolver,
+        semantic_catalog: SemanticCatalog,
     ) -> None:
         self._knowledge = knowledge_service
         self._executions = execution_repository
@@ -28,6 +32,8 @@ class KnowledgeReducer:
         self._resolver = context_resolver
         self._ds = digest_service
         self._clock = clock
+        self._entities = entity_resolver
+        self._semantics = semantic_catalog
 
     def reduce(self, candidate: AnalyzerCandidateObservation) -> KnowledgeObservation:
         execution = self._executions.get(candidate.source_execution_id)
@@ -40,12 +46,43 @@ class KnowledgeReducer:
             raise KnowledgeStateIntegrityError("Analyzer candidate condition does not exist in the mission")
         if not set(candidate.source_artifact_ids) <= set(result.redacted_artifact_ids):
             raise KnowledgeStateIntegrityError("Analyzer candidate references an unrelated artifact")
+        self._semantics.validate(
+            observation_type=candidate.observation_type, predicate=candidate.predicate
+        )
+        strong = (
+            candidate.subject_entity_type, candidate.subject_strong_key_type,
+            candidate.subject_strong_key_value,
+        )
+        if any(item is not None for item in strong) and not all(item is not None for item in strong):
+            raise KnowledgeStateIntegrityError("Analyzer entity strong-key binding is incomplete")
+        if all(item is not None for item in strong):
+            assert candidate.subject_entity_type is not None
+            assert candidate.subject_strong_key_type is not None
+            assert candidate.subject_strong_key_value is not None
+            entity = self._entities.resolve_strong(
+                mission_id=execution.mission_id,
+                entity_type=candidate.subject_entity_type,
+                strong_key_type=candidate.subject_strong_key_type,
+                strong_key_value=candidate.subject_strong_key_value,
+                source_reference_ids=(execution.execution_id, *candidate.source_artifact_ids),
+            )
+            subject_ref = entity.entity_id
+            subject_entity_version: int | None = entity.entity_version
+        else:
+            resolution = self._entities.record_alias_candidate(
+                mission_id=execution.mission_id, left_ref=candidate.subject_ref,
+                right_ref=f"unresolved:{candidate.observation_id}",
+                evidence_reference_ids=(execution.execution_id, *candidate.source_artifact_ids),
+            )
+            subject_ref = resolution.candidate_id
+            subject_entity_version = None
         fields = {
             "observation_id": candidate.observation_id,
             "mission_id": execution.mission_id,
             "source_execution_id": execution.execution_id,
             "observation_type": candidate.observation_type,
-            "subject_ref": candidate.subject_ref,
+            "subject_ref": subject_ref,
+            "subject_entity_version": subject_entity_version,
             "predicate": candidate.predicate,
             "object_ref": candidate.object_ref,
             "attributes": candidate.attributes,

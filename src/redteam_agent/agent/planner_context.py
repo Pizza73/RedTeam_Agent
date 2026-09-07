@@ -13,6 +13,8 @@ from redteam_agent.agent.models import (
     PlannerFeedback,
     RecentExecutionSummary,
 )
+from redteam_agent.agent.retry_budget import AgentRetryBudgetService
+from redteam_agent.agent.working_state import PlannerStateManager
 from redteam_agent.canonical.canonical_json import canonical_dumps
 from redteam_agent.canonical.digest_service import DigestService
 from redteam_agent.context.authorization import ContextAuthorizationService
@@ -26,6 +28,7 @@ from redteam_agent.policy.scope_models import TargetReference
 from redteam_agent.runtime.authorization_context import AuthorizationContextResolver
 from redteam_agent.runtime.clock import Clock
 from redteam_agent.storage.database import Database, UnitOfWork
+from redteam_agent.storage.execution_repositories import MissionExecutionBudgetRepository
 from redteam_agent.storage.repositories import (
     AvailableToolSnapshotRepository,
     SessionSecurityContextSnapshotRepository,
@@ -162,6 +165,8 @@ class ActionCandidateProjector:
                 contract is None
                 or contract.reference() != candidate.action_contract_ref
                 or tool.action_contract_ref != candidate.action_contract_ref
+                or tuple(sorted(candidate.satisfied_precondition_refs))
+                != tuple(sorted(contract.preconditions))
                 or candidate.eligible_session_ids != view.eligible_session_ids
                 or candidate.requires_session != view.requires_session
             ):
@@ -210,6 +215,9 @@ class PlannerContextService:
         snapshot_repository: AvailableToolSnapshotRepository,
         session_repository: SessionSecurityContextSnapshotRepository,
         goal_service: GoalEvaluationService, candidate_projector: ActionCandidateProjector,
+        planner_state_manager: PlannerStateManager,
+        retry_budget_service: AgentRetryBudgetService,
+        mission_budget_repository: MissionExecutionBudgetRepository,
     ) -> None:
         self._db = database
         self._ds = digest_service
@@ -221,6 +229,9 @@ class PlannerContextService:
         self._sessions = session_repository
         self._goals = goal_service
         self._projector = candidate_projector
+        self._planner_state = planner_state_manager
+        self._retry_budgets = retry_budget_service
+        self._mission_budgets = mission_budget_repository
 
     def build(
         self, *, planner_context_id: str, mission_id: str, goal_evaluation_id: str,
@@ -242,6 +253,11 @@ class PlannerContextService:
                 raise PlannerContextError("context rebuild limit reached")
             context_rebuild_count = parent.context_rebuild_count + 1
         current = self._resolver.resolve(mission_id, now=now)
+        mission_budget = self._mission_budgets.get(
+            mission_id, current.mission.mission_revision
+        )
+        if mission_budget is None or iteration != mission_budget.consumed_dispatch_claims:
+            raise PlannerContextError("planner iteration does not match the durable mission budget")
         goal = self._goals.verify_current(goal_evaluation_id, mission_id=mission_id)
         grant = self._context_auth.verify_grant(grant_id=context_grant_id, mission_id=mission_id)
         authorized_context = self._context_builder.build(
@@ -374,9 +390,15 @@ class PlannerContextService:
     ) -> ActionCandidate:
         """Revalidate all sources before accepting one exact Planner proposal."""
         envelope = self.revalidate(planner_context_id)
-        return self._projector.match_action(
+        candidate = self._projector.match_action(
             output=output, projection=envelope.action_candidate_projection
         )
+        if output.working_state_update is not None:
+            self._planner_state.apply(
+                mission_id=envelope.mission_id, proposal=output.working_state_update,
+                allowed_reference_ids=_allowed_working_state_references(envelope),
+            )
+        return candidate
 
     def accept_context_request(
         self, *, planner_context_id: str, output: PlannerContextRequest,
@@ -387,6 +409,26 @@ class PlannerContextService:
             raise PlannerContextError("context rebuild limit reached")
         if not output.retrieval_hints:
             raise PlannerContextError("context request must contain a typed retrieval hint")
+        if self._db.occ_get(_CONTEXT_REQUEST_NS, planner_context_id) is not None:
+            raise PlannerContextError("context request already consumed")
+        root_context_id = envelope.planner_context_id
+        ancestor = envelope
+        while ancestor.parent_context_id is not None:
+            root_context_id = ancestor.parent_context_id
+            loaded_ancestor = self.get(root_context_id)
+            if loaded_ancestor is None:
+                raise PlannerContextError("context request lineage is incomplete")
+            ancestor = loaded_ancestor
+        self._retry_budgets.reserve(
+            mission_id=envelope.mission_id,
+            operation_id=f"{envelope.iteration}:{root_context_id}",
+            retry_kind="context",
+        )
+        if output.working_state_update is not None:
+            self._planner_state.apply(
+                mission_id=envelope.mission_id, proposal=output.working_state_update,
+                allowed_reference_ids=_allowed_working_state_references(envelope),
+            )
         try:
             with UnitOfWork(self._db):
                 self._db.occ_insert(
@@ -396,3 +438,30 @@ class PlannerContextService:
         except RepositoryIntegrityError:
             raise PlannerContextError("context request already consumed") from None
         return output
+
+
+def _allowed_working_state_references(envelope: PlannerContextEnvelope) -> frozenset[str]:
+    references = {
+        envelope.goal_evaluation_id,
+        envelope.context_grant_id,
+        envelope.available_tool_snapshot_id,
+        *(item.execution_id for item in envelope.recent_execution_summaries),
+        *(
+            reference
+            for item in envelope.recent_execution_summaries
+            for reference in item.result_reference_ids
+        ),
+    }
+
+    def collect(value: object, key: str = "") -> None:
+        if isinstance(value, dict):
+            for child_key, child in value.items():
+                collect(child, str(child_key))
+        elif isinstance(value, (list, tuple)):
+            for child in value:
+                collect(child, key)
+        elif isinstance(value, str) and (key.endswith("_id") or key.endswith("_ids")):
+            references.add(value)
+
+    collect(envelope.authorized_context)
+    return frozenset(references)

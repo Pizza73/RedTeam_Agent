@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from redteam_agent.agent.planner_context import PlannerContextService
+from redteam_agent.agent.prerequisites import FinitePrerequisiteSearch, PredicateSnapshot
 from redteam_agent.canonical.digest_service import DigestService
 from redteam_agent.contracts.catalog import ActionContractCatalog
 from redteam_agent.errors import AgentLoopError
@@ -36,6 +37,7 @@ class PlannerActionApplicationService:
         contract_catalog: ActionContractCatalog,
         authorization_service: ExecutionAuthorizationService,
         executor: Executor, digest_service: DigestService, clock: Clock,
+        prerequisite_search: FinitePrerequisiteSearch,
     ) -> None:
         self._contexts = planner_context_service
         self._goals = goal_service
@@ -46,11 +48,13 @@ class PlannerActionApplicationService:
         self._executor = executor
         self._ds = digest_service
         self._clock = clock
+        self._prerequisites = prerequisite_search
 
     def execute(
         self, *, planner_context_id: str, output: PlannerActionOutput,
         plan_id: str, run_id: str, thread_id: str, decision_id: str,
         execution_id: str, task_id: str,
+        predicate_snapshot: PredicateSnapshot | None = None,
     ) -> ActionTransitionResult:
         candidate = self._contexts.accept_action(
             planner_context_id=planner_context_id, output=output
@@ -64,6 +68,15 @@ class PlannerActionApplicationService:
         contract = self._contracts.get(candidate.action_contract_ref.contract_id)
         if snapshot is None or contract is None or contract.reference() != candidate.action_contract_ref:
             raise AgentLoopError("planner action binding is unavailable")
+        if contract.preconditions:
+            if predicate_snapshot is None:
+                raise AgentLoopError("current prerequisite snapshot is required")
+            self._prerequisites.verify_executable(
+                candidate=candidate, predicate_snapshot=predicate_snapshot,
+                mission_id=envelope.mission_id,
+                mission_revision=runtime.mission.mission_revision,
+                authorization_epoch=runtime.mission.authorization_epoch,
+            )
         plan = ExecutionPlan(
             plan_id=plan_id, mission_id=envelope.mission_id,
             mission_revision=runtime.mission.mission_revision,

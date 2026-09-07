@@ -73,6 +73,11 @@ class HypothesisCreateProposal(StrictImmutableBoundaryModel):
     basis_reference_ids: tuple[str, ...]
     next_verification_objective: str | None
 
+    @model_validator(mode="after")
+    def _bounded(self) -> HypothesisCreateProposal:
+        _validate_hypothesis_text(self.statement, self.basis_reference_ids)
+        return self
+
 
 class HypothesisUpdateProposal(StrictImmutableBoundaryModel):
     operation: Literal["update"] = "update"
@@ -83,6 +88,13 @@ class HypothesisUpdateProposal(StrictImmutableBoundaryModel):
     basis_reference_ids: tuple[str, ...]
     next_verification_objective: str | None
 
+    @model_validator(mode="after")
+    def _bounded(self) -> HypothesisUpdateProposal:
+        _validate_hypothesis_text(self.statement, self.basis_reference_ids)
+        if self.proposed_status == "supported" and not self.basis_reference_ids:
+            raise ValueError("supported hypothesis requires a basis reference")
+        return self
+
 
 class HypothesisCloseProposal(StrictImmutableBoundaryModel):
     operation: Literal["close"] = "close"
@@ -91,6 +103,11 @@ class HypothesisCloseProposal(StrictImmutableBoundaryModel):
     proposed_status: Literal["refuted", "abandoned"]
     reason_code: str
     basis_reference_ids: tuple[str, ...]
+
+    @model_validator(mode="after")
+    def _bounded(self) -> HypothesisCloseProposal:
+        _validate_hypothesis_text(self.reason_code, self.basis_reference_ids)
+        return self
 
 
 HypothesisProposal = Annotated[
@@ -103,7 +120,30 @@ class PlanThreadUpdateProposal(StrictImmutableBoundaryModel):
     operation: Literal["continue", "replace", "abandon"]
     objective: str
     expected_thread_version: int | None = Field(default=None, ge=1)
-    hypothesis_updates: tuple[HypothesisProposal, ...]
+    hypothesis_updates: tuple[HypothesisProposal, ...] = Field(max_length=20)
+
+    @model_validator(mode="after")
+    def _bounded(self) -> PlanThreadUpdateProposal:
+        if not self.objective or len(self.objective) > 4096:
+            raise ValueError("Plan Thread objective must contain at most 4096 characters")
+        identities = [
+            f"new:{index}" if item.operation == "create" else item.hypothesis_id
+            for index, item in enumerate(self.hypothesis_updates)
+        ]
+        if len(identities) != len(set(identities)):
+            raise ValueError("a hypothesis may be changed only once per proposal")
+        if self.operation == "abandon" and self.hypothesis_updates:
+            raise ValueError("abandon cannot also update hypotheses")
+        return self
+
+
+def _validate_hypothesis_text(text: str, references: tuple[str, ...]) -> None:
+    if not text or len(text) > 4096:
+        raise ValueError("hypothesis text must contain at most 4096 characters")
+    if len(references) > 20 or len(references) != len(set(references)):
+        raise ValueError("hypothesis basis references must be unique and bounded")
+    if any(not reference or len(reference) > 256 for reference in references):
+        raise ValueError("hypothesis basis reference is invalid")
 
 
 class PlannerActionOutput(StrictImmutableBoundaryModel):

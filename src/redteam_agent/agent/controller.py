@@ -11,6 +11,7 @@ from redteam_agent.agent.models import (
     ControllerDecision,
     ControllerReason,
 )
+from redteam_agent.agent.outcome_accounting import ExecutionOutcomeAccountingService
 from redteam_agent.agent.planner_context import ActionCandidateProjector
 from redteam_agent.canonical.digest_service import DigestService
 from redteam_agent.errors import AgentLoopError
@@ -28,7 +29,7 @@ from redteam_agent.storage.repositories import AvailableToolSnapshotRepository
 _CHECKPOINT_NS = "agent_checkpoint"
 _ACTIVE_EXECUTION_STATES = frozenset({
     "PLANNED", "AUTHORIZED", "DISPATCH_CLAIMED", "DISPATCHED", "RUNNING",
-    "CANCEL_REQUESTED", "RECONCILING",
+    "CANCEL_REQUESTED", "RECONCILING", "OUTCOME_UNKNOWN",
 })
 
 
@@ -40,6 +41,7 @@ class AgentController:
         execution_repository: ExecutionRecordRepository,
         snapshot_repository: AvailableToolSnapshotRepository,
         candidate_projector: ActionCandidateProjector,
+        outcome_accounting: ExecutionOutcomeAccountingService,
     ) -> None:
         self._db = database
         self._ds = digest_service
@@ -50,12 +52,14 @@ class AgentController:
         self._executions = execution_repository
         self._snapshots = snapshot_repository
         self._projector = candidate_projector
+        self._outcomes = outcome_accounting
 
     def step(
         self, *, mission_id: str, operation_id: str,
         projection: ActionCandidateProjection | None = None,
     ) -> ControllerDecision:
-        mission = self._resolver.resolve(mission_id, now=self._clock.now()).mission
+        now = self._clock.now()
+        mission = self._resolver.resolve(mission_id, now=now).mission
         if mission.state != "RUNNING":
             return self._save(
                 mission=mission, operation_id=operation_id,
@@ -64,9 +68,20 @@ class AgentController:
                     candidate_ids=(),
                 ), active_execution_id=None,
             )
+        if not mission.valid_from <= now < mission.valid_until:
+            return self._save(
+                mission=mission, operation_id=operation_id,
+                decision=ControllerDecision(
+                    action="FINALIZE", reason_code="HARD_LIMIT", goal_evaluation_id=None,
+                    candidate_ids=(),
+                ), active_execution_id=None,
+            )
         budget = self._budgets.get(mission_id, mission.mission_revision)
         if budget is None:
             raise AgentLoopError("mission execution budget is missing")
+        consecutive_failures = self._outcomes.reconcile(
+            mission_id=mission_id, mission_revision=mission.mission_revision
+        )
         active = tuple(
             item for item in self._executions.all_for_mission(mission_id)
             if item.provider_execution_state in _ACTIVE_EXECUTION_STATES
@@ -79,6 +94,14 @@ class AgentController:
                     action="RECOVER", reason_code="EXECUTION_IN_PROGRESS", goal_evaluation_id=None,
                     candidate_ids=(),
                 ), active_execution_id=active_execution_id,
+            )
+        if consecutive_failures >= self._outcomes.MAX_CONSECUTIVE_FAILURES:
+            return self._save(
+                mission=mission, operation_id=operation_id,
+                decision=ControllerDecision(
+                    action="FINALIZE", reason_code="HARD_LIMIT", goal_evaluation_id=None,
+                    candidate_ids=(),
+                ), active_execution_id=None,
             )
         evaluation = self._goals.evaluate(mission_id=mission_id)
         if evaluation.status.status == "achieved":
