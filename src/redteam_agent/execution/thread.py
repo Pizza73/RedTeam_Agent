@@ -72,3 +72,16 @@ def verify_thread_id(*, thread_id: str, mission_id: str, mission_revision: int) 
     if run_id == "":
         raise MissionRevisionConflictError("thread_id run id is empty")
     return run_id
+
+
+def verify_run_thread_binding(
+    *, thread_id: str, run_id: str, mission_id: str, mission_revision: int,
+) -> None:
+    """Verify the caller's run id and canonical checkpoint thread as one binding."""
+    bound_run_id = verify_thread_id(
+        thread_id=thread_id,
+        mission_id=mission_id,
+        mission_revision=mission_revision,
+    )
+    if bound_run_id != run_id:
+        raise MissionRevisionConflictError("thread_id run id mismatch")

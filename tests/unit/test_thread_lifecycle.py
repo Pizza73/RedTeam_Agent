@@ -5,7 +5,12 @@ from __future__ import annotations
 import pytest
 
 from redteam_agent.errors import MissionRevisionConflictError
-from redteam_agent.execution.thread import compute_thread_id, new_run_thread, verify_thread_id
+from redteam_agent.execution.thread import (
+    compute_thread_id,
+    new_run_thread,
+    verify_run_thread_binding,
+    verify_thread_id,
+)
 
 
 def test_thread_id_format() -> None:
@@ -41,3 +46,14 @@ def test_verify_rejects_wrong_mission_or_revision() -> None:
 def test_verify_rejects_malformed_thread_id() -> None:
     with pytest.raises(MissionRevisionConflictError):
         verify_thread_id(thread_id="m1:3", mission_id="m1", mission_revision=3)
+
+
+def test_verify_run_thread_binding_rejects_reused_thread_for_another_run() -> None:
+    thread = compute_thread_id(mission_id="m1", mission_revision=3, run_id="run-1")
+    with pytest.raises(MissionRevisionConflictError, match="run id mismatch"):
+        verify_run_thread_binding(
+            thread_id=thread,
+            run_id="run-2",
+            mission_id="m1",
+            mission_revision=3,
+        )

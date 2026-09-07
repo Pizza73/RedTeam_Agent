@@ -28,6 +28,7 @@ from redteam_agent.errors import (
     ContextSelectionError,
     DataAccessResourceError,
     GoalEvaluationError,
+    MissionRevisionConflictError,
     PlannerCandidateError,
     PlannerContextError,
     RepositoryIntegrityError,
@@ -274,6 +275,7 @@ class PlannerContextService:
     ) -> PlannerContextEnvelope:
         now = self._clock.now()
         context_rebuild_count = 0
+        parent: PlannerContextEnvelope | None = None
         if parent_context_id is not None:
             parent = self.get(parent_context_id) if stale_rebuild else self.revalidate(parent_context_id)
             if parent is None:
@@ -291,6 +293,14 @@ class PlannerContextService:
                 raise PlannerContextError("context rebuild limit reached")
             context_rebuild_count = parent.context_rebuild_count + 1
         current = self._resolver.resolve(mission_id, now=now)
+        if (
+            parent_context_id is not None
+            and parent is not None
+            and parent.mission_revision != current.mission.mission_revision
+        ):
+            raise MissionRevisionConflictError(
+                "planner context lineage cannot cross a mission revision"
+            )
         selected_metadata = self._context_selector.select(
             mission_id, _projection_target_values(projection)
         )
@@ -474,6 +484,10 @@ class PlannerContextService:
             return self.revalidate(planner_context_id)
         except _REBUILDABLE_CONTEXT_ERRORS:
             return self.rebuild_stale(planner_context_id)
+
+    def current_mission_revision(self, mission_id: str) -> int:
+        """Read the current revision before selecting a checkpoint thread."""
+        return self._resolver.resolve(mission_id, now=self._clock.now()).mission.mission_revision
 
     def get(self, planner_context_id: str) -> PlannerContextEnvelope | None:
         row = self._db.occ_get(_ENVELOPE_NS, planner_context_id)

@@ -13,9 +13,11 @@ from redteam_agent.agent.models import ActionCandidateSeed
 from redteam_agent.composition.phase1 import build_phase1_kernel
 from redteam_agent.errors import (
     GoalEvaluationConflictError,
+    MissionRevisionConflictError,
     PlannerCandidateError,
     PlannerContextError,
 )
+from redteam_agent.execution.thread import compute_thread_id
 from redteam_agent.plan.models import PlannerActionOutput, PlannerContextRequest, RetrievalHint
 from redteam_agent.policy.scope_models import IpTargetReference
 
@@ -73,7 +75,12 @@ def test_planner_context_and_action_are_exactly_bound_to_current_candidate() -> 
     )
     transition = kernel.action_service.execute(
         planner_context_id=envelope.planner_context_id, output=output,
-        plan_id="phase1-plan-1", run_id="phase1-run-1", thread_id="phase1-thread-1",
+        plan_id="phase1-plan-1", run_id="phase1-run-1",
+        thread_id=compute_thread_id(
+            mission_id=envelope.mission_id,
+            mission_revision=envelope.mission_revision,
+            run_id="phase1-run-1",
+        ),
         decision_id="phase1-decision-1", execution_id="phase1-execution-1",
         task_id="phase1-task-1",
     )
@@ -85,7 +92,12 @@ def test_planner_context_and_action_are_exactly_bound_to_current_candidate() -> 
         kernel.action_service.execute(
             planner_context_id=envelope.planner_context_id, output=output,
             plan_id="phase1-plan-replay", run_id="phase1-run-replay",
-            thread_id="phase1-thread-replay", decision_id="phase1-decision-replay",
+            thread_id=compute_thread_id(
+                mission_id=envelope.mission_id,
+                mission_revision=envelope.mission_revision,
+                run_id="phase1-run-replay",
+            ),
+            decision_id="phase1-decision-replay",
             execution_id="phase1-execution-replay", task_id="phase1-task-replay",
         )
     assert kernel.phase0c.phase0b.mock_adapter.submit_calls == 1
@@ -103,6 +115,57 @@ def test_planner_action_cannot_select_another_target() -> None:
     )
     with pytest.raises(PlannerCandidateError):
         kernel.candidate_projector.match_action(output=output, projection=projection)
+
+
+def test_action_rejects_noncanonical_thread_before_consuming_context() -> None:
+    kernel, seeded, goal, grant, projection = _inputs()
+    mission_id = seeded.seeded.revision.mission_id
+    envelope = kernel.planner_context_service.build(
+        planner_context_id="planner-context-thread-binding",
+        mission_id=mission_id,
+        goal_evaluation_id=goal.evaluation_id,
+        projection=projection,
+        context_grant_id=grant.grant_id,
+        available_tool_snapshot_id=seeded.seeded.snapshot.snapshot_id,
+        iteration=0,
+    )
+    output = PlannerActionOutput(
+        proposal=support.make_proposal(
+            tool=seeded.seeded.tool,
+            arguments={"destinations": ["10.1.2.3"], "port": 443, "protocol": "tcp"},
+            requested_targets=(IpTargetReference(type="ip", address="10.1.2.3"),),
+        ),
+        working_state_update=None,
+        next_iteration_hints=(),
+    )
+    with pytest.raises(MissionRevisionConflictError):
+        kernel.action_service.execute(
+            planner_context_id=envelope.planner_context_id,
+            output=output,
+            plan_id="invalid-thread-plan",
+            run_id="bound-run",
+            thread_id="attacker-selected-noncanonical-thread",
+            decision_id="invalid-thread-decision",
+            execution_id="invalid-thread-execution",
+            task_id="invalid-thread-task",
+        )
+    assert kernel.phase0c.phase0b.mock_adapter.submit_calls == 0
+
+    transition = kernel.action_service.execute(
+        planner_context_id=envelope.planner_context_id,
+        output=output,
+        plan_id="valid-thread-plan",
+        run_id="bound-run",
+        thread_id=compute_thread_id(
+            mission_id=mission_id,
+            mission_revision=envelope.mission_revision,
+            run_id="bound-run",
+        ),
+        decision_id="valid-thread-decision",
+        execution_id="valid-thread-execution",
+        task_id="valid-thread-task",
+    )
+    assert transition.dispatch is not None
 
 
 def test_scope_false_action_never_reaches_mock_adapter() -> None:
@@ -127,7 +190,12 @@ def test_scope_false_action_never_reaches_mock_adapter() -> None:
     transition = kernel.action_service.execute(
         planner_context_id=envelope.planner_context_id, output=output,
         plan_id="phase1-plan-denied", run_id="phase1-run-denied",
-        thread_id="phase1-thread-denied", decision_id="phase1-decision-denied",
+        thread_id=compute_thread_id(
+            mission_id=envelope.mission_id,
+            mission_revision=envelope.mission_revision,
+            run_id="phase1-run-denied",
+        ),
+        decision_id="phase1-decision-denied",
         execution_id="phase1-execution-denied", task_id="phase1-task-denied",
     )
     assert transition.decision.decision == "DENY"

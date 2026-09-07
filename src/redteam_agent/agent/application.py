@@ -10,6 +10,7 @@ from redteam_agent.canonical.digest_service import DigestService
 from redteam_agent.contracts.catalog import ActionContractCatalog
 from redteam_agent.errors import AgentLoopError
 from redteam_agent.execution.executor import DispatchOutcome, Executor
+from redteam_agent.execution.thread import verify_run_thread_binding
 from redteam_agent.goal.service import GoalEvaluationService
 from redteam_agent.plan.models import ExecutionPlan, PlannerActionOutput, compute_proposal_digest
 from redteam_agent.policy.authorization_service import ExecutionAuthorizationService
@@ -56,6 +57,13 @@ class PlannerActionApplicationService:
         execution_id: str, task_id: str,
         predicate_snapshot: PredicateSnapshot | None = None,
     ) -> ActionTransitionResult:
+        envelope = self._contexts.revalidate(planner_context_id)
+        verify_run_thread_binding(
+            thread_id=thread_id,
+            run_id=run_id,
+            mission_id=envelope.mission_id,
+            mission_revision=envelope.mission_revision,
+        )
         candidate = self._contexts.accept_action(
             planner_context_id=planner_context_id, output=output
         )

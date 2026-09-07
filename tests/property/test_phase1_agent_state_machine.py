@@ -21,6 +21,7 @@ from redteam_agent.agent.models import ActionCandidateSeed
 from redteam_agent.agent.workflow import PlanningOperationIds
 from redteam_agent.composition.phase1 import build_phase1_kernel
 from redteam_agent.errors import AgentLoopError
+from redteam_agent.execution.thread import compute_thread_id
 from redteam_agent.plan.models import (
     HypothesisCreateProposal,
     PlannerActionOutput,
@@ -82,6 +83,12 @@ class Phase1AgentStateMachine(RuleBasedStateMachine):
         self.execution_created = False
         self.expired = False
         self.operation = 0
+        self.run_id = "state-machine-run"
+        self.thread_id = compute_thread_id(
+            mission_id=self.mission_id,
+            mission_revision=self.envelope.mission_revision,
+            run_id=self.run_id,
+        )
         self.thread = self.kernel.planner_state_manager.apply(
             mission_id=self.mission_id,
             proposal=PlanThreadUpdateProposal(
@@ -108,8 +115,8 @@ class Phase1AgentStateMachine(RuleBasedStateMachine):
             ids=PlanningOperationIds(
                 operation_id=f"state-machine-operation-{self.operation}",
                 plan_id="state-machine-plan",
-                run_id="state-machine-run",
-                thread_id="state-machine-thread",
+                run_id=self.run_id,
+                thread_id=self.thread_id,
                 decision_id="state-machine-decision",
                 execution_id="state-machine-execution",
                 task_id="state-machine-task",
@@ -211,14 +218,18 @@ class Phase1AgentStateMachine(RuleBasedStateMachine):
             "controller_reason",
             "planner_output_kind",
         }
-        for operation in range(1, self.operation + 1):
-            snapshot = self.kernel.workflow.graph.get_state({
+        if self.operation:
+            checkpointer = self.kernel.workflow.graph.checkpointer
+            assert checkpointer is not None
+            snapshot = checkpointer.get({
                 "configurable": {
-                    "thread_id": f"plan:{self.mission_id}:state-machine-operation-{operation}"
+                    "thread_id": self.thread_id,
                 }
             })
-            assert set(snapshot.values) <= allowed
-            assert all(isinstance(value, str) for value in snapshot.values.values())
+            assert snapshot is not None
+            values = snapshot["channel_values"]
+            assert set(values) <= allowed
+            assert all(isinstance(value, str) for value in values.values())
 
 
 Phase1AgentStateMachine.TestCase.settings = settings(

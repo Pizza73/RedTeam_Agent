@@ -13,12 +13,17 @@ import support_phase0b as p0b
 import support_phase0c as p0c
 from redteam_agent.agent.mock_agents import MockAnalyzer, MockPlanner
 from redteam_agent.agent.workflow import PlanningOperationIds
-from redteam_agent.errors import AgentLoopError
+from redteam_agent.errors import AgentLoopError, MissionRevisionConflictError
 from redteam_agent.execution.models import AdapterCollectionControl
+from redteam_agent.execution.thread import compute_thread_id
 from redteam_agent.knowledge.models import AnalyzerCandidateObservation
 from redteam_agent.plan.models import PlannerActionOutput
 from redteam_agent.policy.scope_models import IpTargetReference
 from redteam_agent.runtime.clock import ManualClock, ManualMonotonicClock
+
+
+def _thread_id(mission_id: str, run_id: str) -> str:
+    return compute_thread_id(mission_id=mission_id, mission_revision=1, run_id=run_id)
 
 
 def test_phase1_uses_compiled_coarse_graphs_without_automatic_retry() -> None:
@@ -86,7 +91,7 @@ def test_stale_planner_context_is_rebuilt_before_the_model_call() -> None:
             operation_id="stale-workflow-plan",
             plan_id="stale-workflow-plan",
             run_id="stale-workflow-run",
-            thread_id="stale-workflow-thread",
+            thread_id=_thread_id(mission_id, "stale-workflow-run"),
             decision_id="stale-workflow-decision",
             execution_id="stale-workflow-execution",
             task_id="stale-workflow-task",
@@ -103,10 +108,16 @@ def test_stale_planner_context_is_rebuilt_before_the_model_call() -> None:
     retry_rows = kernel.phase0c.phase0b.phase0a.database.occ_get_all("agent_retry_budget")
     assert len(retry_rows) == 1
 
-    checkpoint = kernel.workflow.graph.get_state({
-        "configurable": {"thread_id": f"plan:{mission_id}:stale-workflow-plan"}
+    checkpointer = kernel.workflow.graph.checkpointer
+    assert checkpointer is not None
+    checkpoint = checkpointer.get({
+        "configurable": {
+            "thread_id": _thread_id(mission_id, "stale-workflow-run"),
+        }
     })
-    assert set(checkpoint.values) <= {
+    assert checkpoint is not None
+    values = checkpoint["channel_values"]
+    assert set(values) <= {
         "mission_id",
         "operation_id",
         "planner_context_id",
@@ -115,7 +126,55 @@ def test_stale_planner_context_is_rebuilt_before_the_model_call() -> None:
         "controller_reason",
         "planner_output_kind",
     }
-    assert all(isinstance(value, str) for value in checkpoint.values.values())
+    assert all(isinstance(value, str) for value in values.values())
+
+
+def test_workflow_rejects_malformed_wrong_revision_and_reused_run_threads() -> None:
+    kernel, seeded, goal, grant, projection = _inputs()
+    mission_id = seeded.seeded.revision.mission_id
+    envelope = kernel.planner_context_service.build(
+        planner_context_id="invalid-workflow-thread-context",
+        mission_id=mission_id,
+        goal_evaluation_id=goal.evaluation_id,
+        projection=projection,
+        context_grant_id=grant.grant_id,
+        available_tool_snapshot_id=seeded.seeded.snapshot.snapshot_id,
+        iteration=0,
+    )
+    invoked = False
+
+    def invoke(_current: object) -> object:
+        nonlocal invoked
+        invoked = True
+        return {}
+
+    invalid_threads = (
+        "attacker-selected-noncanonical-thread",
+        f"{mission_id}:2:bound-run",
+        f"{mission_id}:1:another-run",
+    )
+    for index, invalid_thread in enumerate(invalid_threads):
+        with pytest.raises(MissionRevisionConflictError):
+            kernel.workflow.run_planning_iteration(
+                envelope=envelope,
+                ids=PlanningOperationIds(
+                    operation_id=f"invalid-workflow-thread-{index}",
+                    plan_id="invalid-workflow-plan",
+                    run_id="bound-run",
+                    thread_id=invalid_thread,
+                    decision_id="invalid-workflow-decision",
+                    execution_id="invalid-workflow-execution",
+                    task_id="invalid-workflow-task",
+                ),
+                invoke_planner=invoke,
+            )
+        checkpointer = kernel.workflow.graph.checkpointer
+        assert checkpointer is not None
+        snapshot = checkpointer.get({
+            "configurable": {"thread_id": invalid_thread}
+        })
+        assert snapshot is None
+    assert not invoked
 
 
 def test_graph_checkpoints_are_written_to_the_application_sqlite_file(
@@ -131,6 +190,7 @@ def test_graph_checkpoints_are_written_to_the_application_sqlite_file(
         monotonic_clock=ManualMonotonicClock(support.T0),
     )
     kernel, seeded, goal, grant, projection = _inputs(phase0c=phase0c)
+    mission_id = seeded.seeded.revision.mission_id
     envelope = kernel.planner_context_service.build(
         planner_context_id="durable-checkpoint-context",
         mission_id=seeded.seeded.revision.mission_id,
@@ -155,7 +215,7 @@ def test_graph_checkpoints_are_written_to_the_application_sqlite_file(
             operation_id="durable-checkpoint-plan",
             plan_id="durable-checkpoint-plan",
             run_id="durable-checkpoint-run",
-            thread_id="durable-checkpoint-thread",
+            thread_id=_thread_id(mission_id, "durable-checkpoint-run"),
             decision_id="durable-checkpoint-decision",
             execution_id="durable-checkpoint-execution",
             task_id="durable-checkpoint-task",
@@ -196,7 +256,7 @@ def test_mock_agent_loop_reaches_goal_through_real_policy_and_executor() -> None
         envelope=envelope,
         ids=PlanningOperationIds(
             operation_id="mock-loop-planner", plan_id="mock-loop-plan",
-            run_id="mock-loop-run", thread_id="mock-loop-thread",
+            run_id="mock-loop-run", thread_id=_thread_id(mission_id, "mock-loop-run"),
             decision_id="mock-loop-decision", execution_id="mock-loop-execution",
             task_id="mock-loop-task",
         ),
@@ -224,7 +284,7 @@ def test_mock_agent_loop_reaches_goal_through_real_policy_and_executor() -> None
         envelope=envelope,
         ids=PlanningOperationIds(
             operation_id="mock-loop-recover", plan_id="unused-plan",
-            run_id="unused-run", thread_id="unused-thread",
+            run_id="unused-run", thread_id=_thread_id(mission_id, "unused-run"),
             decision_id="unused-decision", execution_id="unused-execution",
             task_id="unused-task",
         ),
@@ -286,6 +346,19 @@ def test_mock_agent_loop_reaches_goal_through_real_policy_and_executor() -> None
     result_digest = kernel.phase0c.phase0b.phase0a.digest_service.compute(
         "execution_outcome_source_digest", result.model_dump(mode="python")
     )
+    with pytest.raises(MissionRevisionConflictError):
+        kernel.workflow.run_analysis(
+            mission_id=mission_id,
+            mission_revision=envelope.mission_revision,
+            operation_id="invalid-analyzer-thread",
+            execution_id="mock-loop-execution",
+            result_digest=result_digest,
+            context_grant_id=analyzer_grant.grant_id,
+            run_id="mock-loop-run",
+            thread_id="attacker-selected-noncanonical-thread",
+            invoke_analyzer=lambda: analyzer.invoke(execution_id="mock-loop-execution"),
+        )
+    assert analyzer.call_count == 0
     with pytest.raises(AgentLoopError):
         kernel.workflow.run_analysis(
             mission_id=mission_id,
@@ -294,6 +367,8 @@ def test_mock_agent_loop_reaches_goal_through_real_policy_and_executor() -> None
             execution_id="mock-loop-execution",
             result_digest="forged-result-digest",
             context_grant_id=analyzer_grant.grant_id,
+            run_id="mock-loop-run",
+            thread_id=_thread_id(mission_id, "mock-loop-run"),
             invoke_analyzer=lambda: analyzer.invoke(execution_id="mock-loop-execution"),
         )
     assert analyzer.call_count == 0
@@ -305,6 +380,8 @@ def test_mock_agent_loop_reaches_goal_through_real_policy_and_executor() -> None
             execution_id="mock-loop-execution",
             result_digest=result_digest,
             context_grant_id=grant.grant_id,
+            run_id="mock-loop-run",
+            thread_id=_thread_id(mission_id, "mock-loop-run"),
             invoke_analyzer=lambda: analyzer.invoke(execution_id="mock-loop-execution"),
         )
     assert analyzer.call_count == 0
@@ -313,6 +390,8 @@ def test_mock_agent_loop_reaches_goal_through_real_policy_and_executor() -> None
         operation_id="mock-loop-analyzer", execution_id="mock-loop-execution",
         result_digest=result_digest,
         context_grant_id=analyzer_grant.grant_id,
+        run_id="mock-loop-run",
+        thread_id=_thread_id(mission_id, "mock-loop-run"),
         invoke_analyzer=lambda: analyzer.invoke(execution_id="mock-loop-execution"),
     )
     assert observation.object_ref == "sess-1" and analyzer.call_count == 1
@@ -322,7 +401,7 @@ def test_mock_agent_loop_reaches_goal_through_real_policy_and_executor() -> None
             envelope=envelope,
             ids=PlanningOperationIds(
                 operation_id="mock-loop-enter-finalization", plan_id="unused-plan",
-                run_id="unused-run", thread_id="unused-thread",
+                run_id="unused-run", thread_id=_thread_id(mission_id, "unused-run"),
                 decision_id="unused-decision", execution_id="unused-execution",
                 task_id="unused-task",
             ),
@@ -355,7 +434,7 @@ def test_mock_agent_loop_reaches_goal_through_real_policy_and_executor() -> None
         envelope=envelope,
         ids=PlanningOperationIds(
             operation_id="mock-loop-finalize", plan_id="unused-plan",
-            run_id="unused-run", thread_id="unused-thread",
+            run_id="unused-run", thread_id=_thread_id(mission_id, "unused-run"),
             decision_id="unused-decision", execution_id="unused-execution",
             task_id="unused-task",
         ),
@@ -390,7 +469,7 @@ def test_hard_limit_aborts_without_planner_or_goal_rewrite() -> None:
         envelope=envelope,
         ids=PlanningOperationIds(
             operation_id="hard-limit", plan_id="unused-plan", run_id="unused-run",
-            thread_id="unused-thread", decision_id="unused-decision",
+            thread_id=_thread_id(mission_id, "unused-run"), decision_id="unused-decision",
             execution_id="unused-execution", task_id="unused-task",
         ),
         invoke_planner=lambda _envelope: (_ for _ in ()).throw(
@@ -427,7 +506,7 @@ def test_finalizing_resume_uses_bounded_reconciliation_and_cancel() -> None:
         envelope=envelope,
         ids=PlanningOperationIds(
             operation_id="finalizing-plan", plan_id="finalizing-plan", run_id="finalizing-run",
-            thread_id="finalizing-thread", decision_id="finalizing-decision",
+            thread_id=_thread_id(mission_id, "finalizing-run"), decision_id="finalizing-decision",
             execution_id="finalizing-execution", task_id="finalizing-task",
         ),
         invoke_planner=planner.invoke,
@@ -441,7 +520,7 @@ def test_finalizing_resume_uses_bounded_reconciliation_and_cancel() -> None:
         envelope=envelope,
         ids=PlanningOperationIds(
             operation_id="finalizing-resume", plan_id="unused-plan", run_id="unused-run",
-            thread_id="unused-thread", decision_id="unused-decision",
+            thread_id=_thread_id(mission_id, "unused-run"), decision_id="unused-decision",
             execution_id="unused-execution", task_id="unused-task",
         ),
         invoke_planner=lambda _envelope: (_ for _ in ()).throw(
@@ -456,7 +535,7 @@ def test_finalizing_resume_uses_bounded_reconciliation_and_cancel() -> None:
             envelope=envelope,
             ids=PlanningOperationIds(
                 operation_id=f"finalizing-resume-{attempt}", plan_id="unused-plan",
-                run_id="unused-run", thread_id="unused-thread",
+                run_id="unused-run", thread_id=_thread_id(mission_id, "unused-run"),
                 decision_id="unused-decision", execution_id="unused-execution",
                 task_id="unused-task",
             ),
@@ -468,7 +547,7 @@ def test_finalizing_resume_uses_bounded_reconciliation_and_cancel() -> None:
         envelope=envelope,
         ids=PlanningOperationIds(
             operation_id="finalizing-resume-exhausted", plan_id="unused-plan",
-            run_id="unused-run", thread_id="unused-thread",
+            run_id="unused-run", thread_id=_thread_id(mission_id, "unused-run"),
             decision_id="unused-decision", execution_id="unused-execution",
             task_id="unused-task",
         ),
@@ -513,7 +592,7 @@ def test_running_recovery_budget_exhaustion_converges_to_human_review() -> None:
         envelope=envelope,
         ids=PlanningOperationIds(
             operation_id="running-plan", plan_id="running-plan", run_id="running-run",
-            thread_id="running-thread", decision_id="running-decision",
+            thread_id=_thread_id(mission_id, "running-run"), decision_id="running-decision",
             execution_id="running-execution", task_id="running-task",
         ),
         invoke_planner=planner.invoke,
@@ -525,7 +604,7 @@ def test_running_recovery_budget_exhaustion_converges_to_human_review() -> None:
             envelope=envelope,
             ids=PlanningOperationIds(
                 operation_id=f"running-recovery-{attempt}", plan_id="unused-plan",
-                run_id="unused-run", thread_id="unused-thread",
+                run_id="unused-run", thread_id=_thread_id(mission_id, "unused-run"),
                 decision_id="unused-decision", execution_id="unused-execution",
                 task_id="unused-task",
             ),
@@ -565,7 +644,7 @@ def test_finalizing_cancelled_execution_collects_ingests_and_completes() -> None
         envelope=envelope,
         ids=PlanningOperationIds(
             operation_id="cancel-plan", plan_id="cancel-plan", run_id="cancel-run",
-            thread_id="cancel-thread", decision_id="cancel-decision",
+            thread_id=_thread_id(mission_id, "cancel-run"), decision_id="cancel-decision",
             execution_id="cancel-execution", task_id="cancel-task",
         ),
         invoke_planner=planner.invoke,
@@ -579,7 +658,7 @@ def test_finalizing_cancelled_execution_collects_ingests_and_completes() -> None
         envelope=envelope,
         ids=PlanningOperationIds(
             operation_id="cancel-start", plan_id="unused-plan", run_id="unused-run",
-            thread_id="unused-thread", decision_id="unused-decision",
+            thread_id=_thread_id(mission_id, "unused-run"), decision_id="unused-decision",
             execution_id="unused-execution", task_id="unused-task",
         ),
         invoke_planner=lambda _envelope: (_ for _ in ()).throw(AssertionError("no Planner")),
@@ -595,7 +674,7 @@ def test_finalizing_cancelled_execution_collects_ingests_and_completes() -> None
         envelope=envelope,
         ids=PlanningOperationIds(
             operation_id="cancel-finish", plan_id="unused-plan", run_id="unused-run",
-            thread_id="unused-thread", decision_id="unused-decision",
+            thread_id=_thread_id(mission_id, "unused-run"), decision_id="unused-decision",
             execution_id="unused-execution", task_id="unused-task",
         ),
         invoke_planner=lambda _envelope: (_ for _ in ()).throw(AssertionError("no Planner")),

@@ -27,6 +27,7 @@ from redteam_agent.context.selector import ContextSelector
 from redteam_agent.erasure.service import VerifiedQuarantineEraser
 from redteam_agent.errors import (
     AgentLoopError,
+    MissionRevisionConflictError,
     OutputPublicationError,
     RawResultQuarantineError,
     SecureIngestionError,
@@ -37,6 +38,7 @@ from redteam_agent.execution.executor import Executor
 from redteam_agent.execution.models import AdapterCollectionControl, ProviderTaskBinding
 from redteam_agent.execution.reconcile import ReconcileOutcome, ReconciliationService
 from redteam_agent.execution.recovery import ExecutionRecoveryService
+from redteam_agent.execution.thread import verify_run_thread_binding
 from redteam_agent.goal.service import GoalEvaluationService
 from redteam_agent.ingestion.service import SecureIngestionService
 from redteam_agent.knowledge.models import (
@@ -197,6 +199,17 @@ class Phase1AgentWorkflow:
         self, *, envelope: PlannerContextEnvelope, ids: PlanningOperationIds,
         invoke_planner: Callable[[PlannerContextEnvelope], object],
     ) -> WorkflowStepResult:
+        current_revision = self._contexts.current_mission_revision(envelope.mission_id)
+        if envelope.mission_revision != current_revision:
+            raise MissionRevisionConflictError(
+                "planner context mission revision is not current"
+            )
+        verify_run_thread_binding(
+            thread_id=ids.thread_id,
+            run_id=ids.run_id,
+            mission_id=envelope.mission_id,
+            mission_revision=current_revision,
+        )
         sink = _PlanningResultSink()
         cast(
             _PlanningGraphState,
@@ -206,7 +219,7 @@ class Phase1AgentWorkflow:
                     "operation_id": ids.operation_id,
                     "planner_context_id": envelope.planner_context_id,
                 },
-                config={"configurable": {"thread_id": f"plan:{envelope.mission_id}:{ids.operation_id}"}},
+                config={"configurable": {"thread_id": ids.thread_id}},
                 context=_PlanningRuntime(
                     envelope=envelope, ids=ids, invoke_planner=invoke_planner, sink=sink
                 ),
@@ -224,8 +237,17 @@ class Phase1AgentWorkflow:
     def run_analysis(
         self, *, mission_id: str, mission_revision: int, operation_id: str,
         execution_id: str, result_digest: str, invoke_analyzer: Callable[[], object],
-        context_grant_id: str,
+        context_grant_id: str, run_id: str, thread_id: str,
     ) -> KnowledgeObservation:
+        current_revision = self._contexts.current_mission_revision(mission_id)
+        if mission_revision != current_revision:
+            raise MissionRevisionConflictError("Analyzer mission revision is not current")
+        verify_run_thread_binding(
+            thread_id=thread_id,
+            run_id=run_id,
+            mission_id=mission_id,
+            mission_revision=current_revision,
+        )
         sink = _AnalysisResultSink()
         cast(
             _AnalysisGraphState,
@@ -236,7 +258,7 @@ class Phase1AgentWorkflow:
                     "execution_id": execution_id,
                     "context_grant_id": context_grant_id,
                 },
-                config={"configurable": {"thread_id": f"analysis:{mission_id}:{operation_id}"}},
+                config={"configurable": {"thread_id": thread_id}},
                 context=_AnalysisRuntime(
                     mission_id=mission_id,
                     mission_revision=mission_revision,
