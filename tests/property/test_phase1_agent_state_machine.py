@@ -114,7 +114,7 @@ class Phase1AgentStateMachine(RuleBasedStateMachine):
                 execution_id="state-machine-execution",
                 task_id="state-machine-task",
             ),
-            invoke_planner=lambda: self.planner.invoke(self.envelope),
+            invoke_planner=self.planner.invoke,
         )
 
     @precondition(lambda self: self._state() == "RUNNING" and not self.execution_created)
@@ -201,7 +201,24 @@ class Phase1AgentStateMachine(RuleBasedStateMachine):
             assert checkpoint.mission_id == self.mission_id
             assert checkpoint.planner_context_id is None
             assert checkpoint.operation_id.startswith("state-machine-operation-")
-        assert self.kernel.workflow.graph.checkpointer is None
+        assert self.kernel.workflow.graph.checkpointer is not None
+        allowed = {
+            "mission_id",
+            "operation_id",
+            "planner_context_id",
+            "goal_evaluation_id",
+            "controller_action",
+            "controller_reason",
+            "planner_output_kind",
+        }
+        for operation in range(1, self.operation + 1):
+            snapshot = self.kernel.workflow.graph.get_state({
+                "configurable": {
+                    "thread_id": f"plan:{self.mission_id}:state-machine-operation-{operation}"
+                }
+            })
+            assert set(snapshot.values) <= allowed
+            assert all(isinstance(value, str) for value in snapshot.values.values())
 
 
 Phase1AgentStateMachine.TestCase.settings = settings(

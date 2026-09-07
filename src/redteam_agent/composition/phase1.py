@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import dataclass
+
+from langgraph.checkpoint.sqlite import SqliteSaver
 
 from redteam_agent.agent.application import PlannerActionApplicationService
 from redteam_agent.agent.controller import AgentController
@@ -19,6 +22,7 @@ from redteam_agent.composition.phase0c import Phase0CKernel, build_phase0c_kerne
 from redteam_agent.composition.testing import OPERATOR_ACTOR_TOKEN
 from redteam_agent.context.builder import ContextBodyStore, ContextBuilder
 from redteam_agent.context.selector import ContextSelector
+from redteam_agent.errors import SchemaMigrationRequiredError
 from redteam_agent.goal.service import GoalEvaluationService
 from redteam_agent.knowledge.entities import EntityResolver
 from redteam_agent.knowledge.reducer import KnowledgeReducer
@@ -137,6 +141,7 @@ def build_phase1_kernel(*, phase0c: Phase0CKernel | None = None) -> Phase1Kernel
         context_authorization_service=phase0a.context_authorization_service,
         context_builder=context_builder,
         context_selector=context_selector,
+        tool_availability_service=phase0a.tool_availability_service,
         snapshot_repository=phase0a.snapshot_repository,
         session_repository=phase0a.session_repository,
         goal_service=goals,
@@ -168,6 +173,24 @@ def build_phase1_kernel(*, phase0c: Phase0CKernel | None = None) -> Phase1Kernel
         audit_store=kernel.audit_store, witness_barrier=kernel.critical_witness_barrier,
         operator_actor_token=OPERATOR_ACTOR_TOKEN, digest_service=ds,
     )
+    # LangGraph writes checkpoints from a worker thread.  A dedicated connection
+    # keeps that work out of the application unit-of-work transaction while using
+    # the same durable SQLite file in production.
+    if not phase0a.database.graph_checkpoint_schema_is_current():
+        raise SchemaMigrationRequiredError(
+            "Phase 1 requires the pre-provisioned LangGraph checkpoint schema"
+        )
+    graph_checkpoint_connection = sqlite3.connect(
+        phase0a.database.path,
+        check_same_thread=False,
+    )
+    graph_checkpointer = SqliteSaver(graph_checkpoint_connection)
+    if phase0a.database.path == ":memory:":
+        graph_checkpointer.setup()
+    else:
+        # The exact pinned schema was checked above; suppress SqliteSaver's lazy
+        # CREATE TABLE path during normal startup.
+        graph_checkpointer.is_setup = True
     workflow = Phase1AgentWorkflow(
         controller=controller, llm_gateway=llm_gateway,
         planner_context_service=planner_context, action_service=action_service,
@@ -191,6 +214,7 @@ def build_phase1_kernel(*, phase0c: Phase0CKernel | None = None) -> Phase1Kernel
         context_authorization_service=phase0a.context_authorization_service,
         context_builder=context_builder,
         digest_service=ds,
+        checkpointer=graph_checkpointer,
         verified_finding_projector=verified_findings,
     )
     return Phase1Kernel(

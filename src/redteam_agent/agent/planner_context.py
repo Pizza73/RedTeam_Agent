@@ -23,7 +23,17 @@ from redteam_agent.context.builder import ContextBuilder
 from redteam_agent.context.models import ContextDataAccessGrant, RankedContextCandidate
 from redteam_agent.context.selector import ContextSelector, target_reference_value
 from redteam_agent.contracts.catalog import ActionContractCatalog
-from redteam_agent.errors import PlannerCandidateError, PlannerContextError, RepositoryIntegrityError
+from redteam_agent.errors import (
+    AvailableToolSnapshotStaleError,
+    ContextSelectionError,
+    DataAccessResourceError,
+    GoalEvaluationError,
+    PlannerCandidateError,
+    PlannerContextError,
+    RepositoryIntegrityError,
+    SandboxCapabilityStaleError,
+    SessionContextGrantStaleError,
+)
 from redteam_agent.goal.service import GoalEvaluationService
 from redteam_agent.plan.models import OperationalPhase, PlannerActionOutput, PlannerContextRequest
 from redteam_agent.policy.scope_models import TargetReference
@@ -37,6 +47,7 @@ from redteam_agent.storage.repositories import (
     ToolRegistryRepository,
 )
 from redteam_agent.tools.availability import AvailableToolSnapshot, revalidate_snapshot
+from redteam_agent.tools.availability_service import ToolAvailabilityService
 
 _ENVELOPE_NS = "planner_context_envelope"
 _CONTEXT_REQUEST_NS = "planner_context_request"
@@ -46,6 +57,16 @@ _CONTEXT_ACTION_NS = "planner_context_action"
 MAX_ACTION_CANDIDATES = 32
 MAX_RANKED_METADATA = 100
 MAX_ENVELOPE_TTL_SECONDS = 300
+_REBUILDABLE_CONTEXT_ERRORS = (
+    AvailableToolSnapshotStaleError,
+    ContextSelectionError,
+    DataAccessResourceError,
+    GoalEvaluationError,
+    PlannerCandidateError,
+    PlannerContextError,
+    SandboxCapabilityStaleError,
+    SessionContextGrantStaleError,
+)
 
 
 def _target_key(targets: tuple[TargetReference, ...]) -> bytes:
@@ -216,6 +237,7 @@ class PlannerContextService:
         context_authorization_service: ContextAuthorizationService,
         context_builder: ContextBuilder,
         context_selector: ContextSelector,
+        tool_availability_service: ToolAvailabilityService,
         snapshot_repository: AvailableToolSnapshotRepository,
         session_repository: SessionSecurityContextSnapshotRepository,
         goal_service: GoalEvaluationService, candidate_projector: ActionCandidateProjector,
@@ -230,6 +252,7 @@ class PlannerContextService:
         self._context_auth = context_authorization_service
         self._context_builder = context_builder
         self._context_selector = context_selector
+        self._tool_availability = tool_availability_service
         self._snapshots = snapshot_repository
         self._sessions = session_repository
         self._goals = goal_service
@@ -247,11 +270,21 @@ class PlannerContextService:
         feedback: tuple[PlannerFeedback, ...] = (), working_state_id: str | None = None,
         operational_phase: OperationalPhase = "INITIAL_ACCESS",
         truncation_reason_codes: tuple[str, ...] = (), parent_context_id: str | None = None,
+        stale_rebuild: bool = False,
     ) -> PlannerContextEnvelope:
         now = self._clock.now()
         context_rebuild_count = 0
         if parent_context_id is not None:
-            parent = self.revalidate(parent_context_id)
+            parent = self.get(parent_context_id) if stale_rebuild else self.revalidate(parent_context_id)
+            if parent is None:
+                raise PlannerContextError("context rebuild parent not found")
+            if stale_rebuild:
+                try:
+                    self.revalidate(parent_context_id)
+                except _REBUILDABLE_CONTEXT_ERRORS:
+                    pass
+                else:
+                    raise PlannerContextError("stale rebuild requires a stale parent context")
             if parent.mission_id != mission_id or parent.iteration != iteration:
                 raise PlannerContextError("context rebuild parent belongs to another loop iteration")
             if parent.context_rebuild_count >= 2:
@@ -337,7 +370,10 @@ class PlannerContextService:
                         json.dumps({"planner_context_id": planner_context_id}, sort_keys=True),
                     )
                 else:
-                    if self._db.occ_get(_CONTEXT_REQUEST_NS, parent_context_id) is None:
+                    if (
+                        not stale_rebuild
+                        and self._db.occ_get(_CONTEXT_REQUEST_NS, parent_context_id) is None
+                    ):
                         raise PlannerContextError("context rebuild parent has no accepted request")
                     self._db.occ_insert(
                         _CONTEXT_CHILD_NS, parent_context_id, 1,
@@ -350,6 +386,94 @@ class PlannerContextService:
         except RepositoryIntegrityError:
             raise PlannerContextError("planner context lineage already advanced") from None
         return envelope
+
+    def rebuild_stale(self, planner_context_id: str) -> PlannerContextEnvelope:
+        """Rebuild a stale envelope from current owners within the existing lineage."""
+        parent = self.get(planner_context_id)
+        if parent is None:
+            raise PlannerContextError("planner context not found")
+        try:
+            self.revalidate(planner_context_id)
+        except _REBUILDABLE_CONTEXT_ERRORS:
+            pass
+        else:
+            return parent
+        next_revision = parent.context_rebuild_count + 1
+        if next_revision > 2:
+            raise PlannerContextError("context rebuild limit reached")
+        root_context_id = self._root_context_id(parent)
+        reserved = self._retry_budgets.reserve(
+            mission_id=parent.mission_id,
+            operation_id=f"{parent.iteration}:{root_context_id}",
+            retry_kind="context",
+        )
+        goal = self._goals.evaluate(mission_id=parent.mission_id)
+        snapshot = self._tool_availability.publish(
+            snapshot_id=(
+                f"{parent.planner_context_id}-tools-{next_revision}-"
+                f"attempt-{reserved.consumed_attempts}"
+            ),
+            mission_id=parent.mission_id,
+        )
+        seeds = tuple(
+            ActionCandidateSeed(
+                tool_ref=candidate.tool_ref,
+                canonical_target_binding=candidate.canonical_target_binding,
+                satisfied_precondition_refs=candidate.satisfied_precondition_refs,
+                objective_dependency_ids=candidate.objective_dependency_ids,
+            )
+            for candidate in parent.action_candidate_projection.candidates
+        )
+        projection = self._projector.build(
+            snapshot_id=snapshot.snapshot_id,
+            seeds=seeds,
+            source_version_digests=(goal.evaluation_digest, goal.knowledge_head_digest),
+        )
+        ranked = self._context_selector.select(
+            parent.mission_id, _projection_target_values(projection)
+        )
+        grant = self._context_auth.issue_grant(
+            grant_id=(
+                f"{parent.planner_context_id}-grant-{next_revision}-"
+                f"attempt-{reserved.consumed_attempts}"
+            ),
+            mission_id=parent.mission_id,
+            service_identity="planner_context",
+            candidate_resource_ids=tuple(item.candidate.resource_id for item in ranked),
+            session_ids=tuple(sorted({
+                session_id
+                for candidate in projection.candidates
+                for session_id in candidate.eligible_session_ids
+            })),
+            ttl_seconds=120,
+        )
+        return self.build(
+            planner_context_id=(
+                f"{parent.planner_context_id}-rebuild-{next_revision}-"
+                f"attempt-{reserved.consumed_attempts}"
+            ),
+            mission_id=parent.mission_id,
+            goal_evaluation_id=goal.evaluation_id,
+            projection=projection,
+            context_grant_id=grant.grant_id,
+            available_tool_snapshot_id=snapshot.snapshot_id,
+            iteration=parent.iteration,
+            ranked_candidate_metadata=ranked,
+            recent_execution_summaries=parent.recent_execution_summaries,
+            feedback=parent.feedback,
+            working_state_id=None,
+            operational_phase=parent.operational_phase,
+            truncation_reason_codes=parent.truncation_reason_codes,
+            parent_context_id=parent.planner_context_id,
+            stale_rebuild=True,
+        )
+
+    def revalidate_or_rebuild(self, planner_context_id: str) -> PlannerContextEnvelope:
+        """Return the current envelope or rebuild a stale trusted-source binding."""
+        try:
+            return self.revalidate(planner_context_id)
+        except _REBUILDABLE_CONTEXT_ERRORS:
+            return self.rebuild_stale(planner_context_id)
 
     def get(self, planner_context_id: str) -> PlannerContextEnvelope | None:
         row = self._db.occ_get(_ENVELOPE_NS, planner_context_id)
@@ -480,14 +604,7 @@ class PlannerContextService:
             raise PlannerContextError("context request must contain a typed retrieval hint")
         if self._db.occ_get(_CONTEXT_REQUEST_NS, planner_context_id) is not None:
             raise PlannerContextError("context request already consumed")
-        root_context_id = envelope.planner_context_id
-        ancestor = envelope
-        while ancestor.parent_context_id is not None:
-            root_context_id = ancestor.parent_context_id
-            loaded_ancestor = self.get(root_context_id)
-            if loaded_ancestor is None:
-                raise PlannerContextError("context request lineage is incomplete")
-            ancestor = loaded_ancestor
+        root_context_id = self._root_context_id(envelope)
         self._retry_budgets.reserve(
             mission_id=envelope.mission_id,
             operation_id=f"{envelope.iteration}:{root_context_id}",
@@ -507,6 +624,17 @@ class PlannerContextService:
         except RepositoryIntegrityError:
             raise PlannerContextError("context request already consumed") from None
         return output
+
+    def _root_context_id(self, envelope: PlannerContextEnvelope) -> str:
+        root_context_id = envelope.planner_context_id
+        ancestor = envelope
+        while ancestor.parent_context_id is not None:
+            root_context_id = ancestor.parent_context_id
+            loaded_ancestor = self.get(root_context_id)
+            if loaded_ancestor is None:
+                raise PlannerContextError("context request lineage is incomplete")
+            ancestor = loaded_ancestor
+        return root_context_id
 
 
 def _allowed_working_state_references(envelope: PlannerContextEnvelope) -> frozenset[str]:

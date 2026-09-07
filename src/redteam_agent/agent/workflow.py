@@ -6,6 +6,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import TypedDict, cast
 
+from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.runtime import Runtime
@@ -77,26 +78,46 @@ class WorkflowStepResult:
 
 
 class _PlanningGraphState(TypedDict, total=False):
+    mission_id: str
+    operation_id: str
+    planner_context_id: str
     goal_evaluation_id: str
-    controller_decision: ControllerDecision
-    planner_output: PlannerOutput
-    action_transition: ActionTransitionResult
+    controller_action: str
+    controller_reason: str
+    planner_output_kind: str
+
+
+@dataclass
+class _PlanningResultSink:
+    controller_decision: ControllerDecision | None = None
+    planner_output: PlannerOutput | None = None
+    action_transition: ActionTransitionResult | None = None
 
 
 @dataclass(frozen=True)
 class _PlanningRuntime:
     envelope: PlannerContextEnvelope
     ids: PlanningOperationIds
-    invoke_planner: Callable[[], object]
+    invoke_planner: Callable[[PlannerContextEnvelope], object]
+    sink: _PlanningResultSink
 
 
 class _AnalysisGraphState(TypedDict, total=False):
+    mission_id: str
+    operation_id: str
+    execution_id: str
+    context_grant_id: str
     selected_resource_ids: tuple[str, ...]
     context_grant_digest: str
-    authorized_context: CanonicalJsonObject
-    candidate: AnalyzerCandidateObservation
-    observation: KnowledgeObservation
+    observation_id: str
     goal_evaluation_id: str
+
+
+@dataclass
+class _AnalysisResultSink:
+    authorized_context: CanonicalJsonObject | None = None
+    candidate: AnalyzerCandidateObservation | None = None
+    observation: KnowledgeObservation | None = None
 
 
 @dataclass(frozen=True)
@@ -108,6 +129,7 @@ class _AnalysisRuntime:
     result_digest: str
     context_grant_id: str
     invoke_analyzer: Callable[[], object]
+    sink: _AnalysisResultSink
 
 
 class Phase1AgentWorkflow:
@@ -139,6 +161,7 @@ class Phase1AgentWorkflow:
         context_authorization_service: ContextAuthorizationService,
         context_builder: ContextBuilder,
         digest_service: DigestService,
+        checkpointer: SqliteSaver,
         verified_finding_projector: VerifiedFindingProjector,
     ) -> None:
         self._controller = controller
@@ -165,30 +188,37 @@ class Phase1AgentWorkflow:
         self._context_authorization = context_authorization_service
         self._context_builder = context_builder
         self._digests = digest_service
+        self._checkpointer = checkpointer
         self._verified_findings = verified_finding_projector
         self.graph = self._build_planning_graph()
         self.analysis_graph = self._build_analysis_graph()
 
     def run_planning_iteration(
         self, *, envelope: PlannerContextEnvelope, ids: PlanningOperationIds,
-        invoke_planner: Callable[[], object],
+        invoke_planner: Callable[[PlannerContextEnvelope], object],
     ) -> WorkflowStepResult:
-        state = cast(
+        sink = _PlanningResultSink()
+        cast(
             _PlanningGraphState,
             self.graph.invoke(
-                {},
+                {
+                    "mission_id": envelope.mission_id,
+                    "operation_id": ids.operation_id,
+                    "planner_context_id": envelope.planner_context_id,
+                },
+                config={"configurable": {"thread_id": f"plan:{envelope.mission_id}:{ids.operation_id}"}},
                 context=_PlanningRuntime(
-                    envelope=envelope, ids=ids, invoke_planner=invoke_planner
+                    envelope=envelope, ids=ids, invoke_planner=invoke_planner, sink=sink
                 ),
             ),
         )
-        decision = state.get("controller_decision")
+        decision = sink.controller_decision
         if decision is None:
             raise AgentLoopError("agent graph returned no controller decision")
         return WorkflowStepResult(
             decision,
-            state.get("planner_output"),
-            state.get("action_transition"),
+            sink.planner_output,
+            sink.action_transition,
         )
 
     def run_analysis(
@@ -196,10 +226,17 @@ class Phase1AgentWorkflow:
         execution_id: str, result_digest: str, invoke_analyzer: Callable[[], object],
         context_grant_id: str,
     ) -> KnowledgeObservation:
-        state = cast(
+        sink = _AnalysisResultSink()
+        cast(
             _AnalysisGraphState,
             self.analysis_graph.invoke(
-                {},
+                {
+                    "mission_id": mission_id,
+                    "operation_id": operation_id,
+                    "execution_id": execution_id,
+                    "context_grant_id": context_grant_id,
+                },
+                config={"configurable": {"thread_id": f"analysis:{mission_id}:{operation_id}"}},
                 context=_AnalysisRuntime(
                     mission_id=mission_id,
                     mission_revision=mission_revision,
@@ -208,10 +245,11 @@ class Phase1AgentWorkflow:
                     result_digest=result_digest,
                     context_grant_id=context_grant_id,
                     invoke_analyzer=invoke_analyzer,
+                    sink=sink,
                 ),
             ),
         )
-        observation = state.get("observation")
+        observation = sink.observation
         if observation is None:
             raise AgentLoopError("analysis graph returned no observation")
         return observation
@@ -224,11 +262,12 @@ class Phase1AgentWorkflow:
         builder = StateGraph(_PlanningGraphState, context_schema=_PlanningRuntime)
         builder.add_node("session_refresh", self._graph_session_refresh)  # type: ignore[call-overload]
         builder.add_node("controller", self._graph_controller)  # type: ignore[call-overload]
-        builder.add_node("context_selector", self._graph_context_selector)  # type: ignore[call-overload]
-        builder.add_node("context_authorization", self._graph_context_authorization)  # type: ignore[call-overload]
-        builder.add_node("context_builder", self._graph_context_builder)  # type: ignore[call-overload]
-        builder.add_node("tool_availability", self._graph_tool_availability)  # type: ignore[call-overload]
-        builder.add_node("planner", self._graph_planner)  # type: ignore[call-overload]
+        builder.add_node("context_rebuild", self._graph_context_rebuild)
+        builder.add_node("context_selector", self._graph_context_selector)
+        builder.add_node("context_authorization", self._graph_context_authorization)
+        builder.add_node("context_builder", self._graph_context_builder)
+        builder.add_node("tool_availability", self._graph_tool_availability)
+        builder.add_node("planner", self._graph_planner)
         builder.add_node("context_request", self._graph_context_request)
         builder.add_node("action_application", self._graph_action_application)
         builder.add_node("reconciliation", self._graph_reconciliation)  # type: ignore[call-overload]
@@ -239,13 +278,14 @@ class Phase1AgentWorkflow:
             "controller",
             self._planning_route,
             {
-                "plan": "context_selector",
+                "plan": "context_rebuild",
                 "recover": "reconciliation",
                 "finalize": "finalization",
                 "stop": "finalization",
                 "end": END,
             },
         )
+        builder.add_edge("context_rebuild", "context_selector")
         builder.add_edge("context_selector", "context_authorization")
         builder.add_edge("context_authorization", "context_builder")
         builder.add_edge("context_builder", "tool_availability")
@@ -266,7 +306,7 @@ class Phase1AgentWorkflow:
                 _PlanningGraphState,
                 _PlanningGraphState,
             ],
-            builder.compile(),
+            builder.compile(checkpointer=self._checkpointer),
         )
 
     def _build_analysis_graph(
@@ -303,7 +343,7 @@ class Phase1AgentWorkflow:
                 _AnalysisGraphState,
                 _AnalysisGraphState,
             ],
-            builder.compile(),
+            builder.compile(checkpointer=self._checkpointer),
         )
 
     def _graph_analysis_source_binding(
@@ -360,7 +400,8 @@ class Phase1AgentWorkflow:
             grant_id=context.context_grant_id,
             mission_id=context.mission_id,
         )
-        return {"authorized_context": body}
+        runtime.context.sink.authorized_context = body
+        return {}
 
     def _graph_session_refresh(
         self, _state: _PlanningGraphState, runtime: Runtime[_PlanningRuntime]
@@ -377,70 +418,101 @@ class Phase1AgentWorkflow:
             operation_id=ids.operation_id,
             projection=envelope.action_candidate_projection,
         )
-        return {"controller_decision": decision}
+        runtime.context.sink.controller_decision = decision
+        return {
+            "controller_action": decision.action,
+            "controller_reason": decision.reason_code,
+        }
 
     @staticmethod
     def _planning_route(state: _PlanningGraphState) -> str:
-        decision = state["controller_decision"]
-        if decision.action == "PLAN":
+        action = state["controller_action"]
+        if action == "PLAN":
             return "plan"
-        if decision.action == "RECOVER":
+        if action == "RECOVER":
             return "recover"
-        if decision.action == "FINALIZE":
+        if action == "FINALIZE":
             return "finalize"
-        if decision.action == "STOP":
+        if action == "STOP":
             return "stop"
         return "end"
 
-    def _graph_context_selector(
-        self, _state: _PlanningGraphState, runtime: Runtime[_PlanningRuntime]
+    def _graph_context_rebuild(
+        self, state: _PlanningGraphState, runtime: Runtime[_PlanningRuntime]
     ) -> _PlanningGraphState:
-        self._contexts.revalidate_selection(runtime.context.envelope.planner_context_id)
+        del runtime
+        planner_context_id = state["planner_context_id"]
+        current = self._contexts.revalidate_or_rebuild(planner_context_id)
+        return {"planner_context_id": current.planner_context_id}
+
+    def _graph_context_selector(
+        self, state: _PlanningGraphState, runtime: Runtime[_PlanningRuntime]
+    ) -> _PlanningGraphState:
+        del runtime
+        self._contexts.revalidate_selection(state["planner_context_id"])
         return {}
 
     def _graph_context_authorization(
-        self, _state: _PlanningGraphState, runtime: Runtime[_PlanningRuntime]
+        self, state: _PlanningGraphState, runtime: Runtime[_PlanningRuntime]
     ) -> _PlanningGraphState:
-        self._contexts.revalidate_authorization(runtime.context.envelope.planner_context_id)
+        del runtime
+        self._contexts.revalidate_authorization(state["planner_context_id"])
         return {}
 
     def _graph_context_builder(
-        self, _state: _PlanningGraphState, runtime: Runtime[_PlanningRuntime]
+        self, state: _PlanningGraphState, runtime: Runtime[_PlanningRuntime]
     ) -> _PlanningGraphState:
-        self._contexts.revalidate_context_body(runtime.context.envelope.planner_context_id)
+        del runtime
+        self._contexts.revalidate_context_body(state["planner_context_id"])
         return {}
 
     def _graph_tool_availability(
-        self, _state: _PlanningGraphState, runtime: Runtime[_PlanningRuntime]
+        self, state: _PlanningGraphState, runtime: Runtime[_PlanningRuntime]
     ) -> _PlanningGraphState:
-        self._contexts.revalidate_tool_availability(runtime.context.envelope.planner_context_id)
+        del runtime
+        self._contexts.revalidate_tool_availability(state["planner_context_id"])
         return {}
 
     def _graph_planner(
-        self, _state: _PlanningGraphState, runtime: Runtime[_PlanningRuntime]
+        self, state: _PlanningGraphState, runtime: Runtime[_PlanningRuntime]
     ) -> _PlanningGraphState:
+        envelope = self._contexts.revalidate(state["planner_context_id"])
         output = self._gateway.invoke_planner(
             operation_id=runtime.context.ids.operation_id,
-            envelope=runtime.context.envelope,
+            envelope=envelope,
             invoke=runtime.context.invoke_planner,
         )
-        return {"planner_output": output}
+        runtime.context.sink.planner_output = output
+        return {
+            "planner_output_kind": (
+                "context_request" if isinstance(output, PlannerContextRequest) else "action"
+            )
+        }
 
     @staticmethod
     def _planner_output_route(state: _PlanningGraphState) -> str:
-        output = state["planner_output"]
-        if isinstance(output, PlannerContextRequest):
-            return "context_request"
-        if isinstance(output, PlannerActionOutput):
-            return "action"
-        raise AgentLoopError("Planner returned an unsupported output type")
+        return state["planner_output_kind"]
+
+    def _current_planner_output(
+        self, state: _PlanningGraphState, runtime: Runtime[_PlanningRuntime]
+    ) -> PlannerOutput:
+        output = runtime.context.sink.planner_output
+        if output is None:
+            envelope = self._contexts.revalidate(state["planner_context_id"])
+            output = self._gateway.invoke_planner(
+                operation_id=runtime.context.ids.operation_id,
+                envelope=envelope,
+                invoke=runtime.context.invoke_planner,
+            )
+            runtime.context.sink.planner_output = output
+        return output
 
     def _graph_context_request(
         self, state: _PlanningGraphState, runtime: Runtime[_PlanningRuntime]
     ) -> _PlanningGraphState:
-        output = cast(PlannerContextRequest, state["planner_output"])
+        output = cast(PlannerContextRequest, self._current_planner_output(state, runtime))
         self._contexts.accept_context_request(
-            planner_context_id=runtime.context.envelope.planner_context_id,
+            planner_context_id=state["planner_context_id"],
             output=output,
         )
         return {}
@@ -448,10 +520,10 @@ class Phase1AgentWorkflow:
     def _graph_action_application(
         self, state: _PlanningGraphState, runtime: Runtime[_PlanningRuntime]
     ) -> _PlanningGraphState:
-        output = cast(PlannerActionOutput, state["planner_output"])
+        output = cast(PlannerActionOutput, self._current_planner_output(state, runtime))
         ids = runtime.context.ids
         transition = self._actions.execute(
-            planner_context_id=runtime.context.envelope.planner_context_id,
+            planner_context_id=state["planner_context_id"],
             output=output,
             plan_id=ids.plan_id,
             run_id=ids.run_id,
@@ -460,7 +532,8 @@ class Phase1AgentWorkflow:
             execution_id=ids.execution_id,
             task_id=ids.task_id,
         )
-        return {"action_transition": transition}
+        runtime.context.sink.action_transition = transition
+        return {}
 
     def _graph_reconciliation(
         self, _state: _PlanningGraphState, runtime: Runtime[_PlanningRuntime]
@@ -486,9 +559,9 @@ class Phase1AgentWorkflow:
         self, state: _PlanningGraphState, runtime: Runtime[_PlanningRuntime]
     ) -> _PlanningGraphState:
         mission_id = runtime.context.envelope.mission_id
-        decision = state["controller_decision"]
-        if decision.action == "FINALIZE":
-            if decision.reason_code == "GOAL_ACHIEVED":
+        action = state["controller_action"]
+        if action == "FINALIZE":
+            if state["controller_reason"] == "GOAL_ACHIEVED":
                 self._finalization.begin_completion(mission_id)
             else:
                 self._finalization.begin_abort(mission_id)
@@ -500,7 +573,22 @@ class Phase1AgentWorkflow:
     def _graph_analyzer(
         self, state: _AnalysisGraphState, runtime: Runtime[_AnalysisRuntime]
     ) -> _AnalysisGraphState:
+        self._current_analyzer_candidate(state, runtime)
+        return {}
+
+    def _current_analyzer_candidate(
+        self, state: _AnalysisGraphState, runtime: Runtime[_AnalysisRuntime]
+    ) -> AnalyzerCandidateObservation:
         context = runtime.context
+        if context.sink.candidate is not None:
+            return context.sink.candidate
+        authorized_context = context.sink.authorized_context
+        if authorized_context is None:
+            authorized_context = self._context_builder.build(
+                grant_id=context.context_grant_id,
+                mission_id=context.mission_id,
+            )
+            context.sink.authorized_context = authorized_context
         candidate = self._gateway.invoke_analyzer(
             mission_id=context.mission_id,
             mission_revision=context.mission_revision,
@@ -509,18 +597,21 @@ class Phase1AgentWorkflow:
             result_digest=context.result_digest,
             context_grant_id=context.context_grant_id,
             context_grant_digest=state["context_grant_digest"],
-            authorized_context=state["authorized_context"],
+            authorized_context=authorized_context,
             invoke=context.invoke_analyzer,
         )
         if candidate.source_execution_id != context.execution_id:
             raise AgentLoopError("Analyzer candidate changed its bound source execution")
-        return {"candidate": candidate}
+        context.sink.candidate = candidate
+        return candidate
 
     def _graph_knowledge_reducer(
         self, state: _AnalysisGraphState, runtime: Runtime[_AnalysisRuntime]
     ) -> _AnalysisGraphState:
-        del runtime
-        return {"observation": self._reducer.reduce(state["candidate"])}
+        candidate = self._current_analyzer_candidate(state, runtime)
+        observation = self._reducer.reduce(candidate)
+        runtime.context.sink.observation = observation
+        return {"observation_id": observation.observation_id}
 
     def _graph_analysis_session_refresh(
         self, _state: _AnalysisGraphState, runtime: Runtime[_AnalysisRuntime]

@@ -135,6 +135,25 @@ def test_missing_schema_fails_closed_no_migration() -> None:
         assert not Path(str(Path(tmp) / "act.lock")).exists() or True  # lock released on cleanup
 
 
+def test_unknown_graph_checkpoint_schema_fails_closed_no_migration() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = str(Path(tmp) / "unknown-checkpoint.db")
+        database = Database(db_path)
+        database.connection.execute("DROP TABLE writes")
+        database.connection.execute("CREATE TABLE writes (unknown_column TEXT)")
+        database.close()
+        plan = ProductionStartupPlan(
+            activation_lock_path=str(Path(tmp) / "act.lock"),
+            application_db_path=db_path,
+            topology=_single_host(),
+            witness=_production_witness(),
+            key_provider=_ProdKeyProvider(),
+        )
+        root = ProductionCompositionRoot(plan)
+        with pytest.raises(SchemaMigrationRequiredError, match="checkpoint schema"):
+            root.start()
+
+
 def test_production_witness_without_tpm2_tools_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("PATH", "")
     with tempfile.TemporaryDirectory() as tmp:

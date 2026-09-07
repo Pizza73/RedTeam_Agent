@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import sqlite3
+from pathlib import Path
+
 import pytest
 from test_phase1_planner_context import _inputs
 
 import support
+import support_phase0b as p0b
+import support_phase0c as p0c
 from redteam_agent.agent.mock_agents import MockAnalyzer, MockPlanner
 from redteam_agent.agent.workflow import PlanningOperationIds
 from redteam_agent.errors import AgentLoopError
@@ -13,6 +18,7 @@ from redteam_agent.execution.models import AdapterCollectionControl
 from redteam_agent.knowledge.models import AnalyzerCandidateObservation
 from redteam_agent.plan.models import PlannerActionOutput
 from redteam_agent.policy.scope_models import IpTargetReference
+from redteam_agent.runtime.clock import ManualClock, ManualMonotonicClock
 
 
 def test_phase1_uses_compiled_coarse_graphs_without_automatic_retry() -> None:
@@ -22,6 +28,7 @@ def test_phase1_uses_compiled_coarse_graphs_without_automatic_retry() -> None:
     assert {
         "session_refresh",
         "controller",
+        "context_rebuild",
         "context_selector",
         "context_authorization",
         "context_builder",
@@ -42,10 +49,129 @@ def test_phase1_uses_compiled_coarse_graphs_without_automatic_retry() -> None:
         "post_analysis_session_refresh",
         "goal_evaluation",
     } <= analysis_nodes
-    assert kernel.workflow.graph.checkpointer is None
-    assert kernel.workflow.analysis_graph.checkpointer is None
+    assert kernel.workflow.graph.checkpointer is not None
+    assert kernel.workflow.analysis_graph.checkpointer is not None
     assert all(node.retry_policy is None for node in kernel.workflow.graph.nodes.values())
     assert all(node.retry_policy is None for node in kernel.workflow.analysis_graph.nodes.values())
+
+
+def test_stale_planner_context_is_rebuilt_before_the_model_call() -> None:
+    kernel, seeded, goal, grant, projection = _inputs()
+    mission_id = seeded.seeded.revision.mission_id
+    stale = kernel.planner_context_service.build(
+        planner_context_id="stale-workflow-context",
+        mission_id=mission_id,
+        goal_evaluation_id=goal.evaluation_id,
+        projection=projection,
+        context_grant_id=grant.grant_id,
+        available_tool_snapshot_id=seeded.seeded.snapshot.snapshot_id,
+        iteration=0,
+    )
+    output = PlannerActionOutput(
+        proposal=support.make_proposal(
+            tool=seeded.seeded.tool,
+            arguments={"destinations": ["10.1.2.3"], "port": 443, "protocol": "tcp"},
+            requested_targets=(IpTargetReference(type="ip", address="10.1.2.3"),),
+        ),
+        working_state_update=None,
+        next_iteration_hints=(),
+    )
+    model_inputs = []
+    kernel.phase0c.monotonic_clock.advance(seconds=121)
+    kernel.phase0c.phase0b.phase0a.clock.set(kernel.phase0c.monotonic_clock.now())  # type: ignore[attr-defined]
+
+    step = kernel.workflow.run_planning_iteration(
+        envelope=stale,
+        ids=PlanningOperationIds(
+            operation_id="stale-workflow-plan",
+            plan_id="stale-workflow-plan",
+            run_id="stale-workflow-run",
+            thread_id="stale-workflow-thread",
+            decision_id="stale-workflow-decision",
+            execution_id="stale-workflow-execution",
+            task_id="stale-workflow-task",
+        ),
+        invoke_planner=lambda current: model_inputs.append(current) or output,
+    )
+
+    assert step.action_transition is not None
+    assert len(model_inputs) == 1
+    rebuilt = model_inputs[0]
+    assert rebuilt.parent_context_id == stale.planner_context_id
+    assert rebuilt.context_rebuild_count == 1
+    assert rebuilt.planner_context_id != stale.planner_context_id
+    retry_rows = kernel.phase0c.phase0b.phase0a.database.occ_get_all("agent_retry_budget")
+    assert len(retry_rows) == 1
+
+    checkpoint = kernel.workflow.graph.get_state({
+        "configurable": {"thread_id": f"plan:{mission_id}:stale-workflow-plan"}
+    })
+    assert set(checkpoint.values) <= {
+        "mission_id",
+        "operation_id",
+        "planner_context_id",
+        "goal_evaluation_id",
+        "controller_action",
+        "controller_reason",
+        "planner_output_kind",
+    }
+    assert all(isinstance(value, str) for value in checkpoint.values.values())
+
+
+def test_graph_checkpoints_are_written_to_the_application_sqlite_file(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "phase1.sqlite3"
+    phase0b = p0b.build_phase0b_kernel(
+        db_path=str(database_path),
+        clock=ManualClock(support.T0),
+    )
+    phase0c = p0c.build_phase0c_kernel(
+        phase0b=phase0b,
+        monotonic_clock=ManualMonotonicClock(support.T0),
+    )
+    kernel, seeded, goal, grant, projection = _inputs(phase0c=phase0c)
+    envelope = kernel.planner_context_service.build(
+        planner_context_id="durable-checkpoint-context",
+        mission_id=seeded.seeded.revision.mission_id,
+        goal_evaluation_id=goal.evaluation_id,
+        projection=projection,
+        context_grant_id=grant.grant_id,
+        available_tool_snapshot_id=seeded.seeded.snapshot.snapshot_id,
+        iteration=0,
+    )
+    output = PlannerActionOutput(
+        proposal=support.make_proposal(
+            tool=seeded.seeded.tool,
+            arguments={"destinations": ["10.1.2.3"], "port": 443, "protocol": "tcp"},
+            requested_targets=(IpTargetReference(type="ip", address="10.1.2.3"),),
+        ),
+        working_state_update=None,
+        next_iteration_hints=(),
+    )
+    kernel.workflow.run_planning_iteration(
+        envelope=envelope,
+        ids=PlanningOperationIds(
+            operation_id="durable-checkpoint-plan",
+            plan_id="durable-checkpoint-plan",
+            run_id="durable-checkpoint-run",
+            thread_id="durable-checkpoint-thread",
+            decision_id="durable-checkpoint-decision",
+            execution_id="durable-checkpoint-execution",
+            task_id="durable-checkpoint-task",
+        ),
+        invoke_planner=lambda _current: output,
+    )
+
+    with sqlite3.connect(database_path) as observer:
+        tables = {
+            row[0]
+            for row in observer.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        assert {"checkpoints", "writes"} <= tables
+        assert observer.execute("SELECT COUNT(*) FROM checkpoints").fetchone()[0] > 0
 
 
 def test_mock_agent_loop_reaches_goal_through_real_policy_and_executor() -> None:
@@ -74,19 +200,19 @@ def test_mock_agent_loop_reaches_goal_through_real_policy_and_executor() -> None
             decision_id="mock-loop-decision", execution_id="mock-loop-execution",
             task_id="mock-loop-task",
         ),
-        invoke_planner=lambda: planner.invoke(envelope),
+        invoke_planner=planner.invoke,
     )
     planned = step.planner_output
     assert isinstance(planned, PlannerActionOutput)
     replayed = kernel.llm_gateway.invoke_planner(
         operation_id="mock-loop-planner", envelope=envelope,
-        invoke=lambda: (_ for _ in ()).throw(AssertionError("must not reinvoke")),
+        invoke=lambda _envelope: (_ for _ in ()).throw(AssertionError("must not reinvoke")),
     )
     assert replayed == planned and planner.call_count == 1
     with pytest.raises(AgentLoopError):
         kernel.llm_gateway.invoke_planner(
             operation_id="budget-reset", envelope=envelope,
-            invoke=lambda: planner.invoke(envelope),
+            invoke=planner.invoke,
         )
     transition = step.action_transition
     assert transition is not None
@@ -102,7 +228,7 @@ def test_mock_agent_loop_reaches_goal_through_real_policy_and_executor() -> None
             decision_id="unused-decision", execution_id="unused-execution",
             task_id="unused-task",
         ),
-        invoke_planner=lambda: (_ for _ in ()).throw(
+        invoke_planner=lambda _envelope: (_ for _ in ()).throw(
             AssertionError("recovery must not invoke the Planner")
         ),
     )
@@ -200,7 +326,7 @@ def test_mock_agent_loop_reaches_goal_through_real_policy_and_executor() -> None
                 decision_id="unused-decision", execution_id="unused-execution",
                 task_id="unused-task",
             ),
-            invoke_planner=lambda: (_ for _ in ()).throw(
+            invoke_planner=lambda _envelope: (_ for _ in ()).throw(
                 AssertionError("finalization must not invoke the Planner")
             ),
         )
@@ -233,7 +359,7 @@ def test_mock_agent_loop_reaches_goal_through_real_policy_and_executor() -> None
             decision_id="unused-decision", execution_id="unused-execution",
             task_id="unused-task",
         ),
-        invoke_planner=lambda: (_ for _ in ()).throw(
+        invoke_planner=lambda _envelope: (_ for _ in ()).throw(
             AssertionError("finalization must not invoke the Planner")
         ),
     )
@@ -267,7 +393,7 @@ def test_hard_limit_aborts_without_planner_or_goal_rewrite() -> None:
             thread_id="unused-thread", decision_id="unused-decision",
             execution_id="unused-execution", task_id="unused-task",
         ),
-        invoke_planner=lambda: (_ for _ in ()).throw(
+        invoke_planner=lambda _envelope: (_ for _ in ()).throw(
             AssertionError("hard limit must not invoke the Planner")
         ),
     )
@@ -304,7 +430,7 @@ def test_finalizing_resume_uses_bounded_reconciliation_and_cancel() -> None:
             thread_id="finalizing-thread", decision_id="finalizing-decision",
             execution_id="finalizing-execution", task_id="finalizing-task",
         ),
-        invoke_planner=lambda: planner.invoke(envelope),
+        invoke_planner=planner.invoke,
     )
     kernel.phase0c.phase0b.phase0a.session_repository.save(support.session_snapshot())
     kernel.finalization_service.begin_completion(mission_id)
@@ -318,7 +444,7 @@ def test_finalizing_resume_uses_bounded_reconciliation_and_cancel() -> None:
             thread_id="unused-thread", decision_id="unused-decision",
             execution_id="unused-execution", task_id="unused-task",
         ),
-        invoke_planner=lambda: (_ for _ in ()).throw(
+        invoke_planner=lambda _envelope: (_ for _ in ()).throw(
             AssertionError("FINALIZING recovery must not invoke the Planner")
         ),
     )
@@ -334,7 +460,7 @@ def test_finalizing_resume_uses_bounded_reconciliation_and_cancel() -> None:
                 decision_id="unused-decision", execution_id="unused-execution",
                 task_id="unused-task",
             ),
-            invoke_planner=lambda: (_ for _ in ()).throw(
+            invoke_planner=lambda _envelope: (_ for _ in ()).throw(
                 AssertionError("FINALIZING recovery must not invoke the Planner")
             ),
         )
@@ -346,7 +472,7 @@ def test_finalizing_resume_uses_bounded_reconciliation_and_cancel() -> None:
             decision_id="unused-decision", execution_id="unused-execution",
             task_id="unused-task",
         ),
-        invoke_planner=lambda: (_ for _ in ()).throw(
+        invoke_planner=lambda _envelope: (_ for _ in ()).throw(
             AssertionError("FINALIZING recovery must not invoke the Planner")
         ),
     )
@@ -390,7 +516,7 @@ def test_running_recovery_budget_exhaustion_converges_to_human_review() -> None:
             thread_id="running-thread", decision_id="running-decision",
             execution_id="running-execution", task_id="running-task",
         ),
-        invoke_planner=lambda: planner.invoke(envelope),
+        invoke_planner=planner.invoke,
     )
     adapter = kernel.phase0c.phase0b.mock_adapter
     adapter._reconcile_status = "UNKNOWN"  # type: ignore[attr-defined]
@@ -403,7 +529,7 @@ def test_running_recovery_budget_exhaustion_converges_to_human_review() -> None:
                 decision_id="unused-decision", execution_id="unused-execution",
                 task_id="unused-task",
             ),
-            invoke_planner=lambda: (_ for _ in ()).throw(AssertionError("no Planner")),
+            invoke_planner=lambda _envelope: (_ for _ in ()).throw(AssertionError("no Planner")),
         )
     state = kernel.phase0c.phase0b.phase0a.state_repository.get(mission_id)
     assert state is not None and state.state == "WAITING_HUMAN_REVIEW"
@@ -442,7 +568,7 @@ def test_finalizing_cancelled_execution_collects_ingests_and_completes() -> None
             thread_id="cancel-thread", decision_id="cancel-decision",
             execution_id="cancel-execution", task_id="cancel-task",
         ),
-        invoke_planner=lambda: planner.invoke(envelope),
+        invoke_planner=planner.invoke,
     )
     kernel.phase0c.phase0b.phase0a.session_repository.save(support.session_snapshot())
     kernel.finalization_service.begin_completion(mission_id)
@@ -456,7 +582,7 @@ def test_finalizing_cancelled_execution_collects_ingests_and_completes() -> None
             thread_id="unused-thread", decision_id="unused-decision",
             execution_id="unused-execution", task_id="unused-task",
         ),
-        invoke_planner=lambda: (_ for _ in ()).throw(AssertionError("no Planner")),
+        invoke_planner=lambda _envelope: (_ for _ in ()).throw(AssertionError("no Planner")),
     )
     adapter._reconcile_status = "FOUND_TERMINAL"  # type: ignore[attr-defined]
     adapter._reconcile_provider_status = "cancelled"  # type: ignore[attr-defined]
@@ -472,7 +598,7 @@ def test_finalizing_cancelled_execution_collects_ingests_and_completes() -> None
             thread_id="unused-thread", decision_id="unused-decision",
             execution_id="unused-execution", task_id="unused-task",
         ),
-        invoke_planner=lambda: (_ for _ in ()).throw(AssertionError("no Planner")),
+        invoke_planner=lambda _envelope: (_ for _ in ()).throw(AssertionError("no Planner")),
     )
     state = kernel.phase0c.phase0b.phase0a.state_repository.get(mission_id)
     assert state is not None and state.state == "COMPLETED"

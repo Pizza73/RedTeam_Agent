@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 import support
@@ -18,8 +20,10 @@ from redteam_agent.plan.models import PlannerActionOutput, PlannerContextRequest
 from redteam_agent.policy.scope_models import IpTargetReference
 
 
-def _inputs():
-    kernel = build_phase1_kernel(phase0c=p0c.make_phase0c())
+def _inputs(*, phase0c=None):
+    kernel = build_phase1_kernel(
+        phase0c=p0c.make_phase0c() if phase0c is None else phase0c
+    )
     seeded = p0b.seed_authorized(kernel.phase0c.phase0b)
     mission_id = seeded.seeded.revision.mission_id
     head = kernel.knowledge_service.initialize_mission(
@@ -149,7 +153,7 @@ def test_epoch_change_invalidates_planner_context_before_model_use() -> None:
         kernel.planner_context_service.revalidate(envelope.planner_context_id)
     invoked = False
 
-    def invoke() -> object:
+    def invoke(_envelope: object) -> object:
         nonlocal invoked
         invoked = True
         return {}
@@ -219,3 +223,34 @@ def test_context_request_is_bounded_by_lineage_and_durable_retry_budget() -> Non
         kernel.planner_context_service.accept_context_request(
             planner_context_id=third.planner_context_id, output=request
         )
+
+
+def test_automatic_stale_rebuild_shares_the_lineage_retry_budget() -> None:
+    kernel, seeded, goal, grant, projection = _inputs()
+    first = kernel.planner_context_service.build(
+        planner_context_id="stale-budget-context",
+        mission_id=seeded.seeded.revision.mission_id,
+        goal_evaluation_id=goal.evaluation_id,
+        projection=projection,
+        context_grant_id=grant.grant_id,
+        available_tool_snapshot_id=seeded.seeded.snapshot.snapshot_id,
+        iteration=0,
+    )
+
+    def advance() -> None:
+        kernel.phase0c.monotonic_clock.advance(seconds=121)
+        kernel.phase0c.phase0b.phase0a.clock.set(  # type: ignore[attr-defined]
+            kernel.phase0c.monotonic_clock.now()
+        )
+
+    advance()
+    second = kernel.planner_context_service.rebuild_stale(first.planner_context_id)
+    advance()
+    third = kernel.planner_context_service.rebuild_stale(second.planner_context_id)
+    advance()
+    with pytest.raises(PlannerContextError, match="context rebuild limit reached"):
+        kernel.planner_context_service.rebuild_stale(third.planner_context_id)
+
+    rows = kernel.phase0c.phase0b.phase0a.database.occ_get_all("agent_retry_budget")
+    assert len(rows) == 1
+    assert json.loads(rows[0][2])["consumed_attempts"] == 2

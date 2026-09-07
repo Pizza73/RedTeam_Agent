@@ -21,7 +21,7 @@ from redteam_agent.errors import (
 from redteam_agent.storage.database import Database
 
 # Tables that must already exist for a normal (non-provisioning) production start.
-_REQUIRED_TABLES = ("kv_store", "executions", "occ_store")
+_REQUIRED_TABLES = ("kv_store", "executions", "occ_store", "checkpoints", "writes")
 
 
 @dataclass(frozen=True)
@@ -74,6 +74,11 @@ def check_schema_read_only(database: Database) -> None:
     if missing:
         raise SchemaMigrationRequiredError(
             f"normal startup found a missing/unknown schema ({', '.join(missing)}); "
+            "an explicit stopped-worker migration is required"
+        )
+    if not database.graph_checkpoint_schema_is_current():
+        raise SchemaMigrationRequiredError(
+            "normal startup found an unknown LangGraph checkpoint schema; "
             "an explicit stopped-worker migration is required"
         )
 

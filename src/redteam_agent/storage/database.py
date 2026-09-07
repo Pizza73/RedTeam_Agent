@@ -58,6 +58,7 @@ class Database:
     def __init__(self, path: str = ":memory:", *, create_schema: bool = True) -> None:
         # ``isolation_level=None`` gives explicit transaction control; the unit
         # of work issues BEGIN/COMMIT. Foreign keys are enabled per §32.
+        self._path = path
         self._conn = sqlite3.connect(path, isolation_level=None)
         self._after_commit: list[Callable[[], None]] = []
         self._critical_mutation_recorder: CriticalMutationRecorder | None = None
@@ -76,6 +77,23 @@ class Database:
         ).fetchone()
         return row is not None
 
+    def graph_checkpoint_schema_is_current(self) -> bool:
+        expected = {
+            "PRAGMA table_info(checkpoints)": (
+                "thread_id", "checkpoint_ns", "checkpoint_id", "parent_checkpoint_id",
+                "type", "checkpoint", "metadata",
+            ),
+            "PRAGMA table_info(writes)": (
+                "thread_id", "checkpoint_ns", "checkpoint_id", "task_id", "idx",
+                "channel", "type", "value",
+            ),
+        }
+        for statement, columns in expected.items():
+            actual = tuple(row[1] for row in self._conn.execute(statement).fetchall())
+            if actual != columns:
+                return False
+        return True
+
     def _create_schema(self) -> None:
         # ``row_digest`` binds (namespace, key, json) so a raw single-row edit
         # that changes the JSON without recomputing the digest is caught on read
@@ -93,6 +111,41 @@ class Database:
         )
         self._create_execution_schema()
         self._create_phase0c_schema()
+        self._create_graph_checkpoint_schema()
+
+    def _create_graph_checkpoint_schema(self) -> None:
+        # Pinned langgraph-checkpoint-sqlite 3.1.1 schema. Provisioning owns
+        # creation so a normal Phase 1 start never performs an implicit migration.
+        self._conn.execute("PRAGMA journal_mode = WAL")
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS checkpoints (
+                thread_id TEXT NOT NULL,
+                checkpoint_ns TEXT NOT NULL DEFAULT '',
+                checkpoint_id TEXT NOT NULL,
+                parent_checkpoint_id TEXT,
+                type TEXT,
+                checkpoint BLOB,
+                metadata BLOB,
+                PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id)
+            )
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS writes (
+                thread_id TEXT NOT NULL,
+                checkpoint_ns TEXT NOT NULL DEFAULT '',
+                checkpoint_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                idx INTEGER NOT NULL,
+                channel TEXT NOT NULL,
+                type TEXT,
+                value BLOB,
+                PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id, task_id, idx)
+            )
+            """
+        )
 
     def _create_phase0c_schema(self) -> None:
         # Phase 0C generic OCC row store (SystemDesign §32). Every Phase 0C durable
@@ -258,6 +311,10 @@ class Database:
     @property
     def connection(self) -> sqlite3.Connection:
         return self._conn
+
+    @property
+    def path(self) -> str:
+        return self._path
 
     @property
     def in_transaction(self) -> bool:

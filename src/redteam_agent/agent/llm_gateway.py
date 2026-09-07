@@ -39,7 +39,7 @@ class SharedLLMGateway:
 
     def invoke_planner(
         self, *, operation_id: str, envelope: PlannerContextEnvelope,
-        invoke: Callable[[], object],
+        invoke: Callable[[PlannerContextEnvelope], object],
     ) -> PlannerOutput:
         if self._planner_context_revalidator is None:
             raise AgentLoopError("Planner context revalidator is not bound")
@@ -49,7 +49,7 @@ class SharedLLMGateway:
         raw = self._invoke(
             mission_id=current.mission_id, mission_revision=current.mission_revision,
             operation_id=operation_id, role="planner", input_payload=current.model_dump(mode="python"),
-            invoke=invoke, adapter=_PLANNER,
+            invoke=lambda: invoke(current), adapter=_PLANNER,
         )
         return _PLANNER.validate_json(json.dumps(raw, sort_keys=True))
 
