@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from typing import TypeVar
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from redteam_agent.adapters.capabilities import AdapterCapabilities
 from redteam_agent.approval.models import ApprovalRecord, ApprovalRequest
@@ -30,6 +30,7 @@ from redteam_agent.auth.models import MissionRoleAssignment
 from redteam_agent.canonical.digest_service import DigestService
 from redteam_agent.canonical.json_boundary import load_model_from_json
 from redteam_agent.context.models import ContextDataAccessGrant, ContextResourceIndexRecord
+from redteam_agent.contracts.catalog import ActionContractCatalog, RuleCatalog
 from redteam_agent.errors import (
     MissionLifecycleError,
     MissionStateVersionConflictError,
@@ -52,7 +53,8 @@ from redteam_agent.storage.database import Database
 from redteam_agent.storage.guard import WriteGuard
 from redteam_agent.storage.integrity import verify_object_integrity
 from redteam_agent.tools.availability import AvailableToolSnapshot
-from redteam_agent.tools.registry import ToolRegistryRevision
+from redteam_agent.tools.registry import ToolRegistryRevision, validate_tool_registry
+from redteam_agent.tools.target_extractors import TrustedTargetExtractorRegistry
 
 _M = TypeVar("_M", bound=BaseModel)
 
@@ -63,11 +65,17 @@ class _BaseRepository:
         self._digests = digest_service
 
     def _dump(self, model: BaseModel) -> str:
-        json_text = model.model_dump_json()
-        # Re-validate through the strict schema to reject a model_construct bypass.
-        type(model).model_validate_json(json_text)
-        verify_object_integrity(model, self._digests)  # write-side integrity
-        return json_text
+        # Validate through the strict schema *before* serializing, so a model
+        # built via ``model_construct`` (bypassing validation) is rejected with a
+        # content-free error and never reaches the serializer (which would emit a
+        # warning echoing the offending value). The exception chain is dropped so
+        # no input value leaks into a traceback (Codex #B / G).
+        try:
+            validated = type(model).model_validate(dict(model))
+        except ValidationError:
+            raise RepositoryIntegrityError("model failed strict schema validation before storage") from None
+        verify_object_integrity(validated, self._digests)  # write-side integrity
+        return validated.model_dump_json()
 
     def _load(self, model_cls: type[_M], json_text: str, *, row_key: str, payload_key: str) -> _M:
         model = load_model_from_json(model_cls, json_text)  # dup-key reject + strict
@@ -216,7 +224,33 @@ class MissionLifecycleEventRepository(_GuardedRepository):
 class ToolRegistryRepository(_BaseRepository):
     _NS = "tool_registry_revisions"
 
+    def __init__(
+        self,
+        database: Database,
+        digest_service: DigestService,
+        *,
+        contract_catalog: ActionContractCatalog,
+        rule_catalog: RuleCatalog,
+        extractors: TrustedTargetExtractorRegistry | None = None,
+    ) -> None:
+        super().__init__(database, digest_service)
+        self._contract_catalog = contract_catalog
+        self._rule_catalog = rule_catalog
+        self._extractors = extractors
+
+    def _validate(self, registry: ToolRegistryRevision) -> None:
+        validate_tool_registry(
+            registry,
+            digest_service=self._digests,
+            contract_catalog=self._contract_catalog,
+            rule_catalog=self._rule_catalog,
+            extractors=self._extractors,
+        )
+
     def save(self, registry: ToolRegistryRevision) -> None:
+        # Re-run full domain validation so a self-consistent but invalid registry
+        # cannot be registered via the raw repository path (R13).
+        self._validate(registry)
         self._db.put_idempotent(self._NS, str(registry.registry_revision), self._dump(registry))
 
     def get(self, registry_revision: int) -> ToolRegistryRevision | None:
@@ -225,7 +259,9 @@ class ToolRegistryRepository(_BaseRepository):
         if raw is None:
             return None
         model = load_model_from_json(ToolRegistryRevision, raw)
-        return self._load(ToolRegistryRevision, raw, row_key=key, payload_key=str(model.registry_revision))
+        registry = self._load(ToolRegistryRevision, raw, row_key=key, payload_key=str(model.registry_revision))
+        self._validate(registry)
+        return registry
 
 
 class PolicyRevisionRepository(_BaseRepository):

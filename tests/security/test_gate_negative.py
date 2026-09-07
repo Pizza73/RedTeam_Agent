@@ -86,13 +86,17 @@ def test_plan_capability_digest_tamper_denied() -> None:
 def test_stale_authorization_epoch_denied() -> None:
     _clock, kernel, _seeded, plan, decision = _setup()
     # Operator invalidates authorization: epoch rotates, state stays RUNNING.
-    kernel.mission_manager.invalidate_authorization(support.MISSION_ID, expected_version=2)
+    kernel.mission_manager.invalidate_authorization(
+        support.MISSION_ID, expected_version=2, actor_token=support.OPERATOR_ACTOR_TOKEN
+    )
     assert _deny(kernel, decision, plan) == "AUTHORIZATION_EPOCH_STALE"
 
 
 def test_mission_not_running_denied() -> None:
     _clock, kernel, _seeded, plan, decision = _setup()
-    kernel.mission_manager.pause_mission(support.MISSION_ID, expected_version=2)
+    kernel.mission_manager.pause_mission(
+        support.MISSION_ID, expected_version=2, actor_token=support.OPERATOR_ACTOR_TOKEN
+    )
     assert _deny(kernel, decision, plan) == "MISSION_NOT_RUNNING"
 
 

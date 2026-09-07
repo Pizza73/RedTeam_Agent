@@ -35,11 +35,21 @@ def _redact_subtree(value: Any) -> Any:
     return value
 
 
+def _descend(cursor: Any, token: str) -> Any:
+    if isinstance(cursor, list):
+        return cursor[int(token)]
+    return cursor[token]
+
+
 def _set_at_pointer(root: dict[str, Any], tokens: tuple[str, ...], new_value: Any) -> None:
     cursor: Any = root
     for token in tokens[:-1]:
-        cursor = cursor[token]
-    cursor[tokens[-1]] = new_value
+        cursor = _descend(cursor, token)
+    last = tokens[-1]
+    if isinstance(cursor, list):
+        cursor[int(last)] = new_value  # array index (R22)
+    else:
+        cursor[last] = new_value
 
 
 def redact_arguments(arguments: Any, secret_paths: tuple[str, ...]) -> dict[str, Any]:

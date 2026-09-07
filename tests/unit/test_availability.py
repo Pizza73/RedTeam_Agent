@@ -32,14 +32,14 @@ def _inputs(ds: DigestService, *, adapters=None, sessions=None):
 def test_tool_available_with_matching_adapter_and_scope() -> None:
     ds = DigestService()
     revision = support.mission_revision(ds, profile=support.make_profile(ds))
-    views = resolve_available_tools(_inputs(ds), revision)
+    views = resolve_available_tools(_inputs(ds), revision, support.T0)
     assert len(views) == 1
 
 
 def test_tool_excluded_without_adapter() -> None:
     ds = DigestService()
     revision = support.mission_revision(ds, profile=support.make_profile(ds))
-    views = resolve_available_tools(_inputs(ds, adapters={}), revision)
+    views = resolve_available_tools(_inputs(ds, adapters={}), revision, support.T0)
     assert views == ()
 
 
@@ -50,7 +50,7 @@ def test_tool_excluded_when_mission_lacks_network_scope() -> None:
     revision = support.mission_revision(
         ds, profile=support.make_profile(ds), allowed_scope=(HostScopeRule(type="host", host_id="h1"),)
     )
-    views = resolve_available_tools(_inputs(ds), revision)
+    views = resolve_available_tools(_inputs(ds), revision, support.T0)
     assert views == ()  # network tool needs a network scope
 
 
@@ -66,7 +66,7 @@ def test_session_required_tool_excluded_without_eligible_session() -> None:
         session_snapshots={},
         remote_mcp_trust_policy_digest="rmt",
     )
-    assert resolve_available_tools(inputs, revision) == ()
+    assert resolve_available_tools(inputs, revision, support.T0) == ()
 
 
 def test_snapshot_ttl_exceeding_mission_validity_is_rejected() -> None:
@@ -84,6 +84,7 @@ def test_snapshot_ttl_exceeding_mission_validity_is_rejected() -> None:
 
 def _bindings(snapshot) -> CurrentSnapshotBindings:
     return CurrentSnapshotBindings(
+        mission_id=snapshot.mission_id,
         mission_revision=snapshot.mission_revision,
         authorization_epoch=snapshot.authorization_epoch,
         registry_digest=snapshot.registry_digest,
@@ -118,6 +119,7 @@ def test_revalidate_rejects_binding_drift() -> None:
         inputs=_inputs(ds), digest_service=ds, created_at=support.T0,
     )
     drifted = CurrentSnapshotBindings(
+        mission_id=snapshot.mission_id,
         mission_revision=snapshot.mission_revision,
         authorization_epoch=snapshot.authorization_epoch + 1,  # epoch drift
         registry_digest=snapshot.registry_digest,

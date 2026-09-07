@@ -18,7 +18,11 @@ from pydantic import Field
 from redteam_agent.adapters.capabilities import AdapterCapabilities
 from redteam_agent.canonical.digest_service import DigestService
 from redteam_agent.canonical.immutable import CanonicalJsonObject
-from redteam_agent.errors import AvailableToolSnapshotStaleError, SandboxCapabilityStaleError
+from redteam_agent.errors import (
+    AuthorizationTtlError,
+    AvailableToolSnapshotStaleError,
+    SandboxCapabilityStaleError,
+)
 from redteam_agent.mission.models import MissionRevision
 from redteam_agent.models.base import StrictImmutableBoundaryModel
 from redteam_agent.models.common import ToolRef
@@ -107,10 +111,16 @@ def compute_sandbox_capabilities_digest(
     return digest_service.compute("sandbox_capabilities_digest", {"sandboxes": entries})
 
 
-def _eligible_sessions(tool: ToolDefinition, inputs: ToolAvailabilityInputs) -> tuple[str, ...]:
+_SANDBOX_SUPPORTED_LOCATIONS: frozenset[str] = frozenset({"local_process", "managed_remote"})
+
+
+def _eligible_sessions(tool: ToolDefinition, inputs: ToolAvailabilityInputs, now: datetime) -> tuple[str, ...]:
     eligible: list[str] = []
     for session_id in sorted(inputs.session_snapshots):
-        context = inputs.session_snapshots[session_id].context
+        snapshot = inputs.session_snapshots[session_id]
+        context = snapshot.context
+        if not (now < snapshot.session_fresh_until):  # exclude expired/lost sessions (R15)
+            continue
         if context.os not in tool.supported_os:
             continue
         if context.architecture not in tool.supported_architectures:
@@ -147,28 +157,43 @@ def _scope_compatible(tool: ToolDefinition, revision: MissionRevision) -> bool:
     return mission_supports_scope_type(scope_type, revision.allowed_execution_scope)
 
 
-def _tool_available(tool: ToolDefinition, inputs: ToolAvailabilityInputs, revision: MissionRevision) -> bool:
+def _sandbox_ok(tool: ToolDefinition, inputs: ToolAvailabilityInputs) -> bool:
+    if tool.sandbox_requirement is None:
+        return True
+    sandbox = inputs.sandbox_capabilities.get(tool.adapter_id)
+    adapter = inputs.adapters.get(tool.adapter_id)
+    # The sandbox must be bound to *this* adapter/runtime and its execution
+    # location must match the adapter's and be a supported location; an
+    # untrusted-remote location cannot borrow local capabilities (H-04).
+    if sandbox is None or adapter is None:
+        return False
+    if sandbox.execution_location != adapter.execution_location:
+        return False
+    if sandbox.execution_location not in _SANDBOX_SUPPORTED_LOCATIONS:
+        return False
+    return sandbox.satisfies(tool.sandbox_requirement)
+
+
+def _tool_available(
+    tool: ToolDefinition, inputs: ToolAvailabilityInputs, revision: MissionRevision, now: datetime
+) -> bool:
     if not _adapter_available(tool, inputs):
         return False
     if not _scope_compatible(tool, revision):
         return False
-    if tool.sandbox_requirement is not None:
-        sandbox = inputs.sandbox_capabilities.get(tool.adapter_id)
-        # A tool requiring a sandbox needs the sandbox bound to *its* adapter;
-        # another runtime's sandbox cannot be borrowed (H-04).
-        if sandbox is None or not sandbox.satisfies(tool.sandbox_requirement):
-            return False
-    return not (tool.requires_session and not _eligible_sessions(tool, inputs))
+    if not _sandbox_ok(tool, inputs):
+        return False
+    return not (tool.requires_session and not _eligible_sessions(tool, inputs, now))
 
 
 def resolve_available_tools(
-    inputs: ToolAvailabilityInputs, revision: MissionRevision
+    inputs: ToolAvailabilityInputs, revision: MissionRevision, now: datetime
 ) -> tuple[AvailableToolView, ...]:
     views: list[AvailableToolView] = []
     for tool in inputs.registry.tools:
-        if not _tool_available(tool, inputs, revision):
+        if not _tool_available(tool, inputs, revision, now):
             continue
-        eligible = _eligible_sessions(tool, inputs) if tool.requires_session else ()
+        eligible = _eligible_sessions(tool, inputs, now) if tool.requires_session else ()
         views.append(
             AvailableToolView(
                 tool_ref=tool.tool_ref,
@@ -206,7 +231,11 @@ def _snapshot_expiry(
     used_sessions = {sid for view in views for sid in view.eligible_session_ids}
     for session_id in used_sessions:
         candidates.append(inputs.session_snapshots[session_id].session_fresh_until)
-    return min(candidates)
+    expires_at = min(candidates)
+    # A snapshot must never be published with a non-positive lifetime (R15).
+    if not (created_at < expires_at):
+        raise AuthorizationTtlError("available tool snapshot has a non-positive lifetime")
+    return expires_at
 
 
 def build_available_tool_snapshot(
@@ -220,7 +249,7 @@ def build_available_tool_snapshot(
     created_at: datetime,
     ttl_seconds: int = 900,
 ) -> AvailableToolSnapshot:
-    views = resolve_available_tools(inputs, revision)
+    views = resolve_available_tools(inputs, revision, created_at)
     session_contexts = tuple(snapshot.context for snapshot in inputs.session_snapshots.values())
     binding = {
         "registry_digest": inputs.registry.registry_digest,
@@ -262,6 +291,7 @@ def build_available_tool_snapshot(
 
 @dataclass(frozen=True)
 class CurrentSnapshotBindings:
+    mission_id: str
     mission_revision: int
     authorization_epoch: int
     registry_digest: str
@@ -288,6 +318,7 @@ def revalidate_snapshot(
     if snapshot.sandbox_capabilities_digest != current.sandbox_capabilities_digest:
         raise SandboxCapabilityStaleError("sandbox capability digest changed")
     binding_checks = (
+        snapshot.mission_id == current.mission_id,
         snapshot.mission_revision == current.mission_revision,
         snapshot.authorization_epoch == current.authorization_epoch,
         snapshot.registry_digest == current.registry_digest,

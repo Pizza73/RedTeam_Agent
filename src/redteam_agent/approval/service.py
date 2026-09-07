@@ -14,7 +14,7 @@ Two independent guarantees:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from redteam_agent.approval.models import ApprovalPresentation, ApprovalRecord, ApprovalRequest
@@ -23,9 +23,11 @@ from redteam_agent.auth.principal import PrincipalResolver
 from redteam_agent.auth.rbac import APPROVER_ROLE, RbacPolicy
 from redteam_agent.canonical.digest_service import DigestService
 from redteam_agent.errors import ApprovalAuthorityError, MisleadingApprovalPresentationError
+from redteam_agent.mission.models import Mission
 from redteam_agent.plan.models import ExecutionPlan, compute_proposal_digest
 from redteam_agent.policy.models import PolicyDecision
 from redteam_agent.policy.ttl import enforce_ttl
+from redteam_agent.runtime.authorization_context import AuthorizationContextResolver
 from redteam_agent.runtime.clock import Clock
 from redteam_agent.storage.guard import WriteGuard
 from redteam_agent.storage.repositories import (
@@ -268,24 +270,28 @@ class ApprovalService:
         decision_repository: PolicyDecisionRepository,
         registry_repository: ToolRegistryRepository,
         session_repository: SessionSecurityContextSnapshotRepository,
+        context_resolver: AuthorizationContextResolver,
         principal_resolver: PrincipalResolver,
         rbac: RbacPolicy,
         digest_service: DigestService,
         clock: Clock,
         write_guard: WriteGuard,
         registry_revision: int,
+        max_approval_ttl_seconds: int,
     ) -> None:
         self._requests = request_repository
         self._records = record_repository
         self._decisions = decision_repository
         self._registry_repo = registry_repository
         self._sessions = session_repository
+        self._resolver = context_resolver
         self._principal_resolver = principal_resolver
         self._rbac = rbac
         self._digests = digest_service
         self._clock = clock
         self._guard = write_guard
         self._registry_revision = registry_revision
+        self._max_approval_ttl_seconds = max_approval_ttl_seconds
         request_repository.bind_owner(write_guard)
         record_repository.bind_owner(write_guard)
 
@@ -308,6 +314,14 @@ class ApprovalService:
         tool = registry.by_ref(decision.tool_ref.tool_id, decision.tool_ref.registry_revision)
         if tool is None:
             raise ApprovalAuthorityError("tool not found")
+        # The mission's approval policy and validity window bound the request TTL,
+        # alongside a global maximum and the parent decision expiry (R09).
+        runtime = self._resolver.resolve(decision.mission_id, now=now)
+        mission = runtime.mission
+        if decision.mission_revision != mission.mission_revision:
+            raise ApprovalAuthorityError("decision mission revision is stale")
+        if decision.authorization_epoch != mission.authorization_epoch:
+            raise ApprovalAuthorityError("decision authorization epoch is stale")
         principal_ref = None
         if plan.proposal.session_id is not None:
             snap = self._sessions.get(plan.proposal.session_id)
@@ -322,20 +336,33 @@ class ApprovalService:
             digest_service=self._digests,
             session_id=plan.proposal.session_id,
         )
+        expires_at = self._bounded_request_expiry(now=now, decision=decision, mission=mission)
         enforce_ttl(
-            label="approval_request", issued_at=now, expires_at=decision.expires_at,
-            mission_valid_until=decision.expires_at,
+            label="approval_request", issued_at=now, expires_at=expires_at,
+            mission_valid_until=mission.valid_until, parent_expires_at=decision.expires_at,
         )
         request = build_approval_request(
             approval_request_id=approval_request_id,
             decision=decision,
             presentation=presentation,
             issued_at=now,
-            expires_at=decision.expires_at,
+            expires_at=expires_at,
             digest_service=self._digests,
         )
         self._requests.save(request, guard=self._guard)
         return request
+
+    def _bounded_request_expiry(
+        self, *, now: datetime, decision: PolicyDecision, mission: Mission
+    ) -> datetime:
+        """Smallest of the mission approval TTL, global max, decision and validity."""
+        candidates = (
+            now + timedelta(seconds=mission.approval_policy.approval_ttl_seconds),
+            now + timedelta(seconds=self._max_approval_ttl_seconds),
+            decision.expires_at,
+            mission.valid_until,
+        )
+        return min(candidates)
 
     def submit_decision(
         self, *, approval_id: str, approval_request_id: str, actor_token: str, verdict: str

@@ -25,6 +25,7 @@ def _build_invalid_tool(tool) -> None:
         tools=(tool,),
         digest_service=_ds(),
         contract_catalog=support.empty_contract_catalog(),
+        rule_catalog=support.rule_catalog_for((tool,)),
     )
 
 
@@ -39,7 +40,10 @@ def test_duplicate_tool_id_rejected() -> None:
     tool = support.rebind_contract(support.network_tool())
     catalog = support.contract_catalog_for((support.network_tool(),))
     with pytest.raises(ToolRegistryValidationError):
-        build_tool_registry(registry_revision=1, tools=(tool, tool), digest_service=ds, contract_catalog=catalog)
+        build_tool_registry(
+            registry_revision=1, tools=(tool, tool), digest_service=ds, contract_catalog=catalog,
+            rule_catalog=support.rule_catalog_for((tool,)),
+        )
 
 
 def test_registry_revision_mismatch_rejected() -> None:
@@ -84,7 +88,8 @@ def test_unregistered_action_contract_rejected() -> None:
     tool = support.rebind_contract(support.network_tool())
     with pytest.raises(ToolRegistryValidationError):
         build_tool_registry(
-            registry_revision=1, tools=(tool,), digest_service=ds, contract_catalog=support.empty_contract_catalog()
+            registry_revision=1, tools=(tool,), digest_service=ds,
+            contract_catalog=support.empty_contract_catalog(), rule_catalog=support.rule_catalog_for((tool,)),
         )
 
 
@@ -96,4 +101,7 @@ def test_action_contract_parameter_schema_mismatch_rejected() -> None:
     # so the registered contract's schema digest no longer matches the tool.
     tampered = support.rebind_contract(base).model_copy(update={"parameter_schema": {"type": "object", "x": 1}})
     with pytest.raises(ToolRegistryValidationError):
-        build_tool_registry(registry_revision=1, tools=(tampered,), digest_service=ds, contract_catalog=catalog)
+        build_tool_registry(
+            registry_revision=1, tools=(tampered,), digest_service=ds, contract_catalog=catalog,
+            rule_catalog=support.rule_catalog_for((base,)),
+        )

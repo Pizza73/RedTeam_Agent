@@ -44,12 +44,16 @@ def _validate_success_condition(condition: object, catalog: SemanticCatalog) -> 
     if isinstance(condition, SessionEstablishedCondition):
         if condition.selector_type not in catalog.selector_types:
             raise MissionValidationError("unregistered session selector type")
+        if condition.selector_value.strip() in ("", "any"):
+            raise MissionValidationError("session selector value must be concrete, not empty/any")
     elif isinstance(condition, HostPrivilegeCondition):
         if condition.required_privilege not in catalog.privilege_levels:
             raise MissionValidationError("unregistered privilege level")
     elif isinstance(condition, FindingConfirmedCondition):
-        if condition.fact_type not in catalog.fact_types:
-            raise MissionValidationError("unregistered fact type")
+        if condition.fact_type not in catalog.finding_fact_types:
+            raise MissionValidationError("fact type is not eligible for a finding goal condition")
+        if condition.canonical_entity_ref not in catalog.registered_entity_refs:
+            raise MissionValidationError("finding condition references an unregistered entity")
     else:  # pragma: no cover - discriminated union is exhaustive
         raise MissionValidationError("unknown success condition type")
 
@@ -106,6 +110,11 @@ def validate_mission_revision(
         raise MissionValidationError("llm profile revision mismatch")
     if profile.profile_digest != revision.llm_profile_digest:
         raise MissionValidationError("llm profile digest mismatch")
+    # Phase 0A accepts only the explicit Mock profile. A local LLM profile that
+    # self-attests capability with a bare boolean is rejected; the real
+    # capability-check result is a Phase 2 concern (R17).
+    if profile.profile_kind != "mock":
+        raise MissionValidationError("Phase 0A accepts only the mock agent profile")
     if not profile.is_usable():
         raise MissionValidationError("llm profile capability check has not passed")
 

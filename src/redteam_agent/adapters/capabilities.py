@@ -14,6 +14,7 @@ from redteam_agent.policy.target_binding import TargetBindingMode
 class AdapterCapabilities(StrictImmutableBoundaryModel):
     adapter_id: str = Field(min_length=1)
     adapter_type: Literal["c2", "mcp", "local"]
+    execution_location: Literal["local_process", "managed_remote", "untrusted_remote"]
     capability_revision: str = Field(min_length=1)
     capabilities: frozenset[str]
     supported_os: frozenset[str]

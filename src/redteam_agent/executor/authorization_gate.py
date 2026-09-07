@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from redteam_agent.approval.service import evaluate_executable, verify_presentation_matches_intent
 from redteam_agent.auth.rbac import RbacPolicy
 from redteam_agent.canonical.digest_service import DigestService
+from redteam_agent.contracts.catalog import ActionContractCatalog
 from redteam_agent.errors import AuthorizationKernelError, MisleadingApprovalPresentationError
 from redteam_agent.plan.models import ExecutionPlan, compute_proposal_digest
 from redteam_agent.policy.engine import PolicyEngine, context_from_mission
@@ -59,6 +60,7 @@ class ExecutorAuthorizationGate:
         role_assignment_repository: MissionRoleAssignmentRepository,
         context_resolver: AuthorizationContextResolver,
         policy_engine: PolicyEngine,
+        contract_catalog: ActionContractCatalog,
         clock: Clock,
         digest_service: DigestService,
         registry_revision: int,
@@ -73,6 +75,7 @@ class ExecutorAuthorizationGate:
         self._rbac = RbacPolicy(role_assignment_repository)
         self._resolver = context_resolver
         self._policy_engine = policy_engine
+        self._contracts = contract_catalog
         self._clock = clock
         self._digests = digest_service
         self._registry_revision = registry_revision
@@ -173,6 +176,19 @@ class ExecutorAuthorizationGate:
         # The plan's action contract reference must match the registered tool's.
         if plan.action_contract_ref != tool.action_contract_ref:
             return GateResult(False, "ACTION_CONTRACT_MISMATCH")
+        # The execution-precondition digest must equal the one computed by the
+        # Application from the registered contract; an empty or caller-chosen
+        # value is rejected (R12).
+        contract = self._contracts.get(tool.action_contract_ref.contract_id)
+        if contract is None:
+            return GateResult(False, "CONTRACT_NOT_REGISTERED")
+        if plan.execution_precondition_digest != contract.execution_precondition_digest:
+            return GateResult(False, "PRECONDITION_DIGEST_MISMATCH")
+        # The decision's resolved adapter must match the registered tool's fixed
+        # adapter (a stored-field tamper with a recomputed decision digest is
+        # rejected here as well as by row integrity) (R23).
+        if decision.resolved_adapter != tool.adapter or decision.resolved_adapter_id != tool.adapter_id:
+            return GateResult(False, "RESOLVED_ADAPTER_MISMATCH")
         adapter = self._adapters.get(tool.adapter_id)
         if adapter is None:
             return GateResult(False, "ADAPTER_NOT_FOUND")

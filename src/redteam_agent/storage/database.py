@@ -9,9 +9,17 @@ abstraction keeps that migration possible.
 
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 
 from redteam_agent.errors import RepositoryIntegrityError
+
+_ROW_DIGEST_DOMAIN = b"kv-row-integrity-v1"
+
+
+def _row_digest(namespace: str, key: str, json_text: str) -> str:
+    body = b"\x00".join(part.encode("utf-8") for part in (namespace, key, json_text))
+    return hashlib.sha256(_ROW_DIGEST_DOMAIN + b"\x00" + body).hexdigest()
 
 
 class Database:
@@ -23,12 +31,16 @@ class Database:
         self._create_schema()
 
     def _create_schema(self) -> None:
+        # ``row_digest`` binds (namespace, key, json) so a raw single-row edit
+        # that changes the JSON without recomputing the digest is caught on read
+        # (R10). This is simple-edit integrity, not TPM rollback resistance.
         self._conn.execute(
             """
             CREATE TABLE IF NOT EXISTS kv_store (
                 namespace TEXT NOT NULL,
                 key TEXT NOT NULL,
                 json TEXT NOT NULL,
+                row_digest TEXT NOT NULL,
                 PRIMARY KEY (namespace, key)
             )
             """
@@ -59,29 +71,36 @@ class Database:
                 )
             return
         self._conn.execute(
-            "INSERT INTO kv_store (namespace, key, json) VALUES (?, ?, ?)",
-            (namespace, key, json_text),
+            "INSERT INTO kv_store (namespace, key, json, row_digest) VALUES (?, ?, ?, ?)",
+            (namespace, key, json_text, _row_digest(namespace, key, json_text)),
         )
 
     def overwrite(self, namespace: str, key: str, json_text: str) -> None:
         """Unconditionally upsert (used for OCC-guarded records like mission state)."""
         self._conn.execute(
-            "INSERT OR REPLACE INTO kv_store (namespace, key, json) VALUES (?, ?, ?)",
-            (namespace, key, json_text),
+            "INSERT OR REPLACE INTO kv_store (namespace, key, json, row_digest) VALUES (?, ?, ?, ?)",
+            (namespace, key, json_text, _row_digest(namespace, key, json_text)),
         )
+
+    def _verify_row(self, namespace: str, key: str, json_text: str, stored_digest: str) -> str:
+        if _row_digest(namespace, key, json_text) != stored_digest:
+            raise RepositoryIntegrityError(f"row integrity check failed for {namespace}/{key}")
+        return json_text
 
     def get(self, namespace: str, key: str) -> str | None:
         row = self._conn.execute(
-            "SELECT json FROM kv_store WHERE namespace = ? AND key = ?", (namespace, key)
+            "SELECT json, row_digest FROM kv_store WHERE namespace = ? AND key = ?", (namespace, key)
         ).fetchone()
-        return None if row is None else str(row[0])
+        if row is None:
+            return None
+        return self._verify_row(namespace, key, str(row[0]), str(row[1]))
 
     def get_all(self, namespace: str) -> list[tuple[str, str]]:
-        """Return ``(row_key, json)`` pairs so callers can verify the real key."""
+        """Return ``(row_key, json)`` pairs after verifying each row's integrity."""
         rows = self._conn.execute(
-            "SELECT key, json FROM kv_store WHERE namespace = ? ORDER BY key", (namespace,)
+            "SELECT key, json, row_digest FROM kv_store WHERE namespace = ? ORDER BY key", (namespace,)
         ).fetchall()
-        return [(str(row[0]), str(row[1])) for row in rows]
+        return [(str(k), self._verify_row(namespace, str(k), str(j), str(rd))) for k, j, rd in rows]
 
 
 class UnitOfWork:

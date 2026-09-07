@@ -27,7 +27,7 @@ def test_registered_condition_validates() -> None:
     ds = DigestService()
     profile = support.make_profile(ds)
     condition = SessionEstablishedCondition(
-        condition_id="c1", description="establish", selector_type="active_session", selector_value="any"
+        condition_id="c1", description="establish", selector_type="exact_session", selector_value="sess-1"
     )
     revision = support.mission_revision(ds, profile=profile, success_conditions=(condition,))
     validate_mission_revision(revision, digest_service=ds, profile=profile, policy=_policy(ds))
@@ -53,6 +53,8 @@ def test_unregistered_condition_kind_rejected() -> None:
         selector_types=frozenset({"active_session"}),
         privilege_levels=frozenset({"linux_uid0"}),
         condition_kinds=frozenset({"session_established"}),
+        finding_fact_types=frozenset({"finding"}),
+        registered_entity_refs=frozenset({"entity:host-1"}),
     )
     condition = HostPrivilegeCondition(
         condition_id="c1", description="root", host_ref="h1", required_privilege="linux_uid0"

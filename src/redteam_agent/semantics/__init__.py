@@ -19,6 +19,11 @@ class SemanticCatalog:
     selector_types: frozenset[str]
     privilege_levels: frozenset[str]
     condition_kinds: frozenset[str]
+    # Fact types eligible for a finding_confirmed goal condition. ``execution_outcome``
+    # is deliberately excluded: it has no direct goal correspondence (R11).
+    finding_fact_types: frozenset[str]
+    # Canonical entity references known to the (fixed test-double) entity catalog.
+    registered_entity_refs: frozenset[str]
 
 
 def default_semantic_catalog() -> SemanticCatalog:
@@ -28,4 +33,6 @@ def default_semantic_catalog() -> SemanticCatalog:
         selector_types=frozenset({"exact_session", "active_session"}),
         privilege_levels=frozenset({"linux_uid0", "windows_system", "windows_high_integrity"}),
         condition_kinds=frozenset({"session_established", "host_privilege", "finding_confirmed"}),
+        finding_fact_types=frozenset({"identity", "service", "relationship", "finding"}),
+        registered_entity_refs=frozenset({"entity:host-1", "entity:dc-01", "entity:svc-http"}),
     )

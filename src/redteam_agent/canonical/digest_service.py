@@ -35,10 +35,12 @@ class DigestService:
             expected = set(definition.included_field_paths)
             actual = set(payload)
             if actual != expected:
-                missing = expected - actual
-                unknown = actual - expected
+                # Report only counts, never the (possibly caller-controlled) key
+                # names, so a synthetic key cannot leak into an exception/log.
+                missing = len(expected - actual)
+                unknown = len(actual - expected)
                 raise DigestCatalogError(
-                    f"{digest_name}: field-set mismatch (missing={sorted(missing)}, unknown={sorted(unknown)})"
+                    f"{digest_name}: field-set mismatch (missing={missing}, unknown={unknown})"
                 )
             included = {key: payload[key] for key in definition.included_field_paths}
         else:

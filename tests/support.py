@@ -15,9 +15,21 @@ from typing import Any
 from redteam_agent.adapters.capabilities import AdapterCapabilities
 from redteam_agent.auth.models import AuthenticatedPrincipal, MissionRoleAssignment
 from redteam_agent.canonical.digest_service import DigestService
-from redteam_agent.composition.testing import Phase0AKernel
-from redteam_agent.contracts.catalog import ActionContractCatalog, ActionContractDefinition, parameter_schema_digest
+from redteam_agent.composition.testing import (
+    ADMIN_ACTOR_TOKEN,
+    ADMIN_PRINCIPAL_ID,
+    OPERATOR_ACTOR_TOKEN,
+    OPERATOR_PRINCIPAL_ID,
+    Phase0AKernel,
+)
+from redteam_agent.contracts.catalog import (
+    ActionContractCatalog,
+    ActionContractDefinition,
+    RuleCatalog,
+    parameter_schema_digest,
+)
 from redteam_agent.llm.profile import AgentModelProfile, mock_agent_profile
+from redteam_agent.mission.manager import MISSION_ADMIN_ROLE, MISSION_OPERATOR_ROLE
 from redteam_agent.mission.models import (
     ApprovalPolicy,
     MissionRevision,
@@ -40,6 +52,33 @@ MISSION_ID = "mission-1"
 ADAPTER_ID = "c2-main"
 
 _PLACEHOLDER_CONTRACT = ActionContractReference(contract_id="pending", revision="1", digest="pending")
+
+# Closed parameter schema for the network scan tool: every argument a proposal
+# may carry is declared, and additional properties are rejected (R01). The
+# credential object mirrors the secret-reference shape.
+_SECRET_REFERENCE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "credential_type": {"type": "string"},
+        "secret_version_id": {"type": "string"},
+        "secret_version": {"type": "string"},
+        "principal_ref": {"type": "string"},
+    },
+    "required": ["credential_type", "secret_version_id", "secret_version", "principal_ref"],
+    "additionalProperties": False,
+}
+_NETWORK_PARAMETER_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "destinations": {"type": "array", "items": {"type": "string"}},
+        "port": {"type": "integer"},
+        "protocol": {"type": "string"},
+        "timeout_seconds": {"type": "integer"},
+        "credential": _SECRET_REFERENCE_SCHEMA,
+    },
+    "required": ["destinations"],
+    "additionalProperties": False,
+}
 
 
 def make_profile(digest_service: DigestService) -> AgentModelProfile:
@@ -70,7 +109,7 @@ def network_tool(
         approval_rule=approval_rule,  # type: ignore[arg-type]
         side_effect=side_effect,  # type: ignore[arg-type]
         idempotency="idempotent",
-        parameter_schema={"type": "object"},
+        parameter_schema=_NETWORK_PARAMETER_SCHEMA,
         output_publication_rule_id="pub-1",
         evidence_rule_ids=("ev-1",),
         action_contract_ref=_PLACEHOLDER_CONTRACT,
@@ -106,17 +145,48 @@ def _contract_for(tool: ToolDefinition) -> ActionContractDefinition:
     )
 
 
+def rule_catalog_for(tools: tuple[ToolDefinition, ...]) -> RuleCatalog:
+    """Build a rule catalog that registers each tool's referenced rules."""
+    catalog = RuleCatalog()
+    register_rules_for(catalog, tools)
+    return catalog
+
+
+def register_rules_for(rule_catalog: RuleCatalog, tools: tuple[ToolDefinition, ...]) -> None:
+    for tool in tools:
+        rule_catalog.register_publication(tool.output_publication_rule_id)
+        for rule_id in tool.evidence_rule_ids:
+            rule_catalog.register_evidence(rule_id)
+
+
+def register_contracts_for(catalog: ActionContractCatalog, tools: tuple[ToolDefinition, ...]) -> None:
+    for tool in tools:
+        catalog.register(_contract_for(tool))
+
+
 def build_registered_registry(
-    digest_service: DigestService, base_tools: tuple[ToolDefinition, ...]
+    digest_service: DigestService,
+    base_tools: tuple[ToolDefinition, ...],
+    *,
+    catalog: ActionContractCatalog | None = None,
+    rule_catalog: RuleCatalog | None = None,
 ) -> tuple[ToolRegistryRevision, tuple[ToolDefinition, ...], ActionContractCatalog]:
     definitions = tuple(_contract_for(tool) for tool in base_tools)
-    catalog = ActionContractCatalog(definitions)
+    catalog = catalog if catalog is not None else ActionContractCatalog()
+    for definition in definitions:
+        catalog.register(definition)
+    rule_catalog = rule_catalog if rule_catalog is not None else RuleCatalog()
+    register_rules_for(rule_catalog, base_tools)
     rebound = tuple(
         tool.model_copy(update={"action_contract_ref": definition.reference()})
         for tool, definition in zip(base_tools, definitions, strict=True)
     )
     registry = build_tool_registry(
-        registry_revision=1, tools=rebound, digest_service=digest_service, contract_catalog=catalog
+        registry_revision=1,
+        tools=rebound,
+        digest_service=digest_service,
+        contract_catalog=catalog,
+        rule_catalog=rule_catalog,
     )
     return registry, rebound, catalog
 
@@ -129,14 +199,21 @@ def rebind_contract(tool: ToolDefinition) -> ToolDefinition:
     return tool.model_copy(update={"action_contract_ref": _contract_for(tool).reference()})
 
 
+def contract_for(tool: ToolDefinition) -> ActionContractDefinition:
+    return _contract_for(tool)
+
+
 def empty_contract_catalog() -> ActionContractCatalog:
     return ActionContractCatalog(())
 
 
-def adapter_capabilities(*, adapter_id: str = ADAPTER_ID, adapter_type: str = "c2") -> AdapterCapabilities:
+def adapter_capabilities(
+    *, adapter_id: str = ADAPTER_ID, adapter_type: str = "c2", execution_location: str = "local_process"
+) -> AdapterCapabilities:
     return AdapterCapabilities(
         adapter_id=adapter_id,
         adapter_type=adapter_type,  # type: ignore[arg-type]
+        execution_location=execution_location,  # type: ignore[arg-type]
         capability_revision="1",
         capabilities=frozenset({"scan"}),
         supported_os=frozenset({"linux"}),
@@ -224,7 +301,7 @@ def mission_revision(
     evidence_until = recovery_until + timedelta(days=1)
     conditions = success_conditions or (
         SessionEstablishedCondition(
-            condition_id="c1", description="establish a session", selector_type="active_session", selector_value="any"
+            condition_id="c1", description="establish a session", selector_type="exact_session", selector_value="sess-1"
         ),
     )
     stub = MissionRevision(
@@ -285,7 +362,12 @@ def seed_running_mission(
     ds = kernel.digest_service
     profile = mock_agent_profile(ds)
     kernel.profile_repository.save(profile)
-    registry, rebound, _catalog = build_registered_registry(ds, (tool, *extra_tools))
+    registry, rebound, _catalog = build_registered_registry(
+        ds,
+        (tool, *extra_tools),
+        catalog=kernel.contract_catalog,
+        rule_catalog=kernel.rule_catalog,
+    )
     kernel.registry_repository.save(registry)
     kernel.adapter_repository.save(adapter_capabilities())
     if seed_sandbox:
@@ -293,9 +375,14 @@ def seed_running_mission(
     for session_id in session_ids:
         kernel.session_repository.save(session_snapshot(session_id=session_id, privileged=privileged_session))
 
-    kernel.mission_manager.create_mission(revision)
-    kernel.mission_manager.validate_mission(MISSION_ID, expected_version=0)
-    running = kernel.mission_manager.start_mission(MISSION_ID, expected_version=1)
+    provision_lifecycle_roles(kernel, mission_id=revision.mission_id)
+    kernel.mission_manager.create_mission(revision, actor_token=ADMIN_ACTOR_TOKEN)
+    kernel.mission_manager.validate_mission(
+        MISSION_ID, expected_version=0, actor_token=OPERATOR_ACTOR_TOKEN
+    )
+    running = kernel.mission_manager.start_mission(
+        MISSION_ID, expected_version=1, actor_token=OPERATOR_ACTOR_TOKEN
+    )
 
     snapshot = kernel.tool_availability_service.publish(snapshot_id="snap-1", mission_id=MISSION_ID)
     return SeededMission(
@@ -350,7 +437,7 @@ def make_plan(
         goal_evaluation_id="phase0a-no-goal-eval",
         goal_evaluation_digest="phase0a-no-goal-eval-digest",
         action_contract_ref=tool.action_contract_ref,
-        execution_precondition_digest="precondition-digest-1",
+        execution_precondition_digest=_contract_for(tool).execution_precondition_digest,
         available_tool_snapshot_id=snapshot.snapshot_id,
         available_tool_snapshot_digest=snapshot.snapshot_digest,
         session_security_context_digest=snapshot.session_security_context_digest,
@@ -363,6 +450,20 @@ def make_plan(
 
 def issue_decision(kernel: Phase0AKernel, *, plan: ExecutionPlan, decision_id: str = "decision-1"):
     return kernel.execution_authorization_service.issue(decision_id=decision_id, plan=plan)
+
+
+def provision_lifecycle_roles(kernel: Phase0AKernel, *, mission_id: str = MISSION_ID) -> None:
+    """Grant the Root-fixed admin/operator principals their mission roles (R18)."""
+    kernel.role_assignment_repository.save(
+        MissionRoleAssignment(
+            mission_id=mission_id, principal_id=ADMIN_PRINCIPAL_ID, role=MISSION_ADMIN_ROLE, active=True
+        )
+    )
+    kernel.role_assignment_repository.save(
+        MissionRoleAssignment(
+            mission_id=mission_id, principal_id=OPERATOR_PRINCIPAL_ID, role=MISSION_OPERATOR_ROLE, active=True
+        )
+    )
 
 
 def register_approver(kernel: Phase0AKernel, *, token: str = "tok-approver", principal_id: str = "op-approver") -> None:

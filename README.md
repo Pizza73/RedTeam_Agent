@@ -45,12 +45,12 @@ Phase順序・製品要件は正本§36〜38、開発開始・記録・独立レ
 
 ### 再現手順
 
-Python 3.14.6 で検証。プロジェクト仮想環境内へ固定依存を導入し、システムPython/グローバル設定は変更しない。
+Python 3.14.6 で検証（`.python-version`へ固定）。プロジェクト仮想環境内へ固定依存を導入し、システムPython/グローバル設定は変更しない。
 
 ```sh
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.lock
-.venv/bin/python -m pip install -e .        # または PYTHONPATH=src
+.venv/bin/python -m pip install -e . --no-build-isolation   # lock済みbuild backendを使用
 .venv/bin/ruff check src tests scripts
 .venv/bin/mypy
 .venv/bin/python -m compileall -q src
@@ -58,7 +58,9 @@ python3 -m venv .venv
 .venv/bin/python -m coverage report
 ```
 
-依存は`requirements.lock`へ固定する（worktree絶対パスのeditable entryは含めない）。`pyproject.toml`のbuild backendは`setuptools.build_meta`。
+依存は`requirements.lock`へ固定する（worktree絶対パスのeditable entryは含めない）。build backendは`setuptools.build_meta`で、
+`requirements.lock`と`pyproject.toml`の`build-system.requires`に`setuptools==80.9.0` / `wheel==0.45.1`を固定する。
+編集不要なら`PYTHONPATH=src`でも実行できる。
 
 ### 状態
 

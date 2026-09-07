@@ -84,7 +84,7 @@ def test_available_when_sandbox_bound_to_its_adapter() -> None:
     ds = DigestService()
     registry, _tool = _registry(ds)
     revision = support.mission_revision(ds, profile=support.make_profile(ds))
-    views = resolve_available_tools(_inputs(ds, registry, sandbox_adapter_id="local-x"), revision)
+    views = resolve_available_tools(_inputs(ds, registry, sandbox_adapter_id="local-x"), revision, support.T0)
     assert len(views) == 1
 
 
@@ -92,7 +92,7 @@ def test_not_available_when_sandbox_bound_to_other_adapter() -> None:
     ds = DigestService()
     registry, _tool = _registry(ds)
     revision = support.mission_revision(ds, profile=support.make_profile(ds))
-    views = resolve_available_tools(_inputs(ds, registry, sandbox_adapter_id="other-adapter"), revision)
+    views = resolve_available_tools(_inputs(ds, registry, sandbox_adapter_id="other-adapter"), revision, support.T0)
     assert views == ()
 
 
@@ -100,5 +100,5 @@ def test_not_available_without_sandbox() -> None:
     ds = DigestService()
     registry, _tool = _registry(ds)
     revision = support.mission_revision(ds, profile=support.make_profile(ds))
-    views = resolve_available_tools(_inputs(ds, registry, sandbox_adapter_id=None), revision)
+    views = resolve_available_tools(_inputs(ds, registry, sandbox_adapter_id=None), revision, support.T0)
     assert views == ()

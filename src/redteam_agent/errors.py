@@ -92,6 +92,18 @@ class ToolRegistryValidationError(AuthorizationKernelError):
     """A tool definition or registry revision is invalid."""
 
 
+class ParameterSchemaError(AuthorizationKernelError):
+    """A tool's parameter schema is unsupported, or arguments do not satisfy it."""
+
+
+class ActionContractError(AuthorizationKernelError):
+    """An action contract or its referenced rules are missing or inconsistent."""
+
+
+class MissionAuthorizationError(AuthorizationKernelError):
+    """A mission lifecycle actor is unauthenticated or lacks the required role."""
+
+
 class TargetExtractorResolutionError(AuthorizationKernelError):
     """A target extractor id is unregistered or extraction failed."""
 

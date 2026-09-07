@@ -91,6 +91,7 @@ class AuthorizationContextResolver:
         session_contexts = tuple(snapshot.context for snapshot in sessions.values())
 
         bindings = CurrentSnapshotBindings(
+            mission_id=mission_id,
             mission_revision=state.mission_revision,
             authorization_epoch=state.authorization_epoch,
             registry_digest=registry.registry_digest,

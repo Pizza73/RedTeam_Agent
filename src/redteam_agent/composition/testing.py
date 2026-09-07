@@ -14,17 +14,24 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from redteam_agent.approval.service import ApprovalService
+from redteam_agent.auth.models import AuthenticatedPrincipal
 from redteam_agent.auth.principal import StaticPrincipalResolver
-from redteam_agent.auth.rbac import RbacPolicy
+from redteam_agent.auth.rbac import APPROVER_ROLE, RbacPolicy
 from redteam_agent.canonical.digest_service import DigestService
 from redteam_agent.context.authorization import ContextAuthorizationService
+from redteam_agent.contracts.catalog import ActionContractCatalog, RuleCatalog
 from redteam_agent.executor.authorization_gate import ExecutorAuthorizationGate
-from redteam_agent.mission.manager import MissionManager
+from redteam_agent.mission.manager import (
+    MISSION_ADMIN_ROLE,
+    MISSION_OPERATOR_ROLE,
+    MissionManager,
+)
 from redteam_agent.mission.models import EvidenceRetentionPolicy
 from redteam_agent.mission.validation import MissionValidationPolicy
 from redteam_agent.policy.authorization_service import ExecutionAuthorizationService
 from redteam_agent.policy.engine import PolicyEngine
 from redteam_agent.policy.risk_policy import EffectiveRiskPolicy, default_risk_policy
+from redteam_agent.resources.resource_metadata import StaticResourceMetadataStore
 from redteam_agent.resources.secret_metadata import StaticSecretMetadataStore
 from redteam_agent.runtime.authorization_context import AuthorizationContextResolver
 from redteam_agent.runtime.clock import Clock, SystemUtcClock
@@ -49,10 +56,22 @@ from redteam_agent.storage.repositories import (
     ToolRegistryRepository,
 )
 from redteam_agent.tools.availability_service import ToolAvailabilityService
+from redteam_agent.tools.target_extractors import DEFAULT_TARGET_EXTRACTOR_REGISTRY
 
 DEFAULT_REGISTRY_REVISION = 1
 DEFAULT_EVIDENCE_RETENTION_SECONDS = 30 * 24 * 3600
 DEFAULT_MAX_RECOVERY_WINDOW_SECONDS = 7 * 24 * 3600
+DEFAULT_MAX_APPROVAL_TTL_SECONDS = 3600
+
+# Root-fixed actor tokens and principals installed by this composition. Tests use
+# these tokens as the authenticated lifecycle/approval actors; there is no path
+# that turns a caller-chosen id/role string into authority (R18).
+ADMIN_ACTOR_TOKEN = "token:mission-admin"  # noqa: S105 - opaque test-double actor token, not a secret
+OPERATOR_ACTOR_TOKEN = "token:mission-operator"  # noqa: S105 - opaque test-double actor token, not a secret
+APPROVER_ACTOR_TOKEN = "token:mission-approver"  # noqa: S105 - opaque test-double actor token, not a secret
+ADMIN_PRINCIPAL_ID = "principal:mission-admin"
+OPERATOR_PRINCIPAL_ID = "principal:mission-operator"
+APPROVER_PRINCIPAL_ID = "principal:mission-approver"
 
 
 def build_evidence_retention_policy(digest_service: DigestService) -> EvidenceRetentionPolicy:
@@ -81,6 +100,9 @@ class Phase0AKernel:
     policy_version: str
     principal_resolver: StaticPrincipalResolver
     secret_metadata_store: StaticSecretMetadataStore
+    resource_metadata_store: StaticResourceMetadataStore
+    contract_catalog: ActionContractCatalog
+    rule_catalog: RuleCatalog
     rbac: RbacPolicy
     # repositories
     revision_repository: MissionRevisionRepository
@@ -123,12 +145,22 @@ def build_test_kernel(
     remote_trust_digest = digest_service.compute("remote_mcp_trust_policy_digest", {"policies": []})
     principal_resolver = StaticPrincipalResolver()
     secret_metadata_store = StaticSecretMetadataStore()
+    resource_metadata_store = StaticResourceMetadataStore()
+    contract_catalog = ActionContractCatalog()
+    rule_catalog = RuleCatalog()
+    extractors = DEFAULT_TARGET_EXTRACTOR_REGISTRY
     guard = WriteGuard()
 
     revision_repo = MissionRevisionRepository(database, digest_service)
     state_repo = MissionStateRepository(database, digest_service)
     event_repo = MissionLifecycleEventRepository(database, digest_service)
-    registry_repo = ToolRegistryRepository(database, digest_service)
+    registry_repo = ToolRegistryRepository(
+        database,
+        digest_service,
+        contract_catalog=contract_catalog,
+        rule_catalog=rule_catalog,
+        extractors=extractors,
+    )
     policy_repo = PolicyRevisionRepository(database, digest_service)
     snapshot_repo = AvailableToolSnapshotRepository(database, digest_service)
     decision_repo = PolicyDecisionRepository(database, digest_service)
@@ -145,6 +177,22 @@ def build_test_kernel(
     policy_repo.save(risk_policy)
     rbac = RbacPolicy(role_repo)
 
+    # Install the Root-fixed principals for the mission admin, operator and
+    # approver. Their per-mission role assignments are provisioned when a mission
+    # is created (see tests/support.seed_running_mission).
+    principal_resolver.register(
+        ADMIN_ACTOR_TOKEN,
+        AuthenticatedPrincipal(principal_id=ADMIN_PRINCIPAL_ID, roles=frozenset({MISSION_ADMIN_ROLE})),
+    )
+    principal_resolver.register(
+        OPERATOR_ACTOR_TOKEN,
+        AuthenticatedPrincipal(principal_id=OPERATOR_PRINCIPAL_ID, roles=frozenset({MISSION_OPERATOR_ROLE})),
+    )
+    principal_resolver.register(
+        APPROVER_ACTOR_TOKEN,
+        AuthenticatedPrincipal(principal_id=APPROVER_PRINCIPAL_ID, roles=frozenset({APPROVER_ROLE})),
+    )
+
     validation_policy = MissionValidationPolicy(
         max_recovery_window_seconds=DEFAULT_MAX_RECOVERY_WINDOW_SECONDS,
         evidence_retention_policy=build_evidence_retention_policy(digest_service),
@@ -155,6 +203,8 @@ def build_test_kernel(
         state_repository=state_repo,
         event_repository=event_repo,
         profile_repository=profile_repo,
+        principal_resolver=principal_resolver,
+        rbac=rbac,
         digest_service=digest_service,
         validation_policy=validation_policy,
         clock=clock,
@@ -164,6 +214,8 @@ def build_test_kernel(
         digest_service=digest_service,
         risk_policy=risk_policy,
         secret_metadata_reader=secret_metadata_store,
+        resource_metadata_reader=resource_metadata_store,
+        extractors=extractors,
     )
     context_resolver = AuthorizationContextResolver(
         state_repository=state_repo,
@@ -184,6 +236,7 @@ def build_test_kernel(
         registry_repository=registry_repo,
         adapter_repository=adapter_repo,
         session_repository=session_repo,
+        snapshot_repository=snapshot_repo,
         decision_repository=decision_repo,
         clock=clock,
         write_guard=guard,
@@ -210,22 +263,27 @@ def build_test_kernel(
         decision_repository=decision_repo,
         registry_repository=registry_repo,
         session_repository=session_repo,
+        context_resolver=context_resolver,
         principal_resolver=principal_resolver,
         rbac=rbac,
         digest_service=digest_service,
         clock=clock,
         write_guard=guard,
         registry_revision=registry_revision,
+        max_approval_ttl_seconds=DEFAULT_MAX_APPROVAL_TTL_SECONDS,
     )
     context_authorization_service = ContextAuthorizationService(
         state_repository=state_repo,
         revision_repository=revision_repo,
+        policy_repository=policy_repo,
         index_repository=index_repo,
         session_repository=session_repo,
         grant_repository=grant_repo,
+        resource_metadata_reader=resource_metadata_store,
         digest_service=digest_service,
         clock=clock,
         write_guard=guard,
+        policy_version=risk_policy.policy_version,
     )
     gate = ExecutorAuthorizationGate(
         decision_repository=decision_repo,
@@ -238,6 +296,7 @@ def build_test_kernel(
         role_assignment_repository=role_repo,
         context_resolver=context_resolver,
         policy_engine=policy_engine,
+        contract_catalog=contract_catalog,
         clock=clock,
         digest_service=digest_service,
         registry_revision=registry_revision,
@@ -252,6 +311,9 @@ def build_test_kernel(
         policy_version=risk_policy.policy_version,
         principal_resolver=principal_resolver,
         secret_metadata_store=secret_metadata_store,
+        resource_metadata_store=resource_metadata_store,
+        contract_catalog=contract_catalog,
+        rule_catalog=rule_catalog,
         rbac=rbac,
         revision_repository=revision_repo,
         state_repository=state_repo,

@@ -33,7 +33,9 @@ def test_resolves_current_running_mission() -> None:
 def test_reflects_epoch_rotation() -> None:
     kernel = _kernel()
     _seed(kernel)
-    kernel.mission_manager.invalidate_authorization(support.MISSION_ID, expected_version=2)
+    kernel.mission_manager.invalidate_authorization(
+        support.MISSION_ID, expected_version=2, actor_token=support.OPERATOR_ACTOR_TOKEN
+    )
     runtime = kernel.context_resolver.resolve(support.MISSION_ID, now=support.T0)
     assert runtime.mission.authorization_epoch == 1
     assert runtime.bindings.authorization_epoch == 1

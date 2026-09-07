@@ -18,10 +18,12 @@ from redteam_agent.runtime.clock import Clock
 from redteam_agent.storage.guard import WriteGuard
 from redteam_agent.storage.repositories import (
     AdapterCapabilityRepository,
+    AvailableToolSnapshotRepository,
     PolicyDecisionRepository,
     SessionSecurityContextSnapshotRepository,
     ToolRegistryRepository,
 )
+from redteam_agent.tools.availability import revalidate_snapshot
 
 
 class ExecutionAuthorizationService:
@@ -33,6 +35,7 @@ class ExecutionAuthorizationService:
         registry_repository: ToolRegistryRepository,
         adapter_repository: AdapterCapabilityRepository,
         session_repository: SessionSecurityContextSnapshotRepository,
+        snapshot_repository: AvailableToolSnapshotRepository,
         decision_repository: PolicyDecisionRepository,
         clock: Clock,
         write_guard: WriteGuard,
@@ -43,6 +46,7 @@ class ExecutionAuthorizationService:
         self._registry_repo = registry_repository
         self._adapters = adapter_repository
         self._sessions = session_repository
+        self._snapshots = snapshot_repository
         self._decisions = decision_repository
         self._clock = clock
         self._guard = write_guard
@@ -71,6 +75,20 @@ class ExecutionAuthorizationService:
         if plan.proposal.session_id is not None:
             snap = self._sessions.get(plan.proposal.session_id)
             session_context = snap.context if snap is not None else None
+
+        # Re-validate the referenced snapshot against current bindings/time before
+        # issuing a decision; a stale snapshot must not yield a decision (R14).
+        snapshot = self._snapshots.get(plan.available_tool_snapshot_id)
+        if snapshot is None:
+            raise PolicyEvaluationIndeterminateError("available tool snapshot not found")
+        revalidate_snapshot(
+            snapshot,
+            current=runtime.bindings,
+            session_snapshots=self._sessions.all_snapshots(),
+            now=now,
+            selected_tool_ref=plan.proposal.tool_ref,
+            selected_session_id=plan.proposal.session_id,
+        )
 
         decision = self._engine.authorize(
             decision_id=decision_id,

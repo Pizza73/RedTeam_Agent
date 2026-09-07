@@ -10,11 +10,18 @@ overlaps). Any violation is a fail-closed :class:`SecretArgumentBindingError`.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
 from typing import Any
 
 from redteam_agent.canonical.json_boundary import CanonicalJsonObject
 from redteam_agent.errors import SecretArgumentBindingError
+
+# RFC 6901 array index in canonical ASCII form: "0" or a non-zero-leading run of
+# ASCII digits. ``str.isdigit`` accepts Unicode digits, which would alias e.g.
+# ASCII "1" and ARABIC-INDIC DIGIT ONE (U+0661) onto the same array leaf; this
+# regex forbids that.
+_ARRAY_INDEX_RE = re.compile(r"(?a)\A(0|[1-9][0-9]*)\Z")
 
 
 def parse_json_pointer(pointer: str) -> tuple[str, ...]:
@@ -52,9 +59,7 @@ def _unescape_token(raw: str) -> str:
 
 
 def _is_array_index(token: str) -> bool:
-    if token == "0":  # noqa: S105 - array index literal, not a secret
-        return True
-    return token.isdigit() and not token.startswith("0")
+    return _ARRAY_INDEX_RE.match(token) is not None
 
 
 def resolve_pointer(tokens: tuple[str, ...], arguments: CanonicalJsonObject) -> Any:

@@ -99,32 +99,78 @@ frozen は変更で `ValidationError`。標準 `json.loads` は重複キーを�
 ## 4. 試験結果
 
 対象コミット: **未確定**（未コミットの作業ツリー。Codexが後で実装コミットを固定する）。
-実行環境: worktree `/tmp/redteam-phase0a`、`.venv`（Python 3.14.6）。全て仮想環境Pythonで実行。
+入力コミット `d78d089`。独立レビュー対象の候補コミットは `dce6504`（受入前、下記§5の指摘対応をこの作業ツリーで実施）。
+実行環境: worktree `/tmp/redteam-phase0a`、`.venv`（Python 3.14.6）。全て仮想環境Pythonで実行。以下はR01–R23対応後の再実行結果。
 
 | コマンド | 結果 |
 | --- | --- |
-| `.venv/bin/ruff check src tests scripts` | All checks passed |
-| `.venv/bin/mypy`（package=redteam_agent, strict） | Success: no issues found in 75 source files |
-| `.venv/bin/python -m compileall -q src` | 成功（exit 0） |
-| `.venv/bin/python -m pytest`（Unit/Integration/Security/Property-StateMachine） | 177 passed, 1 warning |
-| `.venv/bin/python -m coverage run --branch -m pytest` + `coverage report` | Branch coverage TOTAL 85%（取得済み） |
+| `.venv/bin/ruff check src tests` | All checks passed（0 warning） |
+| `.venv/bin/mypy`（package=redteam_agent, strict） | Success: no issues found in 77 source files |
+| `.venv/bin/python -m compileall -q src tests` | 成功（exit 0） |
+| `.venv/bin/python -m pytest`（Unit/Integration/Security/Regression/Property-StateMachine） | 236 passed（warningなし） |
+| `.venv/bin/python -m coverage run --branch -m pytest` + `coverage report/json` | line 3271/3558、branch 730/976、coverage.py combined 88.24437582708426%（display 88%） |
+| `.venv/bin/pip check` | No broken requirements found |
+| `git diff --check` | 空（whitespace/conflict marker なし） |
+| `sha256sum -c SHA256SUMS` | manifest記載の7ファイル全て OK（承認済みr3正本のHash整合を確認） |
 | `scripts/verify_pydantic_contract.py` / `scripts/verify_wire_and_immutable.py` | いずれも exit 0（strict/coercion/frozen/重複キー/wire/deep-immutable 契約を確認） |
+| 再現手順（README） | `pip install -r requirements.lock` + `pip install -e . --no-build-isolation`（lock済み `setuptools==80.9.0`/`wheel==0.45.1`）で構築・全チェック実行を確認 |
 
 試験の構成:
 - Unit: canonical/digest（field-set固定含む）、json boundary（H-02重複キー・G例外非漏洩）、scope engine（B-01, IPv4-mapped対称正規化, property-based no-false-allow）、data access、secret path、risk policy、tool registry（+action contract binding）、target extractors（B-02隠しdestination）、immutable（deep）、success conditions、sandbox binding（H-04）、availability、mission validation、ttl/normalizer、git state（H-07）。
 - Integration: 認可フロー（ALLOW/REQUIRE_APPROVAL）、mission manager（B-03 lifecycle/OCC/epoch/atomic audit）、repository integrity（B-06/H-03/row-key/model_construct/dup-key）、authorization context（H-01）、context authorization grant（B-04 stale）、mission state machine（Property/State-machine）。
 - Security: forged writes（owner guard: 偽造decision/record/state/requestのraw save拒否, 未認証/未assign approver拒否）、gate negative（stale epoch/mission非RUNNING/window/decision expired/plan改変多数/approval bypass/RBAC revoked）、zero metrics（scope false-allow, prohibited full-path, unauthorized tool, secret未確認/確定SoT binding, misleading presentation）。
-
-既知の警告: `test_model_construct_bypass_rejected_on_write` は不正型のserialize時にpydanticのUserWarningを1件出す（意図的な`model_construct`迂回を保存前に拒否することの確認）。テスト失敗ではない。
+- Regression（`tests/regression/test_review_probes.py`）: 独立レビュー25 Probe（P01–P25）を現行公開APIへ移植し、修正後の fail-closed 挙動をアサート。攻撃と正当要求を取り違えていたProbeには正当系の対（P01/P07/P22/P23/P24 等）を追加。
+- Unit（追加）: parameter schema subset validator（R01: closed object/型非強制/bool≠int/enum/const/bounds/minItems/未対応keyword fail-closed）、context selector（§18: target優先ランク/新しい順/per-type cap非拡張/cross-mission fail-closed）。
 
 未実行/未達: 実LLM品質Gate（Phase 2）、TPM/`swtpm`統合（Phase 0C）、実Adapter Contract/Integration（Phase 4/5）、D4実機Qualification（`NOT_EVALUATED`）は本Phase対象外で未実施。
 
+### 受入前検査で再現し修正した事項（Codex提供の再現、正式独立レビューではない）
+
+いずれも修正前に公開入口から再現し、修正後にRegressionを追加した。
+
+- A（Context Authorization 未完成）: `issue_grant` が要求TTLを無視し Mission `valid_until`（172800秒）へ暗黙延長、
+  停止/未来時刻/失効/他Mission/未保存/改変Grant/Session範囲外/Source差替えを検証していなかった。
+  修正: `issue_grant` は Current Mission RUNNING/valid window、Current Policy Version、Service Identity、
+  Session存在+Freshness、Index候補と Resource Metadata Source-of-Truth の version/digest一致を検証し、
+  実TTLを `now+ttl_seconds` として Mission validity/固定最大/Session freshness の各上限へ**明示拒否**（ttl<=0/過大/期限）。
+  `verify_grant(grant_id, mission_id)` は Repository から保存済みGrantを読み Root Clock で全Current制約を再検証し、
+  caller-supplied Grantモデルや caller now を権威にしない。Regression: `tests/integration/test_context_authorization.py`（16件）。
+- B（Repository不正Model拒否時のSecret漏洩）: `_dump` が未検証Modelを先に `model_dump_json()` していたため、
+  不正値がpydantic警告・例外へ露出した。修正: 保存前に `model_validate(dict(model))` で厳格再検証し、失敗時は
+  内容非公開の `RepositoryIntegrityError`（例外chainなし `from None`）へ変換してから直列化。Digest field-set不一致・
+  boundary検証エラーはキー名/入力値をechoせずtype件数のみ。Regression: `tests/integration/test_repository_integrity.py::test_invalid_model_rejected_without_leaking_input`（warning/例外/chainに合成Secret非出力を確認）。
+- C（再現設定）: `setuptools==80.9.0` / `wheel==0.45.1` を venv へ導入し `requirements.lock` と `pyproject.toml` の
+  `build-system.requires` へ固定。`.python-version=3.14.6` を追加。READMEの `--no-build-isolation` 手順で lock済み backend による構築を確認。
+
 ## 5. 独立レビュー
 
-**未実施。** Codexが実装会話を引き継がない別セッションで、固定した実装コミットのRead-only Snapshot・
-実コード・試験Evidenceを独立に照合する。実装担当の要約・モデルのPASS文字列・終了コード0を受入根拠にしない。
-本依頼中にCodexから受けた開始前確認（A–G および追加の所有書込/契約/条件validation）への対応は
-実装改善であり、正式な独立レビューPASSではない。
+候補コミット `dce6504` に対して独立レビューが実施された（記録: `/tmp/phase0a-independent-review-1/review.md`、
+再現Probe: `/tmp/phase0a-independent-review-1/probes.py`、結果: `probe-results.json`）。**受入は成立していない。**
+指摘は HIGH 17 / MEDIUM 5 / LOW 1。全指摘（R01–R23）を本作業ツリーで修正し、25 Probe を正式Regressionへ移植した。
+以下は対応内容であり、独立レビューPASSやPhase受入を意味しない（最終コミット固定・再独立レビューはCodexが別セッションで行う）。
+
+各指摘への対応（R番号はレビュー内番号）:
+
+- R01（HIGH, P01/P16）: 登録 `parameter_schema` を認可入口（Policy Engine `resolve` 冒頭）で実引数へ厳格適用。安全なJSON Schema subset validator（closed object・型非強制・bool≠int・未対応keyword/type fail-closed）を追加。Tool登録時に schema supported を検証。
+- R02（HIGH, P02）: `required_data_access_types` の宣言リソースについて Resource Metadata Source-of-Truth から read grant を導出し、未認可は DENY。
+- R03（HIGH, P13）: `requires_session` Tool の実行ホストを normalized target に加え、prohibited host scope を評価。
+- R04（HIGH, P04）: `AvailableToolSnapshot`/`CurrentSnapshotBindings` に `mission_id` を追加し、snapshot revalidation で mission 一致を検証。
+- R05–R08（HIGH, P06–P09）: Context Authorization を維持強化。`verify_grant(grant_id, mission_id)` は保存済みGrantをRoot Clockで再検証し caller Grant/now を信頼しない（R06）。停止Missionでの発行/検証を拒否（R07）。Index候補は権威たる **origin record** をSoTキー・ポリシー評価・binding のcanonicalとし、許可IDへ禁止originをaliasする経路を封鎖（R08）。期限切れ/範囲外Sessionを拒否。
+- R09（HIGH, P11）: Approval Request TTL を Mission `approval_ttl_seconds`・Global最大・Decision `expires_at`・Mission `valid_until` の最小へ発行時に束縛し、Record は Request を超えない。使用時（Gate `evaluate_executable`）に再検証。Mission TTL=1 → 2秒後は `not authorized`。
+- R10/R12（HIGH, P05/P12/P25）: kv_store 行整合Digest（namespace+key+bytes）で raw-SQL 改変を読出し時に fail-closed。`execution_precondition_digest` はApplicationが登録契約から算出した値と一致必須（空/任意値は拒否）。
+- R11（HIGH, P10）: SuccessCondition の selector_value を具体値必須（`""`/`any` 拒否）、`execution_outcome` fact type と未登録entityを finding goal から排除。
+- R13（HIGH, P19/P20）: `ToolRegistryRepository` save/get で `validate_tool_registry` を再実行し raw保存の自己整合な不正Registryを拒否。Rule Catalog（publication/evidence/outcome）はRoot供給、Tool宣言のRule IDが未登録なら拒否。
+- R14（MEDIUM）: `ExecutionAuthorizationService` が Decision発行前に snapshot を revalidate。
+- R15（MEDIUM, P15）: 期限切れSessionは `_eligible_sessions` から除外され、session-required Toolはpublish時に snapshotから除外。snapshotに非正のTTLを許さない。
+- R16（HIGH, P18）: Sandbox/Adapter の `execution_location` 一致と supported location を availability で検証（untrusted_remote は不可, H-04）。
+- R17（HIGH, P21）: Phase 0Aは mock profile のみ受理し、local_llm の自己申告 capability を拒否。
+- R18（HIGH, P22）: Mission Lifecycle 全公開操作に認証済みActor（Root固定 Principal Resolver + Mission RBAC: `mission_admin`/`mission_operator`）を要求し、認証済み `principal_id` を監査actorに記録（bare caller文字列は権威にしない）。
+- R19（MEDIUM）: state-machine testはproductの `LEGAL_*` を輸入しない独立oracleへ書換え。
+- R20（LOW）: coverage.pyのcombined TOTALとbranch coverageを区別し、line/branchの分子・分母を記録。
+- R21（MEDIUM, P23）: RFC6901 array index を ASCII 限定し、`str.isdigit` のUnicode digit alias を封鎖。
+- R22（MEDIUM, P24）: array index の secret pointer/presentation を list index対応。
+- R23（HIGH, P25）: Gate は Decision の resolved adapter が登録Tool固定adapterと一致することを再照合。
+- 対応の正当系（レビューが攻撃と取り違えた要求）: schema一致引数のALLOW、Context TTLの非延長発行、認証済みActorの監査記録、ASCII array index pointer、array index secret pointerでのApproval Request生成 を Regression で確認。
 
 ## 6. 受入と残課題
 
@@ -143,7 +189,10 @@ frozen は変更で `ValidationError`。標準 `json.loads` は重複キーを�
   - Repositoryは write時に strict schema 再検証（model_construct迂回拒否）、read時に digest/ID/row-key binding を検証し、
     一括読出しも重複キー拒否入口を通す。未知の security family は無条件成功にせず fail closed。
   - Sandbox Capability は adapter/runtime/execution location へ binding し、他Runtimeの能力流用を拒否（H-04）。
-  - TTL は暗黙 min-clamp をやめ範囲外を明示拒否（発行側 + 使用時再確認）。
+  - CallerがTTLを指定する発行APIは範囲外を暗黙補正せず明示拒否し、使用時にも再確認する。Approval Request/Recordの期限はCaller入力ではなく Mission approval_ttl・Global最大・Decision・Mission validity から導出し、その最小へ束縛してGateで再確認する（R09）。
+  - 登録 parameter schema を認可入口で実引数へ厳格適用する安全な JSON Schema subset validator を導入（closed object・型非強制・fail-closed, R01）。
+  - Context Index は権威 origin record を canonical resource とし、許可IDへ禁止originをaliasする経路を封鎖（R08）。
+  - Mission Lifecycle 全操作は認証済みActor（Principal Resolver + Mission RBAC）を要求し、監査actorに認証済み principal_id を記録（R18）。
   - Digest Catalog は explicit digest に included_field_paths を固定し、Field欠落/未知Fieldを検知（§32.2整合）。
   - SuccessCondition は Discriminated Union + 登録済みSemantic Catalog照合とし、未登録/未対応ConditionのMissionを開始させない。
   - ActionContract は exact ToolRef へ固定契約として登録され、parameter schema digest/extractor/evidence/publication/risk/side-effect の整合をTool登録時に検証する。

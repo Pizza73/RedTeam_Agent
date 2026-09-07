@@ -1,19 +1,23 @@
 """Mission Manager: the single legitimate lifecycle entry point (SystemDesign §21.1).
 
-Only this component transitions a mission between lifecycle states. Every
-transition validates the fixed state machine, the expected version/epoch/state,
-and commits the new state together with a mission-owned lifecycle event in one
-SQLite transaction (real OCC). Starting or resuming a mission additionally
-re-checks the trusted clock against the mission validity window, the presence of
-an authorization reference, and that the bound LLM profile is still registered
-and usable. Revocation boundaries (PAUSE, resume, emergency stop, authorization
-invalidation) rotate the authorization epoch (B-03 / B-04 / C).
+Only this component transitions a mission between lifecycle states. Every public
+operation requires an authenticated actor (resolved from a Root-fixed principal
+resolver) that holds the required mission role, and records that authenticated
+principal as the audit actor (R18). A bare caller string is never authority.
+
+Transitions validate the fixed state machine, the expected version/epoch/state,
+and commit the new state together with a mission-owned lifecycle event in one
+SQLite transaction (real OCC). Starting or resuming additionally re-checks the
+trusted clock against the mission validity window, the authorization reference,
+and the bound LLM profile. Revocation boundaries rotate the authorization epoch.
 """
 
 from __future__ import annotations
 
+from redteam_agent.auth.principal import PrincipalResolver
+from redteam_agent.auth.rbac import RbacPolicy
 from redteam_agent.canonical.digest_service import DigestService
-from redteam_agent.errors import MissionLifecycleError, MissionValidationError
+from redteam_agent.errors import MissionAuthorizationError, MissionLifecycleError, MissionValidationError
 from redteam_agent.mission.models import (
     MissionLifecycleEvent,
     MissionLifecycleState,
@@ -31,6 +35,9 @@ from redteam_agent.storage.repositories import (
     MissionStateRepository,
 )
 
+MISSION_ADMIN_ROLE = "mission_admin"
+MISSION_OPERATOR_ROLE = "mission_operator"
+
 
 class MissionManager:
     def __init__(
@@ -41,6 +48,8 @@ class MissionManager:
         state_repository: MissionStateRepository,
         event_repository: MissionLifecycleEventRepository,
         profile_repository: AgentProfileRepository,
+        principal_resolver: PrincipalResolver,
+        rbac: RbacPolicy,
         digest_service: DigestService,
         validation_policy: MissionValidationPolicy,
         clock: Clock,
@@ -51,6 +60,8 @@ class MissionManager:
         self._states = state_repository
         self._events = event_repository
         self._profiles = profile_repository
+        self._principals = principal_resolver
+        self._rbac = rbac
         self._digests = digest_service
         self._validation_policy = validation_policy
         self._clock = clock
@@ -58,9 +69,20 @@ class MissionManager:
         state_repository.bind_owner(write_guard)
         event_repository.bind_owner(write_guard)
 
+    # --- actor authorization ----------------------------------------------
+
+    def _authorize_actor(self, mission_id: str, actor_token: str, role: str) -> str:
+        principal = self._principals.authenticate(actor_token)
+        if principal is None:
+            raise MissionAuthorizationError("mission actor is not authenticated")
+        if not self._rbac.has_role(mission_id, principal.principal_id, role):
+            raise MissionAuthorizationError(f"actor lacks the required mission role: {role}")
+        return principal.principal_id
+
     # --- creation ---------------------------------------------------------
 
-    def create_mission(self, revision: MissionRevision) -> MissionState:
+    def create_mission(self, revision: MissionRevision, *, actor_token: str) -> MissionState:
+        actor = self._authorize_actor(revision.mission_id, actor_token, MISSION_ADMIN_ROLE)
         state = MissionState(
             mission_id=revision.mission_id,
             mission_revision=revision.mission_revision,
@@ -71,20 +93,7 @@ class MissionManager:
         with UnitOfWork(self._db):
             self._revisions.save(revision)
             self._states.create(state, guard=self._guard)
-            self._events.append(
-                guard=self._guard,
-                event=MissionLifecycleEvent(
-                    mission_id=revision.mission_id,
-                    sequence_number=self._events.next_sequence(revision.mission_id),
-                    from_state="DRAFT",
-                    to_state="DRAFT",
-                    mission_state_version=0,
-                    authorization_epoch=0,
-                    actor="mission_manager",
-                    reason="created",
-                    occurred_at=self._clock.now(),
-                )
-            )
+            self._append_event(revision.mission_id, "DRAFT", "DRAFT", state, actor, "created")
         return state
 
     # --- helpers ----------------------------------------------------------
@@ -101,6 +110,30 @@ class MissionManager:
             raise MissionValidationError("mission revision not found")
         return revision
 
+    def _append_event(
+        self,
+        mission_id: str,
+        from_state: MissionLifecycleState,
+        to_state: MissionLifecycleState,
+        new_state: MissionState,
+        actor: str,
+        reason: str,
+    ) -> None:
+        self._events.append(
+            guard=self._guard,
+            event=MissionLifecycleEvent(
+                mission_id=mission_id,
+                sequence_number=self._events.next_sequence(mission_id),
+                from_state=from_state,
+                to_state=to_state,
+                mission_state_version=new_state.mission_state_version,
+                authorization_epoch=new_state.authorization_epoch,
+                actor=actor,
+                reason=reason,
+                occurred_at=self._clock.now(),
+            ),
+        )
+
     def _transition(
         self, mission_id: str, target: MissionLifecycleState, expected_version: int, *, actor: str, reason: str
     ) -> MissionState:
@@ -114,20 +147,7 @@ class MissionManager:
                 expected_state=current.state,
                 target_state=target,
             )
-            self._events.append(
-                guard=self._guard,
-                event=MissionLifecycleEvent(
-                    mission_id=mission_id,
-                    sequence_number=self._events.next_sequence(mission_id),
-                    from_state=current.state,
-                    to_state=target,
-                    mission_state_version=new_state.mission_state_version,
-                    authorization_epoch=new_state.authorization_epoch,
-                    actor=actor,
-                    reason=reason,
-                    occurred_at=self._clock.now(),
-                )
-            )
+            self._append_event(mission_id, current.state, target, new_state, actor, reason)
         return new_state
 
     def _check_startable(self, revision: MissionRevision) -> None:
@@ -142,40 +162,46 @@ class MissionManager:
 
     # --- transitions ------------------------------------------------------
 
-    def validate_mission(self, mission_id: str, expected_version: int) -> MissionState:
+    def validate_mission(self, mission_id: str, expected_version: int, *, actor_token: str) -> MissionState:
+        actor = self._authorize_actor(mission_id, actor_token, MISSION_OPERATOR_ROLE)
         current = self._current(mission_id)
         revision = self._revision(mission_id, current.mission_revision)
         profile = self._profiles.get(revision.llm_profile_revision)
         validate_mission_revision(
             revision, digest_service=self._digests, profile=profile, policy=self._validation_policy
         )
-        return self._transition(mission_id, "VALIDATED", expected_version, actor="mission_manager", reason="validated")
+        return self._transition(mission_id, "VALIDATED", expected_version, actor=actor, reason="validated")
 
-    def start_mission(self, mission_id: str, expected_version: int) -> MissionState:
+    def start_mission(self, mission_id: str, expected_version: int, *, actor_token: str) -> MissionState:
+        actor = self._authorize_actor(mission_id, actor_token, MISSION_OPERATOR_ROLE)
         current = self._current(mission_id)
         self._check_startable(self._revision(mission_id, current.mission_revision))
-        return self._transition(mission_id, "RUNNING", expected_version, actor="mission_manager", reason="started")
+        return self._transition(mission_id, "RUNNING", expected_version, actor=actor, reason="started")
 
-    def pause_mission(self, mission_id: str, expected_version: int) -> MissionState:
-        return self._transition(mission_id, "PAUSED", expected_version, actor="mission_manager", reason="paused")
+    def pause_mission(self, mission_id: str, expected_version: int, *, actor_token: str) -> MissionState:
+        actor = self._authorize_actor(mission_id, actor_token, MISSION_OPERATOR_ROLE)
+        return self._transition(mission_id, "PAUSED", expected_version, actor=actor, reason="paused")
 
-    def resume_mission(self, mission_id: str, expected_version: int) -> MissionState:
+    def resume_mission(self, mission_id: str, expected_version: int, *, actor_token: str) -> MissionState:
+        actor = self._authorize_actor(mission_id, actor_token, MISSION_OPERATOR_ROLE)
         current = self._current(mission_id)
         self._check_startable(self._revision(mission_id, current.mission_revision))
-        return self._transition(mission_id, "RUNNING", expected_version, actor="mission_manager", reason="resumed")
+        return self._transition(mission_id, "RUNNING", expected_version, actor=actor, reason="resumed")
 
-    def begin_finalization(self, mission_id: str, expected_version: int) -> MissionState:
-        return self._transition(
-            mission_id, "FINALIZING", expected_version, actor="mission_manager", reason="finalizing"
-        )
+    def begin_finalization(self, mission_id: str, expected_version: int, *, actor_token: str) -> MissionState:
+        actor = self._authorize_actor(mission_id, actor_token, MISSION_OPERATOR_ROLE)
+        return self._transition(mission_id, "FINALIZING", expected_version, actor=actor, reason="finalizing")
 
-    def complete_mission(self, mission_id: str, expected_version: int) -> MissionState:
-        return self._transition(mission_id, "COMPLETED", expected_version, actor="mission_manager", reason="completed")
+    def complete_mission(self, mission_id: str, expected_version: int, *, actor_token: str) -> MissionState:
+        actor = self._authorize_actor(mission_id, actor_token, MISSION_OPERATOR_ROLE)
+        return self._transition(mission_id, "COMPLETED", expected_version, actor=actor, reason="completed")
 
-    def abort_mission(self, mission_id: str, expected_version: int) -> MissionState:
-        return self._transition(mission_id, "ABORTED", expected_version, actor="mission_manager", reason="aborted")
+    def abort_mission(self, mission_id: str, expected_version: int, *, actor_token: str) -> MissionState:
+        actor = self._authorize_actor(mission_id, actor_token, MISSION_OPERATOR_ROLE)
+        return self._transition(mission_id, "ABORTED", expected_version, actor=actor, reason="aborted")
 
-    def invalidate_authorization(self, mission_id: str, expected_version: int) -> MissionState:
+    def invalidate_authorization(self, mission_id: str, expected_version: int, *, actor_token: str) -> MissionState:
+        actor = self._authorize_actor(mission_id, actor_token, MISSION_OPERATOR_ROLE)
         with UnitOfWork(self._db):
             current = self._current(mission_id)
             new_state = self._states.rotate_epoch_in_place(
@@ -184,18 +210,7 @@ class MissionManager:
                 expected_version=expected_version,
                 expected_epoch=current.authorization_epoch,
             )
-            self._events.append(
-                guard=self._guard,
-                event=MissionLifecycleEvent(
-                    mission_id=mission_id,
-                    sequence_number=self._events.next_sequence(mission_id),
-                    from_state=current.state,
-                    to_state=current.state,
-                    mission_state_version=new_state.mission_state_version,
-                    authorization_epoch=new_state.authorization_epoch,
-                    actor="mission_manager",
-                    reason="authorization_invalidated",
-                    occurred_at=self._clock.now(),
-                )
+            self._append_event(
+                mission_id, current.state, current.state, new_state, actor, "authorization_invalidated"
             )
         return new_state

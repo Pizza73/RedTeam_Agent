@@ -63,15 +63,25 @@ def test_row_key_swap_rejected() -> None:
         kernel.decision_repository.get("wrong-key")
 
 
-def test_model_construct_bypass_rejected_on_write() -> None:
+def test_invalid_model_rejected_without_leaking_input() -> None:
+    import warnings
+
     kernel = _kernel()
     profile = support.make_profile(kernel.digest_service)
     kernel.profile_repository.save(profile)
     revision = support.mission_revision(kernel.digest_service, profile=profile)
-    # Bypass validation with model_construct, producing an invalid field type.
-    bad = revision.model_construct(**{**revision.__dict__, "max_iterations": "not-an-int"})
-    with pytest.raises(ValidationError):
-        kernel.revision_repository.save(bad)
+    marker = "SYNTHETIC_SECRET_SHOULD_NOT_LEAK"
+    # model_copy(update=...) bypasses validation, injecting an invalid value.
+    bad = revision.model_copy(update={"max_iterations": marker})
+    support.provision_lifecycle_roles(kernel)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with pytest.raises(RepositoryIntegrityError) as exc_info:
+            kernel.mission_manager.create_mission(bad, actor_token=support.ADMIN_ACTOR_TOKEN)
+    # The synthetic secret must not appear in the exception, its chain, or any warning.
+    assert marker not in str(exc_info.value)
+    assert exc_info.value.__cause__ is None
+    assert all(marker not in str(w.message) for w in caught)
 
 
 def test_unknown_family_fails_closed() -> None:
@@ -122,8 +132,12 @@ def test_bulk_read_rejects_duplicate_keys() -> None:
 def test_idempotent_conflict_rejected() -> None:
     kernel = _kernel()
     ds = kernel.digest_service
-    reg_a, _tools_a, _cat_a = support.build_registered_registry(ds, (support.network_tool(tool_id="a"),))
-    reg_b, _tools_b, _cat_b = support.build_registered_registry(ds, (support.network_tool(tool_id="b"),))
+    reg_a, _tools_a, _cat_a = support.build_registered_registry(
+        ds, (support.network_tool(tool_id="a"),), catalog=kernel.contract_catalog, rule_catalog=kernel.rule_catalog
+    )
+    reg_b, _tools_b, _cat_b = support.build_registered_registry(
+        ds, (support.network_tool(tool_id="b"),), catalog=kernel.contract_catalog, rule_catalog=kernel.rule_catalog
+    )
     kernel.registry_repository.save(reg_a)
     with pytest.raises(RepositoryIntegrityError):
         kernel.registry_repository.save(reg_b)  # same revision key, different payload

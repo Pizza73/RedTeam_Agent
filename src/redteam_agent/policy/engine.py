@@ -24,8 +24,10 @@ from typing import Literal
 
 from redteam_agent.adapters.capabilities import AdapterCapabilities
 from redteam_agent.canonical.digest_service import DigestService
+from redteam_agent.canonical.immutable import thaw
 from redteam_agent.errors import (
     DataAccessPatternError,
+    ParameterSchemaError,
     PolicyEvaluationIndeterminateError,
     TargetExtractorResolutionError,
 )
@@ -42,15 +44,24 @@ from redteam_agent.policy.target_binding import (
     select_binding_mode,
 )
 from redteam_agent.policy.ttl import enforce_ttl
+from redteam_agent.resources.resource_metadata import ResourceMetadataReader
 from redteam_agent.resources.secret_metadata import SecretMetadataReader
 from redteam_agent.session.models import SessionSecurityContext
 from redteam_agent.tools.models import ToolDefinition
+from redteam_agent.tools.parameter_schema import validate_arguments
 from redteam_agent.tools.secret_argument_path import parse_json_pointer, resolve_pointer, validate_secret_argument_paths
 from redteam_agent.tools.target_extractors import (
     DEFAULT_TARGET_EXTRACTOR_REGISTRY,
     TargetExtractionInput,
     TrustedTargetExtractorRegistry,
 )
+
+_RESOURCE_ID_FIELD: dict[str, str] = {
+    "artifact": "artifact_ids",
+    "report": "report_ids",
+    "local_artifact": "local_artifact_ids",
+    "internal_knowledge": "internal_knowledge_ids",
+}
 
 Decision = Literal["ALLOW", "REQUIRE_APPROVAL", "DENY"]
 
@@ -115,18 +126,22 @@ class PolicyEngine:
         digest_service: DigestService,
         risk_policy: EffectiveRiskPolicy,
         secret_metadata_reader: SecretMetadataReader | None = None,
+        resource_metadata_reader: ResourceMetadataReader | None = None,
         extractors: TrustedTargetExtractorRegistry | None = None,
         decision_ttl_seconds: int = 900,
     ) -> None:
         self._digests = digest_service
         self._risk_policy = risk_policy
         self._secret_metadata = secret_metadata_reader
+        self._resource_metadata = resource_metadata_reader
         self._extractors = extractors if extractors is not None else DEFAULT_TARGET_EXTRACTOR_REGISTRY
         self._decision_ttl_seconds = decision_ttl_seconds
 
     # --- intent resolution ------------------------------------------------
 
-    def _normalized_targets(self, plan: ExecutionPlan, tool: ToolDefinition) -> tuple[NormalizedTarget, ...]:
+    def _normalized_targets(
+        self, plan: ExecutionPlan, tool: ToolDefinition, session_context: SessionSecurityContext | None
+    ) -> tuple[NormalizedTarget, ...]:
         if tool.target_extractor_id is None:
             targets: tuple[NormalizedTarget, ...] = ()
         else:
@@ -144,7 +159,61 @@ class PolicyEngine:
                 raise TargetExtractorResolutionError("session-required tool has no session id")
             if not any(t.type == "session" and t.canonical_value == session_id for t in targets):
                 targets = (*targets, NormalizedTarget(type="session", canonical_value=session_id, source="session"))
+            # The execution session's host is part of the affected target set, so
+            # a prohibited host cannot be reached via a session-scope allow (R03).
+            if session_context is not None:
+                targets = (
+                    *targets,
+                    NormalizedTarget(type="host", canonical_value=session_context.host, source="session"),
+                )
         return targets
+
+    def _derive_resource_requests(
+        self, plan: ExecutionPlan, tool: ToolDefinition
+    ) -> tuple[bool, list[_DataAccessRequest], tuple[str, ...]]:
+        """Derive read data-access requests for declared non-secret resource types (R02)."""
+        if not tool.required_data_access_types:
+            return True, [], ()
+        if self._resource_metadata is None:
+            return False, [], ("RESOURCE_METADATA_UNAVAILABLE",)
+        arguments = thaw(plan.proposal.arguments)
+        requests: list[_DataAccessRequest] = []
+        for resource_type in sorted(tool.required_data_access_types):
+            if resource_type == "secret_reference":
+                continue  # secret resolve is derived separately
+            field = _RESOURCE_ID_FIELD.get(resource_type)
+            if field is None:
+                return False, [], ("UNSUPPORTED_DATA_ACCESS_TYPE",)
+            resource_ids = arguments.get(field) if isinstance(arguments, dict) else None
+            if not isinstance(resource_ids, list) or not resource_ids:
+                return False, [], ("MISSING_RESOURCE_ARGUMENT",)
+            for resource_id in resource_ids:
+                if not isinstance(resource_id, str):
+                    return False, [], ("RESOURCE_REFERENCE_INVALID",)
+                metadata = self._resource_metadata.get(resource_id)
+                if metadata is None or metadata.resource_type != resource_type:
+                    return False, [], ("RESOURCE_NOT_FOUND",)
+                state_digest = self._digests.compute(
+                    "authorization_state_digest",
+                    {
+                        "resource_type": resource_type,
+                        "resource_id": resource_id,
+                        "resource_version": metadata.version,
+                        "resource_digest": metadata.metadata_digest,
+                        "operations": ["read"],
+                    },
+                )
+                requests.append(
+                    _DataAccessRequest(
+                        resource_type=resource_type,  # type: ignore[arg-type]
+                        resource_id=resource_id,
+                        resource_version=metadata.version,
+                        resource_digest=metadata.metadata_digest,
+                        authorization_state_digest=state_digest,
+                        operations=frozenset({"read"}),
+                    )
+                )
+        return True, requests, ()
 
     def _derive_secret_requests(
         self, plan: ExecutionPlan, tool: ToolDefinition, now: datetime
@@ -292,12 +361,31 @@ class PolicyEngine:
         now: datetime,
     ) -> ResolvedAuthorization:
         reason_codes: list[str] = []
+
+        # Re-validate the plan against its strict schema and the arguments against
+        # the tool's registered parameter schema before anything is trusted (R01).
+        inputs_ok = True
         try:
-            targets = self._normalized_targets(plan, tool)
-            target_ok = True
-        except TargetExtractorResolutionError:
+            type(plan).model_validate(dict(plan))
+        except Exception:
+            inputs_ok = False
+            reason_codes.append("PLAN_SCHEMA_INVALID")
+        if inputs_ok:
+            try:
+                validate_arguments(tool.parameter_schema, plan.proposal.arguments)
+            except ParameterSchemaError:
+                inputs_ok = False
+                reason_codes.append("PARAMETER_SCHEMA_INVALID")
+
+        if inputs_ok:
+            try:
+                targets = self._normalized_targets(plan, tool, session_context)
+                target_ok = True
+            except TargetExtractorResolutionError:
+                targets, target_ok = (), False
+                reason_codes.append("TARGET_EXTRACTION_FAILED")
+        else:
             targets, target_ok = (), False
-            reason_codes.append("TARGET_EXTRACTION_FAILED")
 
         if not target_ok:
             scope_ok = False
@@ -311,19 +399,26 @@ class PolicyEngine:
             if not scope_ok:
                 reason_codes.append(f"SCOPE_{scope_decision.reason_code}")
 
-        derive_ok, requests, secret_reasons = self._derive_secret_requests(plan, tool, now)
+        secret_ok, secret_requests, secret_reasons = (
+            self._derive_secret_requests(plan, tool, now) if inputs_ok else (False, [], ())
+        )
+        resource_ok, resource_requests, resource_reasons = (
+            self._derive_resource_requests(plan, tool) if inputs_ok else (False, [], ())
+        )
         reason_codes.extend(secret_reasons)
+        reason_codes.extend(resource_reasons)
+        requests = secret_requests + resource_requests
         grants: tuple[DataAccessGrant, ...] = ()
         grants_ok = True
-        if derive_ok and requests:
+        if secret_ok and resource_ok and requests:
             try:
                 grants_ok, grants, grant_reasons = self._build_grants(requests, context.data_access_policy)
             except DataAccessPatternError:
                 grants_ok, grants, grant_reasons = False, (), ("DATA_ACCESS_INDETERMINATE",)
             reason_codes.extend(grant_reasons)
-        data_ok = derive_ok and grants_ok
+        data_ok = inputs_ok and secret_ok and resource_ok and grants_ok
 
-        has_secret_resolve = derive_ok and any(r.resource_type == "secret_reference" for r in requests)
+        has_secret_resolve = secret_ok and any(r.resource_type == "secret_reference" for r in secret_requests)
         privileged = bool(tool.requires_session and session_context is not None and session_context.privileged)
         effective_risk = compute_effective_risk(
             policy=self._risk_policy,

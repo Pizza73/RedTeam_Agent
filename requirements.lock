@@ -13,6 +13,8 @@ pydantic_core==2.41.5
 Pygments==2.21.0
 pytest==8.4.2
 ruff==0.14.5
+setuptools==80.9.0
 sortedcontainers==2.4.0
 typing-inspection==0.4.4
 typing_extensions==4.16.0
+wheel==0.45.1
