@@ -67,7 +67,7 @@ from redteam_agent.plan.models import ExecutionPlan
 from redteam_agent.policy.models import PolicyDecision
 from redteam_agent.resources.secret_metadata import SecretMetadataReader
 from redteam_agent.runtime.clock import Clock
-from redteam_agent.storage.database import Database, UnitOfWork
+from redteam_agent.storage.database import CriticalMutation, Database, UnitOfWork
 from redteam_agent.storage.execution_repositories import (
     DispatchClaimRepository,
     ExecutionRecordRepository,
@@ -317,6 +317,7 @@ class Executor:
             self._reserve_budget(record)
             self._executions.transition(claimed, expected_version=record.execution_state_version, guard=self._guard)
             self._claims.create(claim, guard=self._guard)
+            self._record_claim_mutation(record.mission_id, claim)
         return claim
 
     def _reserve_budget(self, record: ExecutionRecord) -> None:
@@ -351,6 +352,7 @@ class Executor:
             # OCC: only the caller whose unconsumed -> consumed update affects one
             # row wins; a concurrent consumer conflicts and never dispatches.
             self._claims.update_state(consumed, expected_state="unconsumed", guard=self._guard)
+            self._record_claim_mutation(record.mission_id, consumed)
         # Read back the consumed claim and confirm the durable commit.
         readback = self._claims.get(claim.claim_id)
         if readback is None or readback.claim_state != "consumed" or readback.consumption_id != consumption_id:
@@ -480,6 +482,7 @@ class Executor:
         with UnitOfWork(self._db):
             self._bindings.create(binding, guard=self._guard)
             self._executions.transition(updated, expected_version=record.execution_state_version, guard=self._guard)
+            self._record_task_binding_mutation(record.mission_id, updated.execution_state_version, binding)
         return DispatchOutcome(
             execution_id=execution_id, provider_execution_state="DISPATCHED", pre_dispatch_block_reason=None,
             task_binding=binding, dispatch_attempts=1, reason_code="DISPATCHED",
@@ -566,6 +569,39 @@ class Executor:
             digest_field="record_digest", digest_name="dispatch_claim_digest", digest_service=self._ds,
         )
         self._claims.update_state(invalidated, expected_state="unconsumed", guard=self._guard)
+        record = self._require_execution(claim.execution_id)
+        self._record_claim_mutation(record.mission_id, invalidated)
+
+    def _record_claim_mutation(self, mission_id: str, claim: DispatchClaim) -> None:
+        occurred_at = claim.consumed_at or claim.invalidated_at or claim.issued_at
+        self._db.record_critical_mutation(
+            CriticalMutation(
+                mission_id=mission_id,
+                event_type="DISPATCH_CLAIM_CHANGED",
+                actor_id="executor",
+                occurred_at_iso=occurred_at.isoformat(),
+                record_type="dispatch_claim",
+                record_id=claim.claim_id,
+                state_version=claim.execution_state_version,
+                security_projection_digest=claim.record_digest,
+            )
+        )
+
+    def _record_task_binding_mutation(
+        self, mission_id: str, state_version: int, binding: ResultTaskBinding
+    ) -> None:
+        self._db.record_critical_mutation(
+            CriticalMutation(
+                mission_id=mission_id,
+                event_type="RESULT_TASK_BOUND",
+                actor_id="executor",
+                occurred_at_iso=self._clock.now().isoformat(),
+                record_type="result_task_binding",
+                record_id=binding.task_id,
+                state_version=state_version,
+                security_projection_digest=binding.binding_digest,
+            )
+        )
 
     # --- secret / lookup helpers ------------------------------------------
 

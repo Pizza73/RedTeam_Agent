@@ -73,6 +73,17 @@ def _explicit(name: str, owner: str, included: tuple[str, ...] = ()) -> DigestDe
     )
 
 
+def _obj_ex(name: str, owner: str, excluded: tuple[str, ...]) -> DigestDefinition:
+    """Object-integrity digest excluding several fields (e.g. digest + auth tag)."""
+    return DigestDefinition(
+        digest_name=name,
+        schema_version="v1",
+        owner_component=owner,
+        canonical_model=name,
+        excluded_field_paths=excluded,
+    )
+
+
 _AUTHORIZATION_DIGEST_FIELDS = (
     "mission_id", "mission_revision", "authorization_epoch", "proposal_digest", "tool_ref",
     "resolved_adapter", "resolved_adapter_id", "session_id", "arguments", "normalized_targets",
@@ -132,6 +143,56 @@ _DEFINITIONS: tuple[DigestDefinition, ...] = (
     _explicit("consumption_id_digest", "executor"),
     _explicit("secret_version_bindings_digest", "executor"),
     _explicit("secret_lifecycle_heads_digest", "executor"),
+    # --- Phase 0C: data security / audit ---------------------------------
+    # Envelope encryption key metadata (SystemDesign §34.1).
+    _obj("domain_key_metadata_digest", "crypto", exclude_self="metadata_digest"),
+    _obj("encryption_metadata_digest", "crypto", exclude_self="metadata_digest"),
+    _obj("key_destruction_result_digest", "crypto", exclude_self="result_digest"),
+    # Encrypted raw result quarantine (SystemDesign §33.1).
+    _obj("quarantine_metadata_digest", "quarantine", exclude_self="metadata_digest"),
+    # Secret lifecycle (SystemDesign §34).
+    _obj("secret_version_metadata_digest", "secret_store", exclude_self="metadata_digest"),
+    _obj("secret_lifecycle_event_digest", "secret_store", exclude_self="event_digest"),
+    _obj("secret_confirmation_digest", "secret_store", exclude_self="record_digest"),
+    _explicit("secret_lifecycle_head_digest", "secret_store"),
+    _explicit("secret_logical_head_digest", "secret_store"),
+    _explicit("secret_active_head_digest", "secret_store"),
+    _explicit("migration_plan_digest", "secret_store"),
+    # Typed leases + deployment epoch (SystemDesign §10.3 / §32).
+    _obj("collection_lease_digest", "collection", exclude_self="record_digest"),
+    _obj("ingestion_lease_digest", "ingestion", exclude_self="record_digest"),
+    _obj("deployment_epoch_digest", "composition", exclude_self="record_digest"),
+    # Secure ingestion publication (SystemDesign §33 / §33.2).
+    _obj("publication_rule_digest", "ingestion", exclude_self="rule_digest"),
+    _obj("artifact_digest", "ingestion", exclude_self="artifact_digest"),
+    _obj("redaction_metadata_digest", "ingestion", exclude_self="redaction_metadata_digest"),
+    _obj("manifest_digest", "ingestion", exclude_self="manifest_digest"),
+    _obj("secure_ingestion_state_digest", "ingestion", exclude_self="record_digest"),
+    # Verified erasure (SystemDesign §33.2 / §34.1).
+    _obj("deletion_intent_digest", "verified_erasure", exclude_self="intent_digest"),
+    _obj("erasure_claim_digest", "verified_erasure", exclude_self="claim_digest"),
+    _obj("cleanup_intent_digest", "verified_erasure", exclude_self="intent_digest"),
+    _obj("cleanup_claim_digest", "verified_erasure", exclude_self="claim_digest"),
+    _explicit("copy_inventory_digest", "verified_erasure"),
+    _explicit("erasure_evidence_digest", "verified_erasure"),
+    # Audit hash chain + TPM-witnessed generation (SystemDesign §34.2).
+    _obj("audit_event_digest", "logging", exclude_self="event_digest"),
+    _explicit("audit_head_digest", "logging",
+              ("mission_id", "head_sequence", "head_event_digest", "updated_at_iso")),
+    _obj_ex("generation_record_digest", "logging", ("record_digest", "record_authentication_tag")),
+    _explicit("generation_commit_payload_digest", "logging"),
+    # witness_digest uses the TPM raw-byte formula SHA256(raw prev || raw payload);
+    # it is registered for catalog coverage but computed by the generation coordinator,
+    # never through canonical-JSON (SystemDesign §34.2.1).
+    _explicit("witness_digest", "logging"),
+    _obj("generation_witness_policy_digest", "logging", exclude_self="policy_digest"),
+    _obj("wrapped_key_state_digest", "logging", exclude_self="state_digest"),
+    _obj("nv_index_identity_digest", "logging", exclude_self="identity_digest"),
+    _obj("security_state_binding_digest", "logging", exclude_self="binding_digest"),
+    _explicit("security_projection_digest", "logging"),
+    _obj("critical_witness_intent_digest", "logging", exclude_self="intent_digest"),
+    _obj("trust_recovery_approval_digest", "logging", exclude_self="approval_digest"),
+    _obj("trust_recovery_consumption_digest", "logging", exclude_self="consumption_digest"),
 )
 
 

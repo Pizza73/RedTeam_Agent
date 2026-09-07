@@ -34,5 +34,9 @@ class RbacPolicy:
                 return True
         return False
 
+    def assignments_for(self, mission_id: str) -> tuple[MissionRoleAssignment, ...]:
+        """Return the exact current mapping so security projections can bind it."""
+        return self._reader.assignments_for(mission_id)
+
     def principal_can_approve(self, mission_id: str, principal: AuthenticatedPrincipal) -> bool:
         return self.has_role(mission_id, principal.principal_id, APPROVER_ROLE)

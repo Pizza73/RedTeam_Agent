@@ -49,7 +49,7 @@ from redteam_agent.execution.state_machine import is_legal_collection_edge, is_l
 from redteam_agent.mission.models import Mission
 from redteam_agent.runtime.authorization_context import AuthorizationContextResolver
 from redteam_agent.runtime.clock import Clock
-from redteam_agent.storage.database import Database, UnitOfWork
+from redteam_agent.storage.database import CriticalMutation, Database, UnitOfWork
 from redteam_agent.storage.execution_repositories import (
     ExecutionRecordRepository,
     ExecutionRecoveryAuthorityRepository,
@@ -261,6 +261,18 @@ class ResultCollectionCoordinator:
             self._bindings.create(binding, guard=self._guard)
             self._authorities.create(authority, guard=self._guard)
             self._states.create(state, guard=self._guard)
+            self._db.record_critical_mutation(
+                CriticalMutation(
+                    mission_id=record.mission_id,
+                    event_type="RESULT_TASK_BOUND",
+                    actor_id="result-collection-coordinator",
+                    occurred_at_iso=started.isoformat(),
+                    record_type="result_task_binding",
+                    record_id=binding.task_id,
+                    state_version=record.execution_state_version,
+                    security_projection_digest=binding.binding_digest,
+                )
+            )
         return authority, self._new_sink(authority, binding.binding_digest)
 
     def finalize_local_collection(

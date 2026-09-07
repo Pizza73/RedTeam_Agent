@@ -1,6 +1,8 @@
 annotated-types==0.8.0
 attrs==26.1.0
+cffi==2.1.1
 coverage==7.11.0
+cryptography==46.0.1
 hypothesis==6.140.3
 iniconfig==2.3.0
 mypy==1.18.2
@@ -8,6 +10,7 @@ mypy_extensions==1.1.0
 packaging==26.3
 pathspec==1.1.1
 pluggy==1.6.0
+pycparser==3.0
 pydantic==2.12.4
 pydantic_core==2.41.5
 Pygments==2.21.0

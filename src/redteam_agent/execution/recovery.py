@@ -37,7 +37,7 @@ from redteam_agent.execution.records import (
 from redteam_agent.execution.state_machine import is_legal_provider_edge
 from redteam_agent.runtime.authorization_context import AuthorizationContextResolver
 from redteam_agent.runtime.clock import Clock
-from redteam_agent.storage.database import Database, UnitOfWork
+from redteam_agent.storage.database import CriticalMutation, Database, UnitOfWork
 from redteam_agent.storage.execution_repositories import (
     CancelAttemptRepository,
     ExecutionRecordRepository,
@@ -219,6 +219,18 @@ class ExecutionRecoveryService:
         with UnitOfWork(self._db):
             self._cancels.create(attempt, guard=self._guard)
             self._executions.transition(requested, expected_version=pre_version, guard=self._guard)
+            self._db.record_critical_mutation(
+                CriticalMutation(
+                    mission_id=record.mission_id,
+                    event_type="CANCEL_ATTEMPT_CHANGED",
+                    actor_id="execution-recovery-service",
+                    occurred_at_iso=attempt.created_at.isoformat(),
+                    record_type="cancel_attempt",
+                    record_id=attempt.cancel_attempt_id,
+                    state_version=attempt.post_transition_execution_state_version,
+                    security_projection_digest=attempt.record_digest,
+                )
+            )
         # Only the OCC winner reaches the adapter, exactly once.
         outcome = adapter.cancel(execution_id, provider_task_id)
         updated = finalize_object_digest(
@@ -227,6 +239,18 @@ class ExecutionRecoveryService:
         )
         with UnitOfWork(self._db):
             self._cancels.update(updated, guard=self._guard)
+            self._db.record_critical_mutation(
+                CriticalMutation(
+                    mission_id=record.mission_id,
+                    event_type="CANCEL_ATTEMPT_CHANGED",
+                    actor_id="execution-recovery-service",
+                    occurred_at_iso=updated.updated_at.isoformat(),
+                    record_type="cancel_attempt",
+                    record_id=updated.cancel_attempt_id,
+                    state_version=updated.post_transition_execution_state_version,
+                    security_projection_digest=updated.record_digest,
+                )
+            )
         return CancelResult(cancel_attempt_id=cancel_attempt_id, attempt_state=outcome.result, reached_adapter=True)
 
     def _require_execution(self, execution_id: str) -> ExecutionRecord:

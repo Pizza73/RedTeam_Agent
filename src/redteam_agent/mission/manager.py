@@ -17,7 +17,12 @@ from __future__ import annotations
 from redteam_agent.auth.principal import PrincipalResolver
 from redteam_agent.auth.rbac import RbacPolicy
 from redteam_agent.canonical.digest_service import DigestService
-from redteam_agent.errors import MissionAuthorizationError, MissionLifecycleError, MissionValidationError
+from redteam_agent.errors import (
+    MissionAuthorizationError,
+    MissionLifecycleError,
+    MissionValidationError,
+    TrustRecoveryError,
+)
 from redteam_agent.mission.models import (
     MissionLifecycleEvent,
     MissionLifecycleState,
@@ -26,7 +31,7 @@ from redteam_agent.mission.models import (
 )
 from redteam_agent.mission.validation import MissionValidationPolicy, validate_mission_revision
 from redteam_agent.runtime.clock import Clock
-from redteam_agent.storage.database import Database, UnitOfWork
+from redteam_agent.storage.database import CriticalMutation, Database, UnitOfWork
 from redteam_agent.storage.guard import WriteGuard
 from redteam_agent.storage.repositories import (
     AgentProfileRepository,
@@ -66,8 +71,57 @@ class MissionManager:
         self._validation_policy = validation_policy
         self._clock = clock
         self._guard = write_guard
+        self._trust_recovery_guard: WriteGuard | None = None
         state_repository.bind_owner(write_guard)
         event_repository.bind_owner(write_guard)
+
+    def bind_trust_recovery_guard(self, guard: WriteGuard) -> None:
+        if self._trust_recovery_guard is not None:
+            raise TrustRecoveryError("mission trust recovery guard is already configured")
+        self._trust_recovery_guard = guard
+
+    def invalidate_all_authorizations_for_trust_recovery_in_txn(
+        self, *, guard: WriteGuard, new_trust_epoch: int
+    ) -> tuple[int, str]:
+        """Rotate every mission epoch in the recovery transaction and return its root."""
+        if guard is not self._trust_recovery_guard or not self._db.in_transaction:
+            raise TrustRecoveryError("authorization invalidation requires the offline recovery guard")
+        for current in self._states.all_states():
+            updated = self._states.rotate_epoch_for_trust_recovery(guard=self._guard, current=current)
+            occurred_at = self._clock.now()
+            self._events.append(
+                guard=self._guard,
+                event=MissionLifecycleEvent(
+                    mission_id=current.mission_id,
+                    sequence_number=self._events.next_sequence(current.mission_id),
+                    from_state=current.state,
+                    to_state=updated.state,
+                    mission_state_version=updated.mission_state_version,
+                    authorization_epoch=updated.authorization_epoch,
+                    actor="offline-trust-recovery",
+                    reason=f"trust_epoch_{new_trust_epoch}_authorization_invalidation",
+                    occurred_at=occurred_at,
+                ),
+            )
+        return self.current_authorizations_for_trust_recovery(new_trust_epoch=new_trust_epoch)
+
+    def current_authorizations_for_trust_recovery(
+        self, *, new_trust_epoch: int
+    ) -> tuple[int, str]:
+        """Recompute the recovery authorization root without changing mission state."""
+        projections = tuple(
+            {
+                "mission_id": state.mission_id,
+                "mission_state_version": state.mission_state_version,
+                "authorization_epoch": state.authorization_epoch,
+                "state": state.state,
+            }
+            for state in self._states.all_states()
+        )
+        return len(projections), self._digests.compute(
+            "security_projection_digest",
+            {"new_trust_epoch": new_trust_epoch, "invalidated_authorizations": projections},
+        )
 
     # --- actor authorization ----------------------------------------------
 
@@ -119,6 +173,7 @@ class MissionManager:
         actor: str,
         reason: str,
     ) -> None:
+        occurred_at = self._clock.now()
         self._events.append(
             guard=self._guard,
             event=MissionLifecycleEvent(
@@ -130,9 +185,47 @@ class MissionManager:
                 authorization_epoch=new_state.authorization_epoch,
                 actor=actor,
                 reason=reason,
-                occurred_at=self._clock.now(),
+                occurred_at=occurred_at,
             ),
         )
+        projection = self.current_security_projection(new_state.mission_id)[1]
+        self._db.record_critical_mutation(
+            CriticalMutation(
+                mission_id=mission_id,
+                event_type="MISSION_AUTHORIZATION_CHANGED",
+                actor_id=actor,
+                occurred_at_iso=occurred_at.isoformat(),
+                record_type="mission_authorization",
+                record_id=mission_id,
+                state_version=new_state.mission_state_version + 1,
+                security_projection_digest=projection,
+            )
+        )
+
+    def current_security_projection(self, mission_id: str) -> tuple[int, str]:
+        """Rebuild the current Mission/Authorization projection from owner records."""
+        state = self._current(mission_id)
+        projection = self._digests.compute(
+            "security_projection_digest",
+            {
+                "mission_id": state.mission_id,
+                "mission_revision": state.mission_revision,
+                "mission_state_version": state.mission_state_version,
+                "authorization_epoch": state.authorization_epoch,
+                "state": state.state,
+                "active_revision_digest": self._revision(
+                    state.mission_id, state.mission_revision
+                ).mission_revision_digest,
+                "rbac_projection": tuple(
+                    assignment.model_dump(mode="python")
+                    for assignment in sorted(
+                        self._rbac.assignments_for(state.mission_id),
+                        key=lambda item: (item.principal_id, item.role),
+                    )
+                ),
+            },
+        )
+        return state.mission_state_version + 1, projection
 
     def _transition(
         self, mission_id: str, target: MissionLifecycleState, expected_version: int, *, actor: str, reason: str

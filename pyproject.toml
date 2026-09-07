@@ -7,7 +7,7 @@ name = "redteam-agent"
 version = "0.0.0a1"
 description = "Authorization kernel for an authorized, isolated red-team exercise support agent (Phase 0A)."
 requires-python = ">=3.12"
-dependencies = ["pydantic==2.12.4"]
+dependencies = ["pydantic==2.12.4", "cryptography==46.0.1"]
 
 [project.optional-dependencies]
 dev = [
@@ -31,7 +31,7 @@ select = ["E", "F", "I", "B", "UP", "S", "C4", "SIM", "RUF"]
 ignore = ["S101"]  # asserts are used in tests and as internal invariants
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["S", "B011", "E501", "RUF059"]
+"tests/**" = ["S", "B011", "E501", "RUF059", "SIM105", "SIM117"]
 "scripts/**" = ["S"]
 
 [tool.mypy]
@@ -41,6 +41,14 @@ mypy_path = "src"
 packages = ["redteam_agent"]
 warn_unused_ignores = false
 disallow_any_explicit = false
+
+# The ``cryptography`` package ships its own type hints but is an optional
+# system-provided dependency; when it is not installed in the checking
+# environment, treat its imports as untyped rather than failing the run. The
+# runtime still fails closed via EncryptionUnavailableError when it is absent.
+[[tool.mypy.overrides]]
+module = ["cryptography.*"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

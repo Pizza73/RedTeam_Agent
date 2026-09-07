@@ -14,7 +14,7 @@ from redteam_agent.errors import MissionExecutionBudgetError
 from redteam_agent.execution.models import MissionExecutionBudget
 from redteam_agent.execution.records import finalize_object_digest
 from redteam_agent.runtime.clock import Clock
-from redteam_agent.storage.database import Database, UnitOfWork
+from redteam_agent.storage.database import CriticalMutation, Database, UnitOfWork
 from redteam_agent.storage.execution_repositories import MissionExecutionBudgetRepository
 from redteam_agent.storage.guard import WriteGuard
 
@@ -70,6 +70,18 @@ class MissionExecutionBudgetService:
             )
         )
         self._repo.update(updated, expected_version=current.budget_version, guard=self._guard)
+        self._db.record_critical_mutation(
+            CriticalMutation(
+                mission_id=updated.mission_id,
+                event_type="MISSION_BUDGET_CHANGED",
+                actor_id="mission-budget-service",
+                occurred_at_iso=updated.updated_at.isoformat(),
+                record_type="mission_execution_budget",
+                record_id=f"{updated.mission_id}/{updated.mission_revision}",
+                state_version=updated.budget_version,
+                security_projection_digest=updated.record_digest,
+            )
+        )
         return updated
 
     def get(self, mission_id: str, mission_revision: int) -> MissionExecutionBudget | None:

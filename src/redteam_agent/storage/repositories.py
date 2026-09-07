@@ -130,6 +130,13 @@ class MissionStateRepository(_GuardedRepository):
         model = load_model_from_json(MissionState, raw)
         return self._load(MissionState, raw, row_key=mission_id, payload_key=model.mission_id)
 
+    def all_states(self) -> tuple[MissionState, ...]:
+        states = []
+        for row_key, raw in self._db.get_all(self._NS):
+            model = load_model_from_json(MissionState, raw)
+            states.append(self._load(MissionState, raw, row_key=row_key, payload_key=model.mission_id))
+        return tuple(sorted(states, key=lambda state: state.mission_id))
+
     def create(self, state: MissionState, *, guard: WriteGuard) -> None:
         self._authorize_write(guard, require_transaction=True)
         if state.mission_state_version != 0 or state.state != "DRAFT":
@@ -192,6 +199,23 @@ class MissionStateRepository(_GuardedRepository):
             state=current.state,
         )
         self._db.overwrite(self._NS, mission_id, self._dump(new_state))
+        return new_state
+
+    def rotate_epoch_for_trust_recovery(
+        self, *, guard: WriteGuard, current: MissionState
+    ) -> MissionState:
+        """Invalidate every old authorization epoch while preserving lifecycle state."""
+        self._authorize_write(guard, require_transaction=True)
+        actual = self.get(current.mission_id)
+        if actual != current:
+            raise MissionStateVersionConflictError("mission changed during trust recovery")
+        new_state = current.model_copy(
+            update={
+                "mission_state_version": current.mission_state_version + 1,
+                "authorization_epoch": current.authorization_epoch + 1,
+            }
+        )
+        self._db.overwrite(self._NS, current.mission_id, self._dump(new_state))
         return new_state
 
 
@@ -471,6 +495,17 @@ class MissionRoleAssignmentRepository(_BaseRepository):
 
     def save(self, assignment: MissionRoleAssignment) -> None:
         # Operator/admin RBAC provisioning may update (e.g. revoke) an assignment.
+        # Once the Phase 0C witness bridge is active and a mission exists, a direct
+        # repository update would bypass Mission/Authorization witnessing. Keep the
+        # bootstrap path, but make runtime RBAC immutable until an owner command is
+        # introduced with the corresponding witnessed mission revision.
+        if (
+            self._db.critical_mutation_recording_enabled
+            and self._db.get("mission_states", assignment.mission_id) is not None
+        ):
+            raise RepositoryIntegrityError(
+                "runtime mission role changes require a witnessed mission authorization command"
+            )
         key = f"{assignment.mission_id}/{assignment.principal_id}/{assignment.role}"
         self._db.overwrite(self._NS, key, self._dump(assignment))
 

@@ -200,3 +200,116 @@ class MissionExecutionBudgetError(AuthorizationKernelError):
 
 class MissionRevisionConflictError(AuthorizationKernelError):
     """A run_id/thread_id did not match the mission id/revision it claims."""
+
+
+# --- Phase 0C: data security / audit --------------------------------------
+
+
+class AggregateConsistencyError(AuthorizationKernelError):
+    """An ApplicationUnitOfWork aggregate command was replayed with a different
+    input, missed an expected version, or a child repository committed on its own."""
+
+
+class EncryptionUnavailableError(AuthorizationKernelError):
+    """The standard AEAD provider (the ``cryptography`` package / AES-256-GCM) is
+    not available or a key/algorithm is unusable. Fail closed; never downgrade to
+    plaintext or a non-standard construction (infrastructure/configuration error)."""
+
+
+class NonceReuseError(AuthorizationKernelError):
+    """An encryption nonce would be reused for a key (forbidden)."""
+
+
+class KeyDomainSeparationError(AuthorizationKernelError):
+    """A key domain / resource DEK separation invariant was violated (shared tag,
+    shared domain key id across domains, or a shared resource DEK)."""
+
+
+class CrossDomainKeyError(AuthorizationKernelError):
+    """A ciphertext/metadata for one key domain was opened with another domain's key,
+    or the AAD domain/resource binding did not match."""
+
+
+class RawResultQuarantineError(AuthorizationKernelError):
+    """An encrypted quarantine write/encrypt/binding/integrity check failed (fail closed)."""
+
+
+class SecretLifecycleError(AuthorizationKernelError):
+    """An append-only secret lifecycle event/head/OCC invariant failed."""
+
+
+class SecretConfirmationError(AuthorizationKernelError):
+    """A secret confirmation/replacement precondition (heads/version/actor) failed."""
+
+
+class SecretMigrationRequiredError(AuthorizationKernelError):
+    """A legacy secret reference could not be migrated one-to-one (ambiguous, missing,
+    or digest mismatch); stop rather than aggregate or re-import plaintext."""
+
+
+class LeaseError(AuthorizationKernelError):
+    """A typed lease predicate (owner/fence/epoch/deadline/state/authority) failed."""
+
+
+class ClockIntegrityError(AuthorizationKernelError):
+    """UTC rolled back below the high-water mark, or wall/monotonic divergence exceeded
+    the configured bound; stop new authorization, claim, lease and renewal."""
+
+
+class DeploymentEpochError(AuthorizationKernelError):
+    """A deployment epoch mirror is missing, stale, or worker-mutated, or multi-host
+    topology was detected."""
+
+
+class SecureIngestionError(AuthorizationKernelError):
+    """A repository-bound secure ingestion / publication precondition failed."""
+
+
+class OutputPublicationError(AuthorizationKernelError):
+    """Output could not be published under the fixed publication rule/parser (not published)."""
+
+
+class VerifiedErasureError(AuthorizationKernelError):
+    """A verified-erasure precondition (intent/claim/evidence/key/inventory/read-back) failed."""
+
+
+class AuditChainError(AuthorizationKernelError):
+    """A mission audit sequence/hash-chain invariant failed (gap, duplicate, tamper)."""
+
+
+class GenerationWitnessError(AuthorizationKernelError):
+    """A TPM-witnessed authenticated generation commit precondition failed."""
+
+
+class AnchorRecoveryRequiredError(AuthorizationKernelError):
+    """The current TPM witness / generation anchor is unavailable, reset, rolled back,
+    identity-mismatched, or ambiguous; all missions stop. No local re-seed."""
+
+
+class CriticalWitnessError(AuthorizationKernelError):
+    """A critical state intent is missing, stale, ambiguous, or not yet bound to
+    the authenticated TPM generation. No protected continuation may proceed."""
+
+
+class TrustRecoveryError(AuthorizationKernelError):
+    """An offline trust-recovery approval or adopted state failed exact binding,
+    freshness, worker-stop, one-time consumption, or read-back verification."""
+
+
+class ActivationLockError(AuthorizationKernelError):
+    """The host activation lock could not be acquired (a second root is running)."""
+
+
+class ProductionCompositionError(AuthorizationKernelError):
+    """The production composition root failed a self-check, detected a test double,
+    or was asked to swap a trusted dependency after startup."""
+
+
+class ArchitectureViolationError(AuthorizationKernelError):
+    """A logical component owns a duplicate responsibility or imports in a forbidden
+    direction (architecture ownership/import check)."""
+
+
+class SchemaMigrationRequiredError(AuthorizationKernelError):
+    """Normal startup found an unknown/missing schema; it must not auto-migrate. An
+    explicit stopped-worker migration under the same activation lock is required."""
