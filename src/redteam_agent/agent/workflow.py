@@ -18,6 +18,10 @@ from redteam_agent.agent.models import ControllerDecision, PlannerContextEnvelop
 from redteam_agent.agent.planner_context import PlannerContextService
 from redteam_agent.agent.retry_budget import AgentRetryBudgetService
 from redteam_agent.agent.unresolved import UnresolvedItemService, UnresolvedReason
+from redteam_agent.canonical.digest_service import DigestService
+from redteam_agent.context.authorization import ContextAuthorizationService
+from redteam_agent.context.builder import ContextBuilder
+from redteam_agent.context.selector import ContextSelector
 from redteam_agent.erasure.service import VerifiedQuarantineEraser
 from redteam_agent.errors import (
     AgentLoopError,
@@ -46,6 +50,7 @@ from redteam_agent.quarantine.collection import QuarantineCollectionResult, Quar
 from redteam_agent.storage.execution_repositories import (
     CancelAttemptRepository,
     ExecutionRecordRepository,
+    ExecutionResultRepository,
     RawControlMetadataRepository,
     ResultIngestionStateRepository,
     ResultTaskBindingRepository,
@@ -85,6 +90,7 @@ class _PlanningRuntime:
 
 
 class _AnalysisGraphState(TypedDict, total=False):
+    selected_resource_ids: tuple[str, ...]
     candidate: AnalyzerCandidateObservation
     observation: KnowledgeObservation
     goal_evaluation_id: str
@@ -97,6 +103,7 @@ class _AnalysisRuntime:
     operation_id: str
     execution_id: str
     result_digest: str
+    context_grant_id: str
     invoke_analyzer: Callable[[], object]
 
 
@@ -115,6 +122,7 @@ class Phase1AgentWorkflow:
         recovery_service: ExecutionRecoveryService,
         retry_budget_service: AgentRetryBudgetService,
         execution_repository: ExecutionRecordRepository,
+        result_repository: ExecutionResultRepository,
         task_binding_repository: ResultTaskBindingRepository,
         cancel_attempt_repository: CancelAttemptRepository,
         ingestion_repository: ResultIngestionStateRepository,
@@ -124,6 +132,10 @@ class Phase1AgentWorkflow:
         executor: Executor,
         finalization: FinalizationService,
         goal_service: GoalEvaluationService,
+        context_selector: ContextSelector,
+        context_authorization_service: ContextAuthorizationService,
+        context_builder: ContextBuilder,
+        digest_service: DigestService,
         verified_finding_projector: VerifiedFindingProjector,
     ) -> None:
         self._controller = controller
@@ -136,6 +148,7 @@ class Phase1AgentWorkflow:
         self._recovery = recovery_service
         self._retry_budgets = retry_budget_service
         self._executions = execution_repository
+        self._results = result_repository
         self._bindings = task_binding_repository
         self._cancel_attempts = cancel_attempt_repository
         self._ingestion_states = ingestion_repository
@@ -145,6 +158,10 @@ class Phase1AgentWorkflow:
         self._executor = executor
         self._finalization = finalization
         self._goals = goal_service
+        self._context_selector = context_selector
+        self._context_authorization = context_authorization_service
+        self._context_builder = context_builder
+        self._digests = digest_service
         self._verified_findings = verified_finding_projector
         self.graph = self._build_planning_graph()
         self.analysis_graph = self._build_analysis_graph()
@@ -174,6 +191,7 @@ class Phase1AgentWorkflow:
     def run_analysis(
         self, *, mission_id: str, mission_revision: int, operation_id: str,
         execution_id: str, result_digest: str, invoke_analyzer: Callable[[], object],
+        context_grant_id: str,
     ) -> KnowledgeObservation:
         state = cast(
             _AnalysisGraphState,
@@ -185,6 +203,7 @@ class Phase1AgentWorkflow:
                     operation_id=operation_id,
                     execution_id=execution_id,
                     result_digest=result_digest,
+                    context_grant_id=context_grant_id,
                     invoke_analyzer=invoke_analyzer,
                 ),
             ),
@@ -253,13 +272,23 @@ class Phase1AgentWorkflow:
         _AnalysisGraphState, _AnalysisRuntime, _AnalysisGraphState, _AnalysisGraphState
     ]:
         builder = StateGraph(_AnalysisGraphState, context_schema=_AnalysisRuntime)
+        builder.add_node("analysis_source_binding", self._graph_analysis_source_binding)  # type: ignore[call-overload]
+        builder.add_node("analyzer_context_selector", self._graph_analyzer_context_selector)  # type: ignore[call-overload]
+        builder.add_node(  # type: ignore[call-overload]
+            "analyzer_context_authorization", self._graph_analyzer_context_authorization
+        )
+        builder.add_node("analyzer_context_builder", self._graph_analyzer_context_builder)  # type: ignore[call-overload]
         builder.add_node("analyzer", self._graph_analyzer)  # type: ignore[call-overload]
         builder.add_node("knowledge_reducer", self._graph_knowledge_reducer)  # type: ignore[call-overload]
         builder.add_node(  # type: ignore[call-overload]
             "post_analysis_session_refresh", self._graph_analysis_session_refresh
         )
         builder.add_node("goal_evaluation", self._graph_goal_evaluation)  # type: ignore[call-overload]
-        builder.add_edge(START, "analyzer")
+        builder.add_edge(START, "analysis_source_binding")
+        builder.add_edge("analysis_source_binding", "analyzer_context_selector")
+        builder.add_edge("analyzer_context_selector", "analyzer_context_authorization")
+        builder.add_edge("analyzer_context_authorization", "analyzer_context_builder")
+        builder.add_edge("analyzer_context_builder", "analyzer")
         builder.add_edge("analyzer", "knowledge_reducer")
         builder.add_edge("knowledge_reducer", "post_analysis_session_refresh")
         builder.add_edge("post_analysis_session_refresh", "goal_evaluation")
@@ -273,6 +302,62 @@ class Phase1AgentWorkflow:
             ],
             builder.compile(),
         )
+
+    def _graph_analysis_source_binding(
+        self, _state: _AnalysisGraphState, runtime: Runtime[_AnalysisRuntime]
+    ) -> _AnalysisGraphState:
+        context = runtime.context
+        execution = self._executions.get(context.execution_id)
+        result = self._results.get(context.execution_id)
+        if (
+            execution is None
+            or result is None
+            or execution.mission_id != context.mission_id
+            or execution.mission_revision != context.mission_revision
+            or result.execution_id != execution.execution_id
+            or result.status != "SUCCEEDED"
+        ):
+            raise AgentLoopError("Analyzer source is not the requested current successful result")
+        expected = self._digests.compute(
+            "execution_outcome_source_digest", result.model_dump(mode="python")
+        )
+        if context.result_digest != expected:
+            raise AgentLoopError("Analyzer result digest is not bound to the requested execution")
+        return {}
+
+    def _graph_analyzer_context_selector(
+        self, _state: _AnalysisGraphState, runtime: Runtime[_AnalysisRuntime]
+    ) -> _AnalysisGraphState:
+        selected = self._context_selector.select_authorizable_resource_ids(
+            runtime.context.mission_id, frozenset()
+        )
+        return {"selected_resource_ids": selected}
+
+    def _graph_analyzer_context_authorization(
+        self, state: _AnalysisGraphState, runtime: Runtime[_AnalysisRuntime]
+    ) -> _AnalysisGraphState:
+        context = runtime.context
+        grant = self._context_authorization.verify_grant(
+            grant_id=context.context_grant_id,
+            mission_id=context.mission_id,
+        )
+        if grant.service_identity != "analyzer_context":
+            raise AgentLoopError("Analyzer requires an analyzer_context grant")
+        selected = frozenset(state["selected_resource_ids"])
+        granted = frozenset(item.resource.resource_id for item in grant.resources)
+        if not granted <= selected:
+            raise AgentLoopError("Analyzer grant contains a resource outside current selection")
+        return {}
+
+    def _graph_analyzer_context_builder(
+        self, _state: _AnalysisGraphState, runtime: Runtime[_AnalysisRuntime]
+    ) -> _AnalysisGraphState:
+        context = runtime.context
+        self._context_builder.build(
+            grant_id=context.context_grant_id,
+            mission_id=context.mission_id,
+        )
+        return {}
 
     def _graph_session_refresh(
         self, _state: _PlanningGraphState, runtime: Runtime[_PlanningRuntime]
@@ -421,6 +506,8 @@ class Phase1AgentWorkflow:
             result_digest=context.result_digest,
             invoke=context.invoke_analyzer,
         )
+        if candidate.source_execution_id != context.execution_id:
+            raise AgentLoopError("Analyzer candidate changed its bound source execution")
         return {"candidate": candidate}
 
     def _graph_knowledge_reducer(

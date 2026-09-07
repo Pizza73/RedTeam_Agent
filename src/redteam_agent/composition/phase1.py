@@ -178,6 +178,7 @@ def build_phase1_kernel(*, phase0c: Phase0CKernel | None = None) -> Phase1Kernel
         recovery_service=phase0b.recovery_service,
         retry_budget_service=retry_budgets,
         execution_repository=phase0b.execution_repository,
+        result_repository=phase0b.result_repository,
         task_binding_repository=phase0b.task_binding_repository,
         cancel_attempt_repository=phase0b.cancel_attempt_repository,
         ingestion_repository=phase0b.ingestion_repository,
@@ -186,6 +187,10 @@ def build_phase1_kernel(*, phase0c: Phase0CKernel | None = None) -> Phase1Kernel
         adapters={phase0b.mock_adapter.identity().adapter_id: phase0b.mock_adapter},
         executor=phase0b.executor,
         goal_service=goals,
+        context_selector=context_selector,
+        context_authorization_service=phase0a.context_authorization_service,
+        context_builder=context_builder,
+        digest_service=ds,
         verified_finding_projector=verified_findings,
     )
     return Phase1Kernel(

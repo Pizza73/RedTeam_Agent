@@ -33,6 +33,10 @@ def test_phase1_uses_compiled_coarse_graphs_without_automatic_retry() -> None:
         "finalization",
     } <= planning_nodes
     assert {
+        "analysis_source_binding",
+        "analyzer_context_selector",
+        "analyzer_context_authorization",
+        "analyzer_context_builder",
         "analyzer",
         "knowledge_reducer",
         "post_analysis_session_refresh",
@@ -127,6 +131,65 @@ def test_mock_agent_loop_reaches_goal_through_real_policy_and_executor() -> None
             source_execution_id="mock-loop-execution",
             reason_code="INGESTION_COMPLETE",
         )
+    published = kernel.phase0c.ingestion_service.ingest(ingestion_id=collected.ingestion_id)
+    assert published.deletion_intent_id is not None
+    kernel.phase0c.eraser.run(deletion_intent_id=published.deletion_intent_id)
+    result = kernel.phase0c.phase0b.result_repository.get("mock-loop-execution")
+    assert result is not None and result.status == "SUCCEEDED"
+    verified = kernel.workflow.project_verified_execution("mock-loop-execution")
+    assert verified.verification_state == "confirmed"
+    assert kernel.workflow.project_verified_execution("mock-loop-execution") == verified
+
+    analyzer = MockAnalyzer(AnalyzerCandidateObservation(
+        observation_id="mock-loop-observation", condition_id="c1",
+        source_execution_id="mock-loop-execution", observation_type="finding",
+        subject_ref="host-1", predicate="session_candidate", object_ref="sess-1",
+        attributes={"status": "candidate"}, source_artifact_ids=result.redacted_artifact_ids,
+        llm_confidence=1.0,
+    ))
+    analyzer_grant = (
+        kernel.phase0c.phase0b.phase0a.context_authorization_service.issue_grant(
+            grant_id="mock-loop-analyzer-grant",
+            mission_id=mission_id,
+            service_identity="analyzer_context",
+            candidate_resource_ids=(),
+            session_ids=(),
+            ttl_seconds=120,
+        )
+    )
+    result_digest = kernel.phase0c.phase0b.phase0a.digest_service.compute(
+        "execution_outcome_source_digest", result.model_dump(mode="python")
+    )
+    with pytest.raises(AgentLoopError):
+        kernel.workflow.run_analysis(
+            mission_id=mission_id,
+            mission_revision=envelope.mission_revision,
+            operation_id="mock-loop-analyzer",
+            execution_id="mock-loop-execution",
+            result_digest="forged-result-digest",
+            context_grant_id=analyzer_grant.grant_id,
+            invoke_analyzer=lambda: analyzer.invoke(execution_id="mock-loop-execution"),
+        )
+    assert analyzer.call_count == 0
+    with pytest.raises(AgentLoopError):
+        kernel.workflow.run_analysis(
+            mission_id=mission_id,
+            mission_revision=envelope.mission_revision,
+            operation_id="mock-loop-analyzer",
+            execution_id="mock-loop-execution",
+            result_digest=result_digest,
+            context_grant_id=grant.grant_id,
+            invoke_analyzer=lambda: analyzer.invoke(execution_id="mock-loop-execution"),
+        )
+    assert analyzer.call_count == 0
+    observation = kernel.workflow.run_analysis(
+        mission_id=mission_id, mission_revision=envelope.mission_revision,
+        operation_id="mock-loop-analyzer", execution_id="mock-loop-execution",
+        result_digest=result_digest,
+        context_grant_id=analyzer_grant.grant_id,
+        invoke_analyzer=lambda: analyzer.invoke(execution_id="mock-loop-execution"),
+    )
+    assert observation.object_ref == "sess-1" and analyzer.call_count == 1
     kernel.phase0c.phase0b.phase0a.session_repository.save(support.session_snapshot())
     with pytest.raises(AgentLoopError):
         kernel.workflow.run_planning_iteration(
@@ -143,33 +206,6 @@ def test_mock_agent_loop_reaches_goal_through_real_policy_and_executor() -> None
         )
     finalizing = kernel.phase0c.phase0b.phase0a.state_repository.get(mission_id)
     assert finalizing is not None and finalizing.state == "FINALIZING"
-    published = kernel.phase0c.ingestion_service.ingest(ingestion_id=collected.ingestion_id)
-    assert published.deletion_intent_id is not None
-    with pytest.raises(AgentLoopError):
-        kernel.finalization_service.finalize(mission_id)
-    kernel.phase0c.eraser.run(deletion_intent_id=published.deletion_intent_id)
-    result = kernel.phase0c.phase0b.result_repository.get("mock-loop-execution")
-    assert result is not None and result.status == "SUCCEEDED"
-    verified = kernel.workflow.project_verified_execution("mock-loop-execution")
-    assert verified.verification_state == "confirmed"
-    assert kernel.workflow.project_verified_execution("mock-loop-execution") == verified
-
-    analyzer = MockAnalyzer(AnalyzerCandidateObservation(
-        observation_id="mock-loop-observation", condition_id="c1",
-        source_execution_id="mock-loop-execution", observation_type="finding",
-        subject_ref="host-1", predicate="session_candidate", object_ref="sess-1",
-        attributes={"status": "candidate"}, source_artifact_ids=result.redacted_artifact_ids,
-        llm_confidence=1.0,
-    ))
-    observation = kernel.workflow.run_analysis(
-        mission_id=mission_id, mission_revision=envelope.mission_revision,
-        operation_id="mock-loop-analyzer", execution_id="mock-loop-execution",
-        result_digest=kernel.phase0c.phase0b.phase0a.digest_service.compute(
-            "execution_outcome_source_digest", result.model_dump(mode="python")
-        ),
-        invoke_analyzer=lambda: analyzer.invoke(execution_id="mock-loop-execution"),
-    )
-    assert observation.object_ref == "sess-1" and analyzer.call_count == 1
     assert kernel.goal_service.evaluate(mission_id=mission_id).status.status == "achieved"
 
     # Runtime state changes only through the trusted Session Manager repository,

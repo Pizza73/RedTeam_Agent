@@ -98,6 +98,28 @@ class ContextSelector:
         ranked.sort(key=lambda item: (item.rank_vector, item.stable_tiebreaker))
         return self._apply_caps(ranked)
 
+    def select_authorizable_resource_ids(
+        self,
+        mission_id: str,
+        current_target_values: frozenset[str],
+    ) -> tuple[str, ...]:
+        """Return exact source IDs for the deterministic selected index rows."""
+        selected = self.select(mission_id, current_target_values)
+        try:
+            records = {
+                record.resource_id: record
+                for record in self._reader.query_by_mission(mission_id)
+            }
+        except Exception as exc:
+            raise ContextSelectionError("context index query failed") from exc
+        origins: list[str] = []
+        for item in selected:
+            record = records.get(item.candidate.resource_id)
+            if record is None or record.mission_id != mission_id:
+                raise ContextSelectionError("selected context index row changed")
+            origins.append(record.origin_record_id)
+        return tuple(origins)
+
     def _apply_caps(
         self, ranked: list[RankedContextCandidate]
     ) -> tuple[RankedContextCandidate, ...]:
