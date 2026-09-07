@@ -131,7 +131,12 @@ SQLite checkpointにはIDとrouting文字列だけを保存する。最終独立
 Current Mission Revisionとrun / threadを照合し、別Revision・別runのcheckpoint reuseを拒否する。
 公開Context再構築を直接呼んだ場合の旧Revision retry budget先行消費は
 `28896ae5a4ab8ded665941cb5e0abd4b878f327f`で修正し、Current Revision照合を予算予約より前へ固定した。
-最終判定と固定review artifactは再レビュー完了後に`docs/reviews/`へ記録する。
+固定コミット`1b658a132669d4e0b6e5bf51ea3b0b14dc9823ad`（最終実装
+`28896ae5a4ab8ded665941cb5e0abd4b878f327f`）に対する最終独立再レビューは、
+BLOCKER 0 / HIGH 0 / MEDIUM 0 / LOW 0、Common Gate PASS、Phase 2移行可と判定した。
+固定証跡は`docs/reviews/phase-1-common-gate-1b658a1.md`、SHA256は
+`624d0b1518a11dc2bda5c131c72d85df2397970652550d99c0cdc85a3b34dac8`。
+D4実機REK消去はPhase 1 Gateの対象外で未評価のため、Production有効化は別途その物理適格性確認を要する。
 
 ## Phase 1生成的状態遷移Evidence
 
