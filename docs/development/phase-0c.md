@@ -192,11 +192,29 @@ Snapshotへ展開し、全試験と独立negative probeを実行した。判定�
 | M-02 指定された`docs/implementation-plan.md`不在 | 正本・Common Gateが要求する文書一覧には存在せず、レビュー依頼時の誤指定と確認。代替文書を正本扱いしない |
 | L-01 補助`mypy --strict`のunused ignore 4件 | 不要ignoreを削除し、project gateと直接`--strict`の双方をPASS |
 
+### 7.2 独立再レビューの残存指摘と第2修正（2026-09-07）
+
+独立レビュアーが修正対象コミット`807cc022db8c098a18e42a865acd99964d9a33dc`を再検査した結果、
+H-03 / H-04 / H-05、M-01、L-01の解消を確認した一方、旧サービス参照と公開Composition境界に
+残存する迂回を検出した。永続状態や並行する管理表を追加せず、Owner境界を次のように修正した。
+
+| 再レビュー指摘 | 第2修正 / Evidence |
+| --- | --- |
+| H-01 保持済みPhase 0B Collection / Ingestion参照を再bindすると旧処理を呼べる | 元Coordinator実体をPhase 0C Composition完了時に不可逆にretire。保持済み参照と再bindの双方を回帰試験で拒否 |
+| H-01 Secure compatibility facadeが`recovery_authority_id`を捨てる | Phase 0C Collection全入口で正本と同じMission / Execution / Task Binding / TTL / State Version bindingを検証。`valid_until`以後はexact authority必須、`recovery_until`以後は常に拒否 |
+| H-02 公開Storeのprivate bearer authorityを読み取ると平文を取得できる | bearer authorityを廃止。公開KernelからStoreを除き、Quarantine / Secret / Artifactはmetadata-only viewだけを公開。平文読出しはSecure Ingestion / Executor内部Owner portへ限定 |
+| 新規HIGH 公開KernelのStore / Key Providerから専用Eraserを迂回して暗号文・鍵を破壊できる | 公開KernelからBlob Store / Quarantine Store / Key Providerを除去。unlinkはEraser内部Owner portのみ。公開面にdestroy / unlink / confirm操作がないことを回帰試験で固定 |
+| M-02 `docs/implementation-plan.md`不在 | 当該ファイルは正本にもCommon Gate必須文書にも存在せず、初回レビュー依頼の誤指定。受入判定は`docs/acceptance-criteria.md`の正本一覧で実施 |
+
+第2修正後は実`swtpm` 7件を含む全529試験、branch coverage 87%、ruff、mypy strict、compileall、
+verify scripts、`git diff --check`をPASSした。Common Gateの正式判定は、この第2修正コミットを固定した後の
+独立Read-onlyレビューまで保留する。
+
 ## 8. 受入と残課題
 
 - Phase 0Cの製品コードとUnit / Integration / Security / Architecture / Property-State-machine試験を実装し、
   ruff / mypy(strict) / compileall / branch coverage / verify scripts / git diff --check / sha256sums を実行済み。
-  `swtpm`を含む現行チェックはPASS（527 passed, 0 skipped）。
+  `swtpm`を含む現行チェックはPASS（529 passed, 0 skipped）。
 - Codex完了時の主な受入修正: seeded test providerのKEK / DEK独立性、消去のterminal replayでのProvider再照合、
   Destroy後のread-back `CONFIRMED`、Ciphertext unlink後のinventory再読、swtpm TCTIの連続data/control port、
   未WRITTEN NV Extend / Counterの仕様どおりの初期値処理、TPM必須経路とPublic Area不一致の実試験。
@@ -208,13 +226,13 @@ Snapshotへ展開し、全試験と独立negative probeを実行した。判定�
   - **D4 実機Resource REK消去 = `NOT_EVALUATED`**（正本§34.1.1）: 本Phaseは対象外。swtpm / 文書検査を実機PASSと
     しない。PASS前はProduction採用不可。
 - `encrypted_raw` Artifactの暗号化保存 / Bound AADと、Grant / private authorityなしの平文取得拒否、Ciphertextへの平文非出現を追加検証済み。
-- **未解決の仕様矛盾**: なし。**Security-critical実装残作業**: なし。
+- 第2修正時点で既知の仕様矛盾とSecurity-critical実装残作業は解消済み。独立再レビューの正式判定は未確定。
 - 実C2 / MCP / 外部Targetへの操作は行っていない。全試験はTest Double / 実AES-GCM / `swtpm`だけで実施した。
 - 次段階: 指摘修正コミットを固定し、実装会話から分離したCodexの独立差分再レビューを実施する。
 
 ## 9. Phase 1移行判定
 
-- Phase 0C製品実装のBLOCKER / HIGHと仕様矛盾は、今回のレビュー修正後0件。
+- Phase 0C製品実装の既知のBLOCKER / HIGHと仕様矛盾は、第2修正後0件。正式件数は独立再レビューで確定する。
 - Phase 1が実装する`knowledge_evidence_head`と`KNOWLEDGE_EVIDENCE_CHANGED`をPhase 0Cの閉じたCritical State /
   Witness Policyへ登録済み。Phase 1ではKnowledge Owner RepositoryからCurrent Projection Resolverを接続する。
   接続前のKnowledge EventはFail Closedし、未WitnessのGoal / Context採用へ進まない。

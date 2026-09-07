@@ -29,20 +29,18 @@ def test_quarantine_ciphertext_tamper_detected_on_readback() -> None:
     d = s.seed_dispatched(kernel)
     s.collect(kernel, execution_id=d.execution_id)
     # Tamper with a stored ciphertext chunk blob.
-    handles = kernel.quarantine_blobs.list_prefix(f"q-{d.execution_id}")
-    kernel.quarantine_blobs.put(handles[0], b'{"encryption_metadata_id": "x", "key_domain": "raw_result_quarantine",'
+    handles = kernel.collection_service._quarantine._blobs.list_prefix(f"q-{d.execution_id}")
+    kernel.collection_service._quarantine._blobs.put(handles[0], b'{"encryption_metadata_id": "x", "key_domain": "raw_result_quarantine",'
                                             b' "algorithm_id": "aes_256_gcm_v1", "nonce": "00", "ciphertext": "00",'
                                             b' "aad_digest": "00", "ciphertext_digest": "deadbeef"}')
     with pytest.raises(RawResultQuarantineError):
         kernel.ingestion_service.ingest(ingestion_id=f"ingestion-{d.execution_id}")
 
 
-def test_quarantine_plaintext_requires_internal_ingestion_authority() -> None:
+def test_quarantine_plaintext_reader_is_absent_from_public_kernel() -> None:
     kernel = s.make_phase0c()
-    d = s.seed_dispatched(kernel)
-    s.collect(kernel, execution_id=d.execution_id)
-    with pytest.raises(RawResultQuarantineError):
-        kernel.quarantine_store.open_reader(f"q-{d.execution_id}", authority=object())
+    assert not hasattr(kernel, "quarantine_store")
+    assert not hasattr(kernel.quarantine_metadata, "open_reader")
 
 
 def test_secret_plaintext_absent_from_audit_and_normal_db() -> None:
@@ -68,7 +66,7 @@ def test_occ_row_tamper_detected_on_read() -> None:
     )
     conn.commit()
     with pytest.raises(RepositoryIntegrityError):
-        kernel.quarantine_store.get_metadata(f"q-{d.execution_id}")
+        kernel.quarantine_metadata.get(f"q-{d.execution_id}")
 
 
 def test_ingestion_service_has_no_key_destruction_capability() -> None:

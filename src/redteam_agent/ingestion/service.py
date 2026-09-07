@@ -111,7 +111,6 @@ class SecureIngestionService:
         parser: OutputPublicationParser,
         lease_service: LeaseService,
         audit_store: AuditStore,
-        quarantine_read_authority: object,
         owner_id: str = "ingestion-worker-1",
         fault_injector: FaultInjector | None = None,
     ) -> None:
@@ -135,7 +134,6 @@ class SecureIngestionService:
         self._parser = parser
         self._leases = lease_service
         self._audit = audit_store
-        self._quarantine_read_authority = quarantine_read_authority
         self._owner_id = owner_id
         self._fault = fault_injector if fault_injector is not None else NoFaultInjector()
 
@@ -184,9 +182,7 @@ class SecureIngestionService:
         if binding is None or control is None:
             raise SecureIngestionError("missing task binding or control metadata for ingestion")
 
-        reader = self._quarantine.open_reader(
-            quarantine.quarantine_id, authority=self._quarantine_read_authority
-        )
+        reader = self._quarantine._open_reader_for_ingestion(quarantine.quarantine_id)
         try:
             reader.verify_ciphertext_digest()
             parsed = self._parser.parse_chunks(rule, reader.iter_stream("stdout"))

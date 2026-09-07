@@ -31,7 +31,7 @@ from redteam_agent.execution.adapter import ExecutionAdapter
 from redteam_agent.execution.collection import ResultCollectionCoordinator
 from redteam_agent.execution.ingestion import ResultIngestionCoordinator
 from redteam_agent.execution.secret_source import TrustedSecretSource
-from redteam_agent.ingestion.artifact_store import ArtifactStore
+from redteam_agent.ingestion.artifact_store import ArtifactReference, ArtifactStore
 from redteam_agent.ingestion.manifest import SecureIngestionManifest
 from redteam_agent.ingestion.publication_rule import OutputPublicationParser, OutputPublicationRuleCatalog
 from redteam_agent.ingestion.service import SecureIngestionService
@@ -39,10 +39,12 @@ from redteam_agent.leases.models import LeasePolicy
 from redteam_agent.leases.service import DeploymentEpochService, LeaseService
 from redteam_agent.quarantine.blob_store import InMemoryQuarantineBlobStore
 from redteam_agent.quarantine.collection import QuarantineCollectionService
+from redteam_agent.quarantine.models import RawResultQuarantineMetadata
 from redteam_agent.quarantine.store import EncryptedQuarantineStore
 from redteam_agent.retention.scheduler import LocalRetentionScheduler
 from redteam_agent.runtime.clock import ClockIntegrityGuard, ManualMonotonicClock, MonotonicClock
 from redteam_agent.secrets.migration import LegacySecretMigrator
+from redteam_agent.secrets.models import SecretVersionRecord
 from redteam_agent.secrets.store import SecretLifecycleStore
 from redteam_agent.storage.database import CriticalMutation
 from redteam_agent.storage.guard import WriteGuard
@@ -71,11 +73,13 @@ class _SecureCollectionFacade:
     def start_collection(
         self, *, execution_id: str, recovery_authority_id: str | None = None,
     ) -> _SecureCollectionStart:
-        del recovery_authority_id
         record = self._phase0b.execution_repository.get(execution_id)
         binding = self._phase0b.task_binding_repository.find_by_execution(execution_id)
         if record is None or binding is None or record.resolved_adapter_id not in self._adapters:
             raise RuntimeError("secure collection prerequisites are unavailable")
+        self._service.validate_collection_request(
+            execution_id=execution_id, recovery_authority_id=recovery_authority_id
+        )
         return _SecureCollectionStart(
             collection_id=f"collection-{execution_id}", execution_id=execution_id,
             sink_id=f"sink-{execution_id}",
@@ -86,7 +90,8 @@ class _SecureCollectionFacade:
         record = self._phase0b.execution_repository.get(execution_id)
         assert record is not None
         return self._service.collect_from_adapter(
-            execution_id=execution_id, adapter=self._adapters[record.resolved_adapter_id]
+            execution_id=execution_id, adapter=self._adapters[record.resolved_adapter_id],
+            recovery_authority_id=recovery_authority_id,
         )
 
     def prepare_local_collection(self, *, execution_id: str, binding: object) -> tuple[object, object]:
@@ -120,12 +125,47 @@ class _SecureIngestionFacade:
 
 
 class _SecretLifecycleSource:
-    def __init__(self, store: SecretLifecycleStore, authority: object) -> None:
+    def __init__(self, store: SecretLifecycleStore) -> None:
         self._store = store
-        self._authority = authority
 
     def open_version(self, secret_version_id: str) -> bytearray:
-        return self._store.open_version(secret_version_id, authority=self._authority)
+        return self._store._open_version_for_executor(secret_version_id)
+
+
+class QuarantineMetadataView:
+    """Read-only quarantine metadata exposed by the composition root."""
+
+    def __init__(self, store: EncryptedQuarantineStore) -> None:
+        self._store = store
+
+    def get(self, quarantine_id: str) -> RawResultQuarantineMetadata | None:
+        return self._store.get_metadata(quarantine_id)
+
+    def ciphertext_handles(self, quarantine_id: str) -> tuple[str, ...]:
+        return self._store.ciphertext_handles(quarantine_id)
+
+
+class SecretMetadataView:
+    """Read-only secret lifecycle metadata exposed by the composition root."""
+
+    def __init__(self, store: SecretLifecycleStore) -> None:
+        self._store = store
+
+    def get(self, secret_version_id: str) -> SecretVersionRecord | None:
+        return self._store.get_version(secret_version_id)
+
+    def current_state(self, secret_version_id: str) -> str | None:
+        return self._store.current_state(secret_version_id)
+
+
+class ArtifactMetadataView:
+    """Read-only artifact metadata exposed by the composition root."""
+
+    def __init__(self, store: ArtifactStore) -> None:
+        self._store = store
+
+    def get(self, artifact_id: str) -> ArtifactReference | None:
+        return self._store.get(artifact_id)
 
 
 @dataclass
@@ -134,7 +174,7 @@ class Phase0CKernel:
     monotonic_clock: MonotonicClock
     clock_guard: ClockIntegrityGuard
     data_guard: WriteGuard
-    key_provider: InMemoryEnvelopeKeyProvider
+    key_provider_identity: str
     nv_witness: InMemoryNvExtendWitness
     generation_coordinator: AuthenticatedGenerationCoordinator
     generation_store: GenerationRecordStore
@@ -144,10 +184,9 @@ class Phase0CKernel:
     wrapped_state_blobs: InMemoryQuarantineBlobStore
     epoch_service: DeploymentEpochService
     lease_service: LeaseService
-    quarantine_store: EncryptedQuarantineStore
-    quarantine_blobs: InMemoryQuarantineBlobStore
-    secret_store: SecretLifecycleStore
-    artifact_store: ArtifactStore
+    quarantine_metadata: QuarantineMetadataView
+    secret_metadata: SecretMetadataView
+    artifact_metadata: ArtifactMetadataView
     rule_catalog: OutputPublicationRuleCatalog
     parser: OutputPublicationParser
     collection_service: QuarantineCollectionService
@@ -176,9 +215,6 @@ def build_phase0c_kernel(
     guard = WriteGuard()
     kernel.phase0a.mission_manager.bind_trust_recovery_guard(guard)
     clock_guard = ClockIntegrityGuard(clock)
-    quarantine_read_authority = object()
-    secret_read_authority = object()
-    artifact_read_authority = object()
 
     key_provider = InMemoryEnvelopeKeyProvider(digest_service=ds)
     quarantine_blobs = InMemoryQuarantineBlobStore()
@@ -202,16 +238,13 @@ def build_phase0c_kernel(
     )
     quarantine_store = EncryptedQuarantineStore(
         database=db, blob_store=quarantine_blobs, key_provider=key_provider, digest_service=ds, clock=clock,
-        read_authority=quarantine_read_authority,
     )
     secret_store = SecretLifecycleStore(
         database=db, digest_service=ds, clock=clock, audit_store=audit_store, key_provider=key_provider,
         secret_blob_store=secret_blobs,
-        read_authority=secret_read_authority,
     )
     artifact_store = ArtifactStore(
         database=db, blob_store=artifact_blobs, key_provider=key_provider, digest_service=ds,
-        read_authority=artifact_read_authority,
     )
     rule_catalog = OutputPublicationRuleCatalog(ds)
     rule_catalog.register(
@@ -226,7 +259,9 @@ def build_phase0c_kernel(
         context_resolver=kernel.phase0a.context_resolver, execution_repository=kernel.execution_repository,
         task_binding_repository=kernel.task_binding_repository,
         control_metadata_repository=kernel.control_metadata_repository,
-        ingestion_repository=kernel.ingestion_repository, quarantine_store=quarantine_store,
+        ingestion_repository=kernel.ingestion_repository,
+        recovery_repository=kernel.recovery_authority_repository,
+        quarantine_store=quarantine_store,
         lease_service=lease_service, audit_store=audit_store,
         quarantine_retention_seconds=DEFAULT_QUARANTINE_RETENTION_SECONDS,
     )
@@ -239,7 +274,6 @@ def build_phase0c_kernel(
         registry_repository=kernel.phase0a.registry_repository, registry_revision=kernel.phase0a.registry_revision,
         quarantine_store=quarantine_store, secret_store=secret_store, artifact_store=artifact_store,
         rule_catalog=rule_catalog, parser=parser, lease_service=lease_service, audit_store=audit_store,
-        quarantine_read_authority=quarantine_read_authority,
     )
     eraser = VerifiedQuarantineEraser(
         database=db, digest_service=ds, clock=clock, exec_guard=kernel.execution_guard,
@@ -451,7 +485,11 @@ def build_phase0c_kernel(
     }
     collection_facade = _SecureCollectionFacade(collection_service, kernel, adapters)
     ingestion_facade = _SecureIngestionFacade(ingestion_service, kernel)
-    secret_source = _SecretLifecycleSource(secret_store, secret_read_authority)
+    secret_source = _SecretLifecycleSource(secret_store)
+    legacy_collection = kernel.collection_coordinator
+    legacy_ingestion = kernel.ingestion_coordinator
+    legacy_collection.retire_for_phase0c(guard=kernel.execution_guard)
+    legacy_ingestion.retire_for_phase0c(guard=kernel.execution_guard)
     kernel.executor.bind_phase0c_dependencies(
         guard=kernel.execution_guard,
         collection_coordinator=cast(ResultCollectionCoordinator, collection_facade),
@@ -462,13 +500,17 @@ def build_phase0c_kernel(
     kernel.ingestion_coordinator = cast(ResultIngestionCoordinator, ingestion_facade)
     return Phase0CKernel(
         phase0b=kernel, monotonic_clock=clock, clock_guard=clock_guard, data_guard=guard,
-        key_provider=key_provider, nv_witness=witness, generation_coordinator=coordinator,
+        key_provider_identity=key_provider.provider_identity, nv_witness=witness,
+        generation_coordinator=coordinator,
         generation_store=generation_store, audit_store=audit_store, epoch_service=epoch_service,
         critical_witness_barrier=critical_barrier,
         wrapped_key_state_service=wrapped_key_state_service,
         wrapped_state_blobs=wrapped_state_blobs,
-        lease_service=lease_service, quarantine_store=quarantine_store, quarantine_blobs=quarantine_blobs,
-        secret_store=secret_store, artifact_store=artifact_store, rule_catalog=rule_catalog, parser=parser,
+        lease_service=lease_service,
+        quarantine_metadata=QuarantineMetadataView(quarantine_store),
+        secret_metadata=SecretMetadataView(secret_store),
+        artifact_metadata=ArtifactMetadataView(artifact_store),
+        rule_catalog=rule_catalog, parser=parser,
         collection_service=collection_service, ingestion_service=ingestion_service, eraser=eraser,
         retention_scheduler=retention_scheduler, legacy_migrator=legacy_migrator,
     )

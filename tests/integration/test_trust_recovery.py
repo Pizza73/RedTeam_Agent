@@ -107,7 +107,7 @@ def test_recovery_consumes_exact_approval_and_invalidates_old_leases() -> None:
     approval, contents = _approval(kernel, coordinator, service)
     consumed = service.recover(
         approval_id=approval.approval_id, new_coordinator=coordinator,
-        adopted_contents=contents, provider_identity=kernel.key_provider.provider_identity,
+        adopted_contents=contents, provider_identity=kernel.key_provider_identity,
     )
     assert consumed.new_trust_epoch == 2 and consumed.deployment_epoch == 1
     assert consumed.invalidated_authorization_count == 1
@@ -137,7 +137,7 @@ def test_recovery_consumes_exact_approval_and_invalidates_old_leases() -> None:
         )
     replay = service.recover(
         approval_id=approval.approval_id, new_coordinator=coordinator,
-        adopted_contents=contents, provider_identity=kernel.key_provider.provider_identity,
+        adopted_contents=contents, provider_identity=kernel.key_provider_identity,
     )
     assert replay.consumption_digest == consumed.consumption_digest
 
@@ -154,7 +154,7 @@ def test_recovery_replay_rejects_rolled_back_mission_authorization() -> None:
         approval_id=approval.approval_id,
         new_coordinator=coordinator,
         adopted_contents=contents,
-        provider_identity=kernel.key_provider.provider_identity,
+        provider_identity=kernel.key_provider_identity,
     )
     kernel.phase0b.phase0a.database.overwrite(
         "mission_states",
@@ -166,7 +166,7 @@ def test_recovery_replay_rejects_rolled_back_mission_authorization() -> None:
             approval_id=approval.approval_id,
             new_coordinator=coordinator,
             adopted_contents=contents,
-            provider_identity=kernel.key_provider.provider_identity,
+            provider_identity=kernel.key_provider_identity,
         )
 
 
@@ -178,13 +178,13 @@ def test_recovery_replay_completes_consumption_witness_after_commit_crash() -> N
     with pytest.raises(CommitBoundaryFault):
         service.recover(
             approval_id=approval.approval_id, new_coordinator=coordinator,
-            adopted_contents=contents, provider_identity=kernel.key_provider.provider_identity,
+            adopted_contents=contents, provider_identity=kernel.key_provider_identity,
         )
     current = coordinator.current("audit_head")
     assert current is not None and current.generation == 0
     recovered = service.recover(
         approval_id=approval.approval_id, new_coordinator=coordinator,
-        adopted_contents=contents, provider_identity=kernel.key_provider.provider_identity,
+        adopted_contents=contents, provider_identity=kernel.key_provider_identity,
     )
     current = coordinator.current("audit_head")
     assert current is not None and current.generation == 1
@@ -206,7 +206,7 @@ def test_recovery_rejects_unapproved_adopted_content_before_genesis() -> None:
     with pytest.raises(TrustRecoveryError, match="adopted content"):
         service.recover(
             approval_id=approval.approval_id, new_coordinator=coordinator,
-            adopted_contents=contents, provider_identity=kernel.key_provider.provider_identity,
+            adopted_contents=contents, provider_identity=kernel.key_provider_identity,
         )
     assert not witness.public_area("audit_head").written
 
@@ -228,7 +228,7 @@ def test_recovery_rejects_a_preadvanced_new_witness() -> None:
     with pytest.raises(TrustRecoveryError, match="unapproved generation"):
         service.recover(
             approval_id=approval.approval_id, new_coordinator=coordinator,
-            adopted_contents=contents, provider_identity=kernel.key_provider.provider_identity,
+            adopted_contents=contents, provider_identity=kernel.key_provider_identity,
         )
 
 
@@ -240,7 +240,7 @@ def test_recovery_rejects_worker_stop_mismatch_and_expired_approval() -> None:
     with pytest.raises(TrustRecoveryError, match="worker-stop"):
         wrong_workers.recover(
             approval_id=approval.approval_id, new_coordinator=coordinator,
-            adopted_contents=contents, provider_identity=kernel.key_provider.provider_identity,
+            adopted_contents=contents, provider_identity=kernel.key_provider_identity,
         )
 
     expired_kernel = s.make_phase0c()
@@ -251,7 +251,7 @@ def test_recovery_rejects_worker_stop_mismatch_and_expired_approval() -> None:
     with pytest.raises(TrustRecoveryError, match="not currently valid"):
         expired_service.recover(
             approval_id=expired.approval_id, new_coordinator=coordinator2,
-            adopted_contents=expired_contents, provider_identity=expired_kernel.key_provider.provider_identity,
+            adopted_contents=expired_contents, provider_identity=expired_kernel.key_provider_identity,
         )
 
 
@@ -261,5 +261,5 @@ def test_recovery_without_stored_approval_fails_closed() -> None:
     with pytest.raises(TrustRecoveryError, match="missing"):
         _service(kernel).recover(
             approval_id="absent", new_coordinator=coordinator, adopted_contents={},
-            provider_identity=kernel.key_provider.provider_identity,
+            provider_identity=kernel.key_provider_identity,
         )

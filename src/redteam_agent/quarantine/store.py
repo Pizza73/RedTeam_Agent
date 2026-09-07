@@ -193,14 +193,12 @@ class EncryptedQuarantineStore:
     def __init__(
         self, *, database: Database, blob_store: QuarantineBlobStore,
         key_provider: EncryptionKeyProvider, digest_service: DigestService, clock: Clock,
-        read_authority: object,
     ) -> None:
         self._db = database
         self._blobs = blob_store
         self._keys = key_provider
         self._ds = digest_service
         self._clock = clock
-        self._read_authority = read_authority
 
     # --- metadata ---------------------------------------------------------
 
@@ -343,9 +341,8 @@ class EncryptedQuarantineStore:
         self._store_metadata(updated)
         return updated
 
-    def open_reader(self, quarantine_id: str, *, authority: object) -> EncryptedQuarantineReader:
-        if authority is not self._read_authority:
-            raise RawResultQuarantineError("quarantine plaintext requires ingestion authority")
+    def _open_reader_for_ingestion(self, quarantine_id: str) -> EncryptedQuarantineReader:
+        """Owner port used only by SecureIngestionService; absent from the public store API."""
         metadata = self.get_metadata(quarantine_id)
         if metadata is None:
             raise RawResultQuarantineError("quarantine not found")
@@ -355,7 +352,7 @@ class EncryptedQuarantineStore:
         handle = self._keys.open_resource_key_handle(metadata=enc, operation="decrypt")
         return EncryptedQuarantineReader(metadata=metadata, key_handle=handle, blob_store=self._blobs)
 
-    def unlink_ciphertext(self, quarantine_id: str) -> int:
+    def _unlink_ciphertext_for_erasure(self, quarantine_id: str) -> int:
         """Remove all ciphertext blobs after confirmed key destruction (eraser only)."""
         metadata = self.get_metadata(quarantine_id)
         if metadata is None:

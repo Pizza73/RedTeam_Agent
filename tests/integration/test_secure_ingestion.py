@@ -20,7 +20,7 @@ def test_ingest_requires_committed_quarantine() -> None:
     d = s.seed_dispatched(kernel)
     ingestion_id = s.collect(kernel, execution_id=d.execution_id)
     # Force the quarantine back to a non-committed state to model a not-yet-collected input.
-    kernel.quarantine_store.set_status(f"q-{d.execution_id}", "STREAMING")
+    kernel.collection_service._quarantine.set_status(f"q-{d.execution_id}", "STREAMING")
     with pytest.raises(SecureIngestionError):
         kernel.ingestion_service.ingest(ingestion_id=ingestion_id)
 

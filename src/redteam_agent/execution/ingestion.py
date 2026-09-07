@@ -83,8 +83,20 @@ class ResultIngestionCoordinator:
         self._ds = digest_service
         self._guard = write_guard
         self._retry_policy = retry_policy
+        self._retired = False
+
+    def retire_for_phase0c(self, *, guard: WriteGuard) -> None:
+        """Irreversibly close the Phase 0B plaintext ingestion entry points."""
+        if guard is not self._guard:
+            raise ResultIngestionError("ingestion retirement requires the composition guard")
+        self._retired = True
+
+    def _require_active(self) -> None:
+        if self._retired:
+            raise ResultIngestionError("Phase 0B ingestion is retired after Phase 0C composition")
 
     def ingest(self, *, execution_id: str) -> IngestionResult:
+        self._require_active()
         state = self._require_state(execution_id)
         expired = self._expire_if_due(state)
         if expired is not None:
@@ -139,6 +151,7 @@ class ResultIngestionCoordinator:
         return IngestionResult(state.ingestion_id, "DELETE_PENDING", True)
 
     def fail(self, *, execution_id: str, reason: str) -> IngestionResult:
+        self._require_active()
         state = self._require_state(execution_id)
         if state.status != "INGESTING":
             raise ResultIngestionError("only an INGESTING ingestion can fail")
@@ -148,6 +161,7 @@ class ResultIngestionCoordinator:
         return IngestionResult(failed.ingestion_id, "FAILED", False)
 
     def retry(self, *, execution_id: str) -> IngestionResult:
+        self._require_active()
         state = self._require_state(execution_id)
         expired = self._expire_if_due(state)
         if expired is not None:

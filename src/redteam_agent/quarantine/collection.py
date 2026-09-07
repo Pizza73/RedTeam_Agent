@@ -28,12 +28,14 @@ from redteam_agent.execution.models import (
 )
 from redteam_agent.execution.records import compute_receipt_digest, finalize_object_digest
 from redteam_agent.leases.service import LeaseService
+from redteam_agent.mission.models import Mission
 from redteam_agent.quarantine.store import EncryptedQuarantineStore, EncryptedStreamingQuarantineSink
 from redteam_agent.runtime.authorization_context import AuthorizationContextResolver
 from redteam_agent.runtime.clock import Clock
 from redteam_agent.storage.database import CriticalMutation, Database, UnitOfWork
 from redteam_agent.storage.execution_repositories import (
     ExecutionRecordRepository,
+    ExecutionRecoveryAuthorityRepository,
     RawControlMetadataRepository,
     ResultIngestionStateRepository,
     ResultTaskBindingRepository,
@@ -83,6 +85,7 @@ class QuarantineCollectionService:
         task_binding_repository: ResultTaskBindingRepository,
         control_metadata_repository: RawControlMetadataRepository,
         ingestion_repository: ResultIngestionStateRepository,
+        recovery_repository: ExecutionRecoveryAuthorityRepository,
         quarantine_store: EncryptedQuarantineStore,
         lease_service: LeaseService,
         audit_store: AuditStore,
@@ -98,6 +101,7 @@ class QuarantineCollectionService:
         self._bindings = task_binding_repository
         self._control = control_metadata_repository
         self._ingestion = ingestion_repository
+        self._recovery = recovery_repository
         self._quarantine = quarantine_store
         self._leases = lease_service
         self._audit = audit_store
@@ -106,19 +110,24 @@ class QuarantineCollectionService:
 
     def collect(
         self, *, execution_id: str, stdout: bytes, stderr: bytes, control: AdapterCollectionControl,
+        recovery_authority_id: str | None = None,
     ) -> QuarantineCollectionResult:
         return self.collect_streams(
             execution_id=execution_id,
             stdout_chunks=_bounded_chunks(stdout),
             stderr_chunks=_bounded_chunks(stderr),
             control=control,
+            recovery_authority_id=recovery_authority_id,
         )
 
     def collect_streams(
         self, *, execution_id: str, stdout_chunks: Iterable[bytes],
         stderr_chunks: Iterable[bytes], control: AdapterCollectionControl,
+        recovery_authority_id: str | None = None,
     ) -> QuarantineCollectionResult:
-        context, sink = self._prepare_collection(execution_id=execution_id)
+        context, sink = self._prepare_collection(
+            execution_id=execution_id, recovery_authority_id=recovery_authority_id
+        )
         for chunk in stdout_chunks:
             if chunk:
                 sink.write_stdout(chunk)
@@ -127,9 +136,14 @@ class QuarantineCollectionService:
                 sink.write_stderr(chunk)
         return self._finalize_collection(context=context, sink=sink, control=control)
 
-    def collect_from_adapter(self, *, execution_id: str, adapter: ExecutionAdapter) -> QuarantineCollectionResult:
+    def collect_from_adapter(
+        self, *, execution_id: str, adapter: ExecutionAdapter,
+        recovery_authority_id: str | None = None,
+    ) -> QuarantineCollectionResult:
         """Provider-result entry point; the adapter streams directly into encrypted quarantine."""
-        context, sink = self._prepare_collection(execution_id=execution_id)
+        context, sink = self._prepare_collection(
+            execution_id=execution_id, recovery_authority_id=recovery_authority_id
+        )
         control = adapter.collect_result(execution_id, context.binding, sink)
         return self._finalize_collection(context=context, sink=sink, control=control)
 
@@ -165,6 +179,7 @@ class QuarantineCollectionService:
 
     def _prepare_collection(
         self, *, execution_id: str, local_binding: ResultTaskBinding | None = None,
+        recovery_authority_id: str | None = None,
     ) -> tuple[_CollectionContext, EncryptedStreamingQuarantineSink]:
         record = self._require_execution(execution_id)
         if record.provider_execution_state not in ("DISPATCHED", "RUNNING", "DISPATCH_CLAIMED", "RECONCILING"):
@@ -188,7 +203,9 @@ class QuarantineCollectionService:
             raise RawResultQuarantineError("no result task binding for collection")
         if local_binding is not None and binding.binding_digest != local_binding.binding_digest:
             raise RawResultQuarantineError("local result binding conflicts with the stored binding")
-        mission = self._resolver.resolve(record.mission_id, now=self._clock.now()).mission
+        mission = self._enforce_recovery_window(
+            record, recovery_authority_id=recovery_authority_id
+        )
         started = self._clock.now()
         retention_until = min(started + timedelta(seconds=self._retention_seconds), mission.evidence_retention_until)
         quarantine_id = f"q-{execution_id}"
@@ -231,6 +248,49 @@ class QuarantineCollectionService:
             ),
         )
         return context, sink
+
+    def validate_collection_request(
+        self, *, execution_id: str, recovery_authority_id: str | None = None,
+    ) -> None:
+        """Validate a compatibility start request without creating parallel state."""
+        record = self._require_execution(execution_id)
+        binding = self._bindings.find_by_execution(execution_id)
+        if binding is None:
+            raise RawResultQuarantineError("no result task binding for collection")
+        self._enforce_recovery_window(record, recovery_authority_id=recovery_authority_id)
+
+    def _enforce_recovery_window(
+        self, record: ExecutionRecord, *, recovery_authority_id: str | None,
+    ) -> Mission:
+        now = self._clock.now()
+        mission = self._resolver.resolve(record.mission_id, now=now).mission
+        if not (now < mission.recovery_until):
+            raise RawResultQuarantineError("recovery window has passed; no provider operation permitted")
+        if now < mission.valid_until:
+            return mission
+        if recovery_authority_id is None:
+            raise RawResultQuarantineError(
+                "a purpose-limited recovery authority is required after valid_until"
+            )
+        authority = self._recovery.get(recovery_authority_id)
+        binding = self._bindings.find_by_execution(record.execution_id)
+        binding_id = binding.task_id if binding is not None else None
+        if (
+            authority is None
+            or authority.allowed_operation != "collect_result"
+            or authority.mission_id != record.mission_id
+            or authority.execution_id != record.execution_id
+            or not (now < authority.expires_at)
+            or authority.mission_revision != mission.mission_revision
+            or authority.authorization_epoch != mission.authorization_epoch
+            or authority.origin_authorization_digest != record.authorization_digest
+            or authority.resolved_adapter_id != record.resolved_adapter_id
+            or authority.idempotency_key != record.idempotency_key
+            or authority.expected_execution_state_version != record.execution_state_version
+            or authority.result_task_binding_id != binding_id
+        ):
+            raise RawResultQuarantineError("recovery authority is missing, expired, or wrongly bound")
+        return mission
 
     def _finalize_collection(
         self, *, context: _CollectionContext, sink: EncryptedStreamingQuarantineSink,

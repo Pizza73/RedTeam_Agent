@@ -17,8 +17,8 @@ from redteam_agent.errors import (
     GenerationWitnessError,
     LeaseError,
     RawResultQuarantineError,
+    ResultCollectionError,
     ResultIngestionError,
-    SecretLifecycleError,
 )
 from redteam_agent.runtime.clock import ManualMonotonicClock
 from redteam_agent.storage.database import UnitOfWork
@@ -36,12 +36,51 @@ def test_phase0b_compatibility_callers_converge_on_encrypted_pipeline() -> None:
     kernel.phase0b.collection_coordinator.start_collection(execution_id=seeded.execution_id)
     collected = kernel.phase0b.collection_coordinator.collect(execution_id=seeded.execution_id)
     assert collected.status == "COMPLETE"
-    metadata = kernel.quarantine_store.get_metadata(f"q-{seeded.execution_id}")
+    metadata = kernel.quarantine_metadata.get(f"q-{seeded.execution_id}")
     assert metadata is not None and metadata.status == "COMMITTED" and metadata.chunk_count > 0
 
     published = kernel.phase0b.ingestion_coordinator.ingest(execution_id=seeded.execution_id)
     assert published.status == "DELETE_PENDING"
     assert published.redacted_artifact_ids and published.detected_secret_version_ids
+
+
+def test_retained_phase0b_service_references_are_irreversibly_retired() -> None:
+    phase0b = p0b.make_kernel(stdout_chunks=(p0c.DEFAULT_STDOUT,))
+    legacy_collection = phase0b.collection_coordinator
+    legacy_ingestion = phase0b.ingestion_coordinator
+    kernel = build_phase0c_kernel(
+        phase0b=phase0b, monotonic_clock=ManualMonotonicClock(support.T0)
+    )
+    phase0b.collection_coordinator = legacy_collection
+    phase0b.ingestion_coordinator = legacy_ingestion
+    with pytest.raises(ResultCollectionError, match="retired"):
+        legacy_collection.start_collection(execution_id="missing")
+    with pytest.raises(ResultIngestionError, match="retired"):
+        legacy_ingestion.ingest(execution_id="missing")
+    assert kernel.phase0b is phase0b
+
+
+def test_phase0c_collection_requires_recovery_authority_after_valid_until() -> None:
+    kernel = p0c.make_phase0c()
+    dispatched = p0c.seed_dispatched(kernel)
+    mission = kernel.phase0b.phase0a.revision_repository.get(dispatched.mission_id, 1)
+    assert mission is not None
+    kernel.phase0b.phase0a.clock.set(mission.valid_until)
+    seconds = (mission.valid_until - support.T0).total_seconds()
+    kernel.monotonic_clock.advance(seconds=seconds)
+    with pytest.raises(RawResultQuarantineError, match="recovery authority"):
+        kernel.collection_service.collect(
+            execution_id=dispatched.execution_id, stdout=b"{}", stderr=b"",
+            control=p0c.collection_control(),
+        )
+    authority = kernel.phase0b.recovery_service.issue_authority(
+        authority_id="phase0c-collect", execution_id=dispatched.execution_id,
+        allowed_operation="collect_result", reason="resume encrypted collection",
+    )
+    kernel.collection_service.validate_collection_request(
+        execution_id=dispatched.execution_id,
+        recovery_authority_id=authority.authority_id,
+    )
 
 
 def test_local_result_dispatch_streams_directly_to_encrypted_quarantine() -> None:
@@ -56,22 +95,22 @@ def test_local_result_dispatch_streams_directly_to_encrypted_quarantine() -> Non
     p0b.authorize(seeded)
     outcome = kernel.phase0b.executor.dispatch(execution_id=seeded.execution_id, plan=seeded.plan)
     assert outcome.reason_code == "LOCAL_COMPLETE"
-    metadata = kernel.quarantine_store.get_metadata(f"q-{seeded.execution_id}")
+    metadata = kernel.quarantine_metadata.get(f"q-{seeded.execution_id}")
     assert metadata is not None and metadata.status == "COMMITTED" and metadata.chunk_count == 1
     assert kernel.phase0b.ingestion_repository.find_by_execution(seeded.execution_id) is not None
 
 
-def test_plaintext_loaders_reject_unbound_callers() -> None:
+def test_phase0c_kernel_exposes_only_metadata_views() -> None:
     kernel = p0c.make_phase0c()
-    dispatched = p0c.seed_dispatched(kernel)
-    ingestion_id = p0c.collect(kernel, execution_id=dispatched.execution_id)
-    with pytest.raises(RawResultQuarantineError):
-        kernel.quarantine_store.open_reader(f"q-{dispatched.execution_id}", authority=object())
-
-    published = kernel.ingestion_service.ingest(ingestion_id=ingestion_id)
-    secret_version_id = published.detected_secret_version_ids[0]
-    with pytest.raises(SecretLifecycleError):
-        kernel.secret_store.open_version(secret_version_id, authority=object())
+    assert not hasattr(kernel, "quarantine_store")
+    assert not hasattr(kernel, "secret_store")
+    assert not hasattr(kernel, "artifact_store")
+    assert not hasattr(kernel, "key_provider")
+    assert not hasattr(kernel, "quarantine_blobs")
+    assert not hasattr(kernel.quarantine_metadata, "open_reader")
+    assert not hasattr(kernel.quarantine_metadata, "unlink_ciphertext")
+    assert not hasattr(kernel.secret_metadata, "open_version")
+    assert not hasattr(kernel.secret_metadata, "confirm")
 
 
 def test_measured_epoch_mismatch_stops_leases_and_scheduler() -> None:
@@ -112,7 +151,7 @@ def test_collection_splits_outputs_larger_than_one_mib_into_bounded_chunks() -> 
     dispatched = p0c.seed_dispatched(kernel)
     payload = b"x" * (1024 * 1024 + 1)
     p0c.collect(kernel, execution_id=dispatched.execution_id, stdout=payload)
-    metadata = kernel.quarantine_store.get_metadata(f"q-{dispatched.execution_id}")
+    metadata = kernel.quarantine_metadata.get(f"q-{dispatched.execution_id}")
     assert metadata is not None
     assert metadata.size_bytes == len(payload)
     assert metadata.chunk_count == 2
@@ -137,13 +176,13 @@ def test_stale_sink_cannot_write_after_fence_takeover() -> None:
         owner_id="old", expected_execution_state_version=record.execution_state_version, caps=caps,
     )
     with UnitOfWork(kernel.phase0b.phase0a.database):
-        kernel.quarantine_store.create_quarantine(
+        kernel.collection_service._quarantine.create_quarantine(
             quarantine_id=quarantine_id, mission_id=record.mission_id,
             mission_revision=record.mission_revision, execution_id=record.execution_id,
             task_binding=binding, deployment_epoch=first.fence.deployment_epoch,
             fencing_token=first.fence.fencing_token, retention_until=caps[0],
         )
-    stale_sink = kernel.quarantine_store.open_writer(
+    stale_sink = kernel.collection_service._quarantine.open_writer(
         quarantine_id, sink_id="sink", task_binding_digest=binding.binding_digest,
         max_output_bytes=8 * 1024 * 1024,
         deployment_epoch=first.fence.deployment_epoch,
@@ -161,7 +200,7 @@ def test_stale_sink_cannot_write_after_fence_takeover() -> None:
         new_owner_id="new", expected_execution_state_version=record.execution_state_version, caps=caps,
     )
     with UnitOfWork(kernel.phase0b.phase0a.database):
-        metadata = kernel.quarantine_store.create_quarantine(
+        metadata = kernel.collection_service._quarantine.create_quarantine(
             quarantine_id=quarantine_id, mission_id=record.mission_id,
             mission_revision=record.mission_revision, execution_id=record.execution_id,
             task_binding=binding, deployment_epoch=second.fence.deployment_epoch,

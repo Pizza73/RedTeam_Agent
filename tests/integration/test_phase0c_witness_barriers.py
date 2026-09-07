@@ -281,18 +281,18 @@ def test_first_normal_audit_window_is_witnessed_after_300_seconds() -> None:
 
 
 def _wrapped_envelope(kernel):
-    metadata = kernel.key_provider.create_resource_key(
+    metadata = kernel.eraser._keys.create_resource_key(
         domain="audit_signing", resource_binding_type="provider_state", resource_binding_id="provider-state-1"
     )
-    with kernel.key_provider.open_resource_key_handle(metadata=metadata, operation="encrypt") as handle:
+    with kernel.eraser._keys.open_resource_key_handle(metadata=metadata, operation="encrypt") as handle:
         envelope = handle.encrypt(
             encryption_metadata_id=metadata.resource_key_id,
             nonce=b"\x07" * 12,
             plaintext=b"opaque-encrypted-provider-state",
-            aad_fields={"provider_identity": kernel.key_provider.provider_identity},
+            aad_fields={"provider_identity": kernel.key_provider_identity},
         )
     digests = tuple(
-        kernel.key_provider.get_active_domain_key_metadata(domain).metadata_digest
+        kernel.eraser._keys.get_active_domain_key_metadata(domain).metadata_digest
         for domain in ("secret_store", "raw_result_quarantine", "artifact_store", "audit_signing")
     )
     return envelope, digests
@@ -302,7 +302,7 @@ def test_provider_mutation_is_witnessed_before_key_use(monkeypatch) -> None:
     kernel = s.make_phase0c()
     before = kernel.generation_coordinator.current("wrapped_key_state")
     assert before is not None
-    metadata = kernel.key_provider.create_resource_key(
+    metadata = kernel.eraser._keys.create_resource_key(
         domain="secret_store", resource_binding_type="secret_version_id", resource_binding_id="auto-v1"
     )
     after = kernel.generation_coordinator.current("wrapped_key_state")
@@ -314,25 +314,25 @@ def test_provider_mutation_is_witnessed_before_key_use(monkeypatch) -> None:
 
     monkeypatch.setattr(kernel.wrapped_key_state_service, "commit", fail_commit)
     with pytest.raises(GenerationWitnessError, match="injected wrapped-state failure"):
-        kernel.key_provider.create_resource_key(
+        kernel.eraser._keys.create_resource_key(
             domain="secret_store", resource_binding_type="secret_version_id", resource_binding_id="blocked-v2"
         )
     with pytest.raises(EncryptionUnavailableError, match="not selected"):
-        kernel.key_provider.open_resource_key_handle(metadata=metadata, operation="encrypt")
+        kernel.eraser._keys.open_resource_key_handle(metadata=metadata, operation="encrypt")
 
 
 def test_wrapped_provider_state_is_content_witnessed_and_replay_safe() -> None:
     kernel = s.make_phase0c()
     envelope, digests = _wrapped_envelope(kernel)
     state = kernel.wrapped_key_state_service.commit(
-        operation_id="provider-state-1", provider_identity=kernel.key_provider.provider_identity,
+        operation_id="provider-state-1", provider_identity=kernel.key_provider_identity,
         domain_key_metadata_digests=digests, active_domain_key_bindings_digest="active-bindings",
         wrapped_envelope=envelope,
     )
     current = kernel.generation_coordinator.current("wrapped_key_state")
     assert current is not None and current.state_digest == state.state_digest
     replay = kernel.wrapped_key_state_service.commit(
-        operation_id="provider-state-1", provider_identity=kernel.key_provider.provider_identity,
+        operation_id="provider-state-1", provider_identity=kernel.key_provider_identity,
         domain_key_metadata_digests=digests, active_domain_key_bindings_digest="active-bindings",
         wrapped_envelope=envelope,
     )
@@ -343,7 +343,7 @@ def test_missing_witnessed_provider_blob_fails_closed() -> None:
     kernel = s.make_phase0c()
     envelope, digests = _wrapped_envelope(kernel)
     state = kernel.wrapped_key_state_service.commit(
-        operation_id="provider-state-1", provider_identity=kernel.key_provider.provider_identity,
+        operation_id="provider-state-1", provider_identity=kernel.key_provider_identity,
         domain_key_metadata_digests=digests, active_domain_key_bindings_digest="active-bindings",
         wrapped_envelope=envelope,
     )

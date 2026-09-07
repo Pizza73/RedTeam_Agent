@@ -21,14 +21,12 @@ def _store():
 
     ds = DigestService()
     db = Database(":memory:")
-    read_authority = object()
     store = SecretLifecycleStore(
         database=db, digest_service=ds, clock=ManualClock(datetime(2026, 1, 15, tzinfo=UTC)),
         audit_store=AuditStore(db, ds), key_provider=InMemoryEnvelopeKeyProvider(digest_service=ds),
         secret_blob_store=InMemoryQuarantineBlobStore(),
-        read_authority=read_authority,
     )
-    return ds, db, store, read_authority
+    return ds, db, store
 
 
 def _confirm(store: SecretLifecycleStore, version_id: str, *, active: str | None) -> None:
@@ -43,15 +41,15 @@ def _confirm(store: SecretLifecycleStore, version_id: str, *, active: str | None
 
 
 def test_detect_confirm_supersede_revoke_flow() -> None:
-    ds, db, store, read_authority = _store()
+    ds, db, store = _store()
     v1 = store.detect(secret_id="sec-a", mission_id="mission-1", credential_type="password",
                       associated_principal_ref="svc", value=b"v1", actor_id="ingest", actor_role="ingestion",
                       evidence_digest="e1", reason_code="detected")
     assert v1.version == 1 and store.current_state(v1.secret_version_id) == "DETECTED"
     with pytest.raises(SecretLifecycleError):
-        store.open_version(v1.secret_version_id, authority=read_authority)
+        store._open_version_for_executor(v1.secret_version_id)
     _confirm(store, v1.secret_version_id, active=None)
-    assert bytes(store.open_version(v1.secret_version_id, authority=read_authority)) == b"v1"
+    assert bytes(store._open_version_for_executor(v1.secret_version_id)) == b"v1"
     assert store.current_state(v1.secret_version_id) == "CONFIRMED"
     assert store.active_head("sec-a").active_version_id == v1.secret_version_id
 
@@ -71,7 +69,7 @@ def test_detect_confirm_supersede_revoke_flow() -> None:
 
 
 def test_terminal_no_revival() -> None:
-    ds, db, store, _read_authority = _store()
+    ds, db, store = _store()
     v1 = store.detect(secret_id="sec-b", mission_id="mission-1", credential_type="password",
                       associated_principal_ref=None, value=b"v", actor_id="ingest", actor_role="ingestion",
                       evidence_digest="e", reason_code="detected")
@@ -83,7 +81,7 @@ def test_terminal_no_revival() -> None:
 
 
 def test_confirmation_head_occ_mismatch_rejected() -> None:
-    ds, db, store, _read_authority = _store()
+    ds, db, store = _store()
     v1 = store.detect(secret_id="sec-c", mission_id="mission-1", credential_type="password",
                       associated_principal_ref=None, value=b"v", actor_id="ingest", actor_role="ingestion",
                       evidence_digest="e", reason_code="detected")
@@ -96,7 +94,7 @@ def test_confirmation_head_occ_mismatch_rejected() -> None:
 
 
 def test_metadata_view_reflects_state_change() -> None:
-    ds, db, store, _read_authority = _store()
+    ds, db, store = _store()
     v1 = store.detect(secret_id="sec-d", mission_id="mission-1", credential_type="password",
                       associated_principal_ref=None, value=b"v", actor_id="ingest", actor_role="ingestion",
                       evidence_digest="e", reason_code="detected")
@@ -107,7 +105,7 @@ def test_metadata_view_reflects_state_change() -> None:
 
 
 def test_legacy_migration_one_to_one_read_only() -> None:
-    ds, db, store, _read_authority = _store()
+    ds, db, store = _store()
     migrator = LegacySecretMigrator(db, ds)
     refs = (
         LegacySecretReference(legacy_reference_id="old-1", mission_id="m-legacy", legacy_state="confirmed",
@@ -124,7 +122,7 @@ def test_legacy_migration_one_to_one_read_only() -> None:
 
 
 def test_legacy_migration_ambiguous_fails_closed() -> None:
-    ds, db, store, _read_authority = _store()
+    ds, db, store = _store()
     migrator = LegacySecretMigrator(db, ds)
     same_logical = (
         LegacySecretReference(legacy_reference_id="dup", mission_id="m", legacy_state="detected",

@@ -58,13 +58,11 @@ class ArtifactStore:
     def __init__(
         self, *, database: Database, blob_store: QuarantineBlobStore, key_provider: EncryptionKeyProvider,
         digest_service: DigestService,
-        read_authority: object,
     ) -> None:
         self._db = database
         self._blobs = blob_store
         self._keys = key_provider
         self._ds = digest_service
-        self._read_authority = read_authority
 
     def _artifact_digest(self, fields: dict[str, object]) -> str:
         return self._ds.compute("artifact_digest", {k: v for k, v in fields.items() if k != "artifact_digest"})
@@ -135,16 +133,16 @@ class ArtifactStore:
                                        json.dumps(ref.model_dump(mode="json"), sort_keys=True))
         self._blobs.put(blob_handle, blob_bytes)
 
-    def read_body(
-        self, artifact_id: str, *, execution_id: str, grant: DataAccessGrant, authority: object,
+    def _read_body_with_grant(
+        self, artifact_id: str, *, execution_id: str, grant: DataAccessGrant,
     ) -> bytes:
-        if authority is not self._read_authority:
-            raise SecureIngestionError("artifact body requires an authorized reader")
+        """Owner read port; callers must supply an exact current DataAccessGrant."""
         ref = self.get(artifact_id)
         if ref is None:
             raise SecureIngestionError("artifact not found")
         if (
-            grant.resource_type != "artifact"
+            not isinstance(grant, DataAccessGrant)
+            or grant.resource_type != "artifact"
             or "read" not in grant.operations
             or grant.resource.resource_id != artifact_id
             or grant.resource.resource_version != ref.sha256

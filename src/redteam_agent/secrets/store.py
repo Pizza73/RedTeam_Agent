@@ -80,7 +80,6 @@ class SecretLifecycleStore:
         audit_store: AuditStore,
         key_provider: EncryptionKeyProvider,
         secret_blob_store: QuarantineBlobStore,
-        read_authority: object,
         fault_injector: FaultInjector | None = None,
     ) -> None:
         self._db = database
@@ -89,7 +88,6 @@ class SecretLifecycleStore:
         self._audit = audit_store
         self._keys = key_provider
         self._blobs = secret_blob_store
-        self._read_authority = read_authority
         self._fault = fault_injector if fault_injector is not None else NoFaultInjector()
 
     # --- digests ----------------------------------------------------------
@@ -166,9 +164,8 @@ class SecretLifecycleStore:
 
     # --- value source (executor-owned) ------------------------------------
 
-    def open_version(self, secret_version_id: str, *, authority: object) -> bytearray:
-        if authority is not self._read_authority:
-            raise SecretLifecycleError("secret plaintext requires the executor continuation authority")
+    def _open_version_for_executor(self, secret_version_id: str) -> bytearray:
+        """Owner port used only by the executor continuation."""
         record = self.get_version(secret_version_id)
         if record is None or self.current_state(secret_version_id) != "CONFIRMED":
             raise SecretLifecycleError("only the current CONFIRMED secret version is readable")

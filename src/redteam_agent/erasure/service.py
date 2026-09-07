@@ -133,7 +133,7 @@ class VerifiedQuarantineEraser:
         destroyed = self._destroy_key(intent=intent, erasure_id=erasure_id)
 
         # 4. Unlink ciphertext (only after read-back CONFIRMED).
-        self._quarantine.unlink_ciphertext(intent.quarantine_id)
+        self._quarantine._unlink_ciphertext_for_erasure(intent.quarantine_id)
         if self._quarantine.ciphertext_handles(intent.quarantine_id):
             raise VerifiedErasureError("ciphertext unlink read-back found remaining blobs")
         self._quarantine.set_status(intent.quarantine_id, "DELETED")

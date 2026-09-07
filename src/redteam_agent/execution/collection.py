@@ -116,12 +116,24 @@ class ResultCollectionCoordinator:
         self._registry_revision = registry_revision
         self._quarantine_retention_seconds = quarantine_retention_seconds
         self._system_hard_output_cap = system_hard_output_cap
+        self._retired = False
+
+    def retire_for_phase0c(self, *, guard: WriteGuard) -> None:
+        """Irreversibly close the Phase 0B plaintext collection entry points."""
+        if guard is not self._guard:
+            raise ResultCollectionError("collection retirement requires the composition guard")
+        self._retired = True
+
+    def _require_active(self) -> None:
+        if self._retired:
+            raise ResultCollectionError("Phase 0B collection is retired after Phase 0C composition")
 
     # --- authority --------------------------------------------------------
 
     def start_collection(
         self, *, execution_id: str, recovery_authority_id: str | None = None
     ) -> ResultCollectionAuthority:
+        self._require_active()
         existing = self._authorities.find_by_execution(execution_id)
         if existing is not None:
             return existing  # retention/deadline are fixed; never recomputed on resume
@@ -167,6 +179,7 @@ class ResultCollectionCoordinator:
     # --- provider collect -------------------------------------------------
 
     def collect(self, *, execution_id: str, recovery_authority_id: str | None = None) -> CollectionResult:
+        self._require_active()
         authority = self._authorities.find_by_execution(execution_id)
         if authority is None:
             raise ResultCollectionError("collection authority not found; start collection first")
@@ -228,6 +241,7 @@ class ResultCollectionCoordinator:
     def prepare_local_collection(
         self, *, execution_id: str, binding: ResultTaskBinding
     ) -> tuple[ResultCollectionAuthority, RawResultSink]:
+        self._require_active()
         if binding.binding_type != "local_result":
             raise ResultCollectionError("prepare_local_collection requires a local_result binding")
         record = self._require_execution(execution_id)
@@ -278,6 +292,7 @@ class ResultCollectionCoordinator:
     def finalize_local_collection(
         self, *, execution_id: str, sink: RawResultSink, control: AdapterCollectionControl
     ) -> CollectionResult:
+        self._require_active()
         authority = self._authorities.find_by_execution(execution_id)
         if authority is None:
             raise ResultCollectionError("local collection authority not found")
@@ -373,6 +388,7 @@ class ResultCollectionCoordinator:
         )
 
     def abandon(self, *, execution_id: str, reason: str) -> CollectionResult:
+        self._require_active()
         authority = self._authorities.find_by_execution(execution_id)
         if authority is None:
             raise ResultCollectionError("collection authority not found")
