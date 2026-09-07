@@ -5,14 +5,15 @@
 - 設計正本: `SystemDesign.md` Phase 1、`SystemDesign_AI_Control.md`、`docs/acceptance-criteria.md`
 - 基点: `0a12cf9a702303f1b9ca87c702141addb996ae87`（Phase 0C受入記録）
 - 実装範囲: 基点の次から最終実装コミットまで
-- 最終実装コミット: `0b95281e5dc4d8780c4a74ebf28b1e05818a580e`
+- 最終実装コミット: `f28dd0206b39063becef6bb9c9549b5ae48501e8`
 
 ## 実装と受入要件
 
 | 要件 | 実装 / Evidence |
 | --- | --- |
 | Mission→Planner→Policy→Executor→Analyzer→Goal | `Phase1AgentWorkflow`のcompiled LangGraph、`tests/integration/test_phase1_mock_loop.py::test_mock_agent_loop_reaches_goal_through_real_policy_and_executor` |
-| Coarse Agent Graph / retry境界 | `tests/integration/test_phase1_mock_loop.py::test_phase1_uses_compiled_coarse_graphs_without_automatic_retry`。Planning 11 node、Analysis 4 nodeを実経路に接続し、LangGraph automatic retryは全nodeで未設定 |
+| Coarse Agent Graph / retry境界 | `tests/integration/test_phase1_mock_loop.py::test_phase1_uses_compiled_coarse_graphs_without_automatic_retry`。Planning 11 node、Analysis 8 nodeを実経路に接続し、LangGraph automatic retryは全nodeで未設定 |
+| Analyzer Context / Source Binding | Analyzer用Selector→Grant→Builderと、callback前のexact Execution/Result Digest検証、callback後のsource Execution一致を強制。正常loop内のforged digest / planner grant negative oracle |
 | Context Grant / Tool Snapshot前後検証 | `PlannerContextService`、`test_phase1_planner_context.py`、`test_phase1_context_builder.py` |
 | Scope外・UnavailableのProvider到達拒否 | `PlannerActionApplicationService`、Phase 0A/0B Policy・Executor negative suite |
 | Bounded Context Request / typed Retrieval Hint | Envelope lineage、durable context retry budget、Pydantic closed union tests |
@@ -113,7 +114,8 @@ Verified Finding再投影、古いコミット参照、要件対応表を`a22302
 再レビューで残ったexact Execution未固定、監査Event不足、期限/FINALIZING回復未収束を
 `6eb667966620139eb027874408d59d50935fed82`で修正した。terminal cancelの収集・取込・消去、RUNNING/
 FINALIZING recovery予算枯渇のHuman Review収束、実LangGraph接続、Phase 1生成的状態遷移Evidenceを
-`0b95281e5dc4d8780c4a74ebf28b1e05818a580e`で追加した。
+`0b95281e5dc4d8780c4a74ebf28b1e05818a580e`で追加した。独立プローブで検出したAnalyzer Context/
+Result Source未固定を`f28dd0206b39063becef6bb9c9549b5ae48501e8`で修正した。
 最終判定と固定review artifactは再レビュー完了後に`docs/reviews/`へ記録する。
 
 ## Phase 1生成的状態遷移Evidence
@@ -134,4 +136,5 @@ reconciliation消費が最大3回、予算枯渇時のexact source Unresolved ev
 | RUNNING recovery上限→Finalization Intent→Human Review | `tests/integration/test_phase1_mock_loop.py::test_running_recovery_budget_exhaustion_converges_to_human_review` |
 | Controller/Finalization/Unresolved/Working State生成系列 | `tests/property/test_phase1_agent_state_machine.py::TestPhase1AgentStateMachine::runTest` |
 | Context grant/body/current snapshot negative | `tests/security/test_phase1_context_builder.py::test_context_builder_cannot_read_body_without_stored_grant`、`tests/integration/test_phase1_planner_context.py::test_epoch_change_invalidates_planner_context_before_model_use` |
+| Analyzer forged Result Digest / wrong service Grantのcallback前拒否 | `tests/integration/test_phase1_mock_loop.py::test_mock_agent_loop_reaches_goal_through_real_policy_and_executor` |
 | uncertain submit/reconcileで再送なし | `tests/integration/test_reconciliation.py::test_uncertain_submit_goes_to_reconciliation_without_resubmit` |
