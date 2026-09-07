@@ -148,6 +148,32 @@ def test_secret_reference_schema_with_extra_field_cannot_evade_declaration() -> 
         _build_invalid_tool(tool)
 
 
+def test_valid_secret_schema_cannot_hide_sibling_partial_reference() -> None:
+    secret_schema = thaw(support.network_tool(secret_paths=("/credential",)).parameter_schema)[
+        "properties"
+    ]["credential"]
+    schema = thaw(support.network_tool(secret_paths=("/credential",)).parameter_schema)
+    schema["properties"]["credential"] = {
+        "type": "object",
+        "properties": {
+            "primary": secret_schema,
+            "secondary": {
+                "type": "object",
+                "properties": {"secret_version_id": {"type": "string"}},
+                "required": ["secret_version_id"],
+                "additionalProperties": False,
+            },
+        },
+        "required": ["primary", "secondary"],
+        "additionalProperties": False,
+    }
+    tool = support.network_tool(secret_paths=("/credential/primary",)).model_copy(
+        update={"parameter_schema": schema}
+    )
+    with pytest.raises(ToolRegistryValidationError, match="fixed closed schema"):
+        _build_invalid_tool(tool)
+
+
 def test_phase0a_contract_rejects_unevaluated_predicates() -> None:
     definition = replace(support.contract_for(support.network_tool()), preconditions=("unregistered=true",))
     with pytest.raises(ToolRegistryValidationError):

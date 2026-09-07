@@ -13,7 +13,13 @@ from redteam_agent.composition.testing import build_evidence_retention_policy
 from redteam_agent.errors import MissionValidationError
 from redteam_agent.mission.models import ActiveSessionSelector, ExactSessionSelector, SessionExistsCondition
 from redteam_agent.mission.validation import MissionValidationPolicy, validate_mission_revision
-from redteam_agent.semantics import SessionStateProof, default_semantic_catalog
+from redteam_agent.semantics import (
+    SESSION_EXISTS_RULE_ID,
+    SESSION_GOAL_SOURCE_CAPABILITY_ID,
+    EmptySessionGoalSource,
+    SessionStateProof,
+    default_semantic_catalog,
+)
 
 
 def _policy(ds: DigestService, catalog=None) -> MissionValidationPolicy:
@@ -127,7 +133,7 @@ def test_source_capability_id_mismatch_rejected() -> None:
     condition = SessionExistsCondition(
         condition_id="c1", session_selector=ExactSessionSelector(session_ref="sess-1")
     )
-    with pytest.raises(MissionValidationError, match="binding mismatch"):
+    with pytest.raises(MissionValidationError, match="not implemented"):
         _validate(condition, catalog=catalog)
 
 
@@ -177,3 +183,34 @@ def test_unregistered_catalog_revision_rejected() -> None:
     )
     with pytest.raises(MissionValidationError, match="catalog revision"):
         _validate(condition, catalog=catalog)
+
+
+def test_foreign_rule_object_with_registered_ids_rejected() -> None:
+    class ForeignRule:
+        rule_id = SESSION_EXISTS_RULE_ID
+        source_capability_id = SESSION_GOAL_SOURCE_CAPABILITY_ID
+        proof_schema = SessionStateProof
+        source = EmptySessionGoalSource()
+
+        def validate_static(self, condition, catalog):
+            del condition, catalog
+
+    catalog = replace(default_semantic_catalog(), session_exists_rule=ForeignRule())  # type: ignore[arg-type]
+    condition = SessionExistsCondition(
+        condition_id="c1", session_selector=ExactSessionSelector(session_ref="sess-1")
+    )
+    with pytest.raises(MissionValidationError, match="rule is not registered"):
+        _validate(condition, catalog=catalog)
+
+
+def test_noncallable_source_method_rejected() -> None:
+    catalog = default_semantic_catalog()
+    assert catalog.session_exists_rule is not None
+    source = EmptySessionGoalSource()
+    source.get_current_session = None  # type: ignore[assignment]
+    rule = replace(catalog.session_exists_rule, source=source)
+    condition = SessionExistsCondition(
+        condition_id="c1", session_selector=ExactSessionSelector(session_ref="sess-1")
+    )
+    with pytest.raises(MissionValidationError, match="methods are not callable"):
+        _validate(condition, catalog=replace(catalog, session_exists_rule=rule))

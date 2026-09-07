@@ -95,22 +95,8 @@ def _is_closed_secret_reference_schema(schema: dict[str, object]) -> bool:
     )
 
 
-def _schema_contains_secret_reference(schema: object) -> bool:
-    if not isinstance(schema, dict):
-        return False
-    if _is_closed_secret_reference_schema(schema):
-        return True
-    if schema.get("type") == "object":
-        properties = schema.get("properties")
-        return isinstance(properties, dict) and any(
-            _schema_contains_secret_reference(child) for child in properties.values()
-        )
-    if schema.get("type") == "array":
-        return _schema_contains_secret_reference(schema.get("items"))
-    return False
-
-
-def _schema_contains_reserved_secret_fields(schema: object) -> bool:
+def _validate_secret_schema_nodes(schema: object, tool_id: str) -> bool:
+    """Validate every reserved-field object and report whether any secret exists."""
     if not isinstance(schema, dict):
         return False
     if schema.get("type") == "object":
@@ -118,10 +104,18 @@ def _schema_contains_reserved_secret_fields(schema: object) -> bool:
         if not isinstance(properties, dict):
             return False
         if frozenset(properties) & _SECRET_REFERENCE_FIELDS:
+            if not _is_closed_secret_reference_schema(schema):
+                raise ToolRegistryValidationError(
+                    f"tool {tool_id}: reserved Secret Reference fields require the fixed closed schema"
+                )
             return True
-        return any(_schema_contains_reserved_secret_fields(child) for child in properties.values())
+        found = False
+        for child in properties.values():
+            if _validate_secret_schema_nodes(child, tool_id):
+                found = True
+        return found
     if schema.get("type") == "array":
-        return _schema_contains_reserved_secret_fields(schema.get("items"))
+        return _validate_secret_schema_nodes(schema.get("items"), tool_id)
     return False
 
 
@@ -172,11 +166,7 @@ def _validate_argument_contract(tool: ToolDefinition) -> None:
             f"tool {tool.tool_ref.tool_id}: resource arguments require the artifact extractor"
         )
     root = thaw(tool.parameter_schema)
-    schema_has_secret = _schema_contains_secret_reference(root)
-    if _schema_contains_reserved_secret_fields(root) and not schema_has_secret:
-        raise ToolRegistryValidationError(
-            f"tool {tool.tool_ref.tool_id}: reserved Secret Reference fields require the fixed closed schema"
-        )
+    schema_has_secret = _validate_secret_schema_nodes(root, tool.tool_ref.tool_id)
     if not (
         schema_has_secret
         == bool(tool.secret_argument_paths)

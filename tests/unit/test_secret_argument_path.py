@@ -98,3 +98,8 @@ def test_secret_reference_with_extra_field_is_still_discovered() -> None:
     credential = {**_ARGS["credential"], "note": "must not hide authority"}
     with pytest.raises(SecretArgumentBindingError, match="cover every"):
         validate_secret_argument_paths((), {"credential": credential})
+
+
+def test_partial_secret_reference_is_still_discovered() -> None:
+    with pytest.raises(SecretArgumentBindingError, match="cover every"):
+        validate_secret_argument_paths((), {"credential": {"secret_version_id": "sv-1"}})

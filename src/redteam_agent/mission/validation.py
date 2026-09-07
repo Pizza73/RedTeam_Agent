@@ -29,8 +29,10 @@ from redteam_agent.semantics import (
     SEMANTIC_CATALOG_REVISION,
     SESSION_EXISTS_RULE_ID,
     SESSION_GOAL_SOURCE_CAPABILITY_ID,
+    EmptySessionGoalSource,
+    RepositorySessionGoalSource,
     SemanticCatalog,
-    SessionGoalSource,
+    SessionExistsGoalRule,
     SessionStateProof,
     default_semantic_catalog,
 )
@@ -49,7 +51,7 @@ def _validate_success_condition(condition: object, catalog: SemanticCatalog) -> 
     if not isinstance(condition, SessionExistsCondition):
         raise MissionValidationError("success condition type has no implemented Phase 0A rule")
     rule = catalog.session_exists_rule
-    if rule is None:
+    if rule is None or type(rule) is not SessionExistsGoalRule:
         raise MissionValidationError("session condition rule is not registered")
     if rule.proof_schema is not SessionStateProof:
         raise MissionValidationError("session condition proof schema is not the registered closed model")
@@ -57,8 +59,10 @@ def _validate_success_condition(condition: object, catalog: SemanticCatalog) -> 
         raise MissionValidationError("session condition rule id is not registered")
     if rule.source_capability_id != SESSION_GOAL_SOURCE_CAPABILITY_ID:
         raise MissionValidationError("session condition source capability id is not registered")
-    if not isinstance(rule.source, SessionGoalSource):
+    if type(rule.source) not in (EmptySessionGoalSource, RepositorySessionGoalSource):
         raise MissionValidationError("session condition source capability is not implemented")
+    if not callable(rule.source.get_current_session) or not callable(rule.source.list_current_sessions):
+        raise MissionValidationError("session condition source capability methods are not callable")
     if rule.source.capability_id != SESSION_GOAL_SOURCE_CAPABILITY_ID:
         raise MissionValidationError("session condition source capability binding mismatch")
     rule.validate_static(condition, catalog)
