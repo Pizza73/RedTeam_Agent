@@ -5,7 +5,7 @@
 - 設計正本: `SystemDesign.md` Phase 1、`SystemDesign_AI_Control.md`、`docs/acceptance-criteria.md`
 - 基点: `0a12cf9a702303f1b9ca87c702141addb996ae87`（Phase 0C受入記録）
 - 実装範囲: 基点の次から最終実装コミットまで
-- 最終実装コミット: `f28dd0206b39063becef6bb9c9549b5ae48501e8`
+- 最終実装コミット: `6b7287c003b08e96269bf27f90c6a9f1e9a1d846`
 
 ## 実装と受入要件
 
@@ -116,6 +116,8 @@ Verified Finding再投影、古いコミット参照、要件対応表を`a22302
 FINALIZING recovery予算枯渇のHuman Review収束、実LangGraph接続、Phase 1生成的状態遷移Evidenceを
 `0b95281e5dc4d8780c4a74ebf28b1e05818a580e`で追加した。独立プローブで検出したAnalyzer Context/
 Result Source未固定を`f28dd0206b39063becef6bb9c9549b5ae48501e8`で修正した。
+Analyzer LLM入力をexact Grant DigestとGrant-bound Context本文へ固定する追補を
+`6b7287c003b08e96269bf27f90c6a9f1e9a1d846`で追加した。
 最終判定と固定review artifactは再レビュー完了後に`docs/reviews/`へ記録する。
 
 ## Phase 1生成的状態遷移Evidence
