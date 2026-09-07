@@ -5,7 +5,7 @@
 - 設計正本: `SystemDesign.md` Phase 1、`SystemDesign_AI_Control.md`、`docs/acceptance-criteria.md`
 - 基点: `0a12cf9a702303f1b9ca87c702141addb996ae87`（Phase 0C受入記録）
 - 実装範囲: 基点の次から最終実装コミットまで
-- 最終実装コミット: `a22302824ff6a918d421b2c31347b6448033e6ca`
+- 最終実装コミット: `6eb667966620139eb027874408d59d50935fed82`
 
 ## 実装と受入要件
 
@@ -25,7 +25,7 @@
 | D10 failure accounting | `ExecutionOutcomeAccountingService`、Execution作成順・取込完了後・一度だけ適用 |
 | retry境界分離 | context / persistent commit / dispatch / collection / ingestion / reconciliationの永続Budgetを別Keyで管理 |
 | AD Principal Context Goal | Current Active Session、exact principal、Session Managerが確認した登録済みAD Group SIDを同時要求。Group証明なしを拒否 |
-| Finalization | Result collection、ingestion、verified erasure、unresolved item、Goal、Audit、Witnessを再検証し、`FINALIZING`から再開可能 |
+| Finalization | 終了理由を固定し、期限到達は`ABORTED`、Goal達成は`COMPLETED`へ収束。`FINALIZING`から予算付きReconciliation、必要時Cancel、Final Session/Goal Refreshを再開 |
 | 最大Iteration | Planner iterationをdurable dispatch budgetへ一致させ、ControllerがMission上限で停止 |
 
 ## AI-01〜12 対応
@@ -39,10 +39,10 @@
 | AI-05 | Context Grantと本文Digestを分離。`test_context_builder_reads_only_the_body_bound_by_verified_grant`、grantなしnegative |
 | AI-06 | 全ActionをPolicy→Executor→Claimへ接続。Mock loop、Phase 0A/0B gate negative suite |
 | AI-07 | 実Executionの取込・消去完了後だけFact投影。Mock loopのpre-ingestion/pre-erasure rejection |
-| AI-08 | RECOVERを既存ExecutionのReconciliationへ接続。Mock loop recovery assertion、crash/reconciliation suite |
+| AI-08 | RECOVERを既存Executionの予算付きReconciliationへ接続。Mock loop recovery/finalizing retry assertion、crash/reconciliation suite |
 | AI-09 | Planner Context/Action/epoch/OCC binding。Planner context tests、atomic invalid→valid retry probe |
 | AI-10 | 種類別durable retry budgetとMission dispatch budget。state controls、budget suite |
-| AI-11 | Mission Manager、Goal Evaluator、Source owner、typed unresolved resolutionへ所有権を固定。Mock loop、mission lifecycle suite |
+| AI-11 | Mission Manager、Goal Evaluator、Source owner、exact Execution固定のunresolved eventへ所有権を固定。Mock loop、mission lifecycle suite |
 | AI-12 | 正常Mock loopとscope/stale/replay/tamper negativeを別試験として実行。zero-metrics suite |
 
 ## AC-01〜20 対応
@@ -54,13 +54,13 @@
 | AC-03 | `test_scope_false_action_never_reaches_mock_adapter` |
 | AC-04 | prerequisite searchのunknown observer選択、Planner ContextのCurrent source再検証 |
 | AC-05 | `test_unconfirmed_observation_does_not_change_goal_or_witnessed_fact_head` |
-| AC-06 | Source owner以外からのFact更新拒否、typed unresolved owner-source resolution |
+| AC-06 | Source owner以外からのFact更新拒否、exact Execution固定のappend-only unresolved owner event |
 | AC-07 | Analyzer confidenceをObservation以外のGoal/Policy入力にしない型・Reducer経路 |
 | AC-08 | Phase 1 context builder positive/negative、context authorization suite |
 | AC-09 | Mock Analyzer候補分離、semantic catalog unknown rejection、publication-rule negative suite |
 | AC-10 | Goal Evaluatorの三値集約とControllerの`not_achieved`経路、success-condition validation suite |
 | AC-11 | finite prerequisite searchの固定上限・循環key、`PLANNING_SEARCH_LIMIT`分岐 |
-| AC-12 | bounded Context Request、種類別retry budget、同一operation replay tests |
+| AC-12 | bounded Context Request、種類別retry budget、FINALIZING reconciliation 3回上限、同一operation replay tests |
 | AC-13 | target差替え、epoch変更、snapshot/approval staleのnegative suite |
 | AC-14 | Mock loop RECOVER、`test_uncertain_submit_goes_to_reconciliation_without_resubmit`、crash suite |
 | AC-15 | Verified Finding再投影idempotency、Analyzer候補失敗がowner Factを変更しない境界 |
@@ -83,7 +83,7 @@ negative pathも実行する。
 PATH=/tmp/phase0c-tpm/usr/bin:$PATH \
 LD_LIBRARY_PATH=/tmp/phase0c-tpm/usr/lib/x86_64-linux-gnu:/tmp/phase0c-tpm/usr/lib/x86_64-linux-gnu/swtpm \
 PYTHONPATH=src .venv/bin/python -m pytest -q -ra
-  PASS: 553 tests（swtpm 7件を含む）
+  PASS: 555 tests（swtpm 7件を含む）
 
 .venv/bin/python -m ruff check src tests
   PASS
@@ -108,4 +108,6 @@ coverage run --branch -m pytest / coverage report
 独立レビューは実装と別ContextのCodexが固定コミットのfresh snapshotで実施する。`a808f11`対象の初回判定は
 BLOCKER 0 / HIGH 2 / MEDIUM 3でFAILだった。任意Unresolved解消・cross-mission付替え、Workflow未接続、
 Verified Finding再投影、古いコミット参照、要件対応表を`a22302824ff6a918d421b2c31347b6448033e6ca`で修正した。
+再レビューで残ったexact Execution未固定、監査Event不足、期限/FINALIZING回復未収束を
+`6eb667966620139eb027874408d59d50935fed82`で修正した。
 最終判定と固定review artifactは再レビュー完了後に`docs/reviews/`へ記録する。
