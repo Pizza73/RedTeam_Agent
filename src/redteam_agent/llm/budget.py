@@ -28,7 +28,7 @@ class LLMRequestBudgetPolicy(StrictImmutableBoundaryModel):
     policy_revision: str = Field(min_length=1)
     reserved_output_tokens: int = Field(gt=0)
     safety_margin_tokens: int = Field(default=DEFAULT_SAFETY_MARGIN_TOKENS, ge=256)
-    request_timeout_seconds: int = Field(default=60, gt=0)
+    request_timeout_seconds: float = Field(default=60.0, gt=0)
     policy_digest: str = Field(min_length=1)
 
 
@@ -37,7 +37,7 @@ def build_request_budget_policy(
     profile: LocalLLMProfile,
     policy_revision: str = "llm-request-budget-v1",
     safety_margin_tokens: int = DEFAULT_SAFETY_MARGIN_TOKENS,
-    request_timeout_seconds: int = 60,
+    request_timeout_seconds: float = 60.0,
     digest_service: DigestService,
 ) -> LLMRequestBudgetPolicy:
     """Build a budget policy whose reserved output equals the profile's max output."""

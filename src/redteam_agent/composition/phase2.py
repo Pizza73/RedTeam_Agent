@@ -2,7 +2,7 @@
 
 Extends the Phase 1 kernel with the schema-capability infrastructure, the Local LLM
 planner/analyzer adapter factories, the isolated Local Evaluation Entry Point and the
-agent-quality-policy-v1 gate. The mission validation path is parameterized so a Phase 2
+agent-quality-policy-v2 gate. The mission validation path is parameterized so a Phase 2
 mission accepts only a ``vllm`` profile and requires a passed capability result bound to
 its profile digest (a mock profile cannot bypass the capability check). No new workflow
 state, authorization path or duplicate service is introduced.
@@ -17,7 +17,12 @@ from redteam_agent.composition.phase0c import build_phase0c_kernel
 from redteam_agent.composition.phase1 import Phase1Kernel, build_phase1_kernel
 from redteam_agent.composition.testing import build_test_kernel
 from redteam_agent.errors import LLMCapabilityError, LLMEvaluationError
-from redteam_agent.llm.adapters import LocalLLMAnalyzer, LocalLLMPlanner
+from redteam_agent.execution.adapter import MockExecutionAdapter
+from redteam_agent.llm.adapters import (
+    LocalLLMAnalyzer,
+    LocalLLMPlanner,
+    quality_prompt_set_digests,
+)
 from redteam_agent.llm.attestation import (
     ModelArtifactSource,
     ServerAttestation,
@@ -70,7 +75,9 @@ from redteam_agent.quality.models import (
     build_run_seeds,
 )
 from redteam_agent.quality.runner import RunDriver, derive_driver_evidence_kind
+from redteam_agent.quality.scenario_runner import IsolatedPhase1ScenarioRunner
 from redteam_agent.quality.workflow_driver import (
+    IsolatedPhase1WorkflowRunExecutor,
     Phase1WorkflowRunExecutor,
     RunWorkflow,
     WorkflowBackedQualityDriver,
@@ -79,9 +86,7 @@ from redteam_agent.quality.workflow_driver import (
 
 def _require_bound_tokenizer(token_counter: TokenCounter, profile: LocalLLMProfile) -> None:
     if token_counter.tokenizer_revision != profile.tokenizer_revision:
-        raise LLMCapabilityError(
-            "token counter tokenizer_revision must match the profile's fixed tokenizer_revision"
-        )
+        raise LLMCapabilityError("token counter tokenizer_revision must match the profile's fixed tokenizer_revision")
 
 
 class _LazyMissionCapabilityVerifier:
@@ -152,7 +157,9 @@ class Phase2Kernel:
         self.verify_endpoint_binds_profile(profile)
         assert self.endpoint is not None
         attestation = attest_local_llm_server(
-            profile=profile, endpoint=self.endpoint, provider=provider,
+            profile=profile,
+            endpoint=self.endpoint,
+            provider=provider,
             artifact_source=artifact_source,
             digest_service=self.phase1.phase0c.phase0b.phase0a.digest_service,
             timeout_seconds=timeout_seconds,
@@ -168,14 +175,14 @@ class Phase2Kernel:
             raise LLMEvaluationError("a real qualification requires a live server attestation")
         assert self.endpoint is not None and self.endpoint.base_url is not None
         require_attestation_binding(
-            attestation, profile=profile, base_url=self.endpoint.base_url,
+            attestation,
+            profile=profile,
+            base_url=self.endpoint.base_url,
             digest_service=self.phase1.phase0c.phase0b.phase0a.digest_service,
         )
         stored = self.server_attestation_repository().get(attestation.attestation_digest)
         if attestation.provenance != "direct_network" or stored is None:
-            raise LLMEvaluationError(
-                "a real qualification requires a persisted direct_network server attestation"
-            )
+            raise LLMEvaluationError("a real qualification requires a persisted direct_network server attestation")
         return attestation
 
     def build_evaluation_gateway(self, *, run_id: str) -> EvaluationGateway:
@@ -186,8 +193,10 @@ class Phase2Kernel:
         """
         a = self.phase1.phase0c.phase0b.phase0a
         return EvaluationGateway(
-            database=a.database, digest_service=a.digest_service,
-            clock=self.phase1.phase0c.monotonic_clock, run_id=run_id,
+            database=a.database,
+            digest_service=a.digest_service,
+            clock=self.phase1.phase0c.monotonic_clock,
+            run_id=run_id,
         )
 
     def build_live_capability_probe(
@@ -211,18 +220,23 @@ class Phase2Kernel:
         _require_bound_tokenizer(token_counter, profile)
         assert self.endpoint is not None
         if self.endpoint.base_url is None or client.base_url != self.endpoint.base_url.rstrip("/"):
-            raise LLMEvaluationError(
-                "capability client base_url does not match the configured endpoint"
-            )
+            raise LLMEvaluationError("capability client base_url does not match the configured endpoint")
         a = self.phase1.phase0c.phase0b.phase0a
         clock = self.phase1.phase0c.monotonic_clock
         assert self.endpoint is not None  # narrowed by verify_endpoint_binds_profile
         gateway = self.build_evaluation_gateway(run_id=run_id)
         budget = run_budget if run_budget is not None else build_evaluation_run_budget(clock=clock)
         return LiveCapabilityProbe(
-            profile=profile, policy=policy, endpoint=self.endpoint, client=client,
-            token_counter=token_counter, gateway=gateway, run_budget=budget, clock=clock,
-            digest_service=a.digest_service, cancellation=cancellation,  # type: ignore[arg-type]
+            profile=profile,
+            policy=policy,
+            endpoint=self.endpoint,
+            client=client,
+            token_counter=token_counter,
+            gateway=gateway,
+            run_budget=budget,
+            clock=clock,
+            digest_service=a.digest_service,
+            cancellation=cancellation,  # type: ignore[arg-type]
             attestation=attestation,
         )
 
@@ -244,8 +258,12 @@ class Phase2Kernel:
         _require_bound_tokenizer(token_counter, profile)
         ds = self.phase1.phase0c.phase0b.phase0a.digest_service
         return LocalLLMPlanner(
-            profile=profile, policy=policy, client=client, token_counter=token_counter,
-            clock=self.phase1.phase0c.monotonic_clock, digest_service=ds,
+            profile=profile,
+            policy=policy,
+            client=client,
+            token_counter=token_counter,
+            clock=self.phase1.phase0c.monotonic_clock,
+            digest_service=ds,
         )
 
     def build_binding_checker(
@@ -258,9 +276,12 @@ class Phase2Kernel:
     ) -> MissionBindingChecker:
         a = self.phase1.phase0c.phase0b.phase0a
         return MissionBindingChecker(
-            context_resolver=a.context_resolver, clock=self.phase1.phase0c.monotonic_clock,
-            mission_id=mission_id, expected_profile_digest=expected_profile_digest,
-            expected_revision=expected_revision, expected_epoch=expected_epoch,
+            context_resolver=a.context_resolver,
+            clock=self.phase1.phase0c.monotonic_clock,
+            mission_id=mission_id,
+            expected_profile_digest=expected_profile_digest,
+            expected_revision=expected_revision,
+            expected_epoch=expected_epoch,
         )
 
     def build_analyzer(
@@ -274,8 +295,12 @@ class Phase2Kernel:
         _require_bound_tokenizer(token_counter, profile)
         ds = self.phase1.phase0c.phase0b.phase0a.digest_service
         return LocalLLMAnalyzer(
-            profile=profile, policy=policy, client=client, token_counter=token_counter,
-            clock=self.phase1.phase0c.monotonic_clock, digest_service=ds,
+            profile=profile,
+            policy=policy,
+            client=client,
+            token_counter=token_counter,
+            clock=self.phase1.phase0c.monotonic_clock,
+            digest_service=ds,
         )
 
     # --- quality gate -----------------------------------------------------
@@ -322,12 +347,8 @@ class Phase2Kernel:
         evidence and every capability result must reference that same attestation.
         """
         if self.qualification_commit_id is None or self.dependency_lock_digest is None:
-            raise LLMEvaluationError(
-                "qualification build identity is not configured"
-            )
-        verify_profile_digest(
-            profile, self.phase1.phase0c.phase0b.phase0a.digest_service
-        )
+            raise LLMEvaluationError("qualification build identity is not configured")
+        verify_profile_digest(profile, self.phase1.phase0c.phase0b.phase0a.digest_service)
         self._verify_real_capability_results(profile, capability_results, attestation)
         fields = self._expected_binding_fields(profile, capability_results, attestation)
         ds = self.phase1.phase0c.phase0b.phase0a.digest_service
@@ -356,9 +377,7 @@ class Phase2Kernel:
         _require_bound_tokenizer(token_counter, profile)
         assert self.endpoint is not None
         if self.endpoint.base_url is None or client.base_url != self.endpoint.base_url.rstrip("/"):
-            raise LLMEvaluationError(
-                "quality client base_url does not match the configured endpoint"
-            )
+            raise LLMEvaluationError("quality client base_url does not match the configured endpoint")
         ds = self.phase1.phase0c.phase0b.phase0a.digest_service
         ds.verify(
             "llm_request_budget_policy_digest",
@@ -366,9 +385,7 @@ class Phase2Kernel:
             policy.policy_digest,
         )
         if evaluation_binding.gateway_budget_policy_digest != policy.policy_digest:
-            raise LLMEvaluationError(
-                "quality driver policy does not match the evaluation binding"
-            )
+            raise LLMEvaluationError("quality driver policy does not match the evaluation binding")
         clock = self.phase1.phase0c.monotonic_clock
         return LocalLLMQualityDriver(
             profile=profile,
@@ -376,11 +393,7 @@ class Phase2Kernel:
             client=client,
             token_counter=token_counter,
             gateway=self.build_evaluation_gateway(run_id=run_id),
-            run_budget=(
-                run_budget
-                if run_budget is not None
-                else build_evaluation_run_budget(clock=clock)
-            ),
+            run_budget=(run_budget if run_budget is not None else build_evaluation_run_budget(clock=clock)),
             clock=clock,
             evaluation_binding=evaluation_binding,
             attestation=attestation,
@@ -407,13 +420,9 @@ class Phase2Kernel:
         _require_bound_tokenizer(token_counter, profile)
         assert self.endpoint is not None and self.endpoint.base_url is not None
         if client.base_url != self.endpoint.base_url.rstrip("/"):
-            raise LLMEvaluationError(
-                "workflow quality client base_url does not match the configured endpoint"
-            )
+            raise LLMEvaluationError("workflow quality client base_url does not match the configured endpoint")
         if evaluation_binding.profile_digest != profile.profile_digest:
-            raise LLMEvaluationError(
-                "workflow quality driver profile does not match the evaluation binding"
-            )
+            raise LLMEvaluationError("workflow quality driver profile does not match the evaluation binding")
         if attestation is not None:
             require_attestation_binding(
                 attestation,
@@ -444,6 +453,111 @@ class Phase2Kernel:
             attestation=attestation,
             evaluation_binding=evaluation_binding,
             executor=executor,
+            token_counter=token_counter,
+        )
+
+    def build_isolated_workflow_quality_driver(
+        self,
+        *,
+        profile: LocalLLMProfile,
+        policy: LLMRequestBudgetPolicy,
+        client: VLLMChatClient,
+        token_counter: TokenCounter,
+        evaluation_binding: EvaluationBinding,
+        capability_results: tuple[LLMSchemaCapabilityResult, ...],
+        attestation: ServerAttestation | None = None,
+        max_parallel_runs: int = 1,
+    ) -> WorkflowBackedQualityDriver:
+        """Build the only workflow driver eligible for formal D11 evidence.
+
+        Every call creates a fresh in-memory product kernel and a side-effect-free
+        adapter whose mode is taken from the expectation-free environment input.
+        """
+        self.verify_endpoint_binds_profile(profile)
+        _require_bound_tokenizer(token_counter, profile)
+        assert self.endpoint is not None and self.endpoint.base_url is not None
+        if client.base_url != self.endpoint.base_url.rstrip("/"):
+            raise LLMEvaluationError("workflow quality client base_url does not match the configured endpoint")
+        if evaluation_binding.profile_digest != profile.profile_digest:
+            raise LLMEvaluationError("workflow quality driver profile does not match the evaluation binding")
+        if attestation is not None:
+            require_attestation_binding(
+                attestation,
+                profile=profile,
+                base_url=client.base_url,
+                digest_service=self.phase1.phase0c.phase0b.phase0a.digest_service,
+            )
+
+        def kernel_factory(run_input):  # type: ignore[no-untyped-def]
+            adapter = MockExecutionAdapter(
+                adapter_id="quality-isolated-adapter",
+                result_delivery_mode="provider_task",
+                reconcile_status="FOUND_TERMINAL",
+                reconcile_provider_status="succeeded",
+                stdout_chunks=(
+                    b'{"host":"127.0.0.1","status":"observed","port":0}',
+                ),
+                clock_value=self.phase1.phase0c.phase0b.phase0a.clock.now(),
+            )
+            isolated = build_phase2_kernel(
+                endpoint=self.endpoint,
+                _scenario_mock_adapter=adapter,
+            )
+            a = isolated.phase1.phase0c.phase0b.phase0a
+            a.profile_repository.save(profile)
+            for result in capability_results:
+                isolated.capability_repository.save(result)
+            return isolated.phase1
+
+        def planner_factory(phase1: Phase1Kernel) -> LocalLLMPlanner:
+            return LocalLLMPlanner(
+                profile=profile,
+                policy=policy,
+                client=client,
+                token_counter=token_counter,
+                clock=phase1.phase0c.monotonic_clock,
+                digest_service=phase1.phase0c.phase0b.phase0a.digest_service,
+            )
+
+        def analyzer_factory(phase1: Phase1Kernel) -> LocalLLMAnalyzer:
+            return LocalLLMAnalyzer(
+                profile=profile,
+                policy=policy,
+                client=client,
+                token_counter=token_counter,
+                clock=phase1.phase0c.monotonic_clock,
+                digest_service=phase1.phase0c.phase0b.phase0a.digest_service,
+            )
+
+        scenario_runner = IsolatedPhase1ScenarioRunner(
+            kernel_factory=kernel_factory,
+            planner_factory=planner_factory,
+            analyzer_factory=analyzer_factory,
+            profile=profile,
+        )
+        executor = IsolatedPhase1WorkflowRunExecutor(
+            workflow=self.phase1.workflow,
+            planner=self.build_planner(
+                profile=profile,
+                policy=policy,
+                client=client,
+                token_counter=token_counter,
+            ),
+            analyzer=self.build_analyzer(
+                profile=profile,
+                policy=policy,
+                client=client,
+                token_counter=token_counter,
+            ),
+            run_workflow=scenario_runner,
+        )
+        return WorkflowBackedQualityDriver(
+            client=client,
+            attestation=attestation,
+            evaluation_binding=evaluation_binding,
+            executor=executor,
+            token_counter=token_counter,
+            max_parallel_runs=max_parallel_runs,
         )
 
     def verify_endpoint_binds_profile(self, profile: LocalLLMProfile) -> None:
@@ -479,9 +593,7 @@ class Phase2Kernel:
         ``NOT_RUN`` — never a fabricated ``PASS``.
         """
         if self.endpoint is None or not self.endpoint.endpoint_available:
-            return self.quality_gate_not_run(
-                reason="no local vLLM endpoint configured for a real qualification"
-            )
+            return self.quality_gate_not_run(reason="no local vLLM endpoint configured for a real qualification")
         if self.qualification_commit_id is None or self.dependency_lock_digest is None:
             return self.quality_gate_not_run(
                 reason="qualification commit and dependency-lock identity are not configured"
@@ -495,11 +607,14 @@ class Phase2Kernel:
         bound = evaluation_binding.model_dump(mode="python")
         mismatched = tuple(
             f"evaluation binding {name} does not match the trusted input"
-            for name, value in expected_fields.items() if bound.get(name) != value
+            for name, value in expected_fields.items()
+            if bound.get(name) != value
         )
         if mismatched:
             return blocked_report(
-                corpus=self.quality_corpus, digest_service=ds, reasons=mismatched,
+                corpus=self.quality_corpus,
+                digest_service=ds,
+                reasons=mismatched,
                 evaluation_binding_digest=evaluation_binding.binding_digest,
             )
         self._require_persisted_attestation(attestation, profile)
@@ -508,8 +623,11 @@ class Phase2Kernel:
                 "a real qualification requires a real workflow-derived run driver, not a test double"
             )
         return run_agent_quality_gate(
-            corpus=self.quality_corpus, digest_service=ds, driver=driver,
-            external_prerequisites=REAL_LLM_PREREQUISITES, evaluation_binding=evaluation_binding,
+            corpus=self.quality_corpus,
+            digest_service=ds,
+            driver=driver,
+            external_prerequisites=REAL_LLM_PREREQUISITES,
+            evaluation_binding=evaluation_binding,
             expected_capability_result_digests=tuple(r.result_digest for r in capability_results),
             expected_binding_fields=expected_fields,
             evidence_sink=self.quality_evidence_repository(),
@@ -530,9 +648,7 @@ class Phase2Kernel:
             "llm_schema_digest",
             {
                 "schema_name": "action_contract_catalog",
-                "schema": {
-                    "definition_digests": tuple(item.definition_digest for item in contracts)
-                },
+                "schema": {"definition_digests": tuple(item.definition_digest for item in contracts)},
             },
         )
         return {
@@ -547,23 +663,16 @@ class Phase2Kernel:
             "schema_capability_corpus_digest": self.schema_corpus.corpus_digest(ds),
             "agent_quality_corpus_version": self.quality_corpus.corpus_version,
             "agent_quality_corpus_digest": self.quality_corpus.corpus_digest(ds),
-            "schema_digests": tuple(
-                (str(name), compute_schema_digest(name, ds)) for name in ACTUAL_SCHEMA_NAMES
-            ),
+            "schema_digests": tuple((str(name), compute_schema_digest(name, ds)) for name in ACTUAL_SCHEMA_NAMES),
             "prompt_set_digests": tuple(
-                (str(name), self.schema_corpus.prompt_set_digest(name, ds))
-                for name in ACTUAL_SCHEMA_NAMES
-            ),
+                (str(name), self.schema_corpus.prompt_set_digest(name, ds)) for name in ACTUAL_SCHEMA_NAMES
+            ) + quality_prompt_set_digests(ds),
             "contract_digest": contract_digest,
             "catalog_digest": ds.catalog.catalog_digest,
             "gateway_budget_policy_digest": self.request_budget_policy(profile).policy_digest,
             "dependency_lock_digest": self.dependency_lock_digest,
-            "capability_result_digests": tuple(
-                result.result_digest for result in capability_results
-            ),
-            "server_attestation_digest": (
-                attestation.attestation_digest if attestation is not None else None
-            ),
+            "capability_result_digests": tuple(result.result_digest for result in capability_results),
+            "server_attestation_digest": (attestation.attestation_digest if attestation is not None else None),
             "run_seeds": build_run_seeds(self.quality_corpus),
         }
 
@@ -575,6 +684,7 @@ class Phase2Kernel:
     ) -> None:
         ds = self.phase1.phase0c.phase0b.phase0a.digest_service
         verify_profile_digest(profile, ds)
+        current_corpus_digest = self.schema_corpus.corpus_digest(ds)
         covered: set[str] = set()
         for result in results:
             ds.verify(
@@ -588,13 +698,22 @@ class Phase2Kernel:
                 raise LLMEvaluationError(f"capability result for {result.schema_name} did not pass")
             if result.profile_digest != profile.profile_digest:
                 raise LLMEvaluationError("capability result is not bound to the qualifying profile")
-            if result.server_attestation_digest is None or (
-                attestation is not None
-                and result.server_attestation_digest != attestation.attestation_digest
+            expected_schema_digest = compute_schema_digest(result.schema_name, ds)
+            expected_prompt_digest = self.schema_corpus.prompt_set_digest(result.schema_name, ds)
+            if (
+                result.schema_digest != expected_schema_digest
+                or result.corpus_version != self.schema_corpus.corpus_version
+                or result.corpus_digest != current_corpus_digest
+                or result.prompt_set_digest != expected_prompt_digest
+                or result.structured_output_mode != profile.structured_output_mode
             ):
                 raise LLMEvaluationError(
-                    "capability result is not bound to the attested server"
+                    "capability result is stale for the current schema, corpus, prompt, or output mode"
                 )
+            if result.server_attestation_digest is None or (
+                attestation is not None and result.server_attestation_digest != attestation.attestation_digest
+            ):
+                raise LLMEvaluationError("capability result is not bound to the attested server")
             if result.unsafe_boundary_acceptances != 0 or result.cancellation_failures != 0:
                 raise LLMEvaluationError("capability result has non-zero safety counters")
             if result.valid_within_retry_budget / result.sample_count < MIN_VALID_RATIO:
@@ -613,9 +732,7 @@ class Phase2Kernel:
                 structured_output_mode=result.structured_output_mode,
             )
             if stored is None or stored.result_digest != result.result_digest:
-                raise LLMEvaluationError(
-                    "capability result is not the persisted result for this binding"
-                )
+                raise LLMEvaluationError("capability result is not the persisted result for this binding")
             covered.add(result.schema_name)
         expected = {str(name) for name in ACTUAL_SCHEMA_NAMES}
         if covered != expected or len(results) != len(expected):
@@ -627,6 +744,8 @@ def build_phase2_kernel(
     endpoint: LocalLLMEndpointConfig | None = None,
     qualification_commit_id: str | None = None,
     dependency_lock_digest: str | None = None,
+    db_path: str = ":memory:",
+    _scenario_mock_adapter: MockExecutionAdapter | None = None,
 ) -> Phase2Kernel:
     if qualification_commit_id is not None and (
         len(qualification_commit_id) not in (40, 64)
@@ -641,9 +760,20 @@ def build_phase2_kernel(
     lazy_verifier: _LazyMissionCapabilityVerifier = _LazyMissionCapabilityVerifier()
     verifier_ref: LLMCapabilityVerifier = lazy_verifier
     phase0a = build_test_kernel(
-        allowed_profile_types=frozenset({"vllm"}), capability_verifier=verifier_ref
+        db_path=db_path,
+        allowed_profile_types=frozenset({"vllm"}),
+        capability_verifier=verifier_ref,
     )
-    phase0b = build_phase0b_kernel(phase0a=phase0a)
+    phase0b = build_phase0b_kernel(
+        phase0a=phase0a,
+        mock_adapter=_scenario_mock_adapter,
+        result_delivery_mode=(
+            _scenario_mock_adapter.identity().result_delivery_mode
+            if _scenario_mock_adapter is not None
+            else "provider_task"
+        ),
+        adapter_id=(_scenario_mock_adapter.identity().adapter_id if _scenario_mock_adapter is not None else "c2-main"),
+    )
     phase0c = build_phase0c_kernel(phase0b=phase0b)
     phase1 = build_phase1_kernel(phase0c=phase0c)
     ds = phase0a.digest_service

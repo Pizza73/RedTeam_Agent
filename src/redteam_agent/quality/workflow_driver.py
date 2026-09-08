@@ -8,7 +8,8 @@ actual ``Phase1AgentWorkflow`` execution.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -17,6 +18,7 @@ from redteam_agent.goal.models import GoalTruth
 from redteam_agent.llm.adapters import LocalLLMAnalyzer, LocalLLMPlanner
 from redteam_agent.llm.attestation import ServerAttestation, attestation_is_real
 from redteam_agent.llm.client import VLLMChatClient
+from redteam_agent.llm.tokenizer import HuggingFaceTokenCounter, TokenCounter
 from redteam_agent.mission.models import MissionLifecycleState
 from redteam_agent.quality.environment import QualityEnvironmentSpec
 from redteam_agent.quality.models import (
@@ -117,9 +119,7 @@ class Phase1WorkflowRunExecutor:
         self._analyzer = analyzer
         self._run_workflow = run_workflow
 
-    def execute(
-        self, fixture: QualityFixture, attempt_index: int, seed: str
-    ) -> WorkflowRunTrace:
+    def execute(self, fixture: QualityFixture, attempt_index: int, seed: str) -> WorkflowRunTrace:
         return self._run_workflow(
             self._workflow,
             self._planner,
@@ -128,6 +128,26 @@ class Phase1WorkflowRunExecutor:
             attempt_index,
             seed,
         )
+
+    @property
+    def is_composition_owned(self) -> bool:
+        """The public callback constructor is a test seam, never formal evidence."""
+        return False
+
+
+class IsolatedPhase1WorkflowRunExecutor(Phase1WorkflowRunExecutor):
+    """Executor reserved for the product-owned isolated scenario runner."""
+
+    def __init__(self, **kwargs: object) -> None:
+        from redteam_agent.quality.scenario_runner import IsolatedPhase1ScenarioRunner
+
+        if type(kwargs.get("run_workflow")) is not IsolatedPhase1ScenarioRunner:
+            raise ValueError("formal executor requires the isolated product scenario runner")
+        super().__init__(**kwargs)  # type: ignore[arg-type]
+
+    @property
+    def is_composition_owned(self) -> bool:
+        return True
 
 
 class WorkflowBackedQualityDriver:
@@ -140,19 +160,20 @@ class WorkflowBackedQualityDriver:
         attestation: ServerAttestation | None,
         evaluation_binding: EvaluationBinding,
         executor: Phase1WorkflowRunExecutor,
+        token_counter: TokenCounter,
+        max_parallel_runs: int = 1,
     ) -> None:
-        if attestation is not None and (
-            evaluation_binding.server_attestation_digest != attestation.attestation_digest
-        ):
+        if max_parallel_runs < 1 or max_parallel_runs > 32:
+            raise ValueError("max_parallel_runs must be between 1 and 32")
+        if attestation is not None and (evaluation_binding.server_attestation_digest != attestation.attestation_digest):
             raise ValueError("workflow driver binding does not reference its attestation")
         self._client = client
         self._attestation = attestation
         self._binding = evaluation_binding
         self._executor = executor
-        self._seeds = {
-            (fixture_id, attempt): seed
-            for fixture_id, attempt, seed in evaluation_binding.run_seeds
-        }
+        self._token_counter = token_counter
+        self._max_parallel_runs = max_parallel_runs
+        self._seeds = {(fixture_id, attempt): seed for fixture_id, attempt, seed in evaluation_binding.run_seeds}
 
     @property
     def evidence_kind(self) -> Literal["real_local_llm", "test_double"]:
@@ -160,6 +181,8 @@ class WorkflowBackedQualityDriver:
             "real_local_llm"
             if self._client.uses_direct_network_transport
             and attestation_is_real(self._attestation)
+            and type(self._token_counter) is HuggingFaceTokenCounter
+            and self._executor.is_composition_owned
             else "test_double"
         )
 
@@ -169,15 +192,9 @@ class WorkflowBackedQualityDriver:
 
     @property
     def server_attestation_digest(self) -> str | None:
-        return (
-            self._attestation.attestation_digest
-            if self._attestation is not None
-            else None
-        )
+        return self._attestation.attestation_digest if self._attestation is not None else None
 
-    def drive(
-        self, fixture: QualityFixture, attempt_index: int
-    ) -> QualityRunObservation:
+    def drive(self, fixture: QualityFixture, attempt_index: int) -> QualityRunObservation:
         seed = self._seeds.get((fixture.fixture_id, attempt_index))
         if seed is None:
             raise ValueError("workflow driver binding has no seed for this run")
@@ -202,8 +219,50 @@ class WorkflowBackedQualityDriver:
         )
         return observation.model_copy(update={"diagnostics": trace.diagnostics})
 
+    def drive_many(
+        self, requests: tuple[tuple[QualityFixture, int], ...]
+    ) -> tuple[QualityRunObservation | Exception, ...]:
+        """Drive an ordered batch through independently isolated kernels.
+
+        Exceptions are returned in their input positions so the runner can preserve
+        its fixed 300-record order and convert ordinary model failures into failed
+        observations without dropping a run.
+        """
+
+        def one(request: tuple[QualityFixture, int]) -> QualityRunObservation | Exception:
+            try:
+                return self.drive(*request)
+            except Exception as exc:  # consumed by QualityRunner under its normal rules
+                return exc
+
+        if self._max_parallel_runs == 1:
+            return tuple(one(request) for request in requests)
+        with ThreadPoolExecutor(max_workers=self._max_parallel_runs) as pool:
+            return tuple(pool.map(one, requests))
+
+    def drive_many_completed(
+        self, requests: tuple[tuple[QualityFixture, int], ...]
+    ) -> Iterator[tuple[int, QualityRunObservation | Exception]]:
+        """Yield completed positions promptly so durable evidence is appended incrementally."""
+        if self._max_parallel_runs == 1:
+            for index, request in enumerate(requests):
+                yield index, self.drive_many((request,))[0]
+            return
+        with ThreadPoolExecutor(max_workers=self._max_parallel_runs) as pool:
+            futures = {
+                pool.submit(self.drive, fixture, attempt): index
+                for index, (fixture, attempt) in enumerate(requests)
+            }
+            for future in as_completed(futures):
+                index = futures[future]
+                try:
+                    yield index, future.result()
+                except Exception as exc:
+                    yield index, exc
+
 
 __all__ = [
+    "IsolatedPhase1WorkflowRunExecutor",
     "Phase1WorkflowRunExecutor",
     "QualityWorkflowInput",
     "RunWorkflow",

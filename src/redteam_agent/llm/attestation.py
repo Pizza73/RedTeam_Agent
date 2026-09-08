@@ -6,7 +6,8 @@ Before a capability or 300-run result may be labelled ``real_local_llm`` the
 configured server is attested against the immutable :class:`LocalLLMProfile`:
 
 * ``GET /health`` must be 200 and ``GET /version`` must report exactly
-  ``profile.runtime_version`` (vLLM serves both at the server root).
+``profile.runtime_version`` (vLLM serves both at the server root). A configured
+API credential is read from its Secret-file for each request and is never persisted.
 * ``GET /v1/models`` must list exactly one model whose ``id`` equals the configured
   endpoint model / profile ``model_name`` (zero or duplicate entries are ambiguous).
   vLLM's model card also carries ``root`` (the ``--model`` path / id) and
@@ -24,15 +25,15 @@ The evidence is canonicalized into an immutable :class:`ServerAttestation` seale
 ``attestation_digest`` and bound to the profile digest and endpoint. Its ``provenance``
 is derived from the concrete provider / artifact-source types: only the production
 :class:`HttpServerMetadataProvider` over its own retry-disabled network transport
-together with :class:`LocalModelArtifactSource` yields ``direct_network``; any injected
-provider, transport or artifact source is ``test_double`` and can never make evidence
-real.
+together with :class:`LocalModelArtifactSource` or a verified
+:class:`SignedManifestArtifactSource` yields ``direct_network``; any injected provider,
+transport or artifact source is ``test_double`` and can never make evidence real.
 
 vLLM API limitation: the OpenAI-compatible API exposes no model hash, tokenizer
 revision, chat-template digest or structured-output capability flag, and does not
 reveal a ``--tokenizer`` / ``--chat-template`` override. Those are therefore attested
 from the local artifacts at the reported ``root`` plus the behavioural probe, and a
-server whose ``root`` is not a local model directory cannot be attested.
+server whose ``root`` is not locally readable requires the signed-manifest source.
 """
 
 from __future__ import annotations
@@ -52,6 +53,7 @@ from redteam_agent.canonical.json_boundary import parse_json_no_duplicate_keys
 from redteam_agent.errors import LLMAttestationError
 from redteam_agent.llm.config import LocalLLMEndpointConfig
 from redteam_agent.llm.profile import LocalLLMProfile, verify_profile_digest
+from redteam_agent.llm.secrets import APIKeySource, authorization_headers
 from redteam_agent.models.base import StrictImmutableBoundaryModel
 
 AttestationProvenance = Literal["direct_network", "test_double"]
@@ -127,10 +129,16 @@ def server_root(base_url: str) -> str:
 
 
 class HttpServerMetadataProvider:
-    """Production provider: plain GET/POST over a retry-disabled transport, no headers."""
+    """Production provider: authenticated GET/POST over a retry-disabled transport."""
 
-    def __init__(self, *, transport: httpx.BaseTransport | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        api_key_source: APIKeySource | None = None,
+        transport: httpx.BaseTransport | None = None,
+    ) -> None:
         self._transport = transport if transport is not None else httpx.HTTPTransport(retries=0)
+        self._api_key_source = api_key_source
 
     @property
     def uses_direct_network_transport(self) -> bool:
@@ -145,7 +153,9 @@ class HttpServerMetadataProvider:
         root = server_root(base)
         try:
             with httpx.Client(
-                transport=self._transport, timeout=httpx.Timeout(timeout_seconds), headers={}
+                transport=self._transport,
+                timeout=httpx.Timeout(timeout_seconds),
+                headers=authorization_headers(self._api_key_source),
             ) as client:
                 health = client.get(f"{root}/health")
                 version = client.get(f"{root}/version")
@@ -180,6 +190,12 @@ class ModelArtifactIdentity:
     model_hash: str
     tokenizer_revision: str
     chat_template_digest: str | None
+    served_model_id: str | None = None
+    runtime_version: str | None = None
+    max_model_len: int | None = None
+    snapshot_revision: str | None = None
+    container_image_digest: str | None = None
+    manifest_digest: str | None = None
 
 
 class ModelArtifactSource(Protocol):
@@ -248,6 +264,48 @@ class LocalModelArtifactSource:
         return None
 
 
+class SignedManifestArtifactSource:
+    """Resolve remote artifacts from an operator-signed, locally verified manifest."""
+
+    def __init__(
+        self,
+        *,
+        manifest_path: str | Path,
+        public_key_path: str | Path,
+        expected_key_id: str,
+        digest_service: DigestService,
+    ) -> None:
+        self._manifest_path = Path(manifest_path)
+        self._public_key_path = Path(public_key_path)
+        self._expected_key_id = expected_key_id
+        self._digest_service = digest_service
+
+    def resolve(self, model_root: str) -> ModelArtifactIdentity | None:
+        from redteam_agent.llm.artifact_manifest import (
+            load_and_verify_remote_model_artifact_manifest,
+        )
+
+        manifest = load_and_verify_remote_model_artifact_manifest(
+            manifest_path=self._manifest_path,
+            public_key_path=self._public_key_path,
+            expected_key_id=self._expected_key_id,
+            digest_service=self._digest_service,
+        )
+        if manifest.model_root != model_root:
+            return None
+        return ModelArtifactIdentity(
+            model_hash=manifest.model_hash,
+            tokenizer_revision=manifest.tokenizer_revision,
+            chat_template_digest=manifest.chat_template_digest,
+            served_model_id=manifest.served_model_id,
+            runtime_version=manifest.runtime_version,
+            max_model_len=manifest.max_model_len,
+            snapshot_revision=manifest.snapshot_revision,
+            container_image_digest=manifest.container_image_digest,
+            manifest_digest=manifest.manifest_digest,
+        )
+
+
 class ServerAttestation(StrictImmutableBoundaryModel):
     """Canonical, digest-sealed evidence that the configured server serves the profile."""
 
@@ -262,6 +320,9 @@ class ServerAttestation(StrictImmutableBoundaryModel):
     chat_template_digest: str | None
     runtime_version: str = Field(min_length=1)
     max_model_len: int | None
+    artifact_manifest_digest: str | None = None
+    snapshot_revision: str | None = None
+    container_image_digest: str | None = None
     structured_output_mode: str = Field(min_length=1)
     structured_output_verified: bool
     evidence_sources: tuple[str, ...] = Field(min_length=1)
@@ -284,7 +345,7 @@ def derive_attestation_provenance(
     if (
         type(provider) is HttpServerMetadataProvider
         and provider.uses_direct_network_transport
-        and type(artifact_source) is LocalModelArtifactSource
+        and type(artifact_source) in (LocalModelArtifactSource, SignedManifestArtifactSource)
     ):
         return "direct_network"
     return "test_double"
@@ -389,6 +450,12 @@ def attest_local_llm_server(
         raise LLMAttestationError("served tokenizer revision does not match the profile")
     if identity.chat_template_digest != profile.chat_template_digest:
         raise LLMAttestationError("served chat template does not match the profile")
+    if identity.served_model_id is not None and identity.served_model_id != card["id"]:
+        raise LLMAttestationError("signed manifest served model does not match the server")
+    if identity.runtime_version is not None and identity.runtime_version != runtime_version:
+        raise LLMAttestationError("signed manifest runtime does not match the server")
+    if identity.max_model_len is not None and identity.max_model_len != max_model_len:
+        raise LLMAttestationError("signed manifest context length does not match the server")
     _verify_probe(
         evidence.structured_output_probe, model=endpoint.model,
         mode=profile.structured_output_mode,
@@ -405,6 +472,9 @@ def attest_local_llm_server(
         "chat_template_digest": identity.chat_template_digest,
         "runtime_version": runtime_version,
         "max_model_len": max_model_len,
+        "artifact_manifest_digest": identity.manifest_digest,
+        "snapshot_revision": identity.snapshot_revision,
+        "container_image_digest": identity.container_image_digest,
         "structured_output_mode": profile.structured_output_mode,
         "structured_output_verified": True,
         "evidence_sources": ("/health", "/version", "/v1/models", "/v1/chat/completions#probe"),
@@ -460,6 +530,7 @@ __all__ = [
     "RawServerEvidence",
     "ServerAttestation",
     "ServerMetadataProvider",
+    "SignedManifestArtifactSource",
     "attest_local_llm_server",
     "attestation_is_real",
     "derive_attestation_provenance",

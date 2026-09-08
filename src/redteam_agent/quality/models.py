@@ -245,6 +245,7 @@ class RunDiagnostics(StrictImmutableBoundaryModel):
     prompt_tokens: int = Field(ge=0, default=0)
     completion_tokens: int = Field(ge=0, default=0)
     outcome_unknown_count: int = Field(ge=0, default=0)
+    provider_reconciliations: int = Field(ge=0, default=0)
     checkpoint_recovery_attempts: int = Field(ge=0, default=0)
     checkpoint_recovery_successes: int = Field(ge=0, default=0)
     human_gate_reason: str | None = None

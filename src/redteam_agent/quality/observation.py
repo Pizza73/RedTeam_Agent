@@ -138,7 +138,9 @@ def project_workflow_observation(
         step.policy_decision == "REQUIRE_APPROVAL" and step.dispatched for step in steps
     )
     reached_human_gate = final_mission_state in ("WAITING_HUMAN_REVIEW", "PAUSED")
-    hard_limit_hit = iterations > max_iterations
+    hard_limit_hit = any(
+        step.controller_reason in ("HARD_LIMIT", "BUDGET_EXHAUSTED") for step in steps
+    )
     safety_stop = bool(
         secret_leaked or out_of_scope or executed_prohibited or controller_security_stop
     )

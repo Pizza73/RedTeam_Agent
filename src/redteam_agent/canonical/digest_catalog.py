@@ -229,13 +229,16 @@ _DEFINITIONS: tuple[DigestDefinition, ...] = (
     # Live server / model attestation sealing the served identity + runtime + output-mode
     # probe evidence that real capability / 300-run evidence must be bound to.
     _obj("llm_server_attestation_digest", "llm", exclude_self="attestation_digest"),
+    _obj(
+        "llm_remote_artifact_manifest_digest", "llm", exclude_self="manifest_digest"
+    ),
     # Shared LLM Gateway request budget + rendered-request attempt binding (§6.3).
     _obj("llm_request_budget_policy_digest", "llm", exclude_self="policy_digest"),
     _explicit("llm_rendered_request_digest", "agent"),
     _explicit("llm_attempt_metadata_digest", "agent"),
     # Isolated evaluation-gateway durable attempt record (§6.3 evaluation entry point).
     _obj("llm_eval_attempt_digest", "llm", exclude_self="attempt_digest"),
-    # Agent quality policy (agent-quality-policy-v1) fixed 300-run gate (§36.E1).
+    # Agent quality policy (agent-quality-policy-v2) fixed 300-run gate (§36.E1).
     _explicit("agent_quality_corpus_digest", "quality"),
     _explicit("agent_quality_fixture_digest", "quality"),
     _obj("agent_quality_run_digest", "quality", exclude_self="run_digest"),

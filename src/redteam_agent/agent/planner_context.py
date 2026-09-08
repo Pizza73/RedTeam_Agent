@@ -55,6 +55,7 @@ _CONTEXT_REQUEST_NS = "planner_context_request"
 _CONTEXT_CHILD_NS = "planner_context_child"
 _CONTEXT_ROOT_NS = "planner_context_root"
 _CONTEXT_ACTION_NS = "planner_context_action"
+_CONTEXT_REPLAN_NS = "planner_context_replan"
 MAX_ACTION_CANDIDATES = 32
 MAX_RANKED_METADATA = 100
 MAX_ENVELOPE_TTL_SECONDS = 300
@@ -79,9 +80,13 @@ class ActionCandidateProjector:
     """Restrict application seeds to exact visible tools and registered contracts."""
 
     def __init__(
-        self, *, snapshot_repository: AvailableToolSnapshotRepository,
-        registry_repository: ToolRegistryRepository, contract_catalog: ActionContractCatalog,
-        digest_service: DigestService, registry_revision: int,
+        self,
+        *,
+        snapshot_repository: AvailableToolSnapshotRepository,
+        registry_repository: ToolRegistryRepository,
+        contract_catalog: ActionContractCatalog,
+        digest_service: DigestService,
+        registry_revision: int,
     ) -> None:
         self._snapshots = snapshot_repository
         self._registries = registry_repository
@@ -90,7 +95,10 @@ class ActionCandidateProjector:
         self._registry_revision = registry_revision
 
     def build(
-        self, *, snapshot_id: str, seeds: tuple[ActionCandidateSeed, ...],
+        self,
+        *,
+        snapshot_id: str,
+        seeds: tuple[ActionCandidateSeed, ...],
         source_version_digests: tuple[str, ...],
     ) -> ActionCandidateProjection:
         snapshot = self._snapshots.get(snapshot_id)
@@ -108,23 +116,25 @@ class ActionCandidateProjector:
             contract = self._contracts.get(tool.action_contract_ref.contract_id)
             if contract is None or contract.reference() != tool.action_contract_ref:
                 raise PlannerCandidateError("candidate action contract is not exact and registered")
-            if tuple(sorted(set(seed.satisfied_precondition_refs))) != tuple(
-                sorted(contract.preconditions)
-            ):
+            if tuple(sorted(set(seed.satisfied_precondition_refs))) != tuple(sorted(contract.preconditions)):
                 raise PlannerCandidateError("candidate does not bind every registered precondition")
-            targets = tuple(sorted(seed.canonical_target_binding, key=lambda item: canonical_dumps(
-                item.model_dump(mode="python")
-            )))
+            targets = tuple(
+                sorted(seed.canonical_target_binding, key=lambda item: canonical_dumps(item.model_dump(mode="python")))
+            )
             if len(targets) != len({_target_key((target,)) for target in targets}):
                 raise PlannerCandidateError("candidate target binding contains duplicates")
             fields = {
                 "tool_ref": seed.tool_ref.model_dump(mode="python"),
                 "action_contract_ref": tool.action_contract_ref.model_dump(mode="python"),
+                "display_name": tool.display_name,
+                "description": tool.description,
+                "parameter_schema": tool.parameter_schema,
                 "canonical_target_binding": [item.model_dump(mode="python") for item in targets],
                 "satisfied_precondition_refs": sorted(set(seed.satisfied_precondition_refs)),
                 "objective_dependency_ids": sorted(set(seed.objective_dependency_ids)),
                 "eligible_session_ids": list(view.eligible_session_ids),
                 "requires_session": view.requires_session,
+                "suggested_arguments": seed.suggested_arguments,
             }
             candidate_digest = self._ds.compute("action_candidate_digest", fields)
             satisfied = tuple(sorted(set(seed.satisfied_precondition_refs)))
@@ -133,17 +143,25 @@ class ActionCandidateProjector:
                 candidate_id=f"candidate-{candidate_digest[:24]}",
                 tool_ref=seed.tool_ref,
                 action_contract_ref=tool.action_contract_ref,
+                display_name=tool.display_name,
+                description=tool.description,
+                parameter_schema=tool.parameter_schema,
                 canonical_target_binding=targets,
                 satisfied_precondition_refs=satisfied,
                 objective_dependency_ids=dependencies,
                 eligible_session_ids=view.eligible_session_ids,
                 requires_session=view.requires_session,
+                suggested_arguments=seed.suggested_arguments,
             )
             candidates[candidate.candidate_id] = candidate
         ordered = sorted(
             candidates.values(),
-            key=lambda item: (item.tool_ref.tool_id, item.tool_ref.registry_revision,
-                              _target_key(item.canonical_target_binding), item.candidate_id),
+            key=lambda item: (
+                item.tool_ref.tool_id,
+                item.tool_ref.registry_revision,
+                _target_key(item.canonical_target_binding),
+                item.candidate_id,
+            ),
         )
         limited = len(ordered) > MAX_ACTION_CANDIDATES
         fields = {
@@ -165,7 +183,10 @@ class ActionCandidateProjector:
         )
 
     def verify(
-        self, projection: ActionCandidateProjection, *, snapshot: AvailableToolSnapshot,
+        self,
+        projection: ActionCandidateProjection,
+        *,
+        snapshot: AvailableToolSnapshot,
     ) -> None:
         payload = projection.model_dump(mode="python")
         expected = payload.pop("projection_digest")
@@ -190,8 +211,10 @@ class ActionCandidateProjector:
                 contract is None
                 or contract.reference() != candidate.action_contract_ref
                 or tool.action_contract_ref != candidate.action_contract_ref
-                or tuple(sorted(candidate.satisfied_precondition_refs))
-                != tuple(sorted(contract.preconditions))
+                or candidate.display_name != tool.display_name
+                or candidate.description != tool.description
+                or candidate.parameter_schema != tool.parameter_schema
+                or tuple(sorted(candidate.satisfied_precondition_refs)) != tuple(sorted(contract.preconditions))
                 or candidate.eligible_session_ids != view.eligible_session_ids
                 or candidate.requires_session != view.requires_session
             ):
@@ -199,6 +222,9 @@ class ActionCandidateProjector:
             fields = {
                 "tool_ref": candidate.tool_ref.model_dump(mode="python"),
                 "action_contract_ref": candidate.action_contract_ref.model_dump(mode="python"),
+                "display_name": candidate.display_name,
+                "description": candidate.description,
+                "parameter_schema": candidate.parameter_schema,
                 "canonical_target_binding": [
                     item.model_dump(mode="python") for item in candidate.canonical_target_binding
                 ],
@@ -206,17 +232,22 @@ class ActionCandidateProjector:
                 "objective_dependency_ids": list(candidate.objective_dependency_ids),
                 "eligible_session_ids": list(candidate.eligible_session_ids),
                 "requires_session": candidate.requires_session,
+                "suggested_arguments": candidate.suggested_arguments,
             }
             expected_id = f"candidate-{self._ds.compute('action_candidate_digest', fields)[:24]}"
             if candidate.candidate_id != expected_id:
                 raise PlannerCandidateError("candidate identity digest mismatch")
 
     def match_action(
-        self, *, output: PlannerActionOutput, projection: ActionCandidateProjection,
+        self,
+        *,
+        output: PlannerActionOutput,
+        projection: ActionCandidateProjection,
     ) -> ActionCandidate:
         requested = _target_key(output.proposal.requested_targets)
         matches = [
-            candidate for candidate in projection.candidates
+            candidate
+            for candidate in projection.candidates
             if candidate.tool_ref == output.proposal.tool_ref
             and _target_key(candidate.canonical_target_binding) == requested
             and (
@@ -233,7 +264,11 @@ class PlannerContextService:
     """Build and revalidate prompt snapshots without making them authority."""
 
     def __init__(
-        self, *, database: Database, digest_service: DigestService, clock: Clock,
+        self,
+        *,
+        database: Database,
+        digest_service: DigestService,
+        clock: Clock,
         context_resolver: AuthorizationContextResolver,
         context_authorization_service: ContextAuthorizationService,
         context_builder: ContextBuilder,
@@ -241,7 +276,8 @@ class PlannerContextService:
         tool_availability_service: ToolAvailabilityService,
         snapshot_repository: AvailableToolSnapshotRepository,
         session_repository: SessionSecurityContextSnapshotRepository,
-        goal_service: GoalEvaluationService, candidate_projector: ActionCandidateProjector,
+        goal_service: GoalEvaluationService,
+        candidate_projector: ActionCandidateProjector,
         planner_state_manager: PlannerStateManager,
         retry_budget_service: AgentRetryBudgetService,
         mission_budget_repository: MissionExecutionBudgetRepository,
@@ -263,14 +299,22 @@ class PlannerContextService:
         self._mission_budgets = mission_budget_repository
 
     def build(
-        self, *, planner_context_id: str, mission_id: str, goal_evaluation_id: str,
-        projection: ActionCandidateProjection, context_grant_id: str,
-        available_tool_snapshot_id: str, iteration: int,
+        self,
+        *,
+        planner_context_id: str,
+        mission_id: str,
+        goal_evaluation_id: str,
+        projection: ActionCandidateProjection,
+        context_grant_id: str,
+        available_tool_snapshot_id: str,
+        iteration: int,
         ranked_candidate_metadata: tuple[RankedContextCandidate, ...] = (),
         recent_execution_summaries: tuple[RecentExecutionSummary, ...] = (),
-        feedback: tuple[PlannerFeedback, ...] = (), working_state_id: str | None = None,
+        feedback: tuple[PlannerFeedback, ...] = (),
+        working_state_id: str | None = None,
         operational_phase: OperationalPhase = "INITIAL_ACCESS",
-        truncation_reason_codes: tuple[str, ...] = (), parent_context_id: str | None = None,
+        truncation_reason_codes: tuple[str, ...] = (),
+        parent_context_id: str | None = None,
         stale_rebuild: bool = False,
     ) -> PlannerContextEnvelope:
         now = self._clock.now()
@@ -298,30 +342,24 @@ class PlannerContextService:
             and parent is not None
             and parent.mission_revision != current.mission.mission_revision
         ):
-            raise MissionRevisionConflictError(
-                "planner context lineage cannot cross a mission revision"
-            )
-        selected_metadata = self._context_selector.select(
-            mission_id, _projection_target_values(projection)
-        )
+            raise MissionRevisionConflictError("planner context lineage cannot cross a mission revision")
+        selected_metadata = self._context_selector.select(mission_id, _projection_target_values(projection))
         if ranked_candidate_metadata != selected_metadata:
             raise PlannerContextError("ranked context metadata is not the current deterministic selection")
-        mission_budget = self._mission_budgets.get(
-            mission_id, current.mission.mission_revision
-        )
+        mission_budget = self._mission_budgets.get(mission_id, current.mission.mission_revision)
         if mission_budget is None or iteration != mission_budget.consumed_dispatch_claims:
             raise PlannerContextError("planner iteration does not match the durable mission budget")
         goal = self._goals.verify_current(goal_evaluation_id, mission_id=mission_id)
         grant = self._context_auth.verify_grant(grant_id=context_grant_id, mission_id=mission_id)
-        authorized_context = self._context_builder.build(
-            grant_id=context_grant_id, mission_id=mission_id
-        )
+        authorized_context = self._context_builder.build(grant_id=context_grant_id, mission_id=mission_id)
         snapshot = self._snapshots.get(available_tool_snapshot_id)
         if snapshot is None:
             raise PlannerContextError("available tool snapshot not found")
         revalidate_snapshot(
-            snapshot, current=current.bindings,
-            session_snapshots=self._sessions.all_snapshots(), now=now,
+            snapshot,
+            current=current.bindings,
+            session_snapshots=self._sessions.all_snapshots(),
+            now=now,
         )
         self._projector.verify(projection, snapshot=snapshot)
         if len(ranked_candidate_metadata) > MAX_RANKED_METADATA:
@@ -341,56 +379,70 @@ class PlannerContextService:
         visible = {view.tool_ref for view in snapshot.tools}
         if any(item.visible_tool_ref is not None and item.visible_tool_ref not in visible for item in feedback):
             raise PlannerContextError("feedback reveals a tool outside the visible snapshot")
-        expires_at = min(grant.expires_at, snapshot.expires_at, now + timedelta(
-            seconds=MAX_ENVELOPE_TTL_SECONDS
-        ))
+        expires_at = min(grant.expires_at, snapshot.expires_at, now + timedelta(seconds=MAX_ENVELOPE_TTL_SECONDS))
         if not now < expires_at:
             raise PlannerContextError("planner context has no positive lifetime")
         draft = PlannerContextEnvelope(
-            planner_context_id=planner_context_id, envelope_revision=1,
+            planner_context_id=planner_context_id,
+            envelope_revision=1,
             parent_context_id=parent_context_id,
             context_rebuild_count=context_rebuild_count,
             goal_evaluation_id=goal.evaluation_id,
             goal_evaluation_digest=goal.evaluation_digest,
             action_candidate_projection=projection,
             action_candidate_digest=projection.projection_digest,
-            mission_id=mission_id, mission_revision=current.mission.mission_revision,
-            authorization_epoch=current.mission.authorization_epoch, iteration=iteration,
-            context_grant_id=grant.grant_id, context_grant_digest=grant.grant_digest,
+            mission_id=mission_id,
+            mission_revision=current.mission.mission_revision,
+            authorization_epoch=current.mission.authorization_epoch,
+            iteration=iteration,
+            context_grant_id=grant.grant_id,
+            context_grant_digest=grant.grant_digest,
             available_tool_snapshot_id=snapshot.snapshot_id,
             available_tool_snapshot_digest=snapshot.snapshot_digest,
             authorized_context=authorized_context,
             ranked_candidate_metadata=ranked_candidate_metadata,
             recent_execution_summaries=recent_execution_summaries,
-            feedback=feedback, working_state_id=working_state_id,
+            feedback=feedback,
+            working_state_id=working_state_id,
             operational_phase=operational_phase,
             truncation_reason_codes=tuple(sorted(set(truncation_reason_codes))),
-            created_at=now, expires_at=expires_at, envelope_digest="pending",
+            created_at=now,
+            expires_at=expires_at,
+            envelope_digest="pending",
         )
         fields = draft.model_dump(mode="python")
         fields.pop("envelope_digest")
-        envelope = draft.model_copy(update={
-            "envelope_digest": self._ds.compute("planner_context_envelope_digest", fields)
-        })
+        envelope = draft.model_copy(
+            update={"envelope_digest": self._ds.compute("planner_context_envelope_digest", fields)}
+        )
         try:
             with UnitOfWork(self._db):
                 if parent_context_id is None:
                     self._db.occ_insert(
-                        _CONTEXT_ROOT_NS, f"{mission_id}:{iteration}", 1,
+                        _CONTEXT_ROOT_NS,
+                        f"{mission_id}:{iteration}",
+                        1,
                         json.dumps({"planner_context_id": planner_context_id}, sort_keys=True),
                     )
                 else:
                     if (
                         not stale_rebuild
                         and self._db.occ_get(_CONTEXT_REQUEST_NS, parent_context_id) is None
+                        and self._db.occ_get(_CONTEXT_REPLAN_NS, parent_context_id) is None
                     ):
-                        raise PlannerContextError("context rebuild parent has no accepted request")
+                        raise PlannerContextError(
+                            "context rebuild parent has no accepted request or denied-action replan"
+                        )
                     self._db.occ_insert(
-                        _CONTEXT_CHILD_NS, parent_context_id, 1,
+                        _CONTEXT_CHILD_NS,
+                        parent_context_id,
+                        1,
                         json.dumps({"child_context_id": planner_context_id}, sort_keys=True),
                     )
                 self._db.occ_insert_idempotent(
-                    _ENVELOPE_NS, planner_context_id, 1,
+                    _ENVELOPE_NS,
+                    planner_context_id,
+                    1,
                     json.dumps(envelope.model_dump(mode="json"), sort_keys=True),
                 )
         except RepositoryIntegrityError:
@@ -402,13 +454,9 @@ class PlannerContextService:
         parent = self.get(planner_context_id)
         if parent is None:
             raise PlannerContextError("planner context not found")
-        current_revision = self._resolver.resolve(
-            parent.mission_id, now=self._clock.now()
-        ).mission.mission_revision
+        current_revision = self._resolver.resolve(parent.mission_id, now=self._clock.now()).mission.mission_revision
         if parent.mission_revision != current_revision:
-            raise MissionRevisionConflictError(
-                "planner context rebuild cannot cross a mission revision"
-            )
+            raise MissionRevisionConflictError("planner context rebuild cannot cross a mission revision")
         try:
             self.revalidate(planner_context_id)
         except _REBUILDABLE_CONTEXT_ERRORS:
@@ -426,10 +474,7 @@ class PlannerContextService:
         )
         goal = self._goals.evaluate(mission_id=parent.mission_id)
         snapshot = self._tool_availability.publish(
-            snapshot_id=(
-                f"{parent.planner_context_id}-tools-{next_revision}-"
-                f"attempt-{reserved.consumed_attempts}"
-            ),
+            snapshot_id=(f"{parent.planner_context_id}-tools-{next_revision}-attempt-{reserved.consumed_attempts}"),
             mission_id=parent.mission_id,
         )
         seeds = tuple(
@@ -446,28 +491,22 @@ class PlannerContextService:
             seeds=seeds,
             source_version_digests=(goal.evaluation_digest, goal.knowledge_head_digest),
         )
-        ranked = self._context_selector.select(
-            parent.mission_id, _projection_target_values(projection)
-        )
+        ranked = self._context_selector.select(parent.mission_id, _projection_target_values(projection))
         grant = self._context_auth.issue_grant(
-            grant_id=(
-                f"{parent.planner_context_id}-grant-{next_revision}-"
-                f"attempt-{reserved.consumed_attempts}"
-            ),
+            grant_id=(f"{parent.planner_context_id}-grant-{next_revision}-attempt-{reserved.consumed_attempts}"),
             mission_id=parent.mission_id,
             service_identity="planner_context",
             candidate_resource_ids=tuple(item.candidate.resource_id for item in ranked),
-            session_ids=tuple(sorted({
-                session_id
-                for candidate in projection.candidates
-                for session_id in candidate.eligible_session_ids
-            })),
+            session_ids=tuple(
+                sorted(
+                    {session_id for candidate in projection.candidates for session_id in candidate.eligible_session_ids}
+                )
+            ),
             ttl_seconds=120,
         )
         return self.build(
             planner_context_id=(
-                f"{parent.planner_context_id}-rebuild-{next_revision}-"
-                f"attempt-{reserved.consumed_attempts}"
+                f"{parent.planner_context_id}-rebuild-{next_revision}-attempt-{reserved.consumed_attempts}"
             ),
             mission_id=parent.mission_id,
             goal_evaluation_id=goal.evaluation_id,
@@ -516,9 +555,7 @@ class PlannerContextService:
         if not now < envelope.expires_at:
             raise PlannerContextError("planner context expired")
         current = self._resolver.resolve(envelope.mission_id, now=now)
-        goal = self._goals.verify_current(
-            envelope.goal_evaluation_id, mission_id=envelope.mission_id
-        )
+        goal = self._goals.verify_current(envelope.goal_evaluation_id, mission_id=envelope.mission_id)
         self.revalidate_selection(planner_context_id)
         grant = self.revalidate_authorization(planner_context_id)
         self.revalidate_context_body(planner_context_id)
@@ -547,9 +584,7 @@ class PlannerContextService:
     def revalidate_authorization(self, planner_context_id: str) -> ContextDataAccessGrant:
         """Verify the persisted grant against the current mission binding."""
         envelope = self._require(planner_context_id)
-        grant = self._context_auth.verify_grant(
-            grant_id=envelope.context_grant_id, mission_id=envelope.mission_id
-        )
+        grant = self._context_auth.verify_grant(grant_id=envelope.context_grant_id, mission_id=envelope.mission_id)
         if grant.grant_digest != envelope.context_grant_digest:
             raise PlannerContextError("context grant binding drift")
         return grant
@@ -557,9 +592,7 @@ class PlannerContextService:
     def revalidate_context_body(self, planner_context_id: str) -> CanonicalJsonObject:
         """Rebuild only the bodies named by the verified grant."""
         envelope = self._require(planner_context_id)
-        body = self._context_builder.build(
-            grant_id=envelope.context_grant_id, mission_id=envelope.mission_id
-        )
+        body = self._context_builder.build(grant_id=envelope.context_grant_id, mission_id=envelope.mission_id)
         if canonical_dumps(body) != canonical_dumps(envelope.authorized_context):
             raise PlannerContextError("authorized context body changed")
         return body
@@ -573,8 +606,10 @@ class PlannerContextService:
         if snapshot is None:
             raise PlannerContextError("available tool snapshot not found")
         revalidate_snapshot(
-            snapshot, current=current.bindings,
-            session_snapshots=self._sessions.all_snapshots(), now=now,
+            snapshot,
+            current=current.bindings,
+            session_snapshots=self._sessions.all_snapshots(),
+            now=now,
         )
         self._projector.verify(envelope.action_candidate_projection, snapshot=snapshot)
         return snapshot
@@ -588,13 +623,14 @@ class PlannerContextService:
         return envelope
 
     def accept_action(
-        self, *, planner_context_id: str, output: PlannerActionOutput,
+        self,
+        *,
+        planner_context_id: str,
+        output: PlannerActionOutput,
     ) -> ActionCandidate:
         """Revalidate all sources before accepting one exact Planner proposal."""
         envelope = self.revalidate(planner_context_id)
-        candidate = self._projector.match_action(
-            output=output, projection=envelope.action_candidate_projection
-        )
+        candidate = self._projector.match_action(output=output, projection=envelope.action_candidate_projection)
         if self._db.occ_get(_CONTEXT_ACTION_NS, planner_context_id) is not None:
             raise PlannerContextError("planner action context already consumed") from None
         try:
@@ -607,7 +643,9 @@ class PlannerContextService:
                         use_existing_transaction=True,
                     )
                 self._db.occ_insert(
-                    _CONTEXT_ACTION_NS, planner_context_id, 1,
+                    _CONTEXT_ACTION_NS,
+                    planner_context_id,
+                    1,
                     json.dumps(output.model_dump(mode="json"), sort_keys=True),
                 )
         except RepositoryIntegrityError:
@@ -615,7 +653,10 @@ class PlannerContextService:
         return candidate
 
     def accept_context_request(
-        self, *, planner_context_id: str, output: PlannerContextRequest,
+        self,
+        *,
+        planner_context_id: str,
+        output: PlannerContextRequest,
     ) -> PlannerContextRequest:
         """Authorize only a bounded rebuild; this creates no execution artifact."""
         envelope = self.revalidate(planner_context_id)
@@ -633,18 +674,39 @@ class PlannerContextService:
         )
         if output.working_state_update is not None:
             self._planner_state.apply(
-                mission_id=envelope.mission_id, proposal=output.working_state_update,
+                mission_id=envelope.mission_id,
+                proposal=output.working_state_update,
                 allowed_reference_ids=_allowed_working_state_references(envelope),
             )
         try:
             with UnitOfWork(self._db):
                 self._db.occ_insert(
-                    _CONTEXT_REQUEST_NS, planner_context_id, 1,
+                    _CONTEXT_REQUEST_NS,
+                    planner_context_id,
+                    1,
                     json.dumps(output.model_dump(mode="json"), sort_keys=True),
                 )
         except RepositoryIntegrityError:
             raise PlannerContextError("context request already consumed") from None
         return output
+
+    def authorize_denied_action_replan(self, planner_context_id: str) -> None:
+        """Record the trusted action service's one child-replan authorization.
+
+        The parent must already have consumed an action output.  This marker grants
+        no execution authority; it only permits one child context at the unchanged
+        durable dispatch-budget iteration after Policy returned ``DENY``.
+        """
+        self._require(planner_context_id)
+        if self._db.occ_get(_CONTEXT_ACTION_NS, planner_context_id) is None:
+            raise PlannerContextError("denied-action replan requires a consumed action context")
+        with UnitOfWork(self._db):
+            self._db.occ_insert_idempotent(
+                _CONTEXT_REPLAN_NS,
+                planner_context_id,
+                1,
+                json.dumps({"reason_code": "POLICY_DENIED"}, sort_keys=True),
+            )
 
     def _root_context_id(self, envelope: PlannerContextEnvelope) -> str:
         root_context_id = envelope.planner_context_id
@@ -664,11 +726,7 @@ def _allowed_working_state_references(envelope: PlannerContextEnvelope) -> froze
         envelope.context_grant_id,
         envelope.available_tool_snapshot_id,
         *(item.execution_id for item in envelope.recent_execution_summaries),
-        *(
-            reference
-            for item in envelope.recent_execution_summaries
-            for reference in item.result_reference_ids
-        ),
+        *(reference for item in envelope.recent_execution_summaries for reference in item.result_reference_ids),
     }
 
     def collect(value: object, key: str = "") -> None:

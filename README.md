@@ -73,11 +73,11 @@ Phase 2 は Local LLM（vLLM、`chat_completions` 固定）向けの Profile・C
 評価入口・品質 Gate を追加する。Pydantic AI は固定依存に含まれないため、同契約を満たす明示的な OpenAI 互換
 HTTP Client（`httpx`）を用いる。開発記録は [docs/development/phase-2.md](docs/development/phase-2.md)。
 
-- Schema Capability（§6.2）: `schema-capability-corpus-v1`（`src/redteam_agent/llm/capability_corpus.py`）を
+- Schema Capability（§6.2）: `schema-capability-corpus-v2`（`src/redteam_agent/llm/capability_corpus.py`）を
   Planner/Analyzer の全 Actual Schema Digest に対して実行し、Valid 率 95%以上・Unsafe Boundary Acceptance 0 件・
   Cancellation Failure 0 件を満たすと合格。結果は Profile Digest / Model Hash / Runtime / Tokenizer / Template /
   Output Mode / Schema / Corpus へ Binding し、いずれかの変更で失効する。
-- Agent Quality（§36.E1 / §37.1 D11）: `agent-quality-policy-v1`（`src/redteam_agent/quality/corpus.py`）の
+- Agent Quality（§36.E1 / §37.1 D11）: `agent-quality-policy-v2`（`src/redteam_agent/quality/corpus.py`）の
   10 Family × 10 Fixture × 3 Run = 300 Run を独立 Oracle で採点する。
 
 エンドポイント設定例（`LocalLLMEndpointConfig`。`base_url=None` は未設定＝Gate `NOT_RUN`）:
@@ -86,8 +86,9 @@ HTTP Client（`httpx`）を用いる。開発記録は [docs/development/phase-2
 llm:
   provider: vllm
   wire_api: chat_completions
-  base_url: http://127.0.0.1:8000/v1   # 未設定なら null（Gate は NOT_RUN）
-  model: qwen
+  base_url: http://10.0.6.181:8100/v1
+  model: gemma-4-31B-it
+  api_key_file: /absolute/path/to/vllm-api.key
   temperature: 0.1
 ```
 
@@ -95,11 +96,16 @@ llm:
 
 ```python
 from redteam_agent.composition.phase2 import build_phase2_kernel
-from redteam_agent.llm.attestation import HttpServerMetadataProvider, LocalModelArtifactSource
+from redteam_agent.llm.attestation import HttpServerMetadataProvider, SignedManifestArtifactSource
 from redteam_agent.llm.client import VLLMChatClient
 from redteam_agent.llm.config import LocalLLMEndpointConfig
+from redteam_agent.llm.secrets import FileAPIKeySource
 
-config = LocalLLMEndpointConfig(model="qwen", base_url="http://127.0.0.1:8000/v1")
+config = LocalLLMEndpointConfig(
+    model="gemma-4-31B-it",
+    base_url="http://10.0.6.181:8100/v1",
+    api_key_file="/absolute/path/to/vllm-api.key",
+)
 kernel = build_phase2_kernel(
     endpoint=config,
     qualification_commit_id=commit_id,             # 評価対象の完全な commit ID
@@ -113,12 +119,13 @@ token_counter = ... # 実モデルの Tokenizer（profile.tokenizer_revision に
 # MockTransport を注入した同じ Probe は test_double のままである。LiveCapabilityProbe は
 # 隔離 EvaluationGateway（Attempt 予約 → Token Preflight → 有限 Run Budget/期限 → Network）を経由し、
 # Endpoint/Profile と実 Tokenizer の束縛を必須化する。test_double は永続化されず Mission も認可しない。
-client = VLLMChatClient(base_url=config.base_url)
+key_source = FileAPIKeySource(config.api_key_file)
+client = VLLMChatClient(base_url=config.base_url, api_key_source=key_source)
 policy = kernel.request_budget_policy(profile)
 attestation = kernel.attest_server(
     profile=profile,
-    provider=HttpServerMetadataProvider(),
-    artifact_source=LocalModelArtifactSource(),
+    provider=HttpServerMetadataProvider(api_key_source=key_source),
+    artifact_source=SignedManifestArtifactSource(...),
 )
 probe = kernel.build_live_capability_probe(
     profile=profile, policy=policy, client=client, token_counter=token_counter,
@@ -131,10 +138,10 @@ capability_results = kernel.run_capability_evaluation(profile=profile, probe=pro
 binding = kernel.build_evaluation_binding(
     profile=profile, capability_results=capability_results, attestation=attestation,
 )
-quality_driver = kernel.build_workflow_quality_driver(
+quality_driver = kernel.build_isolated_workflow_quality_driver(
     profile=profile, policy=policy, client=client, token_counter=token_counter,
     evaluation_binding=binding, attestation=attestation,
-    run_workflow=run_isolated_safe_phase1_scenario,
+    capability_results=capability_results, max_parallel_runs=4,
 )
 report = kernel.qualify_real_local_llm(
     profile=profile, driver=quality_driver,
@@ -147,13 +154,13 @@ report = kernel.qualify_real_local_llm(
 # ・全閾値達成のすべてを満たしたときのみ PASS になる。
 ```
 
-Unit / Integration Test は決定論的な Fake OpenAI 互換 Server（`httpx` mock transport）で経路を検証する。実モデル無し
-で Gate `PASS` を主張しない（本ホストは vLLM 未設定のため実 Gate は `NOT_RUN`）。`run_isolated_safe_phase1_scenario`
+Unit / Integration Test は決定論的な Fake OpenAI 互換 Server（`httpx` mock transport）で経路を検証する。Fakeだけで
+Gate `PASS` を主張しない。構成所有の `IsolatedPhase1ScenarioRunner`
 は期待値を含まない `QualityWorkflowInput.environment_spec` から隔離Missionと安全Adapterを構成し、
 `WorkflowRunTrace` を返す構成所有の実行関数である。MockTransport は具体 Probe／Driver
 を使っても `test_double` と判定され、製品 API は文字列ラベルで real へ付け替えられない。
 トークン計測は実モデルの Tokenizer を `count_request` で用いることが前提であり、近似 Counter は Test 専用で本番
-Fallback はない。大規模モデルの Download や vLLM Server の Install は行わない。
+Fallback はない。現在の実モデル資格状態と実行結果はPhase 2開発記録に保存する。
 
 ## 今回の整合方針（設計）
 

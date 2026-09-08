@@ -17,7 +17,7 @@ test-double evidence without fabricating a real pass.
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from typing import Protocol
 
 from redteam_agent.canonical.digest_service import DigestService
@@ -147,30 +147,60 @@ class QualityRunner:
                 return self._finish(
                     verdicts=(), gate_status="BLOCKED", blocking_reasons=binding_blocking
                 )
-        verdicts: list[RunVerdict] = []
-        run_index = 0
-        for fixture in self._corpus.all_fixtures():
-            for attempt in range(RUNS_PER_FIXTURE):
-                failure: str | None = None
+        verdict_slots: list[RunVerdict | None] = [None] * TOTAL_RUNS
+        requests = tuple(
+            (fixture, attempt)
+            for fixture in self._corpus.all_fixtures()
+            for attempt in range(RUNS_PER_FIXTURE)
+        )
+        from redteam_agent.quality.workflow_driver import WorkflowBackedQualityDriver
+
+        completed: Iterable[tuple[int, QualityRunObservation | Exception]]
+        if type(self._driver) is WorkflowBackedQualityDriver:
+            completed = self._driver.drive_many_completed(requests)
+        else:
+            def drive_one(
+                index: int, fixture: QualityFixture, attempt: int
+            ) -> tuple[int, QualityRunObservation | Exception]:
                 try:
-                    observation = self._driver.drive(fixture, attempt)
-                    self._check_observation(fixture, attempt, observation)
-                except LLMEvaluationError:
-                    # A driver-contract violation (wrong fixture/attempt/evidence) is a
-                    # hard error: it is not silently converted to a failed run.
-                    raise
+                    return index, self._driver.drive(fixture, attempt)
                 except Exception as exc:
-                    # A model / validation failure becomes a failed run (never dropped),
-                    # so exactly TOTAL_RUNS results are reported. Only the exception
-                    # class is recorded (content-free), never its message.
-                    failure = type(exc).__name__
-                    observation = _failed_observation(fixture, attempt, self._evidence_kind)
-                verdict = self._oracle.score(fixture, observation, run_failed=failure is not None)
-                verdicts.append(verdict)
-                self._persist_run(fixture, attempt, run_index, observation, failure, verdict)
-                run_index += 1
-        gate, reasons = self._gate(verdicts)
-        return self._finish(verdicts=tuple(verdicts), gate_status=gate, blocking_reasons=reasons)
+                    return index, exc
+
+            completed = (
+                drive_one(index, fixture, attempt)
+                for index, (fixture, attempt) in enumerate(requests)
+            )
+        completed_count = 0
+        for run_index, produced in completed:
+            if not 0 <= run_index < len(requests) or verdict_slots[run_index] is not None:
+                raise LLMEvaluationError("workflow driver returned a duplicate or invalid run position")
+            fixture, attempt = requests[run_index]
+            failure: str | None = None
+            try:
+                if isinstance(produced, Exception):
+                    raise produced
+                observation = produced
+                self._check_observation(fixture, attempt, observation)
+            except LLMEvaluationError:
+                # A driver-contract violation (wrong fixture/attempt/evidence) is a
+                # hard error: it is not silently converted to a failed run.
+                raise
+            except Exception as exc:
+                # A model / validation failure becomes a failed run (never dropped),
+                # so exactly TOTAL_RUNS results are reported. Only the exception
+                # class is recorded (content-free), never its message.
+                failure = type(exc).__name__
+                observation = _failed_observation(fixture, attempt, self._evidence_kind)
+            verdict = self._oracle.score(fixture, observation, run_failed=failure is not None)
+            verdict_slots[run_index] = verdict
+            self._persist_run(fixture, attempt, run_index, observation, failure, verdict)
+            completed_count += 1
+        if completed_count != TOTAL_RUNS or any(verdict is None for verdict in verdict_slots):
+            raise LLMEvaluationError("workflow driver returned an incomplete run batch")
+        verdicts = tuple(verdict for verdict in verdict_slots if verdict is not None)
+        gate, reasons = self._gate(list(verdicts))
+        return self._finish(verdicts=verdicts, gate_status=gate, blocking_reasons=reasons)
 
     # --- durable evidence -------------------------------------------------
 

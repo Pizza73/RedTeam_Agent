@@ -1,4 +1,4 @@
-"""Integration tests for the agent-quality-policy-v1 gate (SystemDesign §36.E1 / D11)."""
+"""Integration tests for the agent-quality-policy-v2 gate (SystemDesign §36.E1 / D11)."""
 
 from __future__ import annotations
 
@@ -249,7 +249,7 @@ def _binding(ds: DigestService, corpus: AgentQualityCorpus, *, corpus_digest: st
         "commit_id": "deadbeef",
         "profile_digest": "pd", "model_hash": "mh", "tokenizer_revision": "tok-1",
         "chat_template_digest": None, "runtime_version": "vllm-test-0.1", "output_mode": "native_json_schema",
-        "schema_capability_corpus_version": "schema-capability-corpus-v1",
+        "schema_capability_corpus_version": "schema-capability-corpus-v2",
         "schema_capability_corpus_digest": "scd",
         "agent_quality_corpus_version": corpus.corpus_version,
         "agent_quality_corpus_digest": corpus_digest,

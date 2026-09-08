@@ -31,13 +31,17 @@ class PlannerActionApplicationService:
     """The sole Phase 1 transition from a Planner action into existing gates."""
 
     def __init__(
-        self, *, planner_context_service: PlannerContextService,
+        self,
+        *,
+        planner_context_service: PlannerContextService,
         goal_service: GoalEvaluationService,
         context_resolver: AuthorizationContextResolver,
         snapshot_repository: AvailableToolSnapshotRepository,
         contract_catalog: ActionContractCatalog,
         authorization_service: ExecutionAuthorizationService,
-        executor: Executor, digest_service: DigestService, clock: Clock,
+        executor: Executor,
+        digest_service: DigestService,
+        clock: Clock,
         prerequisite_search: FinitePrerequisiteSearch,
     ) -> None:
         self._contexts = planner_context_service
@@ -52,9 +56,16 @@ class PlannerActionApplicationService:
         self._prerequisites = prerequisite_search
 
     def execute(
-        self, *, planner_context_id: str, output: PlannerActionOutput,
-        plan_id: str, run_id: str, thread_id: str, decision_id: str,
-        execution_id: str, task_id: str,
+        self,
+        *,
+        planner_context_id: str,
+        output: PlannerActionOutput,
+        plan_id: str,
+        run_id: str,
+        thread_id: str,
+        decision_id: str,
+        execution_id: str,
+        task_id: str,
         predicate_snapshot: PredicateSnapshot | None = None,
     ) -> ActionTransitionResult:
         envelope = self._contexts.revalidate(planner_context_id)
@@ -64,9 +75,7 @@ class PlannerActionApplicationService:
             mission_id=envelope.mission_id,
             mission_revision=envelope.mission_revision,
         )
-        candidate = self._contexts.accept_action(
-            planner_context_id=planner_context_id, output=output
-        )
+        candidate = self._contexts.accept_action(planner_context_id=planner_context_id, output=output)
         envelope = self._contexts.revalidate(planner_context_id)
         current_goal = self._goals.evaluate(mission_id=envelope.mission_id)
         if current_goal.status.status == "achieved":
@@ -80,17 +89,21 @@ class PlannerActionApplicationService:
             if predicate_snapshot is None:
                 raise AgentLoopError("current prerequisite snapshot is required")
             self._prerequisites.verify_executable(
-                candidate=candidate, predicate_snapshot=predicate_snapshot,
+                candidate=candidate,
+                predicate_snapshot=predicate_snapshot,
                 mission_id=envelope.mission_id,
                 mission_revision=runtime.mission.mission_revision,
                 authorization_epoch=runtime.mission.authorization_epoch,
             )
         plan = ExecutionPlan(
-            plan_id=plan_id, mission_id=envelope.mission_id,
+            plan_id=plan_id,
+            mission_id=envelope.mission_id,
             mission_revision=runtime.mission.mission_revision,
             observed_mission_state_version=runtime.mission.mission_state_version,
             observed_authorization_epoch=runtime.mission.authorization_epoch,
-            run_id=run_id, thread_id=thread_id, proposal=output.proposal,
+            run_id=run_id,
+            thread_id=thread_id,
+            proposal=output.proposal,
             proposal_digest=compute_proposal_digest(output.proposal, self._ds),
             goal_evaluation_id=current_goal.evaluation_id,
             goal_evaluation_digest=current_goal.evaluation_digest,
@@ -106,10 +119,14 @@ class PlannerActionApplicationService:
         )
         decision = self._authorization.issue(decision_id=decision_id, plan=plan)
         if decision.decision != "ALLOW":
+            if decision.decision == "DENY":
+                self._contexts.authorize_denied_action_replan(planner_context_id)
             return ActionTransitionResult(plan=plan, decision=decision, dispatch=None)
         self._executor.create_execution(
-            execution_id=execution_id, task_id=task_id,
-            decision_id=decision.decision_id, plan=plan,
+            execution_id=execution_id,
+            task_id=task_id,
+            decision_id=decision.decision_id,
+            plan=plan,
         )
         dispatch = self._executor.dispatch(execution_id=execution_id, plan=plan)
         return ActionTransitionResult(plan=plan, decision=decision, dispatch=dispatch)

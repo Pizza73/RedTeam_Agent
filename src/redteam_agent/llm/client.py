@@ -23,6 +23,7 @@ from typing import Any, Literal
 import httpx
 
 from redteam_agent.errors import LLMTransportError
+from redteam_agent.llm.secrets import APIKeySource, authorization_headers
 
 
 class CancellationToken:
@@ -35,6 +36,12 @@ class CancellationToken:
 
     def cancel(self) -> None:
         self._cancelled = True
+
+    def request_started(self) -> None:
+        """Hook invoked immediately before the blocking HTTP send."""
+
+    def request_finished(self) -> None:
+        """Hook invoked after the HTTP call terminates."""
 
     @property
     def cancelled(self) -> bool:
@@ -56,6 +63,9 @@ class ChatCompletionRequest:
     response_format: dict[str, Any] | None = None
     tools: tuple[dict[str, Any], ...] | None = None
     tool_choice: dict[str, Any] | None = None
+    structured_outputs: dict[str, Any] | None = None
+    guided_decoding_backend: Literal["xgrammar"] | None = None
+    seed: int | None = None
 
 
 @dataclass(frozen=True)
@@ -69,12 +79,20 @@ class ChatCompletionResult:
 class VLLMChatClient:
     """Synchronous OpenAI-compatible chat-completions client for a local vLLM."""
 
-    def __init__(self, *, base_url: str, transport: httpx.BaseTransport | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        api_key_source: APIKeySource | None = None,
+        transport: httpx.BaseTransport | None = None,
+    ) -> None:
         if not (base_url.startswith("http://") or base_url.startswith("https://")):
             raise LLMTransportError("vLLM base_url must be an http(s) URL", reason="config_error")
         self._base_url = base_url.rstrip("/")
+        self._api_key_source = api_key_source
         # retries=0 disables httpx connection-level retries; there is no request retry.
-        self._transport = transport if transport is not None else httpx.HTTPTransport(retries=0)
+        self._transport = transport
+        self._direct_network = transport is None
 
     @property
     def uses_direct_network_transport(self) -> bool:
@@ -84,7 +102,7 @@ class VLLMChatClient:
         by them are test-double evidence.  Keeping this decision inside the client
         prevents a caller from upgrading a mock transport with an evidence label.
         """
-        return type(self._transport) is httpx.HTTPTransport
+        return self._direct_network
 
     @property
     def base_url(self) -> str:
@@ -104,9 +122,27 @@ class VLLMChatClient:
             # cancellation evidence (no request reached the network).
             raise LLMTransportError("request cancelled before send", reason="cancelled_before_send")
         payload = self._payload(request)
+        # A direct request owns its transport for exactly one call.  This avoids
+        # sharing a transport that one short-lived httpx.Client may close while a
+        # concurrent qualification worker is still using it.
+        transport = (
+            httpx.HTTPTransport(retries=0)
+            if self._direct_network
+            else self._transport
+        )
         try:
-            with httpx.Client(transport=self._transport, timeout=httpx.Timeout(timeout_seconds)) as client:
-                response = client.post(f"{self._base_url}/chat/completions", json=payload)
+            with httpx.Client(
+                transport=transport,
+                timeout=httpx.Timeout(timeout_seconds),
+                headers=authorization_headers(self._api_key_source),
+            ) as client:
+                if cancel_token is not None:
+                    cancel_token.request_started()
+                try:
+                    response = client.post(f"{self._base_url}/chat/completions", json=payload)
+                finally:
+                    if cancel_token is not None:
+                        cancel_token.request_finished()
         except httpx.TimeoutException as exc:
             raise LLMTransportError("vLLM request timed out", reason="timeout") from exc
         except httpx.ConnectError as exc:
@@ -138,6 +174,12 @@ class VLLMChatClient:
             payload["tools"] = list(request.tools)
         if request.tool_choice is not None:
             payload["tool_choice"] = request.tool_choice
+        if request.structured_outputs is not None:
+            payload["structured_outputs"] = request.structured_outputs
+        if request.guided_decoding_backend is not None:
+            payload["guided_decoding_backend"] = request.guided_decoding_backend
+        if request.seed is not None:
+            payload["seed"] = request.seed
         return payload
 
     @staticmethod

@@ -11,6 +11,7 @@ digest input, and digests are still re-verified on write/read/use.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from types import MappingProxyType
 from typing import Annotated, Any
 
@@ -34,9 +35,9 @@ def deep_freeze(value: Any) -> Any:
 
 def thaw(value: Any) -> Any:
     """Recursively convert read-only mappings/tuples back to plain dict/list."""
-    if isinstance(value, MappingProxyType):
+    if isinstance(value, (MappingProxyType, Mapping)):
         return {key: thaw(item) for key, item in value.items()}
-    if isinstance(value, tuple):
+    if isinstance(value, (tuple, list)):
         return [thaw(item) for item in value]
     return value
 

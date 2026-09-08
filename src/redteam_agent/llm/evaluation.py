@@ -26,6 +26,7 @@ Two probes are provided:
 from __future__ import annotations
 
 from datetime import timedelta
+from threading import Lock, Timer
 from typing import Literal, Protocol
 
 from redteam_agent.canonical.digest_service import DigestService
@@ -42,7 +43,7 @@ from redteam_agent.llm.attestation import (
     attestation_is_real,
     require_attestation_binding,
 )
-from redteam_agent.llm.budget import LLMRequestBudgetPolicy
+from redteam_agent.llm.budget import LLMRequestBudgetPolicy, build_request_budget_policy
 from redteam_agent.llm.capability import (
     MAX_VALIDATION_RETRIES,
     CapabilityEvaluator,
@@ -62,7 +63,7 @@ from redteam_agent.llm.evaluation_gateway import EvaluationGateway, EvaluationRu
 from redteam_agent.llm.profile import LocalLLMProfile
 from redteam_agent.llm.schemas import validate_actual_schema
 from redteam_agent.llm.structured_output import build_chat_request, extract_raw_output
-from redteam_agent.llm.tokenizer import TokenCounter
+from redteam_agent.llm.tokenizer import HuggingFaceTokenCounter, TokenCounter
 from redteam_agent.runtime.clock import Clock
 
 _EVAL_SYSTEM = (
@@ -102,6 +103,40 @@ class InFlightCancellation(Protocol):
 
     def new_token(self) -> CancellationToken:
         ...
+
+
+class _TimedCancellationToken(CancellationToken):
+    def __init__(self, delay_seconds: float) -> None:
+        super().__init__()
+        self._delay_seconds = delay_seconds
+        self._timer: Timer | None = None
+        self._lock = Lock()
+
+    def request_started(self) -> None:
+        with self._lock:
+            if self._timer is not None:
+                return
+            timer = Timer(self._delay_seconds, self.cancel)
+            timer.daemon = True
+            self._timer = timer
+            timer.start()
+
+    def request_finished(self) -> None:
+        with self._lock:
+            if self._timer is not None:
+                self._timer.cancel()
+
+
+class TimedInFlightCancellation:
+    """Cancel only after the client starts its blocking HTTP request."""
+
+    def __init__(self, *, delay_seconds: float = 0.01) -> None:
+        if delay_seconds <= 0:
+            raise LLMEvaluationError("cancellation delay must be positive")
+        self._delay_seconds = delay_seconds
+
+    def new_token(self) -> CancellationToken:
+        return _TimedCancellationToken(self._delay_seconds)
 
 
 class SyntheticCapabilityProbe:
@@ -179,7 +214,9 @@ class LiveCapabilityProbe:
         """
         return (
             "real_local_llm"
-            if self._client.uses_direct_network_transport and attestation_is_real(self._attestation)
+            if self._client.uses_direct_network_transport
+            and attestation_is_real(self._attestation)
+            and type(self._tokens) is HuggingFaceTokenCounter
             else "test_double"
         )
 
@@ -199,7 +236,9 @@ class LiveCapabilityProbe:
             return self._probe_cancel(case)
         return self._probe_accept(case)
 
-    def _binding_for(self, case: SchemaProbeCase) -> AttemptBinding:
+    def _binding_for(
+        self, case: SchemaProbeCase, *, timeout_seconds: float | None = None
+    ) -> AttemptBinding:
         prompt = case.generation_prompt or (
             f"Produce a minimal valid {case.schema_name} for an authorized capability probe."
         )
@@ -214,8 +253,17 @@ class LiveCapabilityProbe:
             max_tokens=self._policy.reserved_output_tokens,
             temperature=0.1,
         )
+        policy = self._policy
+        if timeout_seconds is not None:
+            policy = build_request_budget_policy(
+                profile=self._profile,
+                policy_revision=f"{self._policy.policy_revision}:timeout-probe",
+                safety_margin_tokens=self._policy.safety_margin_tokens,
+                request_timeout_seconds=timeout_seconds,
+                digest_service=self._ds,
+            )
         return AttemptBinding(
-            profile=self._profile, policy=self._policy, token_counter=self._tokens,
+            profile=self._profile, policy=policy, token_counter=self._tokens,
             request=request, schema_name=case.schema_name, deadline=self._run_budget.deadline,
             clock=self._clock, digest_service=self._ds, binding_checker=None,
         )
@@ -242,7 +290,10 @@ class LiveCapabilityProbe:
         return ProbeOutcome(kind="output", raw=last_raw, retries_used=MAX_VALIDATION_RETRIES + 1)
 
     def _probe_timeout(self, case: SchemaProbeCase) -> ProbeOutcome:
-        binding = self._binding_for(case)
+        # A deliberately tiny, still-positive HTTP timeout proves the direct client
+        # terminates an actual request. It remains gateway-preflighted and uses a
+        # separately digested probe-only policy.
+        binding = self._binding_for(case, timeout_seconds=0.001)
         try:
             self._gateway.execute(binding=binding, client=self._client, run_budget=self._run_budget)
         except LLMTransportError as exc:
@@ -319,6 +370,7 @@ __all__ = [
     "LiveCapabilityProbe",
     "LocalEvaluationHarness",
     "SyntheticCapabilityProbe",
+    "TimedInFlightCancellation",
     "assert_endpoint_matches_profile",
     "build_evaluation_run_budget",
 ]

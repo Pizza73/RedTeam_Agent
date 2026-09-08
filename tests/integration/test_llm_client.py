@@ -6,12 +6,15 @@ double, never a real model.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 import support_phase2 as fake
 from redteam_agent.canonical.digest_service import DigestService
 from redteam_agent.errors import LLMTransportError
 from redteam_agent.llm.client import CancellationToken, ChatCompletionRequest, ChatMessage, VLLMChatClient
+from redteam_agent.llm.secrets import FileAPIKeySource
 from redteam_agent.llm.structured_output import build_chat_request, extract_raw_output
 
 
@@ -107,3 +110,30 @@ def test_message_roles_follow_handling() -> None:
     )
     assert [m.role for m in request.messages] == ["user"]
     assert isinstance(request.messages[0], ChatMessage)
+
+
+def test_api_key_is_sent_as_bearer_header_and_not_in_payload(tmp_path) -> None:
+    ds = DigestService()
+    key_file = tmp_path / "vllm.key"
+    key_file.write_text("test-api-key\n")
+    key_file.chmod(0o600)
+    seen = []
+
+    def handler(request):  # type: ignore[no-untyped-def]
+        seen.append(request)
+        return fake.native_response(fake.VALID_ANALYSIS_OUTPUT)
+
+    import httpx
+
+    client = VLLMChatClient(
+        base_url="http://vllm.local/v1",
+        api_key_source=FileAPIKeySource(key_file),
+        transport=httpx.MockTransport(handler),
+    )
+    client.complete(_request(ds), timeout_seconds=5)
+    assert seen[0].headers["authorization"] == "Bearer test-api-key"
+    assert b"test-api-key" not in seen[0].content
+    structured = json.loads(seen[0].content)["structured_outputs"]
+    assert structured["disable_any_whitespace"] is True
+    assert structured["json"]
+    assert json.loads(seen[0].content)["guided_decoding_backend"] == "xgrammar"

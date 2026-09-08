@@ -7,6 +7,7 @@ the qualification gate then reports ``NOT_RUN`` rather than fabricating a pass.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Literal
 
 from pydantic import Field, model_validator
@@ -21,6 +22,7 @@ class LocalLLMEndpointConfig(StrictImmutableBoundaryModel):
     wire_api: Literal["chat_completions"] = "chat_completions"
     base_url: str | None = None
     model: str = Field(min_length=1)
+    api_key_file: str | None = None
     temperature: float = Field(ge=0.0, le=2.0, default=0.1)
     request_timeout_seconds: int = Field(gt=0, default=60)
 
@@ -31,6 +33,8 @@ class LocalLLMEndpointConfig(StrictImmutableBoundaryModel):
             self.base_url.startswith("http://") or self.base_url.startswith("https://")
         ):
             raise ValueError("base_url must be an http(s) URL")
+        if self.api_key_file is not None and not Path(self.api_key_file).is_absolute():
+            raise ValueError("api_key_file must be an absolute path")
         return self
 
     @property

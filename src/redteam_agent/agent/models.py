@@ -16,9 +16,16 @@ from redteam_agent.policy.scope_models import TargetReference
 
 ControllerAction = Literal["SECURITY_STOP", "STOP", "RECOVER", "FINALIZE", "PLAN", "WAIT", "PAUSE"]
 ControllerReason = Literal[
-    "SECURITY_ERROR", "MISSION_NOT_RUNNING", "HARD_LIMIT", "EXECUTION_IN_PROGRESS",
-    "GOAL_ACHIEVED", "CANDIDATES_READY", "SOURCE_REFRESH_PENDING",
-    "NO_ACTION_IN_SUPPORTED_MODEL", "PLANNING_SEARCH_LIMIT", "BUDGET_EXHAUSTED",
+    "SECURITY_ERROR",
+    "MISSION_NOT_RUNNING",
+    "HARD_LIMIT",
+    "EXECUTION_IN_PROGRESS",
+    "GOAL_ACHIEVED",
+    "CANDIDATES_READY",
+    "SOURCE_REFRESH_PENDING",
+    "NO_ACTION_IN_SUPPORTED_MODEL",
+    "PLANNING_SEARCH_LIMIT",
+    "BUDGET_EXHAUSTED",
 ]
 
 
@@ -52,17 +59,22 @@ class ActionCandidateSeed(StrictImmutableBoundaryModel):
     canonical_target_binding: tuple[TargetReference, ...]
     satisfied_precondition_refs: tuple[str, ...]
     objective_dependency_ids: tuple[str, ...]
+    suggested_arguments: CanonicalJsonObject = Field(default_factory=dict)
 
 
 class ActionCandidate(StrictImmutableBoundaryModel):
     candidate_id: str = Field(min_length=1)
     tool_ref: ToolRef
     action_contract_ref: ActionContractReference
+    display_name: str = Field(min_length=1)
+    description: str = Field(min_length=1)
+    parameter_schema: CanonicalJsonObject
     canonical_target_binding: tuple[TargetReference, ...]
     satisfied_precondition_refs: tuple[str, ...]
     objective_dependency_ids: tuple[str, ...]
     eligible_session_ids: tuple[str, ...]
     requires_session: bool
+    suggested_arguments: CanonicalJsonObject = Field(default_factory=dict)
 
 
 class ActionCandidateProjection(StrictImmutableBoundaryModel):
@@ -90,8 +102,12 @@ class RecentExecutionSummary(StrictImmutableBoundaryModel):
 
 class PlannerFeedback(StrictImmutableBoundaryModel):
     reason_code: Literal[
-        "POLICY_DENIED", "APPROVAL_REQUIRED", "STALE_CONTEXT", "INVALID_PROPOSAL",
-        "EXECUTION_FAILED", "NO_VALID_PROPOSAL",
+        "POLICY_DENIED",
+        "APPROVAL_REQUIRED",
+        "STALE_CONTEXT",
+        "INVALID_PROPOSAL",
+        "EXECUTION_FAILED",
+        "NO_VALID_PROPOSAL",
     ]
     safe_summary: str
     visible_tool_ref: ToolRef | None = None

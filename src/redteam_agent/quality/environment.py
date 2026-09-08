@@ -51,6 +51,7 @@ RecoveryTrigger = Literal[
     "tool_replan",
     "context_request",
 ]
+TerminationTrigger = Literal["normal", "exhaust_budget", "leave_indeterminate"]
 
 # Field names that belong to the independent oracle expectation and must never
 # appear anywhere inside the environment model (defence in depth for the
@@ -254,6 +255,7 @@ class QualityEnvironmentSpec(StrictImmutableBoundaryModel):
     untrusted_payload: UntrustedPayloadInput | None
     analyzer_observations: tuple[AnalyzerObservationInput, ...]
     recovery_trigger: RecoveryTrigger
+    termination_trigger: TerminationTrigger = "normal"
 
     @model_validator(mode="after")
     def _bounded(self) -> QualityEnvironmentSpec:
@@ -314,6 +316,7 @@ __all__ = [
     "SafeTargetKind",
     "SafeToolInput",
     "SubmitOutcome",
+    "TerminationTrigger",
     "UntrustedPayloadInput",
     "assert_no_expectation_leak",
 ]

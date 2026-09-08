@@ -23,3 +23,9 @@ def test_endpoint_available_when_base_url_set() -> None:
 def test_non_http_base_url_rejected() -> None:
     with pytest.raises(ValidationError):
         LocalLLMEndpointConfig(model="qwen", base_url="ftp://nope")
+
+
+def test_api_key_file_must_be_absolute() -> None:
+    with pytest.raises(ValidationError):
+        LocalLLMEndpointConfig(model="qwen", api_key_file="relative/key")
+    assert LocalLLMEndpointConfig(model="qwen", api_key_file="/run/secrets/vllm-api.key")

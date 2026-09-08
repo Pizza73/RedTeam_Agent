@@ -17,3 +17,6 @@ dist/
 .coverage.*
 htmlcov/
 coverage.xml
+
+# Host-local runtime credentials, tokenizer artifacts and qualification evidence
+.runtime/

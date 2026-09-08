@@ -259,7 +259,10 @@ class SchemaCapabilityCorpus(StrictImmutableBoundaryModel):
         The prompt set is part of the capability binding: changing the prompts a model
         was qualified against invalidates the stored result.
         """
+        from redteam_agent.llm.structured_output import STRUCTURED_OUTPUT_REQUEST_REVISION
+
         payload = {
+            "structured_output_request_revision": STRUCTURED_OUTPUT_REQUEST_REVISION,
             "corpus_version": self.corpus_version,
             "schema_name": schema_name,
             "prompts": [

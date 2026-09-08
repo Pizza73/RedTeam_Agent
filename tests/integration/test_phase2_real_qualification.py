@@ -156,6 +156,26 @@ def test_binding_builder_rejects_capability_results_for_other_profile() -> None:
         )
 
 
+def test_binding_builder_rejects_stale_capability_prompt_revision() -> None:
+    kernel, ds, profile = _kernel_with_endpoint()
+    results, _ = _real_bundle(kernel, ds, profile)
+    original = results[0]
+    fields = original.model_dump(mode="python")
+    fields["prompt_set_digest"] = "f" * 64
+    fields.pop("result_digest")
+    stale = original.model_copy(
+        update={
+            "prompt_set_digest": fields["prompt_set_digest"],
+            "result_digest": ds.compute("llm_schema_capability_result_digest", fields),
+        }
+    )
+    with pytest.raises(LLMEvaluationError, match="stale"):
+        kernel.build_evaluation_binding(
+            profile=profile,
+            capability_results=(stale, *results[1:]),
+        )
+
+
 def test_formal_path_blocks_tampered_seed_before_network() -> None:
     kernel, ds, profile = _kernel_with_endpoint()
     results, binding = _real_bundle(kernel, ds, profile)
