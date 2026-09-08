@@ -7,6 +7,7 @@
 - 基点: Phase 2 受入コミット `d89739a`（`docs/development/phase-2.md` / `docs/reviews/phase-2-common-gate-66f55ba.md`、Phase 3移行 `PERMITTED`）
 - 実装ブランチ: `codex/phase-3-human-approval-durable-resume`
 - 実装対象コミット: `897f553badfcf5debcc1eab9d3c7d803cc083090`（初版 実装 + 試験）、`99437ef294a9a40dda5861f1a87f80aa10e3c747`（第1次レビュー対応: LangGraph Checkpoint駆動のDurable Resumeへ改修）、`a8820705619ec8475299e0df5e85476e7a7f5299`（第2次レビュー対応: 全未完了Execution照合・実Checkpoint内容検証・graph内FINALIZING引継ぎ）
+- 最終独立レビュー: `docs/reviews/phase-3-common-gate-a882070.md`、Common Gate `PASS`、Phase 3 `ACCEPTED`
 - 実装範囲: Phase 0A〜2 の型・Test Double境界を保存したまま、Human Approval の完全表示・厳密Binding強制と、停止 / レビュー中Mission の Durable Resume 照合・引継ぎを実装する。新しいWorkflow状態・Graph・永続Record・認可経路・重複Serviceは追加しない。実 C2 / MCP / 外部Target / Credential / Payload / Implant / Detection Evasion 機構は実装しない。Phase 4 / 5 は実装しない。
 
 ## 実装方針
@@ -48,17 +49,17 @@ Phase 3 の Approval / Recovery / Mission Lifecycle の型と大半の強制は 
 
 ```text
 .venv/bin/ruff check .                                  PASS
-PYTHONPATH=src .venv/bin/mypy                            PASS: 196 source files
+PYTHONPATH=src .venv/bin/mypy                            PASS: 194 source files（固定snapshot）
 PYTHONPATH=src .venv/bin/mypy --strict src              PASS: 193 source files
 .venv/bin/python -m compileall -q -f src tests scripts  PASS
 PYTHONPATH=src scripts/verify_pydantic_contract.py      PASS
 PYTHONPATH=src scripts/verify_wire_and_immutable.py     PASS
-PYTHONPATH=src .venv/bin/python -m pytest tests         PASS: 809 passed / 7 skipped
+PATH=<isolated-swtpm>/usr/bin:$PATH ... pytest -o addopts= -q -ra  PASS: 816 passed / 0 skipped
   （新規 Phase 3: tests/integration/test_phase3_durable_resume.py 20 + tests/security/test_phase3_approval.py 10 = 30 passed）
-PYTHONPATH=src .venv/bin/coverage run --branch -m pytest / coverage report   PASS: 17,013 statements / 4,458 branches / 86%
+同一swtpm環境で coverage run --branch / coverage report  PASS: 17,013 statements / 4,458 branches / 86.516696940059%
 ```
 
-- `7 skipped` は `tests/integration/test_swtpm_witness.py` の swtpm / tpm2-tools 未導入による環境Skipで、Phase 3 実装とは無関係。既存Testの削除・skip・xfail化は行っていない（追加のみ）。
+- 隔離済み`swtpm` / `tpm2-tools`を用いてWitness 7件も実行し、skip 0を確認した。既存Testの削除・skip・xfail化は行っていない（追加のみ）。
 - 実 C2 / MCP / 外部Target への Side Effect は 0 件。Durable Resume / Approval Test はすべて決定論的 Test Double（`MockExecutionAdapter`）で完結し、Secret 平文の露出はない。
 
 ## 独立レビュー
@@ -77,13 +78,11 @@ PYTHONPATH=src .venv/bin/coverage run --branch -m pytest / coverage report   PAS
   - graph state に `mission_revision` / `run_id` を追加し通常Planningが書込む。`durable_resume` は `SqliteSaver` の実Checkpoint `channel_values` を現在Repository・Canonical threadへ照合し、foreign mission / wrong revision / wrong run / corrupt を DB変更・Adapter Read前に `MissionRevisionConflictError` でFail Closed。
   - WAITING_HUMAN_REVIEW -> FINALIZING 引継ぎを graph finalization node（Mission Manager + 元の durable intent）内へ移し、LangGraph を単一Workflow所有者として維持。認証済みOperator Triggerは維持。
   - 決定論的Regression（複数Execution各1回照合・binding一致、実Checkpoint内容拒否、zero Planner / zero Analyzer）を追加。file-backed restart Testは引き続きPASS。
-- 上記対応後に Common Gate の技術条件（Unit / Integration / Security / Recovery Test・ruff・mypy・compileall・branch coverage）を再実行しPASS。独立 Codex による再レビュー（Read-only Snapshot・実コード・試験Evidence）は本実装会話と分離した別Sessionで実施する Common Gate の必須条件であり、本記録時点では再レビュー未完了（PENDING）。本記録は技術Gate成立だけを主張し、Common Gate PASS / Phase 3 受入完了は独立再レビュー完了まで主張しない。
+- 上記対応後、Codexが最終実装`a882070`を再レビューし、swtpm 7件を含む全816件、branch coverage、ruff、configured / direct strict mypy、compileall、boundary検証、SHA256SUMS、依存整合性を独立に再実行した。指摘残数はBLOCKER / HIGH / MEDIUM / LOWすべて0、Common Gate `PASS`、Phase 3 `ACCEPTED`。詳細は`docs/reviews/phase-3-common-gate-a882070.md`。
 
 ## 受入根拠・残課題
 
-- Phase 3 の全受入条件（承認境界・Epoch単調増加・非再利用・LangGraph Checkpoint->App DB->Adapter照合・不明Outcome非再送・停止 / レビュー状態保存・並行変化の写像・§21.1.3 引継ぎ）を実コードと決定論Testで確認済み。
+- Phase 3 の全受入条件（承認境界・Epoch単調増加・非再利用・LangGraph Checkpoint->App DB->Adapter照合・不明Outcome非再送・停止 / レビュー状態保存・並行変化の写像・§21.1.3 引継ぎ）を実コードと決定論Testで確認済み。Common Gate `PASS`によりPhase 3は受入済み。
 - 残課題 / 未検証:
-  - 独立 Codex レビューが未実施（上記）。
   - D4 実機消去は引き続き `NOT_EVALUATED`。Production採用は別条件。
   - Phase 4（承認済み C2 Adapter）/ Phase 5（承認済み MCP Adapter）は本Phase対象外で未実装。実Adapter / Provider Human Gate は保持する。
-  - `swtpm` / tpm2-tools 未導入環境では Witness 統合 Test が Skip される（本Phaseの範囲外）。

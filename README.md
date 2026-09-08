@@ -74,6 +74,9 @@ Phase 0Aの製品コードと Unit/Integration/Security/Property-State-machine �
 Phase 3 は Human Approval の完全表示・厳密Bindingと、停止 / レビュー中Missionの Durable Resume を追加する。
 新しいWorkflow状態・Graph・永続Record・認可経路・重複Serviceは追加せず、実C2 / MCP / 外部Target / Credential /
 Payload / Implant 操作も持たない。開発記録は [docs/development/phase-3.md](docs/development/phase-3.md)。
+最終実装`a8820705619ec8475299e0df5e85476e7a7f5299`は独立Common Gateで816件（swtpm 7件を含みskip 0）、
+branch coverage 86.516696940059%、ruff / mypy / boundary検証に合格し、Phase 3は`ACCEPTED`。
+詳細は [Phase 3独立レビュー](docs/reviews/phase-3-common-gate-a882070.md)。Phase 4はProvider Human Gate完了まで未着手とする。
 
 - `REQUIRE_APPROVAL` は一致する有効な `APPROVED` Record がなければ Dispatch できず、`DENY` は Record があっても
   実行不可、Plan / Intent 変更・期限切れ・Replay・誤Digest・誤Epoch / Revision・誤Bindingはすべて Fail Closed する
