@@ -81,12 +81,15 @@ Payload / Implant 操作も持たない。開発記録は [docs/development/phas
 - `PAUSE` / `Resume` は `authorization_epoch` を単調増加させ `mission_revision` は不変とし、Pause前の Grant /
   Snapshot / Decision / Approval を再利用しない（`MissionManager`、`tests/integration/test_phase3_durable_resume.py`）。
 - Durable Resume は Compiled Planning Graph と LangGraph Checkpoint が Workflow Resume を所有する。認証済み
-  Operator が Canonical `thread_id` で Resume を Trigger すると実 Checkpoint を復元し、既存 RECONCILING node が
-  LangGraph Checkpoint → Application DB → Adapter の順（DBがExecution Stateの正）で Current Recovery Authority
-  だけを用いて照合する。新規 Dispatch / LLM 呼出しは 0 件、不明な非冪等 Outcome は `OUTCOME_UNKNOWN` のまま
-  自動再送しない。Mission を RUNNING へ戻さず現在 Mission に対応する Graph 状態へ写像し（並行の正当な変化も拒否せず写像）、
-  WAITING_HUMAN_REVIEW は全Item解決時にだけ Mission Manager が §21.1.3 の既存 FINALIZING へ進める
-  （`Phase1AgentWorkflow.durable_resume` / `FinalizationService.advance_from_human_review`）。
+  Operator が Canonical `thread_id` で Resume を Trigger すると実 Checkpoint を復元し、その `channel_values` の
+  mission_id / mission_revision / run_id を現在 Repository・Canonical thread へ検証（誤 mission / revision / run /
+  corrupt は DB 変更・Adapter Read 前に Fail Closed）してから、既存 RECONCILING node が **全未完了 Execution** を
+  決定論順で Task Binding 別に各1回、LangGraph Checkpoint → Application DB → Adapter の順（DB が Execution State の正）で
+  Current Recovery Authority だけを用いて照合する。新規 Dispatch / Planner / Analyzer 呼出しは 0 件、不明な非冪等
+  Outcome は `OUTCOME_UNKNOWN` のまま自動再送しない。Mission を RUNNING へ戻さず現在 Mission に対応する Graph 状態へ
+  写像し（並行の正当な変化も拒否せず写像）、WAITING_HUMAN_REVIEW は全Item解決時にだけ graph finalization node 内で
+  Mission Manager が §21.1.3 の既存 FINALIZING へ進める（`Phase1AgentWorkflow.durable_resume` /
+  `FinalizationService.advance_from_human_review`）。
 
 ## Phase 2 Local LLM（Capability / 300-Run Qualification）
 

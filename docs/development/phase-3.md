@@ -6,7 +6,7 @@
 - 設計改訂: `system-design-v1-r3` / `ai-control-v1-r3`
 - 基点: Phase 2 受入コミット `d89739a`（`docs/development/phase-2.md` / `docs/reviews/phase-2-common-gate-66f55ba.md`、Phase 3移行 `PERMITTED`）
 - 実装ブランチ: `codex/phase-3-human-approval-durable-resume`
-- 実装対象コミット: `897f553badfcf5debcc1eab9d3c7d803cc083090`（初版 実装 + 試験）、`99437ef294a9a40dda5861f1a87f80aa10e3c747`（独立レビュー指摘対応: LangGraph Checkpoint駆動のDurable Resumeへ改修）
+- 実装対象コミット: `897f553badfcf5debcc1eab9d3c7d803cc083090`（初版 実装 + 試験）、`99437ef294a9a40dda5861f1a87f80aa10e3c747`（第1次レビュー対応: LangGraph Checkpoint駆動のDurable Resumeへ改修）、`a8820705619ec8475299e0df5e85476e7a7f5299`（第2次レビュー対応: 全未完了Execution照合・実Checkpoint内容検証・graph内FINALIZING引継ぎ）
 - 実装範囲: Phase 0A〜2 の型・Test Double境界を保存したまま、Human Approval の完全表示・厳密Binding強制と、停止 / レビュー中Mission の Durable Resume 照合・引継ぎを実装する。新しいWorkflow状態・Graph・永続Record・認可経路・重複Serviceは追加しない。実 C2 / MCP / 外部Target / Credential / Payload / Implant / Detection Evasion 機構は実装しない。Phase 4 / 5 は実装しない。
 
 ## 実装方針
@@ -31,13 +31,13 @@ Phase 3 の Approval / Recovery / Mission Lifecycle の型と大半の強制は 
 | 未承認ActionはAdapterへ到達しない | `test_unapproved_action_never_reaches_the_adapter`、`test_revoked_approval_blocks_dispatch_before_the_adapter`（`mock_adapter.submit_calls == 0`） |
 | PAUSED / Resume で `authorization_epoch` 増加・`mission_revision` 不変 | `mission/manager.py`、`mission/models.py`（`EPOCH_ROTATING_EDGES`）。`tests/integration/test_phase3_durable_resume.py::test_pre_pause_decision_and_approval_are_not_reused_after_resume` |
 | PAUSED前の Grant / Snapshot / Decision / Approval を再利用しない | Gate の Epoch / Revision 照合。同上（resume後の stale decision は `AUTHORIZATION_EPOCH_STALE` / `PLAN_EPOCH_STALE`） |
-| Resume時に LangGraph Checkpoint -> Application DB -> Adapter の順に照合 | `durable_resume` がGraphを再Invoke→`_graph_reconciliation`（DBから未完了Execution列挙）→`execution/reconcile.py`（Adapter）。`test_durable_resume_reads_checkpoint_then_appdb_then_adapter`（`langgraph_checkpoint`→`appdb:RECONCILING`→`adapter`）、`test_durable_resume_restores_a_persisted_checkpoint_in_a_new_kernel`（file-backed SQLite + 新Kernelで実Checkpoint復元） |
-| 既存 RECONCILING を PAUSED / WAITING_HUMAN_REVIEW に対応、Current Recovery Authority のみ、RUNNINGへ変更せず新規 Dispatch / LLM 0件 | `AgentController.step`（PAUSED/WAITING_HUMAN_REVIEW→RECOVER）+ 既存 `reconciliation` node + `_reconcile`（Recovery Authority発行）。Planner callbackは呼ばれれば例外。`test_durable_resume_reconciles_paused_via_langgraph_checkpoint`（`submit_calls == 1`固定、mission PAUSED維持） |
+| Resume時に LangGraph Checkpoint -> Application DB -> Adapter の順に照合し、実Checkpoint内容（mission_id / mission_revision / run_id）を現在Repository・Canonical threadへ検証 | `durable_resume` が `self._checkpointer.get` の実Checkpoint `channel_values` を検証（§17.2、不一致で `MissionRevisionConflictError`）→Graph再Invoke→`_graph_reconciliation`（DBから未完了Execution列挙）→`execution/reconcile.py`（Adapter）。graph state に `mission_revision` / `run_id` を追加し通常Planningが書込む。`test_durable_resume_reads_checkpoint_then_appdb_then_adapter`、`test_durable_resume_rejects_a_checkpoint_bound_to_another_mission`（foreign mission / wrong revision / wrong run、DB変更・Adapter Read前にFail Closed）、`test_durable_resume_restores_a_persisted_checkpoint_in_a_new_kernel`（file-backed SQLite + 新Kernelで実Checkpoint復元） |
+| 既存 RECONCILING を PAUSED / WAITING_HUMAN_REVIEW に対応、全未完了Executionを決定論順でTask Binding別に各1回照合、Current Recovery Authority のみ、RUNNINGへ変更せず新規 Dispatch / Planner / Analyzer 0件 | `AgentController.step`（PAUSED/WAITING_HUMAN_REVIEW→RECOVER）+ 既存 `reconciliation` node（DBから全未完了Execution列挙・各1回`_reconcile`）。`test_durable_resume_reconciles_paused_via_langgraph_checkpoint`、`test_durable_resume_reconciles_every_incomplete_execution_exactly_once`（2 Execution各1回・binding一致・`submit_calls`不変）、`test_durable_resume_makes_zero_planner_and_analyzer_calls`（LLM Gateway spyでPlanner/Analyzer 0件） |
 | 不明な非冪等Actionを自動再実行しない | `ReconciliationService` の不明 -> `OUTCOME_UNKNOWN`。`test_durable_resume_reconciles_paused_mission_without_dispatch_or_llm` |
 | 照合後は Current Mission に対応する Graph状態へ戻し開始Snapshotで上書きしない。並行の正当な変化は拒否せず写像 | `durable_resume` は照合後に Repository から再読込し `_GRAPH_STATE_BY_MISSION_STATE`（§17.3）で写像。状態変化を拒否せず、自身はRUNNING遷移を行わない。`test_durable_resume_maps_a_concurrent_resume_without_rejecting_it`（並行Operator Resumeの決定論的Interleaving） |
 | Workflow Resume は LangGraph Checkpoint が所有・Canonical thread_id / Mission・Revision Binding検証・誤Thread Replay拒否 | `durable_resume` が `self._checkpointer.get` で実Checkpoint必須化、`verify_run_thread_binding`、Revision不一致で `MissionRevisionConflictError`。`test_durable_resume_requires_an_actual_langgraph_checkpoint` / `test_durable_resume_rejects_a_malformed_or_foreign_thread` |
 | 明示Operator Resume Triggerの認証・認可 | `MissionManager.authorize_operator`（Operator Role必須）。`test_durable_resume_requires_an_authenticated_operator` |
-| WAITING_HUMAN_REVIEW 全Item解決時にだけ既存 FINALIZING へ進め、通常Resumeへ暗黙遷移しない | `FinalizationService.advance_from_human_review`。`test_durable_resume_advances_to_finalizing_once_all_items_resolved` / `test_durable_resume_holds_waiting_review_while_items_are_open` / `test_durable_resume_handoff_preserves_the_original_terminal_reason` / `test_advance_from_human_review_fails_closed_while_items_unresolved` |
+| WAITING_HUMAN_REVIEW 全Item解決時にだけ既存 FINALIZING へ進め、通常Resumeへ暗黙遷移しない。引継ぎは graph finalization node が所有（LangGraph単一所有） | `_graph_finalization`（WAITING_HUMAN_REVIEW + 未Active + 全RESOLVEDで `advance_from_human_review` + 既存FINALIZING drive、元の終了理由保持）/ `FinalizationService.advance_from_human_review`。`test_durable_resume_advances_to_finalizing_once_all_items_resolved`（graph内でABORTED終端まで）/ `test_durable_resume_holds_waiting_review_while_items_are_open` / `test_advance_from_human_review_fails_closed_while_items_unresolved` |
 | Recovery期限後は Provider Read を行わない（§21.3） | `durable_resume` の `recovery_until` 判定。`test_durable_resume_after_recovery_window_makes_no_provider_read`（`reconcile_calls` 不変） |
 | Crash境界（RECONCILING commit後 / Adapter前）を再送なしで回復 | `test_durable_resume_recovers_from_a_crash_between_reconciling_and_adapter`（RECONCILING durable → 再開で `SUCCEEDED`、`submit_calls == 1`） |
 | WAITING_HUMAN_REVIEW -> FINALIZING の OCC | `MissionManager._transition`（`expected_version` / `expected_epoch`）。`test_review_exit_edge_is_occ_guarded` |
@@ -53,9 +53,9 @@ PYTHONPATH=src .venv/bin/mypy --strict src              PASS: 193 source files
 .venv/bin/python -m compileall -q -f src tests scripts  PASS
 PYTHONPATH=src scripts/verify_pydantic_contract.py      PASS
 PYTHONPATH=src scripts/verify_wire_and_immutable.py     PASS
-PYTHONPATH=src .venv/bin/python -m pytest tests         PASS: 804 passed / 7 skipped
-  （新規 Phase 3: tests/integration/test_phase3_durable_resume.py 15 + tests/security/test_phase3_approval.py 10 = 25 passed）
-PYTHONPATH=src .venv/bin/coverage run --branch -m pytest / coverage report   PASS: 17,004 statements / 4,454 branches / 86%
+PYTHONPATH=src .venv/bin/python -m pytest tests         PASS: 809 passed / 7 skipped
+  （新規 Phase 3: tests/integration/test_phase3_durable_resume.py 20 + tests/security/test_phase3_approval.py 10 = 30 passed）
+PYTHONPATH=src .venv/bin/coverage run --branch -m pytest / coverage report   PASS: 17,013 statements / 4,458 branches / 86%
 ```
 
 - `7 skipped` は `tests/integration/test_swtpm_witness.py` の swtpm / tpm2-tools 未導入による環境Skipで、Phase 3 実装とは無関係。既存Testの削除・skip・xfail化は行っていない（追加のみ）。
@@ -69,6 +69,14 @@ PYTHONPATH=src .venv/bin/coverage run --branch -m pytest / coverage report   PAS
 - 対応コミット `99437ef294a9a40dda5861f1a87f80aa10e3c747`:
   - Compiled Planning Graph + LangGraph SqliteSaver を Workflow Resume の所有者とし、Canonical `thread_id` で再Invoke・実Checkpoint必須化・Mission/Revision/Thread検証・誤Thread Replay拒否を実装。既存 `reconciliation` node が DB→Adapter順で照合。認証済みOperator権限を必須化。file-backed SQLite + 新Kernelでの復元Testを追加。
   - 照合後は現在Repository状態を写像し、変化を拒否しない。durable_resume自身はRUNNING遷移を行わない。並行Resumeの決定論的Interleaving Testを追加。
+- 独立 Codex 第2次レビューが `99437ef` に対して HIGH 2件を報告した。
+  - HIGH 1: `_graph_reconciliation` が全未完了ExecutionをDB列挙しながら `active[0]` だけを照合しており、複数未完了時に1件のみ照合して完了報告し得た（§17.1）。
+  - HIGH 2: Canonical thread_id を caller run_id + 現在Missionから計算し、その計算値を `verify_run_thread_binding` で検証していたためTautologicalで、実際に永続化されたCheckpoint内容（channel_values の mission_id / revision / run）を検証していなかった（§17.2）。
+- 対応コミット `a8820705619ec8475299e0df5e85476e7a7f5299`:
+  - `_graph_reconciliation` を全未完了Execution（execution_id昇順・決定論）を各1回Task Binding別に照合するよう改修。AUTHORIZED破棄 / PLANNED Fail-closed / OUTCOME_UNKNOWN読取照合 / Retry予算枯渇 / RUNNING時のみのHuman Review Escalationを保持。
+  - graph state に `mission_revision` / `run_id` を追加し通常Planningが書込む。`durable_resume` は `SqliteSaver` の実Checkpoint `channel_values` を現在Repository・Canonical threadへ照合し、foreign mission / wrong revision / wrong run / corrupt を DB変更・Adapter Read前に `MissionRevisionConflictError` でFail Closed。
+  - WAITING_HUMAN_REVIEW -> FINALIZING 引継ぎを graph finalization node（Mission Manager + 元の durable intent）内へ移し、LangGraph を単一Workflow所有者として維持。認証済みOperator Triggerは維持。
+  - 決定論的Regression（複数Execution各1回照合・binding一致、実Checkpoint内容拒否、zero Planner / zero Analyzer）を追加。file-backed restart Testは引き続きPASS。
 - 上記対応後に Common Gate の技術条件（Unit / Integration / Security / Recovery Test・ruff・mypy・compileall・branch coverage）を再実行しPASS。独立 Codex による再レビュー（Read-only Snapshot・実コード・試験Evidence）は本実装会話と分離した別Sessionで実施する Common Gate の必須条件であり、本記録時点では再レビュー未完了（PENDING）。本記録は技術Gate成立だけを主張し、Common Gate PASS / Phase 3 受入完了は独立再レビュー完了まで主張しない。
 
 ## 受入根拠・残課題
