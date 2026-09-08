@@ -1,7 +1,7 @@
-# RedTeam Agent — 設計資料 と Phase 0A 実装
+# RedTeam Agent — 設計資料と段階実装
 
-許可された隔離演習向け支援AIエージェントの設計資料と、その認可・データ保護基盤（Phase 0A）の実装を保持するリポジトリ。
-Phase 0Aは**実外部Dispatchゼロ**の認可カーネルであり、実C2/MCP/Target接続・Payload生成・汎用Shell実行は含まない。
+許可された隔離演習向け支援AIエージェントの設計資料と、Phase 0A〜2の段階実装を保持するリポジトリ。
+Phase 2までの実ネットワークは閉域Local LLM資格に限定し、実C2/MCP/Target接続・Payload生成・汎用Shell実行は含まない。
 
 ## 担当方針
 
@@ -22,7 +22,8 @@ Phase 0Aは**実外部Dispatchゼロ**の認可カーネルであり、実C2/MCP
 | [docs/acceptance-criteria.md](docs/acceptance-criteria.md) | Phase別の製品受入条件と開発記録の条件 |
 | [docs/safety-invariants.md](docs/safety-invariants.md) | 製品の安全不変条件と開発時の遵守事項 |
 | [docs/threat-model.md](docs/threat-model.md) | 製品と現行開発体制の脅威・対策・限界 |
-| [docs/development/phase-0a.md](docs/development/phase-0a.md) | Phase 0A の開発記録（対象・要件・試験・残課題・独立レビュー未実施） |
+| [docs/development/phase-0a.md](docs/development/phase-0a.md) | Phase 0A の開発記録（対象・要件・試験・残課題・独立レビュー） |
+| [docs/development/phase-2.md](docs/development/phase-2.md) | Phase 2 Local LLM の開発・実モデル資格・独立レビュー記録 |
 
 設計改訂は`system-design-v1-r3` / `ai-control-v1-r3`。
 AIの意味・判断は別冊を先に読み、安全基盤と接続Schemaは正本で確認する。
@@ -64,8 +65,8 @@ python3 -m venv .venv
 
 ### 状態
 
-Phase 0Aの製品コードと Unit/Integration/Security/Property-State-machine 試験を実装済み。ruff/mypy/compileall/branch coverageを実行済み。
-**独立レビューは未実施であり、実装コミットの固定と正式なPhase受入は未完了。** 詳細と残課題は [docs/development/phase-0a.md](docs/development/phase-0a.md) を参照。
+Phase 0Aの製品コードと Unit/Integration/Security/Property-State-machine 試験を実装済み。ruff/mypy/compileall/branch coverageと独立レビューを完了済み。
+受入結果と残課題は [docs/development/phase-0a.md](docs/development/phase-0a.md) を参照。
 
 ## Phase 2 Local LLM（Capability / 300-Run Qualification）
 
@@ -73,8 +74,10 @@ Phase 2 は Local LLM（vLLM、`chat_completions` 固定）向けの Profile・C
 評価入口・品質 Gate を追加する。Pydantic AI は固定依存に含まれないため、同契約を満たす明示的な OpenAI 互換
 HTTP Client（`httpx`）を用いる。開発記録は [docs/development/phase-2.md](docs/development/phase-2.md)。
 
-Phase 2の実装・自動試験・実`gemma-4-31B-it` Capability Check・固定300-Run Qualificationは完了し、
-技術Gateは`PASS`。Phase 3着手前の独立レビューは別の遷移判定として扱う。
+Phase 2の最終実装`66f55bad667261a5cd8ec5e54bb375d7ea0a2644`に対する自動試験、実`gemma-4-31B-it`
+Capability Check、固定300-Run Qualification、独立Common Gateレビューは完了し、Phase 3移行判定は`PERMITTED`。
+詳細は [Phase 2開発記録](docs/development/phase-2.md) と
+[Phase 2独立レビュー](docs/reviews/phase-2-common-gate-66f55ba.md) を参照する。D4実機消去は`NOT_EVALUATED`であり、Production採用は別条件のままである。
 
 - Schema Capability（§6.2）: `schema-capability-corpus-v2`（`src/redteam_agent/llm/capability_corpus.py`）を
   Planner/Analyzer の全 Actual Schema Digest に対して実行し、Valid 率 95%以上・Unsafe Boundary Acceptance 0 件・
@@ -162,8 +165,9 @@ Gate `PASS` を主張しない。構成所有の `IsolatedPhase1ScenarioRunner`
 は期待値を含まない `QualityWorkflowInput.environment_spec` から隔離Missionと安全Adapterを構成し、
 `WorkflowRunTrace` を返す構成所有の実行関数である。MockTransport は具体 Probe／Driver
 を使っても `test_double` と判定され、製品 API は文字列ラベルで real へ付け替えられない。
-トークン計測は実モデルの Tokenizer を `count_request` で用いることが前提であり、近似 Counter は Test 専用で本番
-Fallback はない。現在の実モデル資格状態と実行結果はPhase 2開発記録に保存する。
+送信前Budgetのトークン計測は実モデルの Tokenizer を `count_request` で用い、近似 Counter は Test 専用で本番
+Fallback はない。品質Evidenceの実消費量はvLLM応答の`usage.prompt_tokens` / `usage.completion_tokens`を全完了Attemptで保存し、
+欠落・不正値・LLM Callがあるのに全量0の場合は実GateをFail Closedする。現在の実モデル資格状態と実行結果はPhase 2開発記録に保存する。
 
 ## 今回の整合方針（設計）
 
