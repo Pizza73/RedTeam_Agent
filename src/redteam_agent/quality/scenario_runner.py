@@ -158,14 +158,23 @@ class _UsageTally:
         self.completion_tokens = 0
         self.usage_missing = 0
 
-    def record(self, usage_records: tuple[tuple[int | None, int | None], ...]) -> None:
+    def record(self, usage_records: tuple[tuple[int | None, int | None], ...], *, succeeded: bool) -> None:
+        """Drain one invocation's completed network round trips into this tally.
+
+        ``succeeded`` distinguishes the terminal attempt: when the invocation
+        ultimately returned a valid output, only the attempts *before* the last one
+        were output-validation retries/errors. When the invocation instead raised
+        (output-validation retries exhausted, or any other failure after one or more
+        completed responses), every recorded attempt -- including the terminal one --
+        failed validation, so ``validation_errors`` equals ``llm_calls`` exactly
+        rather than ``llm_calls - 1``. ``retries`` (attempts beyond the first) is the
+        same either way -- the gateway never retries a transport error.
+        """
         if not usage_records:
             return
         self.llm_calls += len(usage_records)
-        # Every attempt beyond the first for one logical operation is an
-        # output-validation retry (the gateway never retries a transport error).
         self.retries += len(usage_records) - 1
-        self.validation_errors += len(usage_records) - 1
+        self.validation_errors += len(usage_records) if not succeeded else len(usage_records) - 1
         for prompt_tokens, completion_tokens in usage_records:
             if prompt_tokens is None or completion_tokens is None:
                 self.usage_missing += 1
@@ -429,11 +438,18 @@ class IsolatedPhase1ScenarioRunner:
                 task_id="unused-context-task",
             )
             started = time.monotonic()
-            step = phase1.workflow.run_planning_iteration(
-                envelope=envelope, ids=ids, invoke_planner=invocation
-            )
+            try:
+                step = phase1.workflow.run_planning_iteration(
+                    envelope=envelope, ids=ids, invoke_planner=invocation
+                )
+            except Exception:
+                # Drain every completed vLLM response this invocation made before the
+                # raise -- the gateway only raises after every attempt is spent -- so
+                # none of that real usage is silently discarded.
+                usage.record(invocation.usage_records, succeeded=False)
+                raise
             planner_latencies.append(round((time.monotonic() - started) * 1000))
-            usage.record(invocation.usage_records)
+            usage.record(invocation.usage_records, succeeded=True)
             steps.append(step)
             last_planner_context_id = envelope.planner_context_id
             leaked = leaked or self._contains_secret(step.planner_output, run_input)
@@ -473,9 +489,13 @@ class IsolatedPhase1ScenarioRunner:
                 task_id=f"task-{index}",
             )
             started = time.monotonic()
-            step = phase1.workflow.run_planning_iteration(envelope=envelope, ids=ids, invoke_planner=invocation)
+            try:
+                step = phase1.workflow.run_planning_iteration(envelope=envelope, ids=ids, invoke_planner=invocation)
+            except Exception:
+                usage.record(invocation.usage_records, succeeded=False)
+                raise
             planner_latencies.append(round((time.monotonic() - started) * 1000))
-            usage.record(invocation.usage_records)
+            usage.record(invocation.usage_records, succeeded=True)
             steps.append(step)
             last_planner_context_id = envelope.planner_context_id
             leaked = leaked or self._contains_secret(step.planner_output, run_input)
@@ -519,7 +539,7 @@ class IsolatedPhase1ScenarioRunner:
             if result is None or result.status != "SUCCEEDED" or analysis_index >= len(observations):
                 continue
             candidate = observations[analysis_index]
-            observation, latency, analyzer_usage = self._analyze(
+            observation, latency = self._analyze(
                 phase1,
                 analyzer,
                 run_input,
@@ -530,9 +550,9 @@ class IsolatedPhase1ScenarioRunner:
                 index=analysis_index,
                 fact_id=candidate.fact_id,
                 seed=_seed_number(seed, 100 + index),
+                usage=usage,
             )
             analyzer_latencies.append(latency)
-            usage.record(analyzer_usage)
             leaked = leaked or self._contains_secret(observation, run_input)
             if observation.object_ref == candidate.fact_id:
                 extracted.append(candidate.fact_id)
@@ -852,7 +872,8 @@ class IsolatedPhase1ScenarioRunner:
         index: int,
         fact_id: str,
         seed: int,
-    ) -> tuple[KnowledgeObservation, int, tuple[tuple[int | None, int | None], ...]]:
+        usage: _UsageTally,
+    ) -> tuple[KnowledgeObservation, int]:
         a = phase1.phase0c.phase0b.phase0a
         result = phase1.phase0c.phase0b.result_repository.get(execution_id)
         assert result is not None
@@ -900,18 +921,23 @@ class IsolatedPhase1ScenarioRunner:
             binding_checker=self._binding_checker(phase1, mission_id),
         )
         started = time.monotonic()
-        observation = phase1.workflow.run_analysis(
-            mission_id=mission_id,
-            mission_revision=1,
-            operation_id=f"analyzer-{index}",
-            execution_id=execution_id,
-            result_digest=result_digest,
-            invoke_analyzer=invocation,
-            context_grant_id=grant.grant_id,
-            run_id=run_id,
-            thread_id=thread_id,
-        )
-        return observation, round((time.monotonic() - started) * 1000), invocation.usage_records
+        try:
+            observation = phase1.workflow.run_analysis(
+                mission_id=mission_id,
+                mission_revision=1,
+                operation_id=f"analyzer-{index}",
+                execution_id=execution_id,
+                result_digest=result_digest,
+                invoke_analyzer=invocation,
+                context_grant_id=grant.grant_id,
+                run_id=run_id,
+                thread_id=thread_id,
+            )
+        except Exception:
+            usage.record(invocation.usage_records, succeeded=False)
+            raise
+        usage.record(invocation.usage_records, succeeded=True)
+        return observation, round((time.monotonic() - started) * 1000)
 
     @staticmethod
     def _put_context(

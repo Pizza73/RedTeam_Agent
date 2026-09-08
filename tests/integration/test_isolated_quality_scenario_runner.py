@@ -7,6 +7,7 @@ from collections.abc import Callable
 import httpx
 
 import support_phase2 as fake
+from redteam_agent.agent.llm_gateway import SharedLLMGateway
 from redteam_agent.composition.phase2 import build_phase2_kernel
 from redteam_agent.errors import LLMEvaluationError
 from redteam_agent.execution.adapter import MockExecutionAdapter
@@ -14,7 +15,7 @@ from redteam_agent.llm.adapters import LocalLLMAnalyzer, LocalLLMPlanner
 from redteam_agent.llm.client import VLLMChatClient
 from redteam_agent.llm.config import LocalLLMEndpointConfig
 from redteam_agent.quality.models import QualityAttemptFailure
-from redteam_agent.quality.scenario_runner import IsolatedPhase1ScenarioRunner
+from redteam_agent.quality.scenario_runner import IsolatedPhase1ScenarioRunner, _UsageTally
 from redteam_agent.quality.workflow_driver import (
     IsolatedPhase1WorkflowRunExecutor,
     WorkflowBackedQualityDriver,
@@ -201,6 +202,14 @@ def test_isolated_runner_preserves_diagnostics_when_a_failed_run_consumed_llm_at
     whose model never issues the required typed context request -- must still report
     the exact token/retry diagnostics of the real LLM network attempt it already made.
     It must never be silently replaced by a fabricated all-zero default.
+
+    Note: the planner call here *succeeds* strict output validation (the model returns
+    a well-formed action); the scenario then raises its own ``RuntimeError`` because
+    that action violates the scenario invariant (a typed context request was required).
+    This is a distinct failure mode from output-validation-retry exhaustion inside the
+    shared gateway -- see
+    ``test_isolated_runner_exhausts_output_validation_retries_and_preserves_exact_diagnostics``
+    below for that scenario.
     """
     endpoint = LocalLLMEndpointConfig(model="qwen-test", base_url="http://127.0.0.1:8000/v1")
     kernel, profile, results, binding = _build_kernel_and_binding(endpoint)
@@ -251,6 +260,133 @@ def test_isolated_runner_preserves_diagnostics_when_a_failed_run_consumed_llm_at
         assert diagnostics.completion_tokens == diagnostics.llm_calls * 3
         return
     raise AssertionError("expected the scenario to raise for an unmet context request")
+
+
+def test_usage_tally_records_terminal_validation_failure_correctly() -> None:
+    """Unit-level proof of the :meth:`_UsageTally.record` contract.
+
+    When the invocation ultimately failed, every completed response -- including the
+    terminal one -- is a validation error, so ``validation_errors`` equals
+    ``llm_calls`` exactly (3 invalid responses -> 3 calls, 2 retries, 3 validation
+    errors). When it ultimately succeeded, only the attempts before the last one were
+    (a second, valid attempt -> 2 calls, 1 retry, 1 validation error).
+    """
+    failed = _UsageTally()
+    failed.record(((10, 2), (11, 3), (12, 4)), succeeded=False)
+    assert failed.llm_calls == 3
+    assert failed.retries == 2
+    assert failed.validation_errors == 3
+    assert failed.usage_missing == 0
+    assert failed.prompt_tokens == 33
+    assert failed.completion_tokens == 9
+
+    succeeded = _UsageTally()
+    succeeded.record(((10, 2), (11, 3)), succeeded=True)
+    assert succeeded.llm_calls == 2
+    assert succeeded.retries == 1
+    assert succeeded.validation_errors == 1
+    assert succeeded.prompt_tokens == 21
+    assert succeeded.completion_tokens == 5
+
+    # An empty invocation (e.g. a driver-contract violation before any network I/O)
+    # contributes nothing either way.
+    empty = _UsageTally()
+    empty.record((), succeeded=False)
+    assert empty.llm_calls == 0
+    assert empty.validation_errors == 0
+
+
+def test_isolated_runner_exhausts_output_validation_retries_and_preserves_exact_diagnostics() -> None:
+    """A model that never produces a schema-valid planner output must still report the
+    exact diagnostics of every completed (but invalid) vLLM response the shared
+    gateway made before exhausting its output-validation retry budget -- never a
+    fabricated success-shaped count, and never silently dropped.
+    """
+    endpoint = LocalLLMEndpointConfig(model="qwen-test", base_url="http://127.0.0.1:8000/v1")
+    kernel, profile, results, binding = _build_kernel_and_binding(endpoint)
+    usage = fake.usage_payload(prompt_tokens=7, completion_tokens=3)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        # Every attempt is a real, completed vLLM response (well-formed JSON, real
+        # server usage) that is nonetheless not a valid PlannerOutput -- an
+        # output-validation retry on every one of the gateway's
+        # MAX_OUTPUT_RETRIES + 1 attempts, never a transport failure.
+        return fake.native_response(json.dumps({}), usage=usage)
+
+    client = VLLMChatClient(base_url=endpoint.base_url, transport=httpx.MockTransport(handler))
+    driver = kernel.build_isolated_workflow_quality_driver(
+        profile=profile,
+        policy=kernel.request_budget_policy(profile),
+        client=client,
+        token_counter=fake.ApproxChatTokenCounter(profile.tokenizer_revision),
+        evaluation_binding=binding,
+        capability_results=results,
+    )
+    fixture = kernel.quality_corpus.all_fixtures()[0]
+    expected_calls = SharedLLMGateway.MAX_OUTPUT_RETRIES + 1
+    try:
+        driver.drive(fixture, 0)
+    except QualityAttemptFailure as exc:
+        assert exc.original_exception_type == "AgentLoopError"
+        diagnostics = exc.diagnostics
+        assert diagnostics.llm_calls == expected_calls
+        assert diagnostics.retries == expected_calls - 1
+        assert diagnostics.validation_errors == expected_calls
+        assert diagnostics.usage_missing_count == 0
+        assert diagnostics.prompt_tokens == expected_calls * 7
+        assert diagnostics.completion_tokens == expected_calls * 3
+        return
+    raise AssertionError("expected the scenario to raise once output-validation retries were exhausted")
+
+
+def test_isolated_runner_exhausts_analyzer_output_validation_retries_and_preserves_exact_diagnostics() -> None:
+    """The analyzer path is distinct from the planner path (a separate invocation,
+    gateway operation and ``_UsageTally.record`` call site in ``_analyze``); prove it
+    independently preserves exact diagnostics on output-validation exhaustion.
+    """
+    endpoint = LocalLLMEndpointConfig(model="qwen-test", base_url="http://127.0.0.1:8000/v1")
+    kernel, profile, results, binding = _build_kernel_and_binding(endpoint)
+    usage = fake.usage_payload(prompt_tokens=7, completion_tokens=3)
+    planner_handler = _handler(usage=usage)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        schema = body["response_format"]["json_schema"]["name"]
+        if schema != "planner_output":
+            # Every analyzer attempt is a real, completed vLLM response that is
+            # nonetheless not a valid AnalyzerCandidateObservation.
+            return fake.native_response(json.dumps({}), usage=usage)
+        return planner_handler(request)
+
+    client = VLLMChatClient(base_url=endpoint.base_url, transport=httpx.MockTransport(handler))
+    driver = kernel.build_isolated_workflow_quality_driver(
+        profile=profile,
+        policy=kernel.request_budget_policy(profile),
+        client=client,
+        token_counter=fake.ApproxChatTokenCounter(profile.tokenizer_revision),
+        evaluation_binding=binding,
+        capability_results=results,
+    )
+    fixture = kernel.quality_corpus.all_fixtures()[0]
+    expected_analyzer_calls = SharedLLMGateway.MAX_OUTPUT_RETRIES + 1
+    try:
+        driver.drive(fixture, 0)
+    except QualityAttemptFailure as exc:
+        assert exc.original_exception_type == "AgentLoopError"
+        diagnostics = exc.diagnostics
+        # Every planner call in this run succeeds first attempt (no retries, no
+        # validation errors); only the analyzer's exhausted attempts contribute.
+        assert diagnostics.validation_errors == expected_analyzer_calls
+        assert diagnostics.retries == expected_analyzer_calls - 1
+        assert diagnostics.llm_calls >= expected_analyzer_calls
+        assert diagnostics.usage_missing_count == 0
+        # The same usage payload is echoed on every call (planner and analyzer), so
+        # the totals are an exact multiple of the exact call count regardless of how
+        # many planner calls preceded the analyzer failure.
+        assert diagnostics.prompt_tokens == diagnostics.llm_calls * 7
+        assert diagnostics.completion_tokens == diagnostics.llm_calls * 3
+        return
+    raise AssertionError("expected the scenario to raise once analyzer output-validation retries were exhausted")
 
 
 def test_isolated_runner_isolates_token_usage_across_parallel_runs() -> None:
