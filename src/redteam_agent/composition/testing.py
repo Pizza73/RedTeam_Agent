@@ -27,7 +27,7 @@ from redteam_agent.mission.manager import (
     MissionManager,
 )
 from redteam_agent.mission.models import EvidenceRetentionPolicy
-from redteam_agent.mission.validation import MissionValidationPolicy
+from redteam_agent.mission.validation import LLMCapabilityVerifier, MissionValidationPolicy
 from redteam_agent.policy.authorization_service import ExecutionAuthorizationService
 from redteam_agent.policy.engine import PolicyEngine
 from redteam_agent.policy.risk_policy import EffectiveRiskPolicy, default_risk_policy
@@ -138,6 +138,8 @@ def build_test_kernel(
     db_path: str = ":memory:",
     registry_revision: int = DEFAULT_REGISTRY_REVISION,
     clock: Clock | None = None,
+    allowed_profile_types: frozenset[str] = frozenset({"mock"}),
+    capability_verifier: LLMCapabilityVerifier | None = None,
 ) -> Phase0AKernel:
     database = Database(db_path)
     digest_service = DigestService()
@@ -198,6 +200,8 @@ def build_test_kernel(
         max_recovery_window_seconds=DEFAULT_MAX_RECOVERY_WINDOW_SECONDS,
         evidence_retention_policy=build_evidence_retention_policy(digest_service),
         semantic_catalog=default_semantic_catalog(RepositorySessionGoalSource(session_repo)),
+        allowed_profile_types=allowed_profile_types,
+        capability_verifier=capability_verifier,
     )
     mission_manager = MissionManager(
         database=database,

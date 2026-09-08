@@ -67,6 +67,94 @@ python3 -m venv .venv
 Phase 0Aの製品コードと Unit/Integration/Security/Property-State-machine 試験を実装済み。ruff/mypy/compileall/branch coverageを実行済み。
 **独立レビューは未実施であり、実装コミットの固定と正式なPhase受入は未完了。** 詳細と残課題は [docs/development/phase-0a.md](docs/development/phase-0a.md) を参照。
 
+## Phase 2 Local LLM（Capability / 300-Run Qualification）
+
+Phase 2 は Local LLM（vLLM、`chat_completions` 固定）向けの Profile・Capability・Gateway 予算・Adapter・
+評価入口・品質 Gate を追加する。Pydantic AI は固定依存に含まれないため、同契約を満たす明示的な OpenAI 互換
+HTTP Client（`httpx`）を用いる。開発記録は [docs/development/phase-2.md](docs/development/phase-2.md)。
+
+- Schema Capability（§6.2）: `schema-capability-corpus-v1`（`src/redteam_agent/llm/capability_corpus.py`）を
+  Planner/Analyzer の全 Actual Schema Digest に対して実行し、Valid 率 95%以上・Unsafe Boundary Acceptance 0 件・
+  Cancellation Failure 0 件を満たすと合格。結果は Profile Digest / Model Hash / Runtime / Tokenizer / Template /
+  Output Mode / Schema / Corpus へ Binding し、いずれかの変更で失効する。
+- Agent Quality（§36.E1 / §37.1 D11）: `agent-quality-policy-v1`（`src/redteam_agent/quality/corpus.py`）の
+  10 Family × 10 Fixture × 3 Run = 300 Run を独立 Oracle で採点する。
+
+エンドポイント設定例（`LocalLLMEndpointConfig`。`base_url=None` は未設定＝Gate `NOT_RUN`）:
+
+```yaml
+llm:
+  provider: vllm
+  wire_api: chat_completions
+  base_url: http://127.0.0.1:8000/v1   # 未設定なら null（Gate は NOT_RUN）
+  model: qwen
+  temperature: 0.1
+```
+
+実 vLLM に対する Capability / 300-Run Qualification は Local Evaluation Entry Point 経由で実行する（擬似コード）:
+
+```python
+from redteam_agent.composition.phase2 import build_phase2_kernel
+from redteam_agent.llm.attestation import HttpServerMetadataProvider, LocalModelArtifactSource
+from redteam_agent.llm.client import VLLMChatClient
+from redteam_agent.llm.config import LocalLLMEndpointConfig
+
+config = LocalLLMEndpointConfig(model="qwen", base_url="http://127.0.0.1:8000/v1")
+kernel = build_phase2_kernel(
+    endpoint=config,
+    qualification_commit_id=commit_id,             # 評価対象の完全な commit ID
+    dependency_lock_digest=requirements_lock_sha256,
+)
+profile = ...       # 実モデルの model_hash / tokenizer_revision / runtime_version に一致する LocalLLMProfile
+token_counter = ... # 実モデルの Tokenizer（profile.tokenizer_revision に一致、TokenCounter.count_request 実装）
+
+# §6.2 Capability: real_local_llm Evidence の Provenance は「具体 Probe」から導出する（Caller の
+# フラグではない）。real は LiveCapabilityProbe + retry 無効の直接 HTTP Transport のみが生む。
+# MockTransport を注入した同じ Probe は test_double のままである。LiveCapabilityProbe は
+# 隔離 EvaluationGateway（Attempt 予約 → Token Preflight → 有限 Run Budget/期限 → Network）を経由し、
+# Endpoint/Profile と実 Tokenizer の束縛を必須化する。test_double は永続化されず Mission も認可しない。
+client = VLLMChatClient(base_url=config.base_url)
+policy = kernel.request_budget_policy(profile)
+attestation = kernel.attest_server(
+    profile=profile,
+    provider=HttpServerMetadataProvider(),
+    artifact_source=LocalModelArtifactSource(),
+)
+probe = kernel.build_live_capability_probe(
+    profile=profile, policy=policy, client=client, token_counter=token_counter,
+    run_id="startup-capability", cancellation=..., attestation=attestation,
+)
+capability_results = kernel.run_capability_evaluation(profile=profile, probe=probe)
+
+# §36.E1 300-Run Qualification。Binding は Kernel が信頼済み構成値から生成し、品質 Driver は
+# 全 model call を隔離 EvaluationGateway 経由で発行する。任意 Driver の evidence_kind 自己申告は拒否される。
+binding = kernel.build_evaluation_binding(
+    profile=profile, capability_results=capability_results, attestation=attestation,
+)
+quality_driver = kernel.build_workflow_quality_driver(
+    profile=profile, policy=policy, client=client, token_counter=token_counter,
+    evaluation_binding=binding, attestation=attestation,
+    run_workflow=run_isolated_safe_phase1_scenario,
+)
+report = kernel.qualify_real_local_llm(
+    profile=profile, driver=quality_driver,
+    evaluation_binding=binding, capability_results=capability_results,
+    attestation=attestation,
+)
+# report.gate_status は PASS / FAIL / BLOCKED / NOT_RUN。real_local_llm Evidence・妥当な EvaluationBinding
+# （commit/profile/model/tokenizer/chat template/runtime/output mode/prompt/schema/contract/catalog/
+# gateway-budget-policy/dependency-lock/両 corpus digest/合格 Capability Result digest/全 300 Run の一意 Seed）
+# ・全閾値達成のすべてを満たしたときのみ PASS になる。
+```
+
+Unit / Integration Test は決定論的な Fake OpenAI 互換 Server（`httpx` mock transport）で経路を検証する。実モデル無し
+で Gate `PASS` を主張しない（本ホストは vLLM 未設定のため実 Gate は `NOT_RUN`）。`run_isolated_safe_phase1_scenario`
+は期待値を含まない `QualityWorkflowInput.environment_spec` から隔離Missionと安全Adapterを構成し、
+`WorkflowRunTrace` を返す構成所有の実行関数である。MockTransport は具体 Probe／Driver
+を使っても `test_double` と判定され、製品 API は文字列ラベルで real へ付け替えられない。
+トークン計測は実モデルの Tokenizer を `count_request` で用いることが前提であり、近似 Counter は Test 専用で本番
+Fallback はない。大規模モデルの Download や vLLM Server の Install は行わない。
+
 ## 今回の整合方針（設計）
 
 - 期限切れ確定は既存Retention Schedulerが行い、通常Workerの未失効Lease条件と分ける。

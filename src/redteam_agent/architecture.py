@@ -31,6 +31,8 @@ LOGICAL_TO_PHYSICAL: dict[str, str] = {
     "mission": "redteam_agent.mission",
     "context_authorization": "redteam_agent.context",
     "planner_information": "redteam_agent.planner_information",
+    "local_llm": "redteam_agent.llm",
+    "agent_quality": "redteam_agent.quality",
 }
 
 # Forbidden import edges (importer prefix -> imported prefix). ``canonical`` and

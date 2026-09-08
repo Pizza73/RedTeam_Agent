@@ -33,10 +33,12 @@ from redteam_agent.execution.models import (
     ResultCollectionStateRecord,
     ResultIngestionStateRecord,
 )
-from redteam_agent.llm.profile import AgentModelProfile
+from redteam_agent.llm.attestation import ServerAttestation
+from redteam_agent.llm.profile import LocalLLMProfile, MockAgentProfile
 from redteam_agent.mission.models import MissionLifecycleEvent, MissionRevision, MissionState
 from redteam_agent.policy.models import PolicyDecision
 from redteam_agent.policy.risk_policy import EffectiveRiskPolicy, verify_risk_policy_digests
+from redteam_agent.quality.models import QualityReport, QualityRunRecord
 from redteam_agent.sandbox.models import SandboxCapabilities
 from redteam_agent.session.models import SessionSecurityContextSnapshot
 from redteam_agent.tools.availability import AvailableToolSnapshot
@@ -51,7 +53,9 @@ _OBJECT_INTEGRITY: dict[str, tuple[str, str]] = {
     ApprovalRecord.__name__: ("record_digest", "record_digest"),
     AvailableToolSnapshot.__name__: ("snapshot_digest", "snapshot_digest"),
     ToolRegistryRevision.__name__: ("registry_digest", "registry_digest"),
-    AgentModelProfile.__name__: ("profile_digest", "profile_digest"),
+    LocalLLMProfile.__name__: ("profile_digest", "profile_digest"),
+    MockAgentProfile.__name__: ("profile_digest", "profile_digest"),
+    ServerAttestation.__name__: ("attestation_digest", "llm_server_attestation_digest"),
     SandboxCapabilities.__name__: ("sandbox_binding_digest", "sandbox_binding_digest"),
     # Phase 0B execution-safety families.
     ExecutionRecord.__name__: ("record_digest", "execution_record_digest"),
@@ -65,6 +69,9 @@ _OBJECT_INTEGRITY: dict[str, tuple[str, str]] = {
     ExecutionRecoveryAuthority.__name__: ("authority_digest", "execution_recovery_authority_digest"),
     ProviderTaskBinding.__name__: ("binding_digest", "result_task_binding_digest"),
     LocalResultBinding.__name__: ("binding_digest", "result_task_binding_digest"),
+    # Phase 2 D11 durable quality evidence.
+    QualityRunRecord.__name__: ("run_digest", "agent_quality_run_digest"),
+    QualityReport.__name__: ("report_digest", "agent_quality_report_digest"),
 }
 
 # Families integrity-checked by id/row-key binding at the repository (no content

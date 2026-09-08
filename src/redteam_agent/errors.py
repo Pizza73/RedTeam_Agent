@@ -337,3 +337,72 @@ class PlannerContextError(AuthorizationKernelError):
 
 class PlannerCandidateError(AuthorizationKernelError):
     """An action candidate projection or planner selection is invalid."""
+
+
+# --- Phase 2: local LLM ---------------------------------------------------
+
+
+class LLMProfileError(AuthorizationKernelError):
+    """A local LLM / mock agent profile is structurally invalid or unregistered."""
+
+
+class LLMProfileMismatchError(LLMProfileError):
+    """A mission's fixed model / wire API / chat template / tokenizer / output mode
+    changed mid-mission (fail closed, no implicit switch)."""
+
+
+class LLMAttestationError(LLMProfileError):
+    """The configured local vLLM server could not be attested against the immutable
+    profile: metadata missing / ambiguous / name-only, or the served model hash, tokenizer,
+    chat template, runtime version, structured-output mode or endpoint binding mismatched."""
+
+
+class LLMCapabilityError(AuthorizationKernelError):
+    """A schema capability result is missing, stale, unbound, or below threshold, or a
+    mission's required schema digests are not all covered by a passed capability result."""
+
+
+class LLMRequestBudgetError(AuthorizationKernelError):
+    """A rendered request's token budget (input + reserved output + margin) exceeds the
+    profile's max context, is unmeasurable, or a request/output/transport retry budget was
+    exhausted; the request must not reach the network."""
+
+
+class LLMTransportError(AuthorizationKernelError):
+    """A local LLM transport outcome is unknown, timed out, was cancelled, or returned a
+    non-structured / free-form body; it is not silently retried and never parsed as a proposal.
+
+    ``reason`` is a typed code so evidence about *how* a request ended is exact: a
+    connection failure can never be mistaken for a timeout or an in-flight cancellation.
+    """
+
+    #: Allowed typed transport-failure reasons.
+    REASONS: frozenset[str] = frozenset({
+        "timeout",
+        "cancelled_before_send",
+        "cancelled_in_flight",
+        "connect_error",
+        "http_status",
+        "protocol_error",
+        "malformed_response",
+        "config_error",
+        "unknown",
+    })
+
+    def __init__(self, message: str, *, reason: str = "unknown") -> None:
+        if reason not in self.REASONS:
+            raise ValueError(f"unknown LLM transport reason: {reason}")
+        super().__init__(message)
+        self.reason = reason
+
+
+class LLMOutputValidationError(AuthorizationKernelError):
+    """A local LLM produced a structured body that failed the strict application boundary.
+    This is an output-validation failure (retried within the bounded validation budget),
+    content-free so the invalid body / raw validation error never enters a retry prompt or log."""
+
+
+class LLMEvaluationError(AuthorizationKernelError):
+    """A local evaluation / qualification precondition failed: the evaluation entry point
+    reached a production port, a corpus was incomplete/rewritten, a denominator was zero, or a
+    real-local-LLM gate was claimed without real-model evidence."""

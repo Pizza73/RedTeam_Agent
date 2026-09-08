@@ -219,6 +219,37 @@ _DEFINITIONS: tuple[DigestDefinition, ...] = (
     _explicit("unresolved_open_evidence_digest", "agent"),
     _explicit("unresolved_resolution_evidence_digest", "agent"),
     _obj("mission_finalization_intent_digest", "mission", exclude_self="intent_digest"),
+    # --- Phase 2: local LLM capability, gateway budget, quality gate ------
+    # Actual-schema fingerprint (planner_output / execution_plan_proposal /
+    # analysis_result) and version-fixed capability corpus (SystemDesign §6.2).
+    _explicit("llm_schema_digest", "llm"),
+    _explicit("schema_capability_corpus_digest", "llm"),
+    _explicit("llm_prompt_set_digest", "llm"),
+    _obj("llm_schema_capability_result_digest", "llm", exclude_self="result_digest"),
+    # Live server / model attestation sealing the served identity + runtime + output-mode
+    # probe evidence that real capability / 300-run evidence must be bound to.
+    _obj("llm_server_attestation_digest", "llm", exclude_self="attestation_digest"),
+    # Shared LLM Gateway request budget + rendered-request attempt binding (§6.3).
+    _obj("llm_request_budget_policy_digest", "llm", exclude_self="policy_digest"),
+    _explicit("llm_rendered_request_digest", "agent"),
+    _explicit("llm_attempt_metadata_digest", "agent"),
+    # Isolated evaluation-gateway durable attempt record (§6.3 evaluation entry point).
+    _obj("llm_eval_attempt_digest", "llm", exclude_self="attempt_digest"),
+    # Agent quality policy (agent-quality-policy-v1) fixed 300-run gate (§36.E1).
+    _explicit("agent_quality_corpus_digest", "quality"),
+    _explicit("agent_quality_fixture_digest", "quality"),
+    _obj("agent_quality_run_digest", "quality", exclude_self="run_digest"),
+    # Fixed per-run input identity (fixture digest + attempt + seed) recorded with
+    # every attempted run so no run can be silently re-seeded or dropped.
+    _explicit(
+        "agent_quality_run_input_digest", "quality",
+        ("fixture_id", "fixture_digest", "attempt_index", "seed"),
+    ),
+    _obj("agent_quality_report_digest", "quality", exclude_self="report_digest"),
+    # Immutable evaluation binding / manifest tying a real 300-run gate to the exact
+    # commit, profile/model, tokenizer, chat template, runtime, output mode and the
+    # prompt / schema / contract / corpus digests plus passed capability results.
+    _obj("agent_quality_evaluation_binding_digest", "quality", exclude_self="binding_digest"),
 )
 
 

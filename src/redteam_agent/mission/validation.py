@@ -9,15 +9,17 @@ ignored later.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Protocol
 
 from redteam_agent.canonical.digest_service import DigestService
 from redteam_agent.errors import (
     DataAccessPatternError,
     DigestIntegrityError,
+    LLMCapabilityError,
     MissionValidationError,
     ScopeEvaluationError,
 )
-from redteam_agent.llm.profile import AgentModelProfile
+from redteam_agent.llm.profile import AgentModelProfile, LocalLLMProfile
 from redteam_agent.mission.models import (
     ADPrincipalContextCondition,
     EvidenceRetentionPolicy,
@@ -39,11 +41,27 @@ from redteam_agent.semantics import (
 )
 
 
+class LLMCapabilityVerifier(Protocol):
+    """Verifies that a local LLM profile has a passed capability result bound to its
+    ``profile_digest`` covering every schema the mission actually uses (Phase 2)."""
+
+    def verify_mission_capability(self, profile: LocalLLMProfile, revision: MissionRevision) -> None:
+        """Raise :class:`LLMCapabilityError` if capability is not proven."""
+        ...
+
+
 @dataclass(frozen=True)
 class MissionValidationPolicy:
     max_recovery_window_seconds: int
     evidence_retention_policy: EvidenceRetentionPolicy
     semantic_catalog: SemanticCatalog = field(default_factory=default_semantic_catalog)
+    # Phase 0A-1 kernels accept only the deterministic mock profile. A Phase 2
+    # kernel sets ``allowed_profile_types={"vllm"}`` and a ``capability_verifier``
+    # so real-LLM missions require a passed capability result and mock profiles
+    # are rejected. This is one validation path, parameterized — not an alternate
+    # authorization route.
+    allowed_profile_types: frozenset[str] = frozenset({"mock"})
+    capability_verifier: LLMCapabilityVerifier | None = None
 
 
 def _validate_success_condition(condition: object, catalog: SemanticCatalog) -> None:
@@ -135,13 +153,20 @@ def validate_mission_revision(
         raise MissionValidationError("llm profile revision mismatch")
     if profile.profile_digest != revision.llm_profile_digest:
         raise MissionValidationError("llm profile digest mismatch")
-    # Phase 0A accepts only the explicit Mock profile. A local LLM profile that
-    # self-attests capability with a bare boolean is rejected; the real
-    # capability-check result is a Phase 2 concern (R17).
-    if profile.profile_kind != "mock":
-        raise MissionValidationError("Phase 0A accepts only the mock agent profile")
+    if profile.profile_type not in policy.allowed_profile_types:
+        raise MissionValidationError("llm profile type is not permitted for this mission")
     if not profile.is_usable():
-        raise MissionValidationError("llm profile capability check has not passed")
+        raise MissionValidationError("llm profile is not usable")
+    # A local LLM profile never self-attests capability with a bare boolean. Its
+    # fitness for a real mission is proven only by a passed capability result bound
+    # to its profile_digest and covering every schema the mission uses.
+    if isinstance(profile, LocalLLMProfile):
+        if policy.capability_verifier is None:
+            raise MissionValidationError("local LLM profile requires a capability verifier")
+        try:
+            policy.capability_verifier.verify_mission_capability(profile, revision)
+        except LLMCapabilityError as exc:
+            raise MissionValidationError(f"local LLM capability not proven: {exc}") from exc
 
     try:
         assert_scope_rules_interpretable(revision.allowed_execution_scope)

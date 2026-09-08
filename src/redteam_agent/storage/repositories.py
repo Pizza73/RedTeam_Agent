@@ -36,7 +36,12 @@ from redteam_agent.errors import (
     MissionStateVersionConflictError,
     RepositoryIntegrityError,
 )
-from redteam_agent.llm.profile import AgentModelProfile
+from redteam_agent.llm.profile import (
+    AgentModelProfile,
+    LocalLLMProfile,
+    MockAgentProfile,
+    parse_agent_profile,
+)
 from redteam_agent.mission.models import (
     EPOCH_ROTATING_EDGES,
     LEGAL_LIFECYCLE_EDGES,
@@ -400,12 +405,17 @@ class AgentProfileRepository(_BaseRepository):
     def save(self, profile: AgentModelProfile) -> None:
         self._db.put_idempotent(self._NS, profile.profile_revision, self._dump(profile))
 
-    def get(self, profile_revision: str) -> AgentModelProfile | None:
+    def get(self, profile_revision: str) -> LocalLLMProfile | MockAgentProfile | None:
         raw = self._db.get(self._NS, profile_revision)
         if raw is None:
             return None
-        model = load_model_from_json(AgentModelProfile, raw)
-        return self._load(AgentModelProfile, raw, row_key=profile_revision, payload_key=model.profile_revision)
+        # The profile is a discriminated union; parse it through the union boundary
+        # (duplicate-key reject + strict) then apply the shared read integrity path.
+        model = parse_agent_profile(raw)
+        verify_object_integrity(model, self._digests)
+        if profile_revision != model.profile_revision:
+            raise RepositoryIntegrityError("stored row key does not match payload identity")
+        return model
 
 
 class SessionSecurityContextSnapshotRepository(_BaseRepository):
