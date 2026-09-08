@@ -166,6 +166,13 @@ class _BoundInvocation:
         # the gateway drives through it. Either element is ``None`` when the server
         # response did not report that count -- never backfilled with an estimate.
         self._usage_records: list[tuple[int | None, int | None]] = []
+        # Exact count of this invocation's own completed responses that failed
+        # strict planner/analyzer schema validation. Incremented only by the
+        # subclass's ``__call__`` at the moment validation actually raises -- never
+        # inferred from whether this invocation, or the workflow call that drives
+        # it, ultimately succeeds or raises. A schema-valid terminal response stays
+        # uncounted even if unrelated processing after it later fails.
+        self._validation_error_count = 0
 
     def before_attempt(self, attempt_index: int) -> Mapping[str, object]:
         metadata = self._binding.before_attempt(attempt_index)
@@ -175,6 +182,10 @@ class _BoundInvocation:
     @property
     def usage_records(self) -> tuple[tuple[int | None, int | None], ...]:
         return tuple(self._usage_records)
+
+    @property
+    def validation_error_count(self) -> int:
+        return self._validation_error_count
 
     def _run(self) -> str:
         if not self._preflight_ok:
@@ -212,6 +223,7 @@ class _PlannerInvocation(_BoundInvocation):
         try:
             model = validate_planner_output(raw)
         except PydanticBoundaryValidationError as exc:
+            self._validation_error_count += 1
             raise LLMOutputValidationError("planner output failed strict validation") from exc
         return model
 
@@ -222,6 +234,7 @@ class _AnalyzerInvocation(_BoundInvocation):
         try:
             model = validate_analysis_result(raw)
         except PydanticBoundaryValidationError as exc:
+            self._validation_error_count += 1
             raise LLMOutputValidationError("analysis output failed strict validation") from exc
         return model
 

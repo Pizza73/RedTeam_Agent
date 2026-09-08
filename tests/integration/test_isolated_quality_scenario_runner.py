@@ -5,9 +5,11 @@ import threading
 from collections.abc import Callable
 
 import httpx
+import pytest
 
 import support_phase2 as fake
 from redteam_agent.agent.llm_gateway import SharedLLMGateway
+from redteam_agent.agent.workflow import Phase1AgentWorkflow
 from redteam_agent.composition.phase2 import build_phase2_kernel
 from redteam_agent.errors import LLMEvaluationError
 from redteam_agent.execution.adapter import MockExecutionAdapter
@@ -262,36 +264,108 @@ def test_isolated_runner_preserves_diagnostics_when_a_failed_run_consumed_llm_at
     raise AssertionError("expected the scenario to raise for an unmet context request")
 
 
-def test_usage_tally_records_terminal_validation_failure_correctly() -> None:
+def test_isolated_runner_preserves_diagnostics_for_downstream_failure_after_valid_llm_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for the diagnostics-accuracy fix: invocation-local outcome
+    accounting, not outer workflow success, is authoritative.
+
+    ``run_planning_iteration`` continues through LangGraph nodes and
+    action/knowledge/repository logic after the shared gateway has already accepted
+    a schema-valid planner output. If that downstream processing raises, the valid
+    LLM response must never be misclassified as a validation error just because the
+    outer workflow call ultimately failed.
+
+    ``run_planning_iteration`` is stubbed to make exactly one real, schema-valid
+    planner call through the actual bound invocation and then raise -- standing in
+    for a downstream graph-node failure -- so the expected accounting (1 call, 0
+    retries, 0 validation errors) is pinned independent of which particular
+    LangGraph node would fail in practice.
+    """
+    endpoint = LocalLLMEndpointConfig(model="qwen-test", base_url="http://127.0.0.1:8000/v1")
+    kernel, profile, results, binding = _build_kernel_and_binding(endpoint)
+    usage = fake.usage_payload(prompt_tokens=7, completion_tokens=3)
+    client = VLLMChatClient(base_url=endpoint.base_url, transport=httpx.MockTransport(_handler(usage=usage)))
+    driver = kernel.build_isolated_workflow_quality_driver(
+        profile=profile,
+        policy=kernel.request_budget_policy(profile),
+        client=client,
+        token_counter=fake.ApproxChatTokenCounter(profile.tokenizer_revision),
+        evaluation_binding=binding,
+        capability_results=results,
+    )
+
+    def fake_run_planning_iteration(self, *, envelope, ids, invoke_planner):  # type: ignore[no-untyped-def]
+        # One real, schema-valid network round trip through the actual bound
+        # invocation -- accepted by the (bypassed) gateway -- then a failure
+        # standing in for downstream graph processing (action/knowledge/repository
+        # logic) that normally runs after a valid output is accepted.
+        invoke_planner.before_attempt(0)
+        invoke_planner(envelope)
+        raise RuntimeError("downstream workflow processing failed after a valid LLM response")
+
+    monkeypatch.setattr(Phase1AgentWorkflow, "run_planning_iteration", fake_run_planning_iteration)
+
+    fixture = kernel.quality_corpus.all_fixtures()[0]
+    try:
+        driver.drive(fixture, 0)
+    except QualityAttemptFailure as exc:
+        assert exc.original_exception_type == "RuntimeError"
+        diagnostics = exc.diagnostics
+        assert diagnostics.llm_calls == 1
+        assert diagnostics.retries == 0
+        assert diagnostics.validation_errors == 0
+        assert diagnostics.usage_missing_count == 0
+        assert diagnostics.prompt_tokens == 7
+        assert diagnostics.completion_tokens == 3
+        return
+    raise AssertionError("expected the downstream workflow failure to propagate")
+
+
+def test_usage_tally_records_exact_invocation_local_validation_errors() -> None:
     """Unit-level proof of the :meth:`_UsageTally.record` contract.
 
-    When the invocation ultimately failed, every completed response -- including the
-    terminal one -- is a validation error, so ``validation_errors`` equals
-    ``llm_calls`` exactly (3 invalid responses -> 3 calls, 2 retries, 3 validation
-    errors). When it ultimately succeeded, only the attempts before the last one were
-    (a second, valid attempt -> 2 calls, 1 retry, 1 validation error).
-    """
-    failed = _UsageTally()
-    failed.record(((10, 2), (11, 3), (12, 4)), succeeded=False)
-    assert failed.llm_calls == 3
-    assert failed.retries == 2
-    assert failed.validation_errors == 3
-    assert failed.usage_missing == 0
-    assert failed.prompt_tokens == 33
-    assert failed.completion_tokens == 9
+    ``validation_errors`` is drained verbatim from the invocation's own exact count
+    (see ``_BoundInvocation.validation_error_count``) -- never inferred from whether
+    the outer workflow call ultimately succeeded or raised. Three examples pinned by
+    the diagnostics-accuracy fix:
 
-    succeeded = _UsageTally()
-    succeeded.record(((10, 2), (11, 3)), succeeded=True)
-    assert succeeded.llm_calls == 2
-    assert succeeded.retries == 1
-    assert succeeded.validation_errors == 1
-    assert succeeded.prompt_tokens == 21
-    assert succeeded.completion_tokens == 5
+    * invalid, invalid, valid -> 3 calls, 2 retries, 2 validation errors.
+    * invalid x3, exhausted -> 3 calls, 2 retries, 3 validation errors.
+    * valid LLM output, then a downstream (non-LLM) workflow exception ->
+      1 call, 0 retries, 0 validation errors -- the schema-valid terminal response
+      is never misclassified as a validation error just because something after it
+      failed.
+    """
+    invalid_invalid_valid = _UsageTally()
+    invalid_invalid_valid.record(((10, 2), (11, 3), (12, 4)), validation_errors=2)
+    assert invalid_invalid_valid.llm_calls == 3
+    assert invalid_invalid_valid.retries == 2
+    assert invalid_invalid_valid.validation_errors == 2
+    assert invalid_invalid_valid.usage_missing == 0
+    assert invalid_invalid_valid.prompt_tokens == 33
+    assert invalid_invalid_valid.completion_tokens == 9
+
+    exhausted = _UsageTally()
+    exhausted.record(((10, 2), (11, 3), (12, 4)), validation_errors=3)
+    assert exhausted.llm_calls == 3
+    assert exhausted.retries == 2
+    assert exhausted.validation_errors == 3
+    assert exhausted.prompt_tokens == 33
+    assert exhausted.completion_tokens == 9
+
+    valid_then_downstream_exception = _UsageTally()
+    valid_then_downstream_exception.record(((10, 2),), validation_errors=0)
+    assert valid_then_downstream_exception.llm_calls == 1
+    assert valid_then_downstream_exception.retries == 0
+    assert valid_then_downstream_exception.validation_errors == 0
+    assert valid_then_downstream_exception.prompt_tokens == 10
+    assert valid_then_downstream_exception.completion_tokens == 2
 
     # An empty invocation (e.g. a driver-contract violation before any network I/O)
     # contributes nothing either way.
     empty = _UsageTally()
-    empty.record((), succeeded=False)
+    empty.record((), validation_errors=0)
     assert empty.llm_calls == 0
     assert empty.validation_errors == 0
 

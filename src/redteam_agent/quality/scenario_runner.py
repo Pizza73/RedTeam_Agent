@@ -158,23 +158,30 @@ class _UsageTally:
         self.completion_tokens = 0
         self.usage_missing = 0
 
-    def record(self, usage_records: tuple[tuple[int | None, int | None], ...], *, succeeded: bool) -> None:
+    def record(
+        self,
+        usage_records: tuple[tuple[int | None, int | None], ...],
+        *,
+        validation_errors: int,
+    ) -> None:
         """Drain one invocation's completed network round trips into this tally.
 
-        ``succeeded`` distinguishes the terminal attempt: when the invocation
-        ultimately returned a valid output, only the attempts *before* the last one
-        were output-validation retries/errors. When the invocation instead raised
-        (output-validation retries exhausted, or any other failure after one or more
-        completed responses), every recorded attempt -- including the terminal one --
-        failed validation, so ``validation_errors`` equals ``llm_calls`` exactly
-        rather than ``llm_calls - 1``. ``retries`` (attempts beyond the first) is the
-        same either way -- the gateway never retries a transport error.
+        ``validation_errors`` is the invocation's own exact count of completed
+        responses that failed strict planner/analyzer schema validation (see
+        ``_BoundInvocation.validation_error_count``). It is never inferred from
+        whether the outer workflow call that drove this invocation ultimately
+        succeeded or raised: a schema-valid terminal LLM response must not be
+        misclassified as a validation error just because unrelated downstream
+        processing (LangGraph nodes, action/knowledge/repository logic) raised
+        after the shared gateway already accepted that valid output. ``retries``
+        (attempts beyond the first) is exact regardless -- the gateway never
+        retries a transport error.
         """
         if not usage_records:
             return
         self.llm_calls += len(usage_records)
         self.retries += len(usage_records) - 1
-        self.validation_errors += len(usage_records) if not succeeded else len(usage_records) - 1
+        self.validation_errors += validation_errors
         for prompt_tokens, completion_tokens in usage_records:
             if prompt_tokens is None or completion_tokens is None:
                 self.usage_missing += 1
@@ -442,14 +449,14 @@ class IsolatedPhase1ScenarioRunner:
                 step = phase1.workflow.run_planning_iteration(
                     envelope=envelope, ids=ids, invoke_planner=invocation
                 )
-            except Exception:
-                # Drain every completed vLLM response this invocation made before the
-                # raise -- the gateway only raises after every attempt is spent -- so
-                # none of that real usage is silently discarded.
-                usage.record(invocation.usage_records, succeeded=False)
-                raise
+            finally:
+                # Drained exactly once from the invocation's own diagnostics -- on
+                # both success and failure -- so every completed vLLM response this
+                # invocation made is accounted for, and a schema-valid terminal
+                # response is never misrecorded as a validation error just because
+                # downstream graph processing raised after the gateway accepted it.
+                usage.record(invocation.usage_records, validation_errors=invocation.validation_error_count)
             planner_latencies.append(round((time.monotonic() - started) * 1000))
-            usage.record(invocation.usage_records, succeeded=True)
             steps.append(step)
             last_planner_context_id = envelope.planner_context_id
             leaked = leaked or self._contains_secret(step.planner_output, run_input)
@@ -491,11 +498,9 @@ class IsolatedPhase1ScenarioRunner:
             started = time.monotonic()
             try:
                 step = phase1.workflow.run_planning_iteration(envelope=envelope, ids=ids, invoke_planner=invocation)
-            except Exception:
-                usage.record(invocation.usage_records, succeeded=False)
-                raise
+            finally:
+                usage.record(invocation.usage_records, validation_errors=invocation.validation_error_count)
             planner_latencies.append(round((time.monotonic() - started) * 1000))
-            usage.record(invocation.usage_records, succeeded=True)
             steps.append(step)
             last_planner_context_id = envelope.planner_context_id
             leaked = leaked or self._contains_secret(step.planner_output, run_input)
@@ -933,10 +938,8 @@ class IsolatedPhase1ScenarioRunner:
                 run_id=run_id,
                 thread_id=thread_id,
             )
-        except Exception:
-            usage.record(invocation.usage_records, succeeded=False)
-            raise
-        usage.record(invocation.usage_records, succeeded=True)
+        finally:
+            usage.record(invocation.usage_records, validation_errors=invocation.validation_error_count)
         return observation, round((time.monotonic() - started) * 1000)
 
     @staticmethod

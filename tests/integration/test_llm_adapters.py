@@ -204,6 +204,77 @@ def test_planner_invocation_accumulates_usage_across_retry_attempts() -> None:
     output = invocation(envelope)
     assert isinstance(output, PlannerActionOutput)
     assert invocation.usage_records == ((100, 10), (100, 20))
+    # Exactly one of the two completed responses failed strict validation -- the
+    # invocation's own count, independent of anything that runs after it returns.
+    assert invocation.validation_error_count == 1
+
+
+def test_planner_invocation_validation_error_count_is_exact_across_repeated_failures() -> None:
+    # Pins the diagnostics-accuracy contract's exact example: invalid, invalid,
+    # valid -> 3 completed responses, 2 of which failed strict validation --
+    # regardless of what happens with the invocation's eventual valid output.
+    ds = DigestService()
+    clock = ManualClock(_NOW)
+    profile = fake.local_profile(ds)
+    client = VLLMChatClient(
+        base_url="http://vllm.local/v1",
+        transport=fake.transport_sequence(
+            [
+                fake.native_response(fake.INVALID_UNKNOWN_FIELD, usage=fake.usage_payload(prompt_tokens=1, completion_tokens=1)),
+                fake.native_response(fake.INVALID_UNKNOWN_FIELD, usage=fake.usage_payload(prompt_tokens=1, completion_tokens=1)),
+                fake.native_response(fake.VALID_PLANNER_ACTION, usage=fake.usage_payload(prompt_tokens=1, completion_tokens=1)),
+            ]
+        ),
+    )
+    envelope = fake.minimal_planner_envelope(ds, authorized_context={"note": "redacted"})
+    invocation = _planner(ds, client, profile, clock).build_invocation(
+        envelope, deadline=clock.now() + timedelta(seconds=30)
+    )
+    for attempt_index in range(2):
+        invocation.before_attempt(attempt_index)
+        with pytest.raises(LLMOutputValidationError):
+            invocation(envelope)
+    invocation.before_attempt(2)
+    output = invocation(envelope)
+    assert isinstance(output, PlannerActionOutput)
+    assert len(invocation.usage_records) == 3
+    assert invocation.validation_error_count == 2
+
+
+def test_analyzer_invocation_validation_error_count_tracks_independently_of_planner() -> None:
+    # The analyzer path is a distinct invocation subclass; prove its own
+    # validation_error_count is tracked from its own strict schema validation, never
+    # inferred from anything downstream.
+    from redteam_agent.llm.adapters import LocalLLMAnalyzer
+
+    ds = DigestService()
+    clock = ManualClock(_NOW)
+    profile = fake.local_profile(ds)
+    policy = build_request_budget_policy(profile=profile, digest_service=ds)
+    client = VLLMChatClient(
+        base_url="http://vllm.local/v1",
+        transport=fake.transport_sequence(
+            [
+                fake.native_response(fake.INVALID_UNKNOWN_FIELD, usage=fake.usage_payload(prompt_tokens=1, completion_tokens=1)),
+                fake.native_response(fake.VALID_ANALYSIS_OUTPUT, usage=fake.usage_payload(prompt_tokens=1, completion_tokens=1)),
+            ]
+        ),
+    )
+    analyzer = LocalLLMAnalyzer(
+        profile=profile, policy=policy, client=client,
+        token_counter=ApproxChatTokenCounter(profile.tokenizer_revision), clock=clock, digest_service=ds,
+    )
+    invocation = analyzer.build_invocation(
+        execution_id="exec-1", result_digest="rd", authorized_context={"redacted": "context"},
+        deadline=clock.now() + timedelta(seconds=30),
+    )
+    invocation.before_attempt(0)
+    with pytest.raises(LLMOutputValidationError):
+        invocation()
+    invocation.before_attempt(1)
+    invocation()
+    assert len(invocation.usage_records) == 2
+    assert invocation.validation_error_count == 1
 
 
 def test_real_adapter_not_callable_without_preflight() -> None:
