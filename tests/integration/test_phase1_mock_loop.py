@@ -119,6 +119,8 @@ def test_stale_planner_context_is_rebuilt_before_the_model_call() -> None:
     values = checkpoint["channel_values"]
     assert set(values) <= {
         "mission_id",
+        "mission_revision",
+        "run_id",
         "operation_id",
         "planner_context_id",
         "goal_evaluation_id",
@@ -126,7 +128,12 @@ def test_stale_planner_context_is_rebuilt_before_the_model_call() -> None:
         "controller_reason",
         "planner_output_kind",
     }
-    assert all(isinstance(value, str) for value in values.values())
+    # Only application-issued record-identity / routing fields; the sole non-string
+    # is the integer mission_revision (a repository record identity, not free text).
+    assert all(
+        isinstance(value, str) or (key == "mission_revision" and isinstance(value, int))
+        for key, value in values.items()
+    )
 
 
 def test_workflow_rejects_malformed_wrong_revision_and_reused_run_threads() -> None:

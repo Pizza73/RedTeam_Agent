@@ -373,6 +373,8 @@ def test_durable_resume_advances_to_finalizing_once_all_items_resolved() -> None
     adapter = phase0b.mock_adapter
     adapter._reconcile_status = "FOUND_TERMINAL"  # type: ignore[attr-defined]
     adapter._reconcile_provider_status = "succeeded"  # type: ignore[attr-defined]
+    # A collectible JSON result so the graph-owned FINALIZING path can complete.
+    adapter._stdout_chunks = (b'{"host":"10.1.2.3","status":"open","port":443}\n',)  # type: ignore[attr-defined]
 
     _resume(kernel, mission_id, operation_id="dr-1")  # settle the provider outcome
     kernel.unresolved_items.resolve_from_execution(
@@ -380,15 +382,18 @@ def test_durable_resume_advances_to_finalizing_once_all_items_resolved() -> None
     )
     assert kernel.unresolved_items.current(mission_id)[0].status == "RESOLVED"
 
+    # The graph finalization node itself takes the WAITING_HUMAN_REVIEW ->
+    # FINALIZING edge (Mission Manager, original ABORTED intent) and drives the
+    # existing FINALIZING workflow to its terminal — LangGraph stays the sole owner.
     result = _resume(kernel, mission_id, operation_id="dr-2")
 
     assert result.entry_mission_state == "WAITING_HUMAN_REVIEW"
     assert result.advanced_to_finalizing is True
-    assert result.mission_state == "FINALIZING"
-    assert kernel.finalization_service.is_finalizing(mission_id)
+    assert result.mission_state == "ABORTED"
+    assert _state(phase0b, mission_id).state == "ABORTED"
     intent = kernel.phase0c.phase0b.phase0a.database.occ_get("mission_finalization_intent", mission_id)
-    assert intent is not None and '"target_state": "ABORTED"' in intent[1]
-    assert adapter.submit_calls == 1
+    assert intent is not None and '"target_state": "ABORTED"' in intent[1]  # original reason preserved
+    assert adapter.submit_calls == 1  # never re-dispatched
 
 
 def test_advance_from_human_review_fails_closed_while_items_unresolved() -> None:
@@ -408,3 +413,133 @@ def test_review_exit_edge_is_occ_guarded() -> None:
         manager.begin_finalization(
             mission_id, expected_version=state.mission_state_version + 5, actor_token=OPERATOR
         )
+
+
+# --- HIGH 1: every incomplete execution reconciled exactly once ------------
+
+
+def _dispatch_second(kernel, ctx, *, execution_id: str = "dr-execution-2") -> None:
+    """Dispatch a second provider-task execution on the still-RUNNING mission."""
+    seeded = ctx[0]
+    phase0a = kernel.phase0c.phase0b.phase0a
+    proposal = support.make_proposal(
+        tool=seeded.seeded.tool,
+        arguments={"destinations": ["10.1.2.3"], "port": 443, "protocol": "tcp"},
+        requested_targets=(IpTargetReference(type="ip", address="10.1.2.3"),),
+    )
+    plan = support.make_plan(phase0a, seeded=seeded.seeded, proposal=proposal, plan_id="dr-plan-2")
+    decision = support.issue_decision(phase0a, plan=plan, decision_id="dr-decision-2")
+    kernel.phase0c.phase0b.executor.create_execution(
+        execution_id=execution_id, task_id="dr-task-2", decision_id=decision.decision_id, plan=plan
+    )
+    out = kernel.phase0c.phase0b.executor.dispatch(execution_id=execution_id, plan=plan)
+    assert out.provider_execution_state == "DISPATCHED"
+
+
+def test_durable_resume_reconciles_every_incomplete_execution_exactly_once() -> None:
+    kernel, phase0b, mission_id, ctx = _running_dispatched()
+    _dispatch_second(kernel, ctx, execution_id="dr-execution-2")
+    adapter = phase0b.mock_adapter
+    adapter._reconcile_status = "UNKNOWN"  # type: ignore[attr-defined]
+    assert adapter.submit_calls == 2  # two dispatches during setup
+    _pause(phase0b, mission_id)
+
+    # Record the exact (execution, provider task) the adapter is asked about, to
+    # prove each reconcile is bound to its own task binding.
+    reads: list[tuple[str, str | None]] = []
+    original = adapter.reconcile
+
+    def spy(execution_id, task_binding):
+        provider_task_id = getattr(task_binding, "provider_task_id", None)
+        reads.append((execution_id, provider_task_id))
+        return original(execution_id, task_binding)
+
+    adapter.reconcile = spy  # type: ignore[method-assign]
+    try:
+        result = _resume(kernel, mission_id)
+    finally:
+        adapter.reconcile = original  # type: ignore[method-assign]
+
+    # Every incomplete execution reconciled exactly once, in deterministic order,
+    # each bound to its own provider task; no execution reported prematurely.
+    assert sorted(e for e, _ in result.reconciled) == ["dr-execution", "dr-execution-2"]
+    assert all(reason == "RECONCILE_UNKNOWN" for _, reason in result.reconciled)
+    assert [e for e, _ in reads] == ["dr-execution", "dr-execution-2"]
+    assert reads == [("dr-execution", "provider-dr-task-dr-run"), ("dr-execution-2", "provider-dr-task-2")]
+    assert adapter.reconcile_calls == 2
+    assert adapter.submit_calls == 2  # no new dispatch during resume
+    for eid in ("dr-execution", "dr-execution-2"):
+        rec = phase0b.execution_repository.get(eid)
+        assert rec is not None and rec.provider_execution_state == "OUTCOME_UNKNOWN"
+    assert _state(phase0b, mission_id).state == "PAUSED"
+
+
+# --- HIGH 2: the actual persisted checkpoint contents are validated --------
+
+
+def _tamper_checkpoint(kernel, mission_id: str, overrides: dict) -> None:
+    saver = kernel.workflow._checkpointer
+    config = {"configurable": {"thread_id": _thread(mission_id)}}
+    tup = saver.get_tuple(config)
+    checkpoint = dict(tup.checkpoint)
+    channel_values = dict(checkpoint["channel_values"])
+    channel_values.update(overrides)
+    checkpoint["channel_values"] = channel_values
+    saver.put(tup.config, checkpoint, tup.metadata, {})
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"mission_id": "foreign-mission"},
+        {"mission_revision": 2},
+        {"run_id": "another-run"},
+    ],
+)
+def test_durable_resume_rejects_a_checkpoint_bound_to_another_mission(overrides) -> None:
+    kernel, phase0b, mission_id, _ = _running_dispatched()
+    adapter = phase0b.mock_adapter
+    _pause(phase0b, mission_id)
+    # The checkpoint exists under the correct thread key but its persisted
+    # channel_values are bound to a different mission / revision / run.
+    _tamper_checkpoint(kernel, mission_id, overrides)
+    reconcile_before = adapter.reconcile_calls
+
+    with pytest.raises(MissionRevisionConflictError):
+        _resume(kernel, mission_id)
+
+    # Fail closed before any execution mutation or adapter read.
+    assert adapter.reconcile_calls == reconcile_before
+    record = phase0b.execution_repository.get(EXECUTION_ID)
+    assert record is not None and record.provider_execution_state == "DISPATCHED"
+    assert _state(phase0b, mission_id).state == "PAUSED"
+
+
+def test_durable_resume_makes_zero_planner_and_analyzer_calls() -> None:
+    kernel, phase0b, mission_id, _ = _running_dispatched()
+    phase0b.mock_adapter._reconcile_status = "UNKNOWN"  # type: ignore[attr-defined]
+    _pause(phase0b, mission_id)
+
+    planner_calls: list[int] = []
+    analyzer_calls: list[int] = []
+    orig_planner = kernel.llm_gateway.invoke_planner
+    orig_analyzer = kernel.llm_gateway.invoke_analyzer
+
+    def spy_planner(*a, **k):
+        planner_calls.append(1)
+        return orig_planner(*a, **k)
+
+    def spy_analyzer(*a, **k):
+        analyzer_calls.append(1)
+        return orig_analyzer(*a, **k)
+
+    kernel.llm_gateway.invoke_planner = spy_planner  # type: ignore[method-assign]
+    kernel.llm_gateway.invoke_analyzer = spy_analyzer  # type: ignore[method-assign]
+    try:
+        result = _resume(kernel, mission_id)
+    finally:
+        kernel.llm_gateway.invoke_planner = orig_planner  # type: ignore[method-assign]
+        kernel.llm_gateway.invoke_analyzer = orig_analyzer  # type: ignore[method-assign]
+
+    assert planner_calls == [] and analyzer_calls == []
+    assert result.mission_state == "PAUSED"

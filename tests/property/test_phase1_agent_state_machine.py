@@ -211,6 +211,8 @@ class Phase1AgentStateMachine(RuleBasedStateMachine):
         assert self.kernel.workflow.graph.checkpointer is not None
         allowed = {
             "mission_id",
+            "mission_revision",
+            "run_id",
             "operation_id",
             "planner_context_id",
             "goal_evaluation_id",
@@ -229,7 +231,10 @@ class Phase1AgentStateMachine(RuleBasedStateMachine):
             assert snapshot is not None
             values = snapshot["channel_values"]
             assert set(values) <= allowed
-            assert all(isinstance(value, str) for value in values.values())
+            assert all(
+                isinstance(value, str) or (key == "mission_revision" and isinstance(value, int))
+                for key, value in values.items()
+            )
 
 
 Phase1AgentStateMachine.TestCase.settings = settings(
