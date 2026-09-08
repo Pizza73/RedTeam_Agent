@@ -51,7 +51,7 @@ from redteam_agent.mission.models import (
 from redteam_agent.models.common import ToolRef
 from redteam_agent.policy.data_access import DataAccessPolicy, DataAccessRule
 from redteam_agent.policy.scope_models import IpTargetReference, NetworkScopeRule
-from redteam_agent.quality.models import RunDiagnostics
+from redteam_agent.quality.models import QualityAttemptFailure, RunDiagnostics
 from redteam_agent.quality.workflow_driver import QualityWorkflowInput, WorkflowRunTrace
 from redteam_agent.resources.resource_metadata import ResourceMetadata
 from redteam_agent.session.models import SessionSecurityContext, SessionSecurityContextSnapshot
@@ -174,6 +174,18 @@ class _UsageTally:
             self.completion_tokens += completion_tokens
 
 
+class _RecoveryTally:
+    """Mutable checkpoint-recovery counters, shared across a scenario call and its
+    exception handler so a partial count survives a mid-run failure (see :class:`_UsageTally`).
+    """
+
+    __slots__ = ("attempts", "successes")
+
+    def __init__(self) -> None:
+        self.attempts = 0
+        self.successes = 0
+
+
 class IsolatedPhase1ScenarioRunner:
     """Execute one expectation-free fixture through a fresh product workflow kernel."""
 
@@ -250,21 +262,108 @@ class IsolatedPhase1ScenarioRunner:
         planner = self._planner_factory(phase1)
         analyzer = self._analyzer_factory(phase1)
         self._verify_factory_binding(planner, analyzer)
+        # Initialized before the fallible scenario body so a failure at any point below
+        # can still report the diagnostics actually observed up to that point -- a run
+        # that consumed real LLM network attempts is never durably recorded as if it
+        # had consumed none.
+        steps: list[WorkflowStepResult] = []
+        planner_latencies: list[int] = []
+        analyzer_latencies: list[int] = []
+        usage = _UsageTally()
+        recovery = _RecoveryTally()
+        try:
+            return self._run_scenario(
+                phase1,
+                planner,
+                analyzer,
+                run_input,
+                attempt_index,
+                seed,
+                steps=steps,
+                planner_latencies=planner_latencies,
+                analyzer_latencies=analyzer_latencies,
+                usage=usage,
+                recovery=recovery,
+            )
+        except LLMEvaluationError:
+            # A driver-contract violation is a hard error, never a scored attempt.
+            raise
+        except Exception as exc:
+            # An ordinary model / output-validation failure. Its exact diagnostics --
+            # every real LLM network attempt already made, its usage, and its retries
+            # -- are preserved rather than replaced by a fabricated zero.
+            raise QualityAttemptFailure(
+                original_exception_type=type(exc).__name__,
+                diagnostics=self._diagnostics_snapshot(
+                    phase1=phase1,
+                    steps=steps,
+                    usage=usage,
+                    recovery=recovery,
+                    planner_latencies=planner_latencies,
+                    analyzer_latencies=analyzer_latencies,
+                ),
+            ) from exc
+
+    @staticmethod
+    def _diagnostics_snapshot(
+        *,
+        phase1: Phase1Kernel,
+        steps: list[WorkflowStepResult],
+        usage: _UsageTally,
+        recovery: _RecoveryTally,
+        planner_latencies: list[int],
+        analyzer_latencies: list[int],
+    ) -> RunDiagnostics:
+        """The exact §36.E1 diagnostics observed so far.
+
+        Shared by the completed-trace path and the failure path so a run that fails
+        after one or more real LLM network attempts reports precisely what those
+        attempts consumed -- never a fabricated zero.
+        """
+        adapter = phase1.phase0c.phase0b.mock_adapter
+        return RunDiagnostics(
+            tool_dispatches=adapter.submit_calls,
+            action_attempts=sum(step.planner_output is not None for step in steps),
+            llm_calls=usage.llm_calls,
+            retries=usage.retries,
+            validation_errors=usage.validation_errors,
+            prompt_tokens=usage.prompt_tokens,
+            completion_tokens=usage.completion_tokens,
+            usage_missing_count=usage.usage_missing,
+            provider_reconciliations=adapter.reconcile_calls,
+            checkpoint_recovery_attempts=recovery.attempts,
+            checkpoint_recovery_successes=recovery.successes,
+            planner_latencies_ms=tuple(planner_latencies),
+            analyzer_latencies_ms=tuple(analyzer_latencies),
+        )
+
+    def _run_scenario(
+        self,
+        phase1: Phase1Kernel,
+        planner: LocalLLMPlanner,
+        analyzer: LocalLLMAnalyzer,
+        run_input: QualityWorkflowInput,
+        attempt_index: int,
+        seed: str,
+        *,
+        steps: list[WorkflowStepResult],
+        planner_latencies: list[int],
+        analyzer_latencies: list[int],
+        usage: _UsageTally,
+        recovery: _RecoveryTally,
+    ) -> WorkflowRunTrace:
+        """The fallible scenario body.  ``steps``/``usage``/latencies are mutated in
+        place so the caller can report exactly what happened even if this raises.
+        """
         tools = self._seed_mission(phase1, run_input, attempt_index)
         mission_id = self._mission_id(run_input, attempt_index)
         run_id = f"quality-run-{attempt_index}"
         thread_id = compute_thread_id(mission_id=mission_id, mission_revision=1, run_id=run_id)
-        steps: list[WorkflowStepResult] = []
         extracted: list[str] = []
-        planner_latencies: list[int] = []
-        analyzer_latencies: list[int] = []
-        usage = _UsageTally()
         leaked = False
         planning_iterations = 0
         analysis_index = 0
         replan_parent: str | None = None
-        checkpoint_recovery_attempts = 0
-        checkpoint_recovery_successes = 0
         recovery_reconciled = False
         last_planner_context_id: str | None = None
 
@@ -396,7 +495,7 @@ class IsolatedPhase1ScenarioRunner:
                 continue
             adapter = phase1.phase0c.phase0b.mock_adapter
             if env.recovery_trigger == "checkpoint_replay" and action_offset == 0:
-                checkpoint_recovery_attempts += 1
+                recovery.attempts += 1
                 before_submit_calls = adapter.submit_calls
                 replay = phase1.workflow.run_planning_iteration(
                     envelope=envelope,
@@ -407,7 +506,7 @@ class IsolatedPhase1ScenarioRunner:
                 )
                 steps.append(replay)
                 if adapter.reconcile_calls > 0 and adapter.submit_calls == before_submit_calls:
-                    checkpoint_recovery_successes += 1
+                    recovery.successes += 1
                     recovery_reconciled = True
             elif env.delivery.async_reconcile_required:
                 phase1.phase0c.phase0b.reconciliation.reconcile(
@@ -467,20 +566,13 @@ class IsolatedPhase1ScenarioRunner:
             extracted_facts=tuple(dict.fromkeys(extracted)),
             confirmed_facts=(),
             secret_leaked=leaked,
-            diagnostics=RunDiagnostics(
-                tool_dispatches=adapter.submit_calls,
-                action_attempts=sum(step.planner_output is not None for step in steps),
-                llm_calls=usage.llm_calls,
-                retries=usage.retries,
-                validation_errors=usage.validation_errors,
-                prompt_tokens=usage.prompt_tokens,
-                completion_tokens=usage.completion_tokens,
-                usage_missing_count=usage.usage_missing,
-                provider_reconciliations=adapter.reconcile_calls,
-                checkpoint_recovery_attempts=checkpoint_recovery_attempts,
-                checkpoint_recovery_successes=checkpoint_recovery_successes,
-                planner_latencies_ms=tuple(planner_latencies),
-                analyzer_latencies_ms=tuple(analyzer_latencies),
+            diagnostics=self._diagnostics_snapshot(
+                phase1=phase1,
+                steps=steps,
+                usage=usage,
+                recovery=recovery,
+                planner_latencies=planner_latencies,
+                analyzer_latencies=analyzer_latencies,
             ),
         )
 

@@ -142,6 +142,25 @@ def test_malformed_usage_fields_are_none_never_estimated() -> None:
     assert result.usage_completion_tokens is None
 
 
+def test_negative_usage_fields_are_none_never_a_fabricated_count() -> None:
+    # A token count is never negative; a negative server value is malformed like any
+    # other and must be treated as missing usage, never folded into a real sum (which
+    # could silently cancel out a positive count elsewhere and hide missing usage).
+    ds = DigestService()
+    client = VLLMChatClient(
+        base_url="http://vllm.local/v1",
+        transport=fake.transport_returning(
+            fake.native_response(
+                fake.VALID_ANALYSIS_OUTPUT,
+                usage={"prompt_tokens": -1, "completion_tokens": -5},
+            )
+        ),
+    )
+    result = client.complete(_request(ds), timeout_seconds=5)
+    assert result.usage_prompt_tokens is None
+    assert result.usage_completion_tokens is None
+
+
 def test_bad_base_url_rejected() -> None:
     with pytest.raises(LLMTransportError):
         VLLMChatClient(base_url="ftp://nope")

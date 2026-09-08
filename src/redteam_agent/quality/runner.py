@@ -36,11 +36,13 @@ from redteam_agent.quality.models import (
     EvaluationBinding,
     EvidenceKind,
     GateStatus,
+    QualityAttemptFailure,
     QualityDiagnosticsSummary,
     QualityFixture,
     QualityReport,
     QualityRunObservation,
     QualityRunRecord,
+    RunDiagnostics,
     RunVerdict,
     build_run_seeds,
 )
@@ -76,13 +78,19 @@ def derive_driver_evidence_kind(driver: object) -> EvidenceKind:
 
 
 def _failed_observation(
-    fixture: QualityFixture, attempt: int, evidence_kind: EvidenceKind
+    fixture: QualityFixture,
+    attempt: int,
+    evidence_kind: EvidenceKind,
+    diagnostics: RunDiagnostics | None = None,
 ) -> QualityRunObservation:
     """A run that the driver could not complete (model / validation failure).
 
     It is a *failed* run, not a dropped one: ``no_candidate_stop`` is never an expected
     terminal in the corpus, so ``reached_expected`` is always false, while the fixture's
-    recall denominator is still counted (never shrunk).
+    recall denominator is still counted (never shrunk). ``diagnostics`` carries whatever
+    was actually observed before the failure (real LLM network attempts, their token
+    usage, retries and missing-usage count); it defaults to all-zero only when the
+    driver made no such attempt.
     """
     return QualityRunObservation(
         fixture_id=fixture.fixture_id,
@@ -100,6 +108,7 @@ def _failed_observation(
         approval_required_without_gate=False,
         secret_leaked=False,
         duplicate_side_effects=0,
+        diagnostics=diagnostics if diagnostics is not None else RunDiagnostics(),
     )
 
 
@@ -186,6 +195,15 @@ class QualityRunner:
                 # A driver-contract violation (wrong fixture/attempt/evidence) is a
                 # hard error: it is not silently converted to a failed run.
                 raise
+            except QualityAttemptFailure as exc:
+                # A model / validation failure that consumed one or more real LLM
+                # network attempts. Only the original exception's class is recorded
+                # (content-free, never its message); its exact usage/retry
+                # diagnostics are preserved rather than replaced by a fabricated zero.
+                failure = exc.original_exception_type
+                observation = _failed_observation(
+                    fixture, attempt, self._evidence_kind, exc.diagnostics
+                )
             except Exception as exc:
                 # A model / validation failure becomes a failed run (never dropped),
                 # so exactly TOTAL_RUNS results are reported. Only the exception

@@ -273,6 +273,25 @@ class RunDiagnostics(StrictImmutableBoundaryModel):
         return self
 
 
+class QualityAttemptFailure(Exception):
+    """An ordinary model / output-validation failure that consumed one or more real
+    LLM network attempts before raising.
+
+    Raised by a real-evidence driver instead of letting the underlying exception
+    propagate bare, so :class:`~redteam_agent.quality.runner.QualityRunner` can build
+    the failed run's durable observation from the diagnostics actually observed --
+    token usage, ``llm_calls``, retries, validation errors and ``usage_missing_count``
+    -- rather than a fabricated all-zero default. ``original_exception_type`` is only
+    the failing exception's class name (content-free, like every other recorded
+    failure reason); the underlying exception itself is chained via ``__cause__``.
+    """
+
+    def __init__(self, *, original_exception_type: str, diagnostics: RunDiagnostics) -> None:
+        super().__init__(original_exception_type)
+        self.original_exception_type = original_exception_type
+        self.diagnostics = diagnostics
+
+
 class QualityRunObservation(StrictImmutableBoundaryModel):
     """The raw observed trace of one run (produced by a driver, scored by the oracle)."""
 
@@ -485,6 +504,7 @@ __all__ = [
     "EvaluationBinding",
     "EvidenceKind",
     "GateStatus",
+    "QualityAttemptFailure",
     "QualityDiagnosticsSummary",
     "QualityFamily",
     "QualityFixture",

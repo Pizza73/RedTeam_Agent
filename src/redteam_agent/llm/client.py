@@ -227,10 +227,12 @@ class VLLMChatClient:
             prompt = usage.get("prompt_tokens")
             completion = usage.get("completion_tokens")
             # Never estimate: an absent or malformed field stays ``None`` rather
-            # than being coerced into a fabricated count.
-            if isinstance(prompt, int) and not isinstance(prompt, bool):
+            # than being coerced into a fabricated count. A token count is never
+            # negative, so a negative server value is malformed too -- treated as
+            # missing usage, not a fabricated (and misleading) sum.
+            if isinstance(prompt, int) and not isinstance(prompt, bool) and prompt >= 0:
                 usage_prompt_tokens = prompt
-            if isinstance(completion, int) and not isinstance(completion, bool):
+            if isinstance(completion, int) and not isinstance(completion, bool) and completion >= 0:
                 usage_completion_tokens = completion
         return ChatCompletionResult(
             content=content if isinstance(content, str) else None,

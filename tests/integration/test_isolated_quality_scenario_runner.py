@@ -13,6 +13,7 @@ from redteam_agent.execution.adapter import MockExecutionAdapter
 from redteam_agent.llm.adapters import LocalLLMAnalyzer, LocalLLMPlanner
 from redteam_agent.llm.client import VLLMChatClient
 from redteam_agent.llm.config import LocalLLMEndpointConfig
+from redteam_agent.quality.models import QualityAttemptFailure
 from redteam_agent.quality.scenario_runner import IsolatedPhase1ScenarioRunner
 from redteam_agent.quality.workflow_driver import (
     IsolatedPhase1WorkflowRunExecutor,
@@ -191,6 +192,65 @@ def test_isolated_runner_records_server_usage_per_run() -> None:
     assert diagnostics.usage_missing_count == 0
     assert diagnostics.prompt_tokens == diagnostics.llm_calls * 7
     assert diagnostics.completion_tokens == diagnostics.llm_calls * 3
+
+
+def test_isolated_runner_preserves_diagnostics_when_a_failed_run_consumed_llm_attempts() -> None:
+    """Regression test for the evidence-integrity gap fixed alongside commit cdab8ec.
+
+    A run that fails part way through -- here, family 2's context-request scenario,
+    whose model never issues the required typed context request -- must still report
+    the exact token/retry diagnostics of the real LLM network attempt it already made.
+    It must never be silently replaced by a fabricated all-zero default.
+    """
+    endpoint = LocalLLMEndpointConfig(model="qwen-test", base_url="http://127.0.0.1:8000/v1")
+    kernel, profile, results, binding = _build_kernel_and_binding(endpoint)
+    usage = fake.usage_payload(prompt_tokens=7, completion_tokens=3)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        # The model answers every planner call with a plain action -- even the very
+        # first call, which requires a typed context_request -- so the scenario
+        # raises only after a real network attempt (with real usage) was made.
+        body = json.loads(request.content)
+        user = json.loads(body["messages"][-1]["content"])
+        candidate = user["available_action_candidates"][0]
+        output = {
+            "output_type": "action",
+            "proposal": {
+                "objective": "isolated quality action",
+                "phase": "DISCOVERY",
+                "tool_ref": candidate["tool_ref"],
+                "requested_targets": candidate["requested_targets"],
+                "session_id": None,
+                "arguments": candidate["suggested_arguments"],
+            },
+            "working_state_update": None,
+            "next_iteration_hints": [],
+        }
+        return fake.native_response(json.dumps(output), usage=usage)
+
+    client = VLLMChatClient(base_url=endpoint.base_url, transport=httpx.MockTransport(handler))
+    driver = kernel.build_isolated_workflow_quality_driver(
+        profile=profile,
+        policy=kernel.request_budget_policy(profile),
+        client=client,
+        token_counter=fake.ApproxChatTokenCounter(profile.tokenizer_revision),
+        evaluation_binding=binding,
+        capability_results=results,
+    )
+    fixture = next(f for f in kernel.quality_corpus.all_fixtures() if f.family_id == 2)
+    try:
+        driver.drive(fixture, 0)
+    except QualityAttemptFailure as exc:
+        assert exc.original_exception_type == "RuntimeError"
+        diagnostics = exc.diagnostics
+        assert diagnostics.llm_calls > 0
+        assert diagnostics.usage_missing_count == 0
+        assert diagnostics.retries == 0
+        assert diagnostics.validation_errors == 0
+        assert diagnostics.prompt_tokens == diagnostics.llm_calls * 7
+        assert diagnostics.completion_tokens == diagnostics.llm_calls * 3
+        return
+    raise AssertionError("expected the scenario to raise for an unmet context request")
 
 
 def test_isolated_runner_isolates_token_usage_across_parallel_runs() -> None:

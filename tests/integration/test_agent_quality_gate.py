@@ -11,17 +11,20 @@ from redteam_agent.llm.budget import build_request_budget_policy
 from redteam_agent.llm.client import VLLMChatClient
 from redteam_agent.quality.corpus import build_agent_quality_corpus
 from redteam_agent.quality.drivers import CompliantTestDoubleDriver, FaultyTestDoubleDriver
+from redteam_agent.quality.evidence import QualityEvidenceRepository
 from redteam_agent.quality.gate import not_run_report, run_agent_quality_gate
 from redteam_agent.quality.models import (
     FAMILY_COUNT,
     TOTAL_RUNS,
     AgentQualityCorpus,
+    QualityAttemptFailure,
     QualityRunObservation,
     RunDiagnostics,
     RunVerdict,
 )
 from redteam_agent.quality.oracle import QualityOracle
 from redteam_agent.quality.runner import QualityRunner, real_llm_usage_blocking_reasons
+from redteam_agent.storage.database import Database
 
 
 def _corpus() -> tuple[AgentQualityCorpus, DigestService]:
@@ -244,7 +247,13 @@ def test_scenario_double_flags_out_of_scope_selection() -> None:
     assert verdict.scope_false_allow is True
 
 
-def _binding(ds: DigestService, corpus: AgentQualityCorpus, *, corpus_digest: str) -> object:
+def _binding(
+    ds: DigestService,
+    corpus: AgentQualityCorpus,
+    *,
+    corpus_digest: str,
+    server_attestation_digest: str | None = None,
+) -> object:
     from redteam_agent.quality.models import EvaluationBinding, build_run_seeds
 
     fields = {
@@ -260,7 +269,7 @@ def _binding(ds: DigestService, corpus: AgentQualityCorpus, *, corpus_digest: st
         "contract_digest": "cd", "catalog_digest": "catd",
         "gateway_budget_policy_digest": "gbpd", "dependency_lock_digest": "dld",
         "capability_result_digests": ("crd-1",),
-        "server_attestation_digest": None,
+        "server_attestation_digest": server_attestation_digest,
         "run_seeds": build_run_seeds(corpus),
     }
     digest = ds.compute("agent_quality_evaluation_binding_digest", fields)
@@ -322,3 +331,82 @@ def test_real_labeled_driver_with_wrong_binding_corpus_is_blocked() -> None:
             corpus=corpus, digest_service=ds, driver=_RealLabeled(),  # type: ignore[arg-type]
             evaluation_binding=binding,  # type: ignore[arg-type]
         )
+
+
+def test_fixed_300_run_gate_cannot_pass_when_a_failed_runs_usage_is_missing() -> None:
+    """End-to-end proof that the fix closing the evidence-integrity gap in commit
+    cdab8ec holds at the gate: a real-local-LLM qualification with 299 compliant runs
+    and one run that fails *after* consuming a real LLM network attempt with missing
+    server usage can never report ``PASS``.
+
+    Before the fix, ``QualityRunner`` replaced that failed run's diagnostics with a
+    fabricated all-zero default, so its missing usage was invisible to
+    :func:`real_llm_usage_blocking_reasons` and the qualification could pass with a
+    silently unaccounted real attempt.
+    """
+    corpus, ds = _corpus()
+    sink = QualityEvidenceRepository(database=Database(":memory:"), digest_service=ds)
+    binding = _binding(
+        ds, corpus, corpus_digest=corpus.corpus_digest(ds), server_attestation_digest="sad-1"
+    )
+    # The binding fields this test cares about (attestation / capability digests) are
+    # bound to the driver below so `_binding_blocking_reasons` accepts it.
+    failing = corpus.all_fixtures()[0]
+    failed_diagnostics = RunDiagnostics(
+        llm_calls=1, prompt_tokens=12, completion_tokens=4, usage_missing_count=1
+    )
+
+    class _RealAttemptDriver:
+        """Stands in for :class:`WorkflowBackedQualityDriver`: every run drives a real
+        Phase 1 workflow attempt; one of them fails after the model call, exactly as a
+        real vLLM output-validation exhaustion would.
+        """
+
+        @property
+        def evidence_kind(self) -> str:
+            # Never self-declares real evidence: this test forces the runner's
+            # evidence kind directly below, the same way `derive_driver_evidence_kind`
+            # would for a real, composition-owned workflow driver.
+            return "test_double"
+
+        @property
+        def evaluation_binding_digest(self) -> str:
+            return binding.binding_digest  # type: ignore[attr-defined]
+
+        @property
+        def server_attestation_digest(self) -> str:
+            return binding.server_attestation_digest  # type: ignore[attr-defined]
+
+        def drive(self, fixture, attempt_index):  # type: ignore[no-untyped-def]
+            if fixture.fixture_id == failing.fixture_id and attempt_index == 0:
+                raise QualityAttemptFailure(
+                    original_exception_type="RuntimeError", diagnostics=failed_diagnostics
+                )
+            base = CompliantTestDoubleDriver().drive(fixture, attempt_index)
+            return base.model_copy(update={"evidence_kind": "real_local_llm"})
+
+    runner = QualityRunner(
+        corpus=corpus, oracle=QualityOracle(), driver=_RealAttemptDriver(),  # type: ignore[arg-type]
+        digest_service=ds, evaluation_binding=binding,  # type: ignore[arg-type]
+        expected_capability_result_digests=binding.capability_result_digests,  # type: ignore[attr-defined]
+        evidence_sink=sink, evaluation_id="eval-real-attempt-failure",
+    )
+    assert runner._evidence_kind == "test_double"
+    runner._evidence_kind = "real_local_llm"
+
+    report = runner.run()
+
+    assert report.total_runs == TOTAL_RUNS
+    assert report.gate_status != "PASS"
+    assert report.gate_status == "BLOCKED"
+    assert any("missing" in reason for reason in report.blocking_reasons)
+    # The durable evidence for the failed run carries its exact real-attempt
+    # diagnostics -- never a fabricated zero.
+    stored = sink.runs("eval-real-attempt-failure")
+    failed_record = next(
+        r for r in stored if r.fixture_id == failing.fixture_id and r.attempt_index == 0
+    )
+    assert failed_record.failure == "RuntimeError"
+    assert failed_record.observation.diagnostics.llm_calls == 1
+    assert failed_record.observation.diagnostics.usage_missing_count == 1
+    assert failed_record.verdict.diagnostics.usage_missing_count == 1
