@@ -1,7 +1,7 @@
 # RedTeam Agent — 設計資料と段階実装
 
-許可された隔離演習向け支援AIエージェントの設計資料と、Phase 0A〜2の段階実装を保持するリポジトリ。
-Phase 2までの実ネットワークは閉域Local LLM資格に限定し、実C2/MCP/Target接続・Payload生成・汎用Shell実行は含まない。
+許可された隔離演習向け支援AIエージェントの設計資料と、Phase 0A〜3の段階実装を保持するリポジトリ。
+Phase 3までの実ネットワークは閉域Local LLM資格に限定し、実C2/MCP/Target接続・Payload生成・汎用Shell実行は含まない。Phase 3はHuman ApprovalとDurable Resumeを追加するが、実Adapterは持たない。
 
 ## 担当方針
 
@@ -24,6 +24,7 @@ Phase 2までの実ネットワークは閉域Local LLM資格に限定し、実C
 | [docs/threat-model.md](docs/threat-model.md) | 製品と現行開発体制の脅威・対策・限界 |
 | [docs/development/phase-0a.md](docs/development/phase-0a.md) | Phase 0A の開発記録（対象・要件・試験・残課題・独立レビュー） |
 | [docs/development/phase-2.md](docs/development/phase-2.md) | Phase 2 Local LLM の開発・実モデル資格・独立レビュー記録 |
+| [docs/development/phase-3.md](docs/development/phase-3.md) | Phase 3 Human Approval / Durable Resume の開発記録（対象・要件・試験・残課題） |
 
 設計改訂は`system-design-v1-r3` / `ai-control-v1-r3`。
 AIの意味・判断は別冊を先に読み、安全基盤と接続Schemaは正本で確認する。
@@ -67,6 +68,23 @@ python3 -m venv .venv
 
 Phase 0Aの製品コードと Unit/Integration/Security/Property-State-machine 試験を実装済み。ruff/mypy/compileall/branch coverageと独立レビューを完了済み。
 受入結果と残課題は [docs/development/phase-0a.md](docs/development/phase-0a.md) を参照。
+
+## Phase 3 Human Approval / Durable Resume
+
+Phase 3 は Human Approval の完全表示・厳密Bindingと、停止 / レビュー中Missionの Durable Resume を追加する。
+新しいWorkflow状態・Graph・永続Record・認可経路・重複Serviceは追加せず、実C2 / MCP / 外部Target / Credential /
+Payload / Implant 操作も持たない。開発記録は [docs/development/phase-3.md](docs/development/phase-3.md)。
+
+- `REQUIRE_APPROVAL` は一致する有効な `APPROVED` Record がなければ Dispatch できず、`DENY` は Record があっても
+  実行不可、Plan / Intent 変更・期限切れ・Replay・誤Digest・誤Epoch / Revision・誤Bindingはすべて Fail Closed する
+  （`ExecutorAuthorizationGate` / `evaluate_executable`、`tests/security/test_phase3_approval.py`）。
+- `PAUSE` / `Resume` は `authorization_epoch` を単調増加させ `mission_revision` は不変とし、Pause前の Grant /
+  Snapshot / Decision / Approval を再利用しない（`MissionManager`、`tests/integration/test_phase3_durable_resume.py`）。
+- Durable Resume は PAUSED / WAITING_HUMAN_REVIEW を Checkpoint → Application DB → Adapter の順に既存 RECONCILING
+  / Current Recovery Authority だけで照合し、新規 Dispatch / LLM 呼出しを 0 件とし、不明な非冪等 Outcome を
+  `OUTCOME_UNKNOWN` のまま自動再送しない。MissionをRUNNINGへ戻さず現在Missionに対応するGraph状態へ戻し、
+  WAITING_HUMAN_REVIEW は全Item解決時にだけ Mission Manager が §21.1.3 の既存 FINALIZING へ進める
+  （`Phase1AgentWorkflow.durable_resume` / `FinalizationService.advance_from_human_review`）。
 
 ## Phase 2 Local LLM（Capability / 300-Run Qualification）
 
