@@ -110,6 +110,33 @@ class FinalizationService:
             actor_token=self._operator_actor_token,
         )
 
+    def mission_state(self, mission_id: str) -> MissionState | None:
+        return self._states.get(mission_id)
+
+    def advance_from_human_review(self, mission_id: str) -> MissionState:
+        """WAITING_HUMAN_REVIEW -> FINALIZING once every item is RESOLVED (§21.1.3).
+
+        This is the single documented path back out of ``WAITING_HUMAN_REVIEW``: it
+        never resumes normal execution, never rewrites the original terminal
+        reason, and reuses the finalization intent that was durably recorded when
+        the mission first entered FINALIZING. The complete-mission predicate is
+        re-evaluated by the ordinary FINALIZING workflow that follows this edge.
+        """
+        state = self._states.get(mission_id)
+        if state is None or state.state != "WAITING_HUMAN_REVIEW":
+            raise AgentLoopError("advancing requires a WAITING_HUMAN_REVIEW mission")
+        items = self._unresolved.current(mission_id)
+        if not items or any(item.status != "RESOLVED" for item in items):
+            raise AgentLoopError("cannot leave human review while items are unresolved")
+        # The original terminal reason is preserved in the durable intent; a
+        # missing intent fails closed rather than inventing a new reason.
+        self._intent(mission_id)
+        return self._manager.begin_finalization(
+            mission_id,
+            expected_version=state.mission_state_version,
+            actor_token=self._operator_actor_token,
+        )
+
     def _begin(
         self,
         mission_id: str,

@@ -11,7 +11,10 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.runtime import Runtime
 
-from redteam_agent.agent.application import ActionTransitionResult, PlannerActionApplicationService
+from redteam_agent.agent.application import (
+    ActionTransitionResult,
+    PlannerActionApplicationService,
+)
 from redteam_agent.agent.controller import AgentController
 from redteam_agent.agent.finalization import FinalizationService
 from redteam_agent.agent.llm_gateway import SharedLLMGateway
@@ -48,9 +51,18 @@ from redteam_agent.knowledge.models import (
 )
 from redteam_agent.knowledge.reducer import KnowledgeReducer
 from redteam_agent.knowledge.verified_facts import VerifiedFindingProjector
-from redteam_agent.mission.models import MissionState
-from redteam_agent.plan.models import PlannerActionOutput, PlannerContextRequest, PlannerOutput
-from redteam_agent.quarantine.collection import QuarantineCollectionResult, QuarantineCollectionService
+from redteam_agent.mission.models import MissionLifecycleState, MissionState
+from redteam_agent.plan.models import (
+    PlannerActionOutput,
+    PlannerContextRequest,
+    PlannerOutput,
+)
+from redteam_agent.quarantine.collection import (
+    QuarantineCollectionResult,
+    QuarantineCollectionService,
+)
+from redteam_agent.runtime.authorization_context import AuthorizationContextResolver
+from redteam_agent.runtime.clock import Clock
 from redteam_agent.storage.execution_repositories import (
     CancelAttemptRepository,
     ExecutionRecordRepository,
@@ -134,6 +146,45 @@ class _AnalysisRuntime:
     sink: _AnalysisResultSink
 
 
+# Provider execution states that a durable resume still reconciles. Terminal
+# states (including OUTCOME_UNKNOWN and BLOCKED) are never re-read or re-sent.
+_RESUME_RECONCILE_STATES = frozenset(
+    {
+        "AUTHORIZED",
+        "DISPATCH_CLAIMED",
+        "DISPATCHED",
+        "RUNNING",
+        "CANCEL_REQUESTED",
+        "RECONCILING",
+    }
+)
+
+# Graph State / Mission State mapping (SystemDesign §17.3). A durable resume
+# reports the graph state that corresponds to the *current* mission, never the
+# state captured when reconciliation began.
+_GRAPH_STATE_BY_MISSION_STATE: dict[MissionLifecycleState, str] = {
+    "PAUSED": "PAUSED",
+    "WAITING_HUMAN_REVIEW": "WAITING_HUMAN_REVIEW",
+    "FINALIZING": "FINALIZING",
+    "COMPLETED": "COMPLETED",
+    "COMPLETED_WITH_UNRESOLVED_ITEMS": "COMPLETED_WITH_UNRESOLVED_ITEMS",
+    "ABORTED": "ABORTED",
+    "FAILED": "FAILED",
+    "RUNNING": "RUNNING",
+}
+
+
+@dataclass(frozen=True)
+class DurableResumeOutcome:
+    """Result of a durable resume reconciliation (no new persisted record)."""
+
+    mission_state: MissionLifecycleState
+    graph_state: str
+    entry_mission_state: MissionLifecycleState
+    reconciled: tuple[tuple[str, str], ...]
+    advanced_to_finalizing: bool
+
+
 class Phase1AgentWorkflow:
     """Runs one bounded coarse node; repositories remain the only source of truth."""
 
@@ -165,6 +216,8 @@ class Phase1AgentWorkflow:
         digest_service: DigestService,
         checkpointer: SqliteSaver,
         verified_finding_projector: VerifiedFindingProjector,
+        context_resolver: AuthorizationContextResolver,
+        clock: Clock,
     ) -> None:
         self._controller = controller
         self._gateway = llm_gateway
@@ -192,6 +245,8 @@ class Phase1AgentWorkflow:
         self._digests = digest_service
         self._checkpointer = checkpointer
         self._verified_findings = verified_finding_projector
+        self._resolver = context_resolver
+        self._clock = clock
         self.graph = self._build_planning_graph()
         self.analysis_graph = self._build_analysis_graph()
 
@@ -673,6 +728,94 @@ class Phase1AgentWorkflow:
 
     def finalize(self, mission_id: str) -> MissionState:
         return self._finalization.finalize(mission_id)
+
+    def durable_resume(self, *, mission_id: str) -> DurableResumeOutcome:
+        """Reconcile a PAUSED / WAITING_HUMAN_REVIEW mission without resuming it.
+
+        This is the durable-resume reconciliation of SystemDesign §17.3 / §21.1.1.
+        It reuses the existing RECONCILING recovery path and Current Recovery
+        Authority only: it dispatches nothing, calls no Planner/Analyzer, and never
+        moves the mission to RUNNING. Reconciliation consults, in order, the durable
+        **checkpoint**, then the **Application DB** execution record, then the
+        **Adapter** (through ``ReconciliationService``), so an uncertain provider
+        outcome becomes ``OUTCOME_UNKNOWN`` and a non-idempotent action is never
+        auto-resent. The mission lifecycle state is preserved; the only permitted
+        progression is the documented ``WAITING_HUMAN_REVIEW -> FINALIZING`` edge
+        (§21.1.3), taken exactly when every unresolved item is already RESOLVED.
+        """
+        now = self._clock.now()
+        mission = self._resolver.resolve(mission_id, now=now).mission
+        if mission.state not in ("PAUSED", "WAITING_HUMAN_REVIEW"):
+            raise AgentLoopError(
+                "durable resume reconciles only a PAUSED or WAITING_HUMAN_REVIEW mission"
+            )
+        entry_state: MissionLifecycleState = mission.state
+        # 1) Checkpoint (durable) — its active execution is reconciled first.
+        checkpoint = self._controller.checkpoint(mission_id)
+        within_recovery = now < mission.recovery_until
+        reconciled: list[tuple[str, str]] = []
+        for execution_id in self._durable_resume_targets(mission_id, checkpoint):
+            if not within_recovery:
+                # After recovery_until no provider read is permitted (§21.3); the
+                # unconfirmed execution stays as-is for human review.
+                reconciled.append((execution_id, "RECOVERY_WINDOW_CLOSED"))
+                continue
+            reconciled.append((execution_id, self._durable_resume_reconcile_one(mission_id, execution_id)))
+        # Re-read the *current* mission; reconciliation must not have changed its
+        # lifecycle state, and the graph state is derived from the repository, not
+        # from the entry snapshot.
+        mission = self._resolver.resolve(mission_id, now=self._clock.now()).mission
+        if mission.state != entry_state:
+            raise AgentLoopError("durable resume must not change the mission lifecycle state")
+        advanced = False
+        if entry_state == "WAITING_HUMAN_REVIEW" and self._all_items_resolved(mission_id):
+            # §21.1.3: the Mission Manager takes the existing WAITING_HUMAN_REVIEW ->
+            # FINALIZING edge, preserving the original terminal reason. The ordinary
+            # FINALIZING workflow (not durable resume) then drives to the terminal;
+            # durable resume never implies a normal resume of its own.
+            self._finalization.advance_from_human_review(mission_id)
+            advanced = True
+            mission = self._resolver.resolve(mission_id, now=self._clock.now()).mission
+        return DurableResumeOutcome(
+            mission_state=mission.state,
+            graph_state=_GRAPH_STATE_BY_MISSION_STATE[mission.state],
+            entry_mission_state=entry_state,
+            reconciled=tuple(reconciled),
+            advanced_to_finalizing=advanced,
+        )
+
+    def _durable_resume_targets(
+        self, mission_id: str, checkpoint: object | None
+    ) -> tuple[str, ...]:
+        ordered: list[str] = []
+        seen: set[str] = set()
+        active_id = getattr(checkpoint, "active_execution_id", None)
+        if isinstance(active_id, str):
+            record = self._executions.get(active_id)
+            if record is not None and record.provider_execution_state in _RESUME_RECONCILE_STATES:
+                ordered.append(active_id)
+                seen.add(active_id)
+        for record in self._executions.all_for_mission(mission_id):
+            if (
+                record.provider_execution_state in _RESUME_RECONCILE_STATES
+                and record.execution_id not in seen
+            ):
+                ordered.append(record.execution_id)
+                seen.add(record.execution_id)
+        return tuple(ordered)
+
+    def _durable_resume_reconcile_one(self, mission_id: str, execution_id: str) -> str:
+        try:
+            return self._reconcile(mission_id, execution_id).reason_code
+        except AgentLoopError as exc:
+            if str(exc) == "reconciliation retry budget exhausted":
+                # Preserve the stopped/review mission state; the operator decides.
+                return "RECONCILE_BUDGET_EXHAUSTED"
+            raise
+
+    def _all_items_resolved(self, mission_id: str) -> bool:
+        items = self._unresolved.current(mission_id)
+        return bool(items) and all(item.status == "RESOLVED" for item in items)
 
     def project_verified_execution(self, execution_id: str) -> VerifiedFinding:
         return self._verified_findings.project_success(execution_id)
