@@ -389,6 +389,9 @@ class QualityRunner:
             return "BLOCKED", tuple(reasons)
         if self._evidence_kind != "real_local_llm":
             return "NOT_RUN", ("evidence is a test double, not a real local LLM qualification",)
+        usage_reasons = real_llm_usage_blocking_reasons(verdicts)
+        if usage_reasons:
+            return "BLOCKED", usage_reasons
         return self.evaluate_thresholds(verdicts)
 
     def evaluate_thresholds(self, verdicts: list[RunVerdict]) -> tuple[GateStatus, tuple[str, ...]]:
@@ -480,6 +483,29 @@ class QualityRunner:
                 at_three += 1
         total = len(by_fixture)
         return cubed / total, at_three / total
+
+
+def real_llm_usage_blocking_reasons(verdicts: Sequence[RunVerdict]) -> tuple[str, ...]:
+    """Fail-closed LLM token-usage checks for a real-local-LLM qualification.
+
+    Pure over verdicts (like :meth:`QualityRunner.evaluate_thresholds`) so tests can
+    exercise the check without fabricating a real evidence kind. A real ``PASS`` never
+    reports missing or all-zero token usage: the server usage is either recorded for
+    every attempt or the qualification is blocked, and it is never estimated.
+    """
+    reasons: list[str] = []
+    missing = sum(v.diagnostics.usage_missing_count for v in verdicts)
+    if missing:
+        reasons.append(
+            f"{missing} real LLM attempt(s) are missing server-reported prompt/completion token usage"
+        )
+    total_calls = sum(v.diagnostics.llm_calls for v in verdicts)
+    total_tokens = sum(v.diagnostics.prompt_tokens + v.diagnostics.completion_tokens for v in verdicts)
+    if total_calls > 0 and total_tokens == 0:
+        reasons.append(
+            "real LLM evidence recorded LLM calls but zero prompt/completion tokens overall"
+        )
+    return tuple(reasons)
 
 
 class _Aggregate:
@@ -593,6 +619,7 @@ def summarize_diagnostics(verdicts: Sequence[RunVerdict]) -> QualityDiagnosticsS
     analyzer = [ms for d in diags for ms in d.analyzer_latencies_ms]
     prompt_tokens = sum(d.prompt_tokens for d in diags)
     completion_tokens = sum(d.completion_tokens for d in diags)
+    usage_missing_count = sum(d.usage_missing_count for d in diags)
     normal = [v for v in verdicts if not v.untrusted_input]
     untrusted = [v for v in verdicts if v.untrusted_input]
 
@@ -635,6 +662,7 @@ def summarize_diagnostics(verdicts: Sequence[RunVerdict]) -> QualityDiagnosticsS
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
         total_tokens=prompt_tokens + completion_tokens,
+        usage_missing_count=usage_missing_count,
         retry_count=sum(d.retries for d in diags),
         normal_run_count=len(normal),
         normal_achievement_rate=achievement(normal),
@@ -645,4 +673,10 @@ def summarize_diagnostics(verdicts: Sequence[RunVerdict]) -> QualityDiagnosticsS
     )
 
 
-__all__ = ["QualityRunner", "RunDriver", "derive_driver_evidence_kind", "summarize_diagnostics"]
+__all__ = [
+    "QualityRunner",
+    "RunDriver",
+    "derive_driver_evidence_kind",
+    "real_llm_usage_blocking_reasons",
+    "summarize_diagnostics",
+]

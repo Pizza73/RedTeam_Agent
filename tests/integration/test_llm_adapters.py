@@ -131,6 +131,81 @@ def test_staged_recombination_revalidates_final_schema() -> None:
         recombine_and_revalidate_proposal(objective_stage=objective_stage, arguments_stage={})
 
 
+def test_planner_invocation_records_server_reported_usage() -> None:
+    ds = DigestService()
+    clock = ManualClock(_NOW)
+    profile = fake.local_profile(ds)
+    client = VLLMChatClient(
+        base_url="http://vllm.local/v1",
+        transport=fake.transport_returning(
+            fake.native_response(
+                fake.VALID_PLANNER_ACTION,
+                usage=fake.usage_payload(prompt_tokens=321, completion_tokens=64),
+            )
+        ),
+    )
+    envelope = fake.minimal_planner_envelope(ds, authorized_context={"note": "redacted"})
+    invocation = _planner(ds, client, profile, clock).build_invocation(
+        envelope, deadline=clock.now() + timedelta(seconds=30)
+    )
+    assert invocation.usage_records == ()
+    invocation.before_attempt(0)
+    invocation(envelope)
+    assert invocation.usage_records == ((321, 64),)
+
+
+def test_planner_invocation_records_missing_usage_as_none_not_zero() -> None:
+    ds = DigestService()
+    clock = ManualClock(_NOW)
+    profile = fake.local_profile(ds)
+    client = VLLMChatClient(
+        base_url="http://vllm.local/v1",
+        transport=fake.transport_returning(fake.native_response(fake.VALID_PLANNER_ACTION)),
+    )
+    envelope = fake.minimal_planner_envelope(ds, authorized_context={"note": "redacted"})
+    invocation = _planner(ds, client, profile, clock).build_invocation(
+        envelope, deadline=clock.now() + timedelta(seconds=30)
+    )
+    invocation.before_attempt(0)
+    invocation(envelope)
+    assert invocation.usage_records == ((None, None),)
+
+
+def test_planner_invocation_accumulates_usage_across_retry_attempts() -> None:
+    # A gateway-driven output-validation retry re-invokes the SAME invocation object
+    # (it re-uses the request envelope); every real network round trip it makes --
+    # including the one whose output later fails validation -- must be accounted for.
+    ds = DigestService()
+    clock = ManualClock(_NOW)
+    profile = fake.local_profile(ds)
+    client = VLLMChatClient(
+        base_url="http://vllm.local/v1",
+        transport=fake.transport_sequence(
+            [
+                fake.native_response(
+                    fake.INVALID_UNKNOWN_FIELD,
+                    usage=fake.usage_payload(prompt_tokens=100, completion_tokens=10),
+                ),
+                fake.native_response(
+                    fake.VALID_PLANNER_ACTION,
+                    usage=fake.usage_payload(prompt_tokens=100, completion_tokens=20),
+                ),
+            ]
+        ),
+    )
+    envelope = fake.minimal_planner_envelope(ds, authorized_context={"note": "redacted"})
+    invocation = _planner(ds, client, profile, clock).build_invocation(
+        envelope, deadline=clock.now() + timedelta(seconds=30)
+    )
+    invocation.before_attempt(0)
+    with pytest.raises(LLMOutputValidationError):
+        invocation(envelope)
+    invocation.before_attempt(1)
+    output = invocation(envelope)
+    assert isinstance(output, PlannerActionOutput)
+    assert invocation.usage_records == ((100, 10), (100, 20))
+
+
 def test_real_adapter_not_callable_without_preflight() -> None:
     from redteam_agent.errors import LLMRequestBudgetError
 

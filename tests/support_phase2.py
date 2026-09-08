@@ -43,7 +43,12 @@ def local_profile(
 
 
 def _body(
-    *, content: str | None, tool_arguments: str | None, finish_reason: str, tool_name: str = "schema"
+    *,
+    content: str | None,
+    tool_arguments: str | None,
+    finish_reason: str,
+    tool_name: str = "schema",
+    usage: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     message: dict[str, Any] = {"role": "assistant"}
     if content is not None:
@@ -53,19 +58,47 @@ def _body(
             {"id": "call-1", "type": "function",
              "function": {"name": tool_name, "arguments": tool_arguments}}
         ]
-    return {"choices": [{"index": 0, "message": message, "finish_reason": finish_reason}]}
+    body: dict[str, Any] = {"choices": [{"index": 0, "message": message, "finish_reason": finish_reason}]}
+    if usage is not None:
+        body["usage"] = usage
+    return body
 
 
-def native_response(content: str, *, finish_reason: str = "stop", status: int = 200) -> httpx.Response:
-    return httpx.Response(status, json=_body(content=content, tool_arguments=None, finish_reason=finish_reason))
+def usage_payload(*, prompt_tokens: int, completion_tokens: int) -> dict[str, int]:
+    """A server-reported ``usage`` object, exactly as a real vLLM response carries it."""
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+    }
 
 
-def tool_response(
-    arguments: str, *, finish_reason: str = "stop", status: int = 200, tool_name: str = "analysis_result"
+def native_response(
+    content: str,
+    *,
+    finish_reason: str = "stop",
+    status: int = 200,
+    usage: dict[str, Any] | None = None,
 ) -> httpx.Response:
     return httpx.Response(
         status,
-        json=_body(content=None, tool_arguments=arguments, finish_reason=finish_reason, tool_name=tool_name),
+        json=_body(content=content, tool_arguments=None, finish_reason=finish_reason, usage=usage),
+    )
+
+
+def tool_response(
+    arguments: str,
+    *,
+    finish_reason: str = "stop",
+    status: int = 200,
+    tool_name: str = "analysis_result",
+    usage: dict[str, Any] | None = None,
+) -> httpx.Response:
+    return httpx.Response(
+        status,
+        json=_body(
+            content=None, tool_arguments=arguments, finish_reason=finish_reason, tool_name=tool_name, usage=usage
+        ),
     )
 
 

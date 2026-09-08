@@ -74,6 +74,11 @@ class ChatCompletionResult:
     tool_call_arguments: str | None
     finish_reason: str
     tool_call_name: str | None = None
+    # Server-reported usage from the response body's ``usage`` object (never
+    # estimated locally). ``None`` when the server omitted or malformed the
+    # corresponding field -- callers must treat that as missing evidence, not zero.
+    usage_prompt_tokens: int | None = None
+    usage_completion_tokens: int | None = None
 
 
 class VLLMChatClient:
@@ -215,11 +220,25 @@ class VLLMChatClient:
                     name = function.get("name")
                     if isinstance(name, str):
                         tool_call_name = name
+        usage = body.get("usage")
+        usage_prompt_tokens: int | None = None
+        usage_completion_tokens: int | None = None
+        if isinstance(usage, dict):
+            prompt = usage.get("prompt_tokens")
+            completion = usage.get("completion_tokens")
+            # Never estimate: an absent or malformed field stays ``None`` rather
+            # than being coerced into a fabricated count.
+            if isinstance(prompt, int) and not isinstance(prompt, bool):
+                usage_prompt_tokens = prompt
+            if isinstance(completion, int) and not isinstance(completion, bool):
+                usage_completion_tokens = completion
         return ChatCompletionResult(
             content=content if isinstance(content, str) else None,
             tool_call_arguments=tool_call_arguments,
             finish_reason=finish_reason,
             tool_call_name=tool_call_name,
+            usage_prompt_tokens=usage_prompt_tokens,
+            usage_completion_tokens=usage_completion_tokens,
         )
 
 

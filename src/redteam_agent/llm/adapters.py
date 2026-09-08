@@ -161,11 +161,20 @@ class _BoundInvocation:
         self._client = client
         self._cancel_token = cancel_token
         self._preflight_ok = False
+        # One (prompt_tokens, completion_tokens) pair per real network round trip
+        # this invocation has made so far, including every output-validation retry
+        # the gateway drives through it. Either element is ``None`` when the server
+        # response did not report that count -- never backfilled with an estimate.
+        self._usage_records: list[tuple[int | None, int | None]] = []
 
     def before_attempt(self, attempt_index: int) -> Mapping[str, object]:
         metadata = self._binding.before_attempt(attempt_index)
         self._preflight_ok = True
         return metadata
+
+    @property
+    def usage_records(self) -> tuple[tuple[int | None, int | None], ...]:
+        return tuple(self._usage_records)
 
     def _run(self) -> str:
         if not self._preflight_ok:
@@ -177,6 +186,10 @@ class _BoundInvocation:
             raise LLMRequestBudgetError("no remaining time budget for request")
         cancel = self._cancel_token if self._cancel_token is not None else CancellationToken()
         result = self._client.complete(self._binding.request, timeout_seconds=timeout, cancel_token=cancel)
+        # Recorded for every completed network round trip, regardless of whether
+        # output extraction/validation succeeds afterward: the attempt still spent
+        # real tokens and must be accounted for.
+        self._usage_records.append((result.usage_prompt_tokens, result.usage_completion_tokens))
         return extract_raw_output(result, self._binding.profile.structured_output_mode, self._binding.schema_name)
 
 
@@ -281,6 +294,18 @@ class LocalLLMPlanner:
         self._tokens = token_counter
         self._clock = clock
         self._ds = digest_service
+
+    @property
+    def client(self) -> VLLMChatClient:
+        return self._client
+
+    @property
+    def token_counter(self) -> TokenCounter:
+        return self._tokens
+
+    @property
+    def profile(self) -> LocalLLMProfile:
+        return self._profile
 
     def build_invocation(
         self,
@@ -399,6 +424,18 @@ class LocalLLMAnalyzer:
         self._tokens = token_counter
         self._clock = clock
         self._ds = digest_service
+
+    @property
+    def client(self) -> VLLMChatClient:
+        return self._client
+
+    @property
+    def token_counter(self) -> TokenCounter:
+        return self._tokens
+
+    @property
+    def profile(self) -> LocalLLMProfile:
+        return self._profile
 
     def build_invocation(
         self,

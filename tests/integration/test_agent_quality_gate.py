@@ -17,9 +17,11 @@ from redteam_agent.quality.models import (
     TOTAL_RUNS,
     AgentQualityCorpus,
     QualityRunObservation,
+    RunDiagnostics,
+    RunVerdict,
 )
 from redteam_agent.quality.oracle import QualityOracle
-from redteam_agent.quality.runner import QualityRunner
+from redteam_agent.quality.runner import QualityRunner, real_llm_usage_blocking_reasons
 
 
 def _corpus() -> tuple[AgentQualityCorpus, DigestService]:
@@ -263,6 +265,43 @@ def _binding(ds: DigestService, corpus: AgentQualityCorpus, *, corpus_digest: st
     }
     digest = ds.compute("agent_quality_evaluation_binding_digest", fields)
     return EvaluationBinding(**fields, binding_digest=digest)  # type: ignore[arg-type]
+
+
+def _verdict(*, diagnostics: RunDiagnostics) -> RunVerdict:
+    return RunVerdict(
+        fixture_id="f", attempt_index=0, family_id=1, reached_expected=True,
+        scope_false_allow=False, approval_bypass=False, secret_leakage=False,
+        duplicate_side_effect=False, false_confirmed_fact=False, false_goal=False,
+        unexpected_human_wait=False, hard_limit_ok=True, is_normal_run=True,
+        recall_numerator=1, recall_denominator=1, diagnostics=diagnostics,
+    )
+
+
+def test_real_llm_usage_blocking_reasons_is_clean_with_recorded_usage() -> None:
+    verdict = _verdict(diagnostics=RunDiagnostics(llm_calls=4, prompt_tokens=400, completion_tokens=80))
+    assert real_llm_usage_blocking_reasons([verdict]) == ()
+
+
+def test_real_llm_usage_blocking_reasons_flags_missing_usage() -> None:
+    verdict = _verdict(
+        diagnostics=RunDiagnostics(llm_calls=4, prompt_tokens=300, completion_tokens=60, usage_missing_count=1)
+    )
+    reasons = real_llm_usage_blocking_reasons([verdict])
+    assert reasons
+    assert any("missing" in reason for reason in reasons)
+
+
+def test_real_llm_usage_blocking_reasons_flags_calls_with_zero_tokens() -> None:
+    # Reproduces the exact defect this closes: real LLM calls happened but the
+    # aggregate token usage is all-zero (the original phase 2 report's shape).
+    verdict = _verdict(diagnostics=RunDiagnostics(llm_calls=1284))
+    reasons = real_llm_usage_blocking_reasons([verdict])
+    assert reasons
+    assert any("zero prompt/completion tokens" in reason for reason in reasons)
+
+
+def test_real_llm_usage_blocking_reasons_allows_zero_calls() -> None:
+    assert real_llm_usage_blocking_reasons([_verdict(diagnostics=RunDiagnostics())]) == ()
 
 
 def test_real_labeled_driver_with_wrong_binding_corpus_is_blocked() -> None:

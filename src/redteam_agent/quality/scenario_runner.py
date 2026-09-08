@@ -31,12 +31,15 @@ from redteam_agent.context.builder import ContextBodyRecord
 from redteam_agent.context.models import ContextResourceIndexRecord
 from redteam_agent.context.selector import ContextSelector
 from redteam_agent.contracts.catalog import ActionContractDefinition, parameter_schema_digest
+from redteam_agent.errors import LLMEvaluationError
 from redteam_agent.execution.models import ExecutionResult
 from redteam_agent.execution.thread import compute_thread_id
 from redteam_agent.knowledge.models import KnowledgeObservation
 from redteam_agent.llm.adapters import LocalLLMAnalyzer, LocalLLMPlanner
 from redteam_agent.llm.binding import MissionBindingChecker
+from redteam_agent.llm.client import VLLMChatClient
 from redteam_agent.llm.profile import LocalLLMProfile
+from redteam_agent.llm.tokenizer import TokenCounter
 from redteam_agent.mission.manager import MISSION_ADMIN_ROLE, MISSION_OPERATOR_ROLE
 from redteam_agent.mission.models import (
     ApprovalPolicy,
@@ -137,6 +140,40 @@ def _tool_definition(
     return tool, contract
 
 
+class _UsageTally:
+    """Per-run LLM token-usage accumulator (local to one :meth:`__call__` invocation).
+
+    Holding this as a plain local object -- never shared class/module state -- is what
+    keeps concurrent runs isolated under :meth:`WorkflowBackedQualityDriver.drive_many`:
+    each thread owns exactly one tally, built and consumed inside its own call frame.
+    """
+
+    __slots__ = ("completion_tokens", "llm_calls", "prompt_tokens", "retries", "usage_missing", "validation_errors")
+
+    def __init__(self) -> None:
+        self.llm_calls = 0
+        self.retries = 0
+        self.validation_errors = 0
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
+        self.usage_missing = 0
+
+    def record(self, usage_records: tuple[tuple[int | None, int | None], ...]) -> None:
+        if not usage_records:
+            return
+        self.llm_calls += len(usage_records)
+        # Every attempt beyond the first for one logical operation is an
+        # output-validation retry (the gateway never retries a transport error).
+        self.retries += len(usage_records) - 1
+        self.validation_errors += len(usage_records) - 1
+        for prompt_tokens, completion_tokens in usage_records:
+            if prompt_tokens is None or completion_tokens is None:
+                self.usage_missing += 1
+                continue
+            self.prompt_tokens += prompt_tokens
+            self.completion_tokens += completion_tokens
+
+
 class IsolatedPhase1ScenarioRunner:
     """Execute one expectation-free fixture through a fresh product workflow kernel."""
 
@@ -147,11 +184,55 @@ class IsolatedPhase1ScenarioRunner:
         planner_factory: Callable[[Phase1Kernel], LocalLLMPlanner],
         analyzer_factory: Callable[[Phase1Kernel], LocalLLMAnalyzer],
         profile: LocalLLMProfile,
+        client: VLLMChatClient,
+        token_counter: TokenCounter,
     ) -> None:
         self._kernel_factory = kernel_factory
         self._planner_factory = planner_factory
         self._analyzer_factory = analyzer_factory
         self._profile = profile
+        # The one trusted client/tokenizer this runner's evidence is bound to. Every
+        # planner/analyzer the factories produce is verified against these exact
+        # objects on every call -- a factory closure cannot silently swap in a
+        # different (fake) transport or tokenizer after construction-time checks.
+        self._client = client
+        self._token_counter = token_counter
+
+    def is_bound_to(self, *, client: VLLMChatClient, token_counter: TokenCounter, profile_digest: str) -> bool:
+        """Whether this runner's trace-producing evidence is bound to the given identity.
+
+        Checked by the driver at ``evidence_kind`` time against the exact objects the
+        real qualification is constructed with, and against the evaluation binding's
+        profile digest -- never a type/class check alone.
+        """
+        return (
+            self._client is client
+            and self._token_counter is token_counter
+            and self._profile.profile_digest == profile_digest
+        )
+
+    def _verify_factory_binding(self, planner: LocalLLMPlanner, analyzer: LocalLLMAnalyzer) -> None:
+        """Reject a planner/analyzer that a factory built against a different identity.
+
+        ``planner_factory``/``analyzer_factory`` are caller-controlled closures; the
+        constructor-time ``client``/``token_counter`` recorded above only prove this
+        runner *claims* an identity, not that every produced adapter actually uses it.
+        This runtime check closes that gap: it fails closed rather than letting a
+        mismatched or injected inner factory pass as real evidence.
+        """
+        mismatched = (
+            planner.client is not self._client
+            or planner.token_counter is not self._token_counter
+            or planner.profile is not self._profile
+            or analyzer.client is not self._client
+            or analyzer.token_counter is not self._token_counter
+            or analyzer.profile is not self._profile
+        )
+        if mismatched:
+            raise LLMEvaluationError(
+                "isolated scenario runner factories produced a planner/analyzer not bound "
+                "to this runner's trusted client/tokenizer/profile"
+            )
 
     def __call__(
         self,
@@ -168,6 +249,7 @@ class IsolatedPhase1ScenarioRunner:
         phase1 = self._kernel_factory(run_input)
         planner = self._planner_factory(phase1)
         analyzer = self._analyzer_factory(phase1)
+        self._verify_factory_binding(planner, analyzer)
         tools = self._seed_mission(phase1, run_input, attempt_index)
         mission_id = self._mission_id(run_input, attempt_index)
         run_id = f"quality-run-{attempt_index}"
@@ -176,6 +258,7 @@ class IsolatedPhase1ScenarioRunner:
         extracted: list[str] = []
         planner_latencies: list[int] = []
         analyzer_latencies: list[int] = []
+        usage = _UsageTally()
         leaked = False
         planning_iterations = 0
         analysis_index = 0
@@ -251,6 +334,7 @@ class IsolatedPhase1ScenarioRunner:
                 envelope=envelope, ids=ids, invoke_planner=invocation
             )
             planner_latencies.append(round((time.monotonic() - started) * 1000))
+            usage.record(invocation.usage_records)
             steps.append(step)
             last_planner_context_id = envelope.planner_context_id
             leaked = leaked or self._contains_secret(step.planner_output, run_input)
@@ -292,6 +376,7 @@ class IsolatedPhase1ScenarioRunner:
             started = time.monotonic()
             step = phase1.workflow.run_planning_iteration(envelope=envelope, ids=ids, invoke_planner=invocation)
             planner_latencies.append(round((time.monotonic() - started) * 1000))
+            usage.record(invocation.usage_records)
             steps.append(step)
             last_planner_context_id = envelope.planner_context_id
             leaked = leaked or self._contains_secret(step.planner_output, run_input)
@@ -329,13 +414,13 @@ class IsolatedPhase1ScenarioRunner:
                     execution_id=ids.execution_id
                 )
                 recovery_reconciled = adapter.reconcile_calls > 0
-            adapter._collect_status = "failed" if fail_delivery else "succeeded"  # type: ignore[attr-defined]
-            adapter._collect_exit_code = 1 if fail_delivery else 0  # type: ignore[attr-defined]
+            adapter._collect_status = "failed" if fail_delivery else "succeeded"
+            adapter._collect_exit_code = 1 if fail_delivery else 0
             result = self._finish_execution(phase1, ids.execution_id)
             if result is None or result.status != "SUCCEEDED" or analysis_index >= len(observations):
                 continue
             candidate = observations[analysis_index]
-            observation, latency = self._analyze(
+            observation, latency, analyzer_usage = self._analyze(
                 phase1,
                 analyzer,
                 run_input,
@@ -348,6 +433,7 @@ class IsolatedPhase1ScenarioRunner:
                 seed=_seed_number(seed, 100 + index),
             )
             analyzer_latencies.append(latency)
+            usage.record(analyzer_usage)
             leaked = leaked or self._contains_secret(observation, run_input)
             if observation.object_ref == candidate.fact_id:
                 extracted.append(candidate.fact_id)
@@ -384,7 +470,12 @@ class IsolatedPhase1ScenarioRunner:
             diagnostics=RunDiagnostics(
                 tool_dispatches=adapter.submit_calls,
                 action_attempts=sum(step.planner_output is not None for step in steps),
-                llm_calls=len(planner_latencies) + len(analyzer_latencies),
+                llm_calls=usage.llm_calls,
+                retries=usage.retries,
+                validation_errors=usage.validation_errors,
+                prompt_tokens=usage.prompt_tokens,
+                completion_tokens=usage.completion_tokens,
+                usage_missing_count=usage.usage_missing,
                 provider_reconciliations=adapter.reconcile_calls,
                 checkpoint_recovery_attempts=checkpoint_recovery_attempts,
                 checkpoint_recovery_successes=checkpoint_recovery_successes,
@@ -669,7 +760,7 @@ class IsolatedPhase1ScenarioRunner:
         index: int,
         fact_id: str,
         seed: int,
-    ) -> tuple[KnowledgeObservation, int]:
+    ) -> tuple[KnowledgeObservation, int, tuple[tuple[int | None, int | None], ...]]:
         a = phase1.phase0c.phase0b.phase0a
         result = phase1.phase0c.phase0b.result_repository.get(execution_id)
         assert result is not None
@@ -728,7 +819,7 @@ class IsolatedPhase1ScenarioRunner:
             run_id=run_id,
             thread_id=thread_id,
         )
-        return observation, round((time.monotonic() - started) * 1000)
+        return observation, round((time.monotonic() - started) * 1000), invocation.usage_records
 
     @staticmethod
     def _put_context(

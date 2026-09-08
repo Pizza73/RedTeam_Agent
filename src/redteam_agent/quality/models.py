@@ -244,6 +244,10 @@ class RunDiagnostics(StrictImmutableBoundaryModel):
     retries: int = Field(ge=0, default=0)
     prompt_tokens: int = Field(ge=0, default=0)
     completion_tokens: int = Field(ge=0, default=0)
+    # Count of real LLM network attempts whose server response omitted or
+    # malformed prompt/completion usage. Never inferred from a zero token count;
+    # a real PASS is blocked while this is non-zero (§36.E1).
+    usage_missing_count: int = Field(ge=0, default=0)
     outcome_unknown_count: int = Field(ge=0, default=0)
     provider_reconciliations: int = Field(ge=0, default=0)
     checkpoint_recovery_attempts: int = Field(ge=0, default=0)
@@ -262,6 +266,8 @@ class RunDiagnostics(StrictImmutableBoundaryModel):
             raise ValueError("invalid actions exceed action attempts")
         if self.validation_errors > self.llm_calls:
             raise ValueError("validation errors exceed llm calls")
+        if self.usage_missing_count > self.llm_calls:
+            raise ValueError("usage missing count exceeds llm calls")
         if any(latency < 0 for latency in (*self.planner_latencies_ms, *self.analyzer_latencies_ms)):
             raise ValueError("latency must be non-negative")
         return self
@@ -367,6 +373,7 @@ class QualityDiagnosticsSummary(StrictImmutableBoundaryModel):
     prompt_tokens: int = Field(ge=0, default=0)
     completion_tokens: int = Field(ge=0, default=0)
     total_tokens: int = Field(ge=0, default=0)
+    usage_missing_count: int = Field(ge=0, default=0)
     retry_count: int = Field(ge=0, default=0)
     normal_run_count: int = Field(ge=0, default=0)
     normal_achievement_rate: float = Field(ge=0.0, le=1.0, default=0.0)

@@ -534,6 +534,8 @@ class Phase2Kernel:
             planner_factory=planner_factory,
             analyzer_factory=analyzer_factory,
             profile=profile,
+            client=client,
+            token_counter=token_counter,
         )
         executor = IsolatedPhase1WorkflowRunExecutor(
             workflow=self.phase1.workflow,

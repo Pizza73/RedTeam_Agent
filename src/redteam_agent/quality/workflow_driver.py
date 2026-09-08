@@ -134,6 +134,17 @@ class Phase1WorkflowRunExecutor:
         """The public callback constructor is a test seam, never formal evidence."""
         return False
 
+    def is_bound_to(
+        self, *, client: VLLMChatClient, token_counter: TokenCounter, profile_digest: str
+    ) -> bool:
+        """Whether the actual trace-producing planner/analyzer are bound to this identity.
+
+        The public callback constructor never carries this proof, regardless of what its
+        ``run_workflow`` callback happens to close over.
+        """
+        del client, token_counter, profile_digest
+        return False
+
 
 class IsolatedPhase1WorkflowRunExecutor(Phase1WorkflowRunExecutor):
     """Executor reserved for the product-owned isolated scenario runner."""
@@ -148,6 +159,16 @@ class IsolatedPhase1WorkflowRunExecutor(Phase1WorkflowRunExecutor):
     @property
     def is_composition_owned(self) -> bool:
         return True
+
+    def is_bound_to(
+        self, *, client: VLLMChatClient, token_counter: TokenCounter, profile_digest: str
+    ) -> bool:
+        from redteam_agent.quality.scenario_runner import IsolatedPhase1ScenarioRunner
+
+        runner = self._run_workflow
+        # Guaranteed by __init__: the constructor rejects any other run_workflow type.
+        assert isinstance(runner, IsolatedPhase1ScenarioRunner)
+        return runner.is_bound_to(client=client, token_counter=token_counter, profile_digest=profile_digest)
 
 
 class WorkflowBackedQualityDriver:
@@ -183,6 +204,16 @@ class WorkflowBackedQualityDriver:
             and attestation_is_real(self._attestation)
             and type(self._token_counter) is HuggingFaceTokenCounter
             and self._executor.is_composition_owned
+            # A composition-owned executor class is not enough on its own: the
+            # planner/analyzer that actually produced the trace must be provably
+            # bound to *this* client/tokenizer, and to *this* evaluation binding's
+            # profile -- never a same-class runner wrapping mismatched or injected
+            # inner factories.
+            and self._executor.is_bound_to(
+                client=self._client,
+                token_counter=self._token_counter,
+                profile_digest=self._binding.profile_digest,
+            )
             else "test_double"
         )
 

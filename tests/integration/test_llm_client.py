@@ -97,6 +97,51 @@ def test_non_positive_timeout_rejected() -> None:
         client.complete(_request(ds), timeout_seconds=0)
 
 
+def test_server_usage_is_captured_from_the_response() -> None:
+    ds = DigestService()
+    client = VLLMChatClient(
+        base_url="http://vllm.local/v1",
+        transport=fake.transport_returning(
+            fake.native_response(
+                fake.VALID_ANALYSIS_OUTPUT,
+                usage=fake.usage_payload(prompt_tokens=123, completion_tokens=45),
+            )
+        ),
+    )
+    result = client.complete(_request(ds), timeout_seconds=5)
+    assert result.usage_prompt_tokens == 123
+    assert result.usage_completion_tokens == 45
+
+
+def test_missing_usage_is_none_not_zero() -> None:
+    # A response with no ``usage`` object at all must never be silently treated as
+    # zero tokens -- the caller has to be able to tell "missing" from "actually zero".
+    ds = DigestService()
+    client = VLLMChatClient(
+        base_url="http://vllm.local/v1",
+        transport=fake.transport_returning(fake.native_response(fake.VALID_ANALYSIS_OUTPUT)),
+    )
+    result = client.complete(_request(ds), timeout_seconds=5)
+    assert result.usage_prompt_tokens is None
+    assert result.usage_completion_tokens is None
+
+
+def test_malformed_usage_fields_are_none_never_estimated() -> None:
+    ds = DigestService()
+    client = VLLMChatClient(
+        base_url="http://vllm.local/v1",
+        transport=fake.transport_returning(
+            fake.native_response(
+                fake.VALID_ANALYSIS_OUTPUT,
+                usage={"prompt_tokens": "lots", "completion_tokens": None},
+            )
+        ),
+    )
+    result = client.complete(_request(ds), timeout_seconds=5)
+    assert result.usage_prompt_tokens is None
+    assert result.usage_completion_tokens is None
+
+
 def test_bad_base_url_rejected() -> None:
     with pytest.raises(LLMTransportError):
         VLLMChatClient(base_url="ftp://nope")
