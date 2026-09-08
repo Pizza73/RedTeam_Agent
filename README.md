@@ -80,9 +80,11 @@ Payload / Implant 操作も持たない。開発記録は [docs/development/phas
   （`ExecutorAuthorizationGate` / `evaluate_executable`、`tests/security/test_phase3_approval.py`）。
 - `PAUSE` / `Resume` は `authorization_epoch` を単調増加させ `mission_revision` は不変とし、Pause前の Grant /
   Snapshot / Decision / Approval を再利用しない（`MissionManager`、`tests/integration/test_phase3_durable_resume.py`）。
-- Durable Resume は PAUSED / WAITING_HUMAN_REVIEW を Checkpoint → Application DB → Adapter の順に既存 RECONCILING
-  / Current Recovery Authority だけで照合し、新規 Dispatch / LLM 呼出しを 0 件とし、不明な非冪等 Outcome を
-  `OUTCOME_UNKNOWN` のまま自動再送しない。MissionをRUNNINGへ戻さず現在Missionに対応するGraph状態へ戻し、
+- Durable Resume は Compiled Planning Graph と LangGraph Checkpoint が Workflow Resume を所有する。認証済み
+  Operator が Canonical `thread_id` で Resume を Trigger すると実 Checkpoint を復元し、既存 RECONCILING node が
+  LangGraph Checkpoint → Application DB → Adapter の順（DBがExecution Stateの正）で Current Recovery Authority
+  だけを用いて照合する。新規 Dispatch / LLM 呼出しは 0 件、不明な非冪等 Outcome は `OUTCOME_UNKNOWN` のまま
+  自動再送しない。Mission を RUNNING へ戻さず現在 Mission に対応する Graph 状態へ写像し（並行の正当な変化も拒否せず写像）、
   WAITING_HUMAN_REVIEW は全Item解決時にだけ Mission Manager が §21.1.3 の既存 FINALIZING へ進める
   （`Phase1AgentWorkflow.durable_resume` / `FinalizationService.advance_from_human_review`）。
 
