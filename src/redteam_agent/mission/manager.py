@@ -133,6 +133,15 @@ class MissionManager:
             raise MissionAuthorizationError(f"actor lacks the required mission role: {role}")
         return principal.principal_id
 
+    def authorize_operator(self, mission_id: str, actor_token: str) -> str:
+        """Authenticate an operator and confirm the mission operator role (R18).
+
+        The durable-resume trigger is operator-initiated, so it must present an
+        authenticated principal that holds the mission operator role, exactly like
+        pause/resume. A bare caller string is never authority.
+        """
+        return self._authorize_actor(mission_id, actor_token, MISSION_OPERATOR_ROLE)
+
     # --- creation ---------------------------------------------------------
 
     def create_mission(self, revision: MissionRevision, *, actor_token: str) -> MissionState:

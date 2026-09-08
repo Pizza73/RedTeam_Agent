@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TypedDict, cast
 
 from langgraph.checkpoint.sqlite import SqliteSaver
@@ -15,7 +15,7 @@ from redteam_agent.agent.application import (
     ActionTransitionResult,
     PlannerActionApplicationService,
 )
-from redteam_agent.agent.controller import AgentController
+from redteam_agent.agent.controller import ACTIVE_EXECUTION_STATES, AgentController
 from redteam_agent.agent.finalization import FinalizationService
 from redteam_agent.agent.llm_gateway import SharedLLMGateway
 from redteam_agent.agent.models import ControllerDecision, PlannerContextEnvelope
@@ -41,7 +41,7 @@ from redteam_agent.execution.executor import Executor
 from redteam_agent.execution.models import AdapterCollectionControl, ProviderTaskBinding
 from redteam_agent.execution.reconcile import ReconcileOutcome, ReconciliationService
 from redteam_agent.execution.recovery import ExecutionRecoveryService
-from redteam_agent.execution.thread import verify_run_thread_binding
+from redteam_agent.execution.thread import compute_thread_id, verify_run_thread_binding
 from redteam_agent.goal.service import GoalEvaluationService
 from redteam_agent.ingestion.service import SecureIngestionService
 from redteam_agent.knowledge.models import (
@@ -51,6 +51,7 @@ from redteam_agent.knowledge.models import (
 )
 from redteam_agent.knowledge.reducer import KnowledgeReducer
 from redteam_agent.knowledge.verified_facts import VerifiedFindingProjector
+from redteam_agent.mission.manager import MissionManager
 from redteam_agent.mission.models import MissionLifecycleState, MissionState
 from redteam_agent.plan.models import (
     PlannerActionOutput,
@@ -106,14 +107,17 @@ class _PlanningResultSink:
     controller_decision: ControllerDecision | None = None
     planner_output: PlannerOutput | None = None
     action_transition: ActionTransitionResult | None = None
+    reconcile_outcomes: list[tuple[str, str]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
 class _PlanningRuntime:
-    envelope: PlannerContextEnvelope
     ids: PlanningOperationIds
     invoke_planner: Callable[[PlannerContextEnvelope], object]
     sink: _PlanningResultSink
+    mission_id: str
+    mission_revision: int
+    envelope: PlannerContextEnvelope | None = None
 
 
 class _AnalysisGraphState(TypedDict, total=False):
@@ -145,19 +149,6 @@ class _AnalysisRuntime:
     invoke_analyzer: Callable[[], object]
     sink: _AnalysisResultSink
 
-
-# Provider execution states that a durable resume still reconciles. Terminal
-# states (including OUTCOME_UNKNOWN and BLOCKED) are never re-read or re-sent.
-_RESUME_RECONCILE_STATES = frozenset(
-    {
-        "AUTHORIZED",
-        "DISPATCH_CLAIMED",
-        "DISPATCHED",
-        "RUNNING",
-        "CANCEL_REQUESTED",
-        "RECONCILING",
-    }
-)
 
 # Graph State / Mission State mapping (SystemDesign §17.3). A durable resume
 # reports the graph state that corresponds to the *current* mission, never the
@@ -218,6 +209,7 @@ class Phase1AgentWorkflow:
         verified_finding_projector: VerifiedFindingProjector,
         context_resolver: AuthorizationContextResolver,
         clock: Clock,
+        mission_manager: MissionManager,
     ) -> None:
         self._controller = controller
         self._gateway = llm_gateway
@@ -247,6 +239,7 @@ class Phase1AgentWorkflow:
         self._verified_findings = verified_finding_projector
         self._resolver = context_resolver
         self._clock = clock
+        self._mission_manager = mission_manager
         self.graph = self._build_planning_graph()
         self.analysis_graph = self._build_analysis_graph()
 
@@ -276,7 +269,8 @@ class Phase1AgentWorkflow:
                 },
                 config={"configurable": {"thread_id": ids.thread_id}},
                 context=_PlanningRuntime(
-                    envelope=envelope, ids=ids, invoke_planner=invoke_planner, sink=sink
+                    envelope=envelope, ids=ids, invoke_planner=invoke_planner, sink=sink,
+                    mission_id=envelope.mission_id, mission_revision=current_revision,
                 ),
             ),
         )
@@ -483,17 +477,18 @@ class Phase1AgentWorkflow:
     def _graph_session_refresh(
         self, _state: _PlanningGraphState, runtime: Runtime[_PlanningRuntime]
     ) -> _PlanningGraphState:
-        evaluation = self._goals.evaluate(mission_id=runtime.context.envelope.mission_id)
+        evaluation = self._goals.evaluate(mission_id=runtime.context.mission_id)
         return {"goal_evaluation_id": evaluation.evaluation_id}
 
     def _graph_controller(
         self, _state: _PlanningGraphState, runtime: Runtime[_PlanningRuntime]
     ) -> _PlanningGraphState:
-        envelope, ids = runtime.context.envelope, runtime.context.ids
+        ctx = runtime.context
+        projection = ctx.envelope.action_candidate_projection if ctx.envelope is not None else None
         decision = self._controller.step(
-            mission_id=envelope.mission_id,
-            operation_id=ids.operation_id,
-            projection=envelope.action_candidate_projection,
+            mission_id=ctx.mission_id,
+            operation_id=ctx.ids.operation_id,
+            projection=projection,
         )
         runtime.context.sink.controller_decision = decision
         return {
@@ -615,27 +610,38 @@ class Phase1AgentWorkflow:
     def _graph_reconciliation(
         self, _state: _PlanningGraphState, runtime: Runtime[_PlanningRuntime]
     ) -> _PlanningGraphState:
-        mission_id = runtime.context.envelope.mission_id
-        checkpoint = self._controller.checkpoint(mission_id)
-        if checkpoint is None or checkpoint.active_execution_id is None:
+        mission_id = runtime.context.mission_id
+        # After the LangGraph checkpoint is restored, the incomplete executions are
+        # enumerated from the Application DB (§17.1). The Application DB — not the
+        # checkpoint — is authoritative over execution state; the Adapter is read
+        # third by ``ReconciliationService``.
+        active = tuple(
+            item for item in self._executions.all_for_mission(mission_id)
+            if item.provider_execution_state in ACTIVE_EXECUTION_STATES
+        )
+        if not active:
             raise AgentLoopError("recovery decision has no active execution binding")
+        execution_id = active[0].execution_id
+        entry_state = self._finalization.mission_state(mission_id)
         try:
-            self._reconcile(mission_id, checkpoint.active_execution_id)
+            outcome = self._reconcile(mission_id, execution_id)
+            runtime.context.sink.reconcile_outcomes.append((execution_id, outcome.reason_code))
         except AgentLoopError as exc:
             if str(exc) != "reconciliation retry budget exhausted":
                 raise
-            self._finalization.begin_abort(mission_id)
-            self._hold_for_review(
-                mission_id,
-                checkpoint.active_execution_id,
-                "EXECUTION_RECONCILED",
-            )
+            runtime.context.sink.reconcile_outcomes.append((execution_id, "RECONCILE_BUDGET_EXHAUSTED"))
+            # State-aware convergence: a RUNNING mission escalates to human review
+            # through the common abort path; a PAUSED / WAITING_HUMAN_REVIEW mission
+            # preserves its lifecycle state (durable resume never resumes it).
+            if entry_state is not None and entry_state.state == "RUNNING":
+                self._finalization.begin_abort(mission_id)
+                self._hold_for_review(mission_id, execution_id, "EXECUTION_RECONCILED")
         return {}
 
     def _graph_finalization(
         self, state: _PlanningGraphState, runtime: Runtime[_PlanningRuntime]
     ) -> _PlanningGraphState:
-        mission_id = runtime.context.envelope.mission_id
+        mission_id = runtime.context.mission_id
         action = state["controller_action"]
         if action == "FINALIZE":
             if state["controller_reason"] == "GOAL_ACHIEVED":
@@ -729,20 +735,26 @@ class Phase1AgentWorkflow:
     def finalize(self, mission_id: str) -> MissionState:
         return self._finalization.finalize(mission_id)
 
-    def durable_resume(self, *, mission_id: str) -> DurableResumeOutcome:
-        """Reconcile a PAUSED / WAITING_HUMAN_REVIEW mission without resuming it.
+    def durable_resume(
+        self, *, mission_id: str, run_id: str, operation_id: str, actor_token: str
+    ) -> DurableResumeOutcome:
+        """Resume-reconcile a PAUSED / WAITING_HUMAN_REVIEW mission via LangGraph.
 
-        This is the durable-resume reconciliation of SystemDesign §17.3 / §21.1.1.
-        It reuses the existing RECONCILING recovery path and Current Recovery
-        Authority only: it dispatches nothing, calls no Planner/Analyzer, and never
-        moves the mission to RUNNING. Reconciliation consults, in order, the durable
-        **checkpoint**, then the **Application DB** execution record, then the
-        **Adapter** (through ``ReconciliationService``), so an uncertain provider
-        outcome becomes ``OUTCOME_UNKNOWN`` and a non-idempotent action is never
-        auto-resent. The mission lifecycle state is preserved; the only permitted
-        progression is the documented ``WAITING_HUMAN_REVIEW -> FINALIZING`` edge
-        (§21.1.3), taken exactly when every unresolved item is already RESOLVED.
+        This is the durable resume of SystemDesign §17.1 / §17.3 / §21.1.1. The
+        compiled planning graph and its LangGraph SqliteSaver own the workflow
+        resume: the graph is re-invoked on the canonical ``thread_id`` so the
+        actual LangGraph checkpoint is restored, its controller node routes a
+        stopped / review-held mission with an incomplete execution to the existing
+        RECONCILING node, and reconciliation reads the Application DB (authoritative
+        over execution state) and then the Adapter. It dispatches nothing, calls no
+        Planner/Analyzer, never moves the mission to RUNNING, and never re-sends an
+        ``OUTCOME_UNKNOWN`` outcome. The only permitted progression is the
+        documented ``WAITING_HUMAN_REVIEW -> FINALIZING`` edge (§21.1.3), taken by
+        the Mission Manager when every unresolved item is already RESOLVED.
         """
+        # An explicit operator Resume trigger requires an authenticated, authorized
+        # operator principal (R18); a bare caller string is never authority.
+        self._mission_manager.authorize_operator(mission_id, actor_token)
         now = self._clock.now()
         mission = self._resolver.resolve(mission_id, now=now).mission
         if mission.state not in ("PAUSED", "WAITING_HUMAN_REVIEW"):
@@ -750,29 +762,54 @@ class Phase1AgentWorkflow:
                 "durable resume reconciles only a PAUSED or WAITING_HUMAN_REVIEW mission"
             )
         entry_state: MissionLifecycleState = mission.state
-        # 1) Checkpoint (durable) — its active execution is reconciled first.
-        checkpoint = self._controller.checkpoint(mission_id)
-        within_recovery = now < mission.recovery_until
-        reconciled: list[tuple[str, str]] = []
-        for execution_id in self._durable_resume_targets(mission_id, checkpoint):
-            if not within_recovery:
-                # After recovery_until no provider read is permitted (§21.3); the
-                # unconfirmed execution stays as-is for human review.
-                reconciled.append((execution_id, "RECOVERY_WINDOW_CLOSED"))
-                continue
-            reconciled.append((execution_id, self._durable_resume_reconcile_one(mission_id, execution_id)))
-        # Re-read the *current* mission; reconciliation must not have changed its
-        # lifecycle state, and the graph state is derived from the repository, not
-        # from the entry snapshot.
+        # Canonical thread binding: thread_id = mission_id:mission_revision:run_id,
+        # matched against the current Mission Repository revision (§17.2). A wrong
+        # mission / revision / run fails closed before any checkpoint is loaded.
+        current_revision = self._contexts.current_mission_revision(mission_id)
+        if mission.mission_revision != current_revision:
+            raise MissionRevisionConflictError("durable resume mission revision is not current")
+        thread_id = compute_thread_id(
+            mission_id=mission_id, mission_revision=current_revision, run_id=run_id
+        )
+        verify_run_thread_binding(
+            thread_id=thread_id, run_id=run_id,
+            mission_id=mission_id, mission_revision=current_revision,
+        )
+        # LangGraph owns Workflow Resume: an actual checkpoint must exist for this
+        # thread, otherwise there is nothing to durably resume.
+        if self._checkpointer.get({"configurable": {"thread_id": thread_id}}) is None:
+            raise AgentLoopError("no LangGraph checkpoint to resume for this thread")
+        sink = _PlanningResultSink()
+
+        def _no_planner(_envelope: PlannerContextEnvelope) -> object:
+            raise AgentLoopError("durable resume must not invoke the Planner")
+
+        ids = PlanningOperationIds(
+            operation_id=operation_id, plan_id="durable-resume", run_id=run_id,
+            thread_id=thread_id, decision_id="durable-resume",
+            execution_id="durable-resume", task_id="durable-resume",
+        )
+        cast(
+            _PlanningGraphState,
+            self.graph.invoke(
+                {"mission_id": mission_id, "operation_id": operation_id},
+                config={"configurable": {"thread_id": thread_id}},
+                context=_PlanningRuntime(
+                    ids=ids, invoke_planner=_no_planner, sink=sink,
+                    mission_id=mission_id, mission_revision=current_revision, envelope=None,
+                ),
+            ),
+        )
+        # Return the graph state of the *current* Mission Repository state, never
+        # the entry snapshot. A concurrent legitimate operator Resume / finalization
+        # may have changed it; that is mapped, not rejected. Durable resume itself
+        # invokes no RUNNING transition.
         mission = self._resolver.resolve(mission_id, now=self._clock.now()).mission
-        if mission.state != entry_state:
-            raise AgentLoopError("durable resume must not change the mission lifecycle state")
         advanced = False
-        if entry_state == "WAITING_HUMAN_REVIEW" and self._all_items_resolved(mission_id):
+        if mission.state == "WAITING_HUMAN_REVIEW" and self._all_items_resolved(mission_id):
             # §21.1.3: the Mission Manager takes the existing WAITING_HUMAN_REVIEW ->
             # FINALIZING edge, preserving the original terminal reason. The ordinary
-            # FINALIZING workflow (not durable resume) then drives to the terminal;
-            # durable resume never implies a normal resume of its own.
+            # FINALIZING workflow (not durable resume) then drives to the terminal.
             self._finalization.advance_from_human_review(mission_id)
             advanced = True
             mission = self._resolver.resolve(mission_id, now=self._clock.now()).mission
@@ -780,38 +817,9 @@ class Phase1AgentWorkflow:
             mission_state=mission.state,
             graph_state=_GRAPH_STATE_BY_MISSION_STATE[mission.state],
             entry_mission_state=entry_state,
-            reconciled=tuple(reconciled),
+            reconciled=tuple(sink.reconcile_outcomes),
             advanced_to_finalizing=advanced,
         )
-
-    def _durable_resume_targets(
-        self, mission_id: str, checkpoint: object | None
-    ) -> tuple[str, ...]:
-        ordered: list[str] = []
-        seen: set[str] = set()
-        active_id = getattr(checkpoint, "active_execution_id", None)
-        if isinstance(active_id, str):
-            record = self._executions.get(active_id)
-            if record is not None and record.provider_execution_state in _RESUME_RECONCILE_STATES:
-                ordered.append(active_id)
-                seen.add(active_id)
-        for record in self._executions.all_for_mission(mission_id):
-            if (
-                record.provider_execution_state in _RESUME_RECONCILE_STATES
-                and record.execution_id not in seen
-            ):
-                ordered.append(record.execution_id)
-                seen.add(record.execution_id)
-        return tuple(ordered)
-
-    def _durable_resume_reconcile_one(self, mission_id: str, execution_id: str) -> str:
-        try:
-            return self._reconcile(mission_id, execution_id).reason_code
-        except AgentLoopError as exc:
-            if str(exc) == "reconciliation retry budget exhausted":
-                # Preserve the stopped/review mission state; the operator decides.
-                return "RECONCILE_BUDGET_EXHAUSTED"
-            raise
 
     def _all_items_resolved(self, mission_id: str) -> bool:
         items = self._unresolved.current(mission_id)

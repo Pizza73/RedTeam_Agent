@@ -218,6 +218,7 @@ def build_phase1_kernel(*, phase0c: Phase0CKernel | None = None) -> Phase1Kernel
         verified_finding_projector=verified_findings,
         context_resolver=phase0a.context_resolver,
         clock=kernel.monotonic_clock,
+        mission_manager=phase0a.mission_manager,
     )
     return Phase1Kernel(
         phase0c=kernel, knowledge_service=knowledge, goal_service=goals, controller=controller,

@@ -27,10 +27,14 @@ from redteam_agent.storage.execution_repositories import (
 from redteam_agent.storage.repositories import AvailableToolSnapshotRepository
 
 _CHECKPOINT_NS = "agent_checkpoint"
-_ACTIVE_EXECUTION_STATES = frozenset({
+# Provider execution states that still require recovery/reconciliation. Shared
+# with the workflow so the controller's RECOVER routing and the reconciliation
+# node enumerate the same incomplete executions from the Application DB (§17.1).
+ACTIVE_EXECUTION_STATES = frozenset({
     "PLANNED", "AUTHORIZED", "DISPATCH_CLAIMED", "DISPATCHED", "RUNNING",
     "CANCEL_REQUESTED", "RECONCILING", "OUTCOME_UNKNOWN",
 })
+_ACTIVE_EXECUTION_STATES = ACTIVE_EXECUTION_STATES
 
 
 class AgentController:
@@ -60,6 +64,30 @@ class AgentController:
     ) -> ControllerDecision:
         now = self._clock.now()
         mission = self._resolver.resolve(mission_id, now=now).mission
+        if mission.state in ("PAUSED", "WAITING_HUMAN_REVIEW"):
+            # Durable resume: reconcile an existing execution through the same
+            # RECONCILING recovery path, without planning, dispatching, or moving
+            # the mission to RUNNING (SystemDesign §17.3 / §21.1.1). If nothing is
+            # incomplete, stop; the mission stays stopped / under review.
+            active = tuple(
+                item for item in self._executions.all_for_mission(mission_id)
+                if item.provider_execution_state in ACTIVE_EXECUTION_STATES
+            )
+            if active:
+                return self._save(
+                    mission=mission, operation_id=operation_id,
+                    decision=ControllerDecision(
+                        action="RECOVER", reason_code="EXECUTION_IN_PROGRESS",
+                        goal_evaluation_id=None, candidate_ids=(),
+                    ), active_execution_id=active[0].execution_id,
+                )
+            return self._save(
+                mission=mission, operation_id=operation_id,
+                decision=ControllerDecision(
+                    action="STOP", reason_code="MISSION_NOT_RUNNING", goal_evaluation_id=None,
+                    candidate_ids=(),
+                ), active_execution_id=None,
+            )
         if mission.state != "RUNNING":
             return self._save(
                 mission=mission, operation_id=operation_id,
