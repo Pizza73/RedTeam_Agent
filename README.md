@@ -73,6 +73,9 @@ Phase 2 は Local LLM（vLLM、`chat_completions` 固定）向けの Profile・C
 評価入口・品質 Gate を追加する。Pydantic AI は固定依存に含まれないため、同契約を満たす明示的な OpenAI 互換
 HTTP Client（`httpx`）を用いる。開発記録は [docs/development/phase-2.md](docs/development/phase-2.md)。
 
+Phase 2の実装・自動試験・実`gemma-4-31B-it` Capability Check・固定300-Run Qualificationは完了し、
+技術Gateは`PASS`。Phase 3着手前の独立レビューは別の遷移判定として扱う。
+
 - Schema Capability（§6.2）: `schema-capability-corpus-v2`（`src/redteam_agent/llm/capability_corpus.py`）を
   Planner/Analyzer の全 Actual Schema Digest に対して実行し、Valid 率 95%以上・Unsafe Boundary Acceptance 0 件・
   Cancellation Failure 0 件を満たすと合格。結果は Profile Digest / Model Hash / Runtime / Tokenizer / Template /
