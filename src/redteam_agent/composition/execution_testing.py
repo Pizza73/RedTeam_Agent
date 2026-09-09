@@ -129,11 +129,6 @@ def build_phase0b_kernel(
     secret_source = StaticTrustedSecretSource()
     dispatch_port = FixedTrustedAdapterDispatchPort(adapters)
 
-    reconciliation = ReconciliationService(
-        database=database, execution_repository=execution_repo, task_binding_repository=binding_repo,
-        recovery_repository=recovery_repo, context_resolver=kernel.context_resolver,
-        adapters=adapters, clock=kernel.clock, digest_service=ds, write_guard=exec_guard,
-    )
     collection_coordinator = ResultCollectionCoordinator(
         database=database, execution_repository=execution_repo, authority_repository=coll_auth_repo,
         state_repository=coll_state_repo, control_metadata_repository=control_repo,
@@ -144,6 +139,15 @@ def build_phase0b_kernel(
         registry_revision=registry_revision,
         quarantine_retention_seconds=DEFAULT_QUARANTINE_RETENTION_SECONDS,
         system_hard_output_cap=DEFAULT_SYSTEM_HARD_OUTPUT_CAP,
+    )
+    reconciliation = ReconciliationService(
+        database=database, execution_repository=execution_repo, task_binding_repository=binding_repo,
+        recovery_repository=recovery_repo, context_resolver=kernel.context_resolver,
+        adapters=adapters,
+        local_result_reconciler=lambda execution_id: collection_coordinator.collect(
+            execution_id=execution_id
+        ),
+        clock=kernel.clock, digest_service=ds, write_guard=exec_guard,
     )
     retry_policy = SecureIngestionRetryPolicy(policy_revision="secure-ingestion-retry-v1", max_attempts_per_ingestion=3)
     ingestion_coordinator = ResultIngestionCoordinator(

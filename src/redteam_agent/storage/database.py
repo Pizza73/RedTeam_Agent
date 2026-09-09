@@ -109,6 +109,18 @@ class Database:
             )
             """
         )
+        # An ApprovalRequest has exactly one immutable human decision.  Keeping
+        # the public row key as approval_id preserves record identity, while the
+        # partial expression index makes request-level single assignment a
+        # database invariant (and therefore race safe), not a scan-then-insert
+        # convention in ApprovalService.
+        self._conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_approval_record_request
+            ON kv_store(json_extract(json, '$.approval_request_id'))
+            WHERE namespace = 'approvals'
+            """
+        )
         self._create_execution_schema()
         self._create_phase0c_schema()
         self._create_graph_checkpoint_schema()

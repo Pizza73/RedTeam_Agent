@@ -20,6 +20,7 @@ Guarantees enforced here:
 
 from __future__ import annotations
 
+import sqlite3
 from typing import TypeVar
 
 from pydantic import BaseModel, ValidationError
@@ -366,7 +367,22 @@ class ApprovalRecordRepository(_GuardedRepository):
 
     def save(self, record: ApprovalRecord, *, guard: WriteGuard) -> None:
         self._authorize_write(guard)
-        self._db.put_idempotent(self._NS, record.approval_id, self._dump(record))
+        text = self._dump(record)
+        existing = self.find_by_request(record.approval_request_id)
+        if existing is not None:
+            if existing == record:
+                return
+            raise RepositoryIntegrityError(
+                "approval request already has an immutable decision"
+            )
+        try:
+            # ``uq_approval_record_request`` is the atomic enforcement point if
+            # two writers race after the read above.
+            self._db.put_idempotent(self._NS, record.approval_id, text)
+        except sqlite3.IntegrityError:
+            raise RepositoryIntegrityError(
+                "approval request already has an immutable decision"
+            ) from None
 
     def get(self, approval_id: str) -> ApprovalRecord | None:
         raw = self._db.get(self._NS, approval_id)

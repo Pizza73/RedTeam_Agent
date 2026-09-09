@@ -372,7 +372,11 @@ class Phase1AgentWorkflow:
         )
         builder.add_edge("context_request", END)
         builder.add_edge("action_application", END)
-        builder.add_edge("reconciliation", END)
+        # Re-evaluate the existing finalization node in the same invocation.
+        # This is a no-op for PAUSED / still-open review missions, but lets a
+        # WAITING_HUMAN_REVIEW mission advance immediately when this pass
+        # settles its final execution and every unresolved item is RESOLVED.
+        builder.add_edge("reconciliation", "finalization")
         builder.add_edge("finalization", END)
         return cast(
             CompiledStateGraph[

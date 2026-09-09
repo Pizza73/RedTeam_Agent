@@ -14,14 +14,16 @@ executor/recovery port, not as public adapter methods.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from contextlib import suppress
 from dataclasses import dataclass
 
 from redteam_agent.canonical.digest_service import DigestService
-from redteam_agent.errors import ExecutionRecordError
+from redteam_agent.errors import ExecutionRecordError, ResultCollectionError
 from redteam_agent.execution.adapter import ExecutionAdapter, ReconciliationResult
 from redteam_agent.execution.models import (
     ExecutionRecord,
+    LocalResultBinding,
     ProviderExecutionState,
     ProviderTaskBinding,
     ResultTaskBinding,
@@ -64,6 +66,7 @@ class ReconciliationService:
         recovery_repository: ExecutionRecoveryAuthorityRepository,
         context_resolver: AuthorizationContextResolver,
         adapters: Mapping[str, ExecutionAdapter],
+        local_result_reconciler: Callable[[str], object],
         clock: Clock,
         digest_service: DigestService,
         write_guard: WriteGuard,
@@ -74,6 +77,7 @@ class ReconciliationService:
         self._recovery = recovery_repository
         self._resolver = context_resolver
         self._adapters = dict(adapters)
+        self._local_result_reconciler = local_result_reconciler
         self._clock = clock
         self._ds = digest_service
         self._guard = write_guard
@@ -83,6 +87,9 @@ class ReconciliationService:
         if record is None:
             raise ExecutionRecordError("execution not found for reconciliation")
         self._enforce_recovery_window(record, recovery_authority_id=recovery_authority_id)
+        binding = self._bindings.find_by_execution(execution_id)
+        if isinstance(binding, LocalResultBinding):
+            return self._reconcile_local_result(record)
         # Enter the read-only RECONCILING state first (no external resubmit).
         record = self._enter_reconciling(record)
         if record.provider_execution_state != "RECONCILING":
@@ -91,11 +98,41 @@ class ReconciliationService:
         adapter = self._adapters.get(record.resolved_adapter_id)
         if adapter is None:
             return self._settle(record, target="OUTCOME_UNKNOWN", reason="ADAPTER_UNAVAILABLE")
-        binding = self._bindings.find_by_execution(execution_id)
         result = adapter.reconcile(execution_id, binding)
         self._verify_reconcile_result(record=record, binding=binding, result=result)
         target = self._map_status(result)
         return self._settle(record, target=target, reason=f"RECONCILE_{result.status}")
+
+    def _reconcile_local_result(self, record: ExecutionRecord) -> ReconcileOutcome:
+        """Recover local delivery exclusively from durable application state.
+
+        A local-result binding never identifies an external provider task.  The
+        collection owner may complete a previously committed capture from its
+        receipt/control metadata; if that durable evidence is incomplete, the
+        consumed dispatch remains uncertain and is recorded OUTCOME_UNKNOWN.
+        In neither case is ``ExecutionAdapter.reconcile`` called.
+        """
+        with suppress(ResultCollectionError):
+            self._local_result_reconciler(record.execution_id)
+        # STREAMING/uncommitted local capture cannot prove an outcome after a
+        # crash. Fail closed without asking the adapter to reconstruct it.
+        current = self._executions.get(record.execution_id)
+        if current is None:
+            raise ExecutionRecordError("local-result execution disappeared during reconciliation")
+        if current.provider_execution_state in {"SUCCEEDED", "FAILED", "CANCELLED"}:
+            return ReconcileOutcome(
+                current.execution_id,
+                current.provider_execution_state,
+                "LOCAL_CAPTURE_RECONCILED",
+            )
+        reconciling = self._enter_reconciling(current)
+        if reconciling.provider_execution_state != "RECONCILING":
+            raise ExecutionRecordError("local-result execution cannot enter reconciliation")
+        return self._settle(
+            reconciling,
+            target="OUTCOME_UNKNOWN",
+            reason="LOCAL_CAPTURE_INCOMPLETE",
+        )
 
     def _enforce_recovery_window(
         self, record: ExecutionRecord, *, recovery_authority_id: str | None

@@ -15,6 +15,7 @@ import pytest
 from test_phase1_planner_context import _inputs
 
 import support
+import support_phase0b as p0b
 from redteam_agent.agent.mock_agents import MockPlanner
 from redteam_agent.agent.workflow import PlanningOperationIds
 from redteam_agent.composition.execution_testing import build_phase0b_kernel
@@ -543,3 +544,126 @@ def test_durable_resume_makes_zero_planner_and_analyzer_calls() -> None:
 
     assert planner_calls == [] and analyzer_calls == []
     assert result.mission_state == "PAUSED"
+
+
+def test_reconciliation_advances_review_when_last_execution_settles() -> None:
+    kernel, phase0b, mission_id, ctx = _running_dispatched()
+    _dispatch_second(kernel, ctx, execution_id="dr-execution-2")
+    kernel.finalization_service.begin_abort(mission_id)
+    unresolved_id = "unresolved-first-execution"
+    kernel.unresolved_items.open(
+        unresolved_id=unresolved_id,
+        mission_id=mission_id,
+        source_execution_id=EXECUTION_ID,
+        reason_code="EXECUTION_RECONCILED",
+    )
+    kernel.finalization_service.wait_for_human_review(mission_id)
+    adapter = phase0b.mock_adapter
+    original = adapter.reconcile
+
+    def first_pass(execution_id, task_binding):
+        adapter._reconcile_status = (  # type: ignore[attr-defined]
+            "FOUND_TERMINAL" if execution_id == EXECUTION_ID else "FOUND_RUNNING"
+        )
+        adapter._reconcile_provider_status = "succeeded"  # type: ignore[attr-defined]
+        return original(execution_id, task_binding)
+
+    adapter.reconcile = first_pass  # type: ignore[method-assign]
+    try:
+        _resume(kernel, mission_id, operation_id="dr-first-pass")
+    finally:
+        adapter.reconcile = original  # type: ignore[method-assign]
+    kernel.unresolved_items.resolve_from_execution(unresolved_id=unresolved_id)
+    adapter._reconcile_status = "FOUND_TERMINAL"  # type: ignore[attr-defined]
+    adapter._reconcile_provider_status = "succeeded"  # type: ignore[attr-defined]
+    adapter._stdout_chunks = (  # type: ignore[attr-defined]
+        b'{"host":"10.1.2.3","status":"open","port":443}\n',
+    )
+
+    result = _resume(kernel, mission_id, operation_id="dr-final-pass")
+
+    assert result.advanced_to_finalizing is True
+    assert result.mission_state == "ABORTED"
+    assert all(
+        phase0b.execution_repository.get(execution_id).provider_execution_state == "SUCCEEDED"
+        for execution_id in (EXECUTION_ID, "dr-execution-2")
+    )
+
+
+def test_local_result_reconciliation_never_calls_the_adapter() -> None:
+    kernel = p0b.make_kernel(result_delivery_mode="local_result")
+    tool = support.network_tool().model_copy(update={"adapter": "local"})
+    seeded = p0b.seed_authorized(kernel, tool=tool)
+    p0b.authorize(seeded)
+    original_submit = kernel.mock_adapter.submit
+
+    class SimulatedProcessCrash(BaseException):
+        pass
+
+    def crash_before_local_control_commit(*_args, **_kwargs):
+        raise SimulatedProcessCrash
+
+    kernel.mock_adapter.submit = crash_before_local_control_commit  # type: ignore[method-assign]
+    try:
+        with pytest.raises(SimulatedProcessCrash):
+            kernel.executor.dispatch(execution_id=seeded.execution_id, plan=seeded.plan)
+    finally:
+        kernel.mock_adapter.submit = original_submit  # type: ignore[method-assign]
+    binding = kernel.task_binding_repository.find_by_execution(seeded.execution_id)
+    assert binding is not None and binding.binding_type == "local_result"
+    kernel.phase0a.mission_manager.pause_mission(
+        support.MISSION_ID, expected_version=2, actor_token=OPERATOR
+    )
+    authority = kernel.recovery_service.issue_authority(
+        authority_id="local-reconcile-authority",
+        execution_id=seeded.execution_id,
+        allowed_operation="reconcile",
+        reason="restart-local-capture",
+    )
+    before = kernel.mock_adapter.reconcile_calls
+
+    outcome = kernel.reconciliation.reconcile(
+        execution_id=seeded.execution_id,
+        recovery_authority_id=authority.authority_id,
+    )
+
+    assert outcome.provider_execution_state == "OUTCOME_UNKNOWN"
+    assert outcome.reason_code == "LOCAL_CAPTURE_INCOMPLETE"
+    assert kernel.mock_adapter.reconcile_calls == before
+
+
+def test_local_result_reconciliation_completes_from_durable_metadata(monkeypatch) -> None:
+    kernel = p0b.make_kernel(result_delivery_mode="local_result")
+    tool = support.network_tool().model_copy(update={"adapter": "local"})
+    seeded = p0b.seed_authorized(kernel, tool=tool)
+    p0b.authorize(seeded)
+    original_complete = kernel.collection_coordinator._complete
+
+    def crash_after_metadata_commit(**_kwargs):
+        raise RuntimeError("crash after durable local metadata")
+
+    monkeypatch.setattr(kernel.collection_coordinator, "_complete", crash_after_metadata_commit)
+    with pytest.raises(RuntimeError, match="after durable local metadata"):
+        kernel.executor.dispatch(execution_id=seeded.execution_id, plan=seeded.plan)
+    monkeypatch.setattr(kernel.collection_coordinator, "_complete", original_complete)
+    state = kernel.collection_state_repository.get("collection-state-exec-1")
+    assert state is not None and state.status == "COMMITTED_METADATA_PENDING"
+    kernel.phase0a.mission_manager.pause_mission(
+        support.MISSION_ID, expected_version=2, actor_token=OPERATOR
+    )
+    authority = kernel.recovery_service.issue_authority(
+        authority_id="local-metadata-reconcile-authority",
+        execution_id=seeded.execution_id,
+        allowed_operation="reconcile",
+        reason="restart-local-metadata",
+    )
+    before = kernel.mock_adapter.reconcile_calls
+
+    outcome = kernel.reconciliation.reconcile(
+        execution_id=seeded.execution_id,
+        recovery_authority_id=authority.authority_id,
+    )
+
+    assert outcome.provider_execution_state == "SUCCEEDED"
+    assert outcome.reason_code == "LOCAL_CAPTURE_RECONCILED"
+    assert kernel.mock_adapter.reconcile_calls == before

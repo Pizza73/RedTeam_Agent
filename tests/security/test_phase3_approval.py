@@ -19,7 +19,7 @@ from redteam_agent.approval.service import (
     evaluate_executable,
 )
 from redteam_agent.composition.testing import build_test_kernel
-from redteam_agent.errors import ExecutorAuthorizationError
+from redteam_agent.errors import ExecutorAuthorizationError, RepositoryIntegrityError
 from redteam_agent.runtime.clock import ManualClock
 
 
@@ -183,3 +183,58 @@ def test_revoked_approval_blocks_dispatch_before_the_adapter() -> None:
     out = kernel.executor.dispatch(execution_id=seeded.execution_id, plan=seeded.plan)
     assert out.provider_execution_state == "BLOCKED"
     assert kernel.mock_adapter.submit_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("first_verdict", "second_verdict", "first_id", "second_id", "authorized"),
+    [
+        ("APPROVED", "REJECTED", "z-approved", "a-rejected", True),
+        ("REJECTED", "APPROVED", "z-rejected", "a-approved", False),
+    ],
+)
+def test_approval_request_decision_is_single_assignment(
+    first_verdict, second_verdict, first_id, second_id, authorized
+) -> None:
+    kernel, _seeded, plan, decision, request = _approval_decision()
+    first = kernel.approval_service.submit_decision(
+        approval_id=first_id,
+        approval_request_id=request.approval_request_id,
+        actor_token="tok-approver",
+        verdict=first_verdict,
+    )
+
+    # Caller-chosen IDs and verdict ordering cannot create a contradictory
+    # second source of truth for the same immutable human decision.
+    with pytest.raises(RepositoryIntegrityError, match="already has an immutable decision"):
+        kernel.approval_service.submit_decision(
+            approval_id=second_id,
+            approval_request_id=request.approval_request_id,
+            actor_token="tok-approver",
+            verdict=second_verdict,
+        )
+
+    assert kernel.record_repository.find_by_request(request.approval_request_id) == first
+    result = kernel.authorization_gate.authorize_execution(
+        decision_id=decision.decision_id, plan=plan
+    )
+    assert result.authorized is authorized
+
+
+def test_approval_single_assignment_is_enforced_by_the_database(monkeypatch) -> None:
+    kernel, _seeded, _plan, _decision, request = _approval_decision()
+    kernel.approval_service.submit_decision(
+        approval_id="z-first",
+        approval_request_id=request.approval_request_id,
+        actor_token="tok-approver",
+        verdict="APPROVED",
+    )
+    # Simulate two writers both passing the repository's advisory read. The
+    # database unique index remains the atomic linearization point.
+    monkeypatch.setattr(kernel.record_repository, "find_by_request", lambda _request_id: None)
+    with pytest.raises(RepositoryIntegrityError, match="already has an immutable decision"):
+        kernel.approval_service.submit_decision(
+            approval_id="a-racing",
+            approval_request_id=request.approval_request_id,
+            actor_token="tok-approver",
+            verdict="REJECTED",
+        )
