@@ -6,8 +6,8 @@
 - 設計改訂: `system-design-v1-r3` / `ai-control-v1-r3`
 - 基点: Phase 2 受入コミット `d89739a`（`docs/development/phase-2.md` / `docs/reviews/phase-2-common-gate-66f55ba.md`、Phase 3移行 `PERMITTED`）
 - 実装ブランチ: `codex/phase-3-human-approval-durable-resume`
-- 実装対象コミット: `897f553badfcf5debcc1eab9d3c7d803cc083090`（初版 実装 + 試験）、`99437ef294a9a40dda5861f1a87f80aa10e3c747`（第1次レビュー対応: LangGraph Checkpoint駆動のDurable Resumeへ改修）、`a8820705619ec8475299e0df5e85476e7a7f5299`（第2次レビュー対応: 全未完了Execution照合・実Checkpoint内容検証・graph内FINALIZING引継ぎ）、`dfe3d11a8fc11122545760c7d0e2f6ce22bdfe51`（受入後再レビュー対応: Approval単一割当・同一pass finalization・local-result非Adapter照合）
-- 独立レビュー状態: `a882070`は`docs/reviews/phase-3-common-gate-a882070.md`でCommon Gate `PASS`。その後の再レビュー指摘を修正した`dfe3d11`は新しい独立Common Gate待ちであり、Phase 4移行判定は保留する。
+- 実装対象コミット: `897f553badfcf5debcc1eab9d3c7d803cc083090`（初版 実装 + 試験）、`99437ef294a9a40dda5861f1a87f80aa10e3c747`（第1次レビュー対応: LangGraph Checkpoint駆動のDurable Resumeへ改修）、`a8820705619ec8475299e0df5e85476e7a7f5299`（第2次レビュー対応: 全未完了Execution照合・実Checkpoint内容検証・graph内FINALIZING引継ぎ）、`dfe3d11a8fc11122545760c7d0e2f6ce22bdfe51`（受入後再レビュー対応: Approval単一割当・同一pass finalization・local-result非Adapter照合）、`a612cecefe8fd7db0a21842212ed245c113fe38d`（独立レビュー対応: Approval一意Indexの本番起動検査）
+- 最終独立レビュー: `docs/reviews/phase-3-common-gate-a612cec.md`、Common Gate `PASS`、Phase 3 `ACCEPTED`
 - 実装範囲: Phase 0A〜2 の型・Test Double境界を保存したまま、Human Approval の完全表示・厳密Binding強制と、停止 / レビュー中Mission の Durable Resume 照合・引継ぎを実装する。新しいWorkflow状態・Graph・永続Record・認可経路・重複Serviceは追加しない。実 C2 / MCP / 外部Target / Credential / Payload / Implant / Detection Evasion 機構は実装しない。Phase 4 / 5 は実装しない。
 
 ## 実装方針
@@ -88,11 +88,12 @@ PATH=<isolated-swtpm>/usr/bin:$PATH ... pytest -o addopts= -q -ra  PASS: 816 pas
 - planning graphの`reconciliation`から既存`finalization` nodeへ接続し、最後のExecutionが同じ照合passでterminalになった場合も、全Item RESOLVEDなら追加Triggerなしで`WAITING_HUMAN_REVIEW -> FINALIZING`へ進める。
 - `LocalResultBinding`は`ExecutionAdapter.reconcile()`へ渡さず、durable capture / receipt / control metadataだけで照合する。確定済みmetadataはterminalへ収束し、不完全captureはAdapter非接触で`OUTCOME_UNKNOWN`とする。
 - 回帰試験を6件追加し、Phase 3専用36件をPASS。全体は815 passed / 7 skipped（ローカル環境にswtpm / tpm2-toolsがないためWitness 7件をskip）、ruff、configured mypy 196 files、direct strict mypy 193 files、compileall、boundary検証、SHA256SUMS、依存整合性をPASSした。
-- `dfe3d11`を対象とするswtpm 7件込みの独立Common Gate、branch coverage、指摘ゼロ確認は未実施。旧`a882070`の受入記録を新実装へ自動継承せず、Phase 4は新しいGate完了まで保留する。
+- 独立レビューで、本番read-only起動検査がApproval一意Indexの欠落を検出しないHIGH 1件を追加検出。`a612cec`でIndex定義全体の検査と回帰試験を追加した。
+- 隔離swtpm 7件を含む全823件をskip 0でPASSし、branch coverage 86.549272870882%、ruff、configured / direct strict mypy、compileall、boundary検証、SHA256SUMS、依存整合性をPASSした。未解決指摘は0、Common Gate `PASS`、Phase 3 `ACCEPTED`。詳細は`docs/reviews/phase-3-common-gate-a612cec.md`。
 
 ## 受入根拠・残課題
 
-- `a882070`に対する旧Common Gateは`PASS`。再レビュー修正版`dfe3d11`はローカル検証済みだが、新しい独立Common Gate待ちのためPhase 3再受入・Phase 4移行は保留する。
+- 再レビュー修正版`a612cec`に対するCommon Gateは`PASS`し、Phase 3を再受入した。Phase 4は承認済みC2 ProviderのProvider Human Gate完了まで保留する。
 - 残課題 / 未検証:
   - D4 実機消去は引き続き `NOT_EVALUATED`。Production採用は別条件。
   - Phase 4（承認済み C2 Adapter）/ Phase 5（承認済み MCP Adapter）は本Phase対象外で未実装。実Adapter / Provider Human Gate は保持する。

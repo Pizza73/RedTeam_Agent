@@ -74,11 +74,11 @@ Phase 0Aの製品コードと Unit/Integration/Security/Property-State-machine �
 Phase 3 は Human Approval の完全表示・厳密Bindingと、停止 / レビュー中Missionの Durable Resume を追加する。
 新しいWorkflow状態・Graph・永続Record・認可経路・重複Serviceは追加せず、実C2 / MCP / 外部Target / Credential /
 Payload / Implant 操作も持たない。開発記録は [docs/development/phase-3.md](docs/development/phase-3.md)。
-実装`a8820705619ec8475299e0df5e85476e7a7f5299`は独立Common Gateで一度受入済みだが、その後の再レビュー指摘を
-`dfe3d11a8fc11122545760c7d0e2f6ce22bdfe51`で修正した。修正版はローカルでPhase 3専用36件、全体815件をPASS
-（swtpm / tpm2-tools未導入のためWitness 7件skip）し、ruff / mypy / boundary検証にも合格している。
-新しい独立Common Gateは未実施のため、詳細は [Phase 3開発記録](docs/development/phase-3.md) と
-[旧Phase 3独立レビュー](docs/reviews/phase-3-common-gate-a882070.md) を参照する。Phase 4は修正版Common GateとProvider Human Gate完了まで未着手とする。
+受入後再レビュー指摘を`dfe3d11a8fc11122545760c7d0e2f6ce22bdfe51`で修正し、独立レビュー中の本番Schema検査指摘を
+`a612cecefe8fd7db0a21842212ed245c113fe38d`で修正した。隔離swtpmを含む全823件をskip 0でPASSし、
+branch coverage 86.549272870882%、ruff / mypy / boundary検証にも合格。未解決指摘0でPhase 3を再受入した。
+詳細は [Phase 3修正版独立レビュー](docs/reviews/phase-3-common-gate-a612cec.md) を参照する。
+Phase 4は承認済みC2 ProviderのProvider Human Gate完了まで未着手とする。
 
 - `REQUIRE_APPROVAL` は一致する有効な `APPROVED` Record がなければ Dispatch できず、`DENY` は Record があっても
   実行不可、Plan / Intent 変更・期限切れ・Replay・誤Digest・誤Epoch / Revision・誤Bindingはすべて Fail Closed する
