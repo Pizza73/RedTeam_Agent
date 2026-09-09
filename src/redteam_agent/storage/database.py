@@ -20,6 +20,14 @@ from redteam_agent.errors import (
 )
 
 _ROW_DIGEST_DOMAIN = b"kv-row-integrity-v1"
+_APPROVAL_RECORD_INDEX_NAME = "uq_approval_record_request"
+_APPROVAL_RECORD_INDEX_SQL = " ".join(
+    """
+    CREATE UNIQUE INDEX uq_approval_record_request
+    ON kv_store(json_extract(json, '$.approval_request_id'))
+    WHERE namespace = 'approvals'
+    """.lower().split()
+)
 
 
 @dataclass(frozen=True)
@@ -93,6 +101,20 @@ class Database:
             if actual != columns:
                 return False
         return True
+
+    def approval_record_schema_is_current(self) -> bool:
+        """Verify the exact request-level single-assignment index read-only."""
+        row = self._conn.execute(
+            """
+            SELECT sql
+            FROM sqlite_master
+            WHERE type = 'index' AND name = ? AND tbl_name = 'kv_store'
+            """,
+            (_APPROVAL_RECORD_INDEX_NAME,),
+        ).fetchone()
+        if row is None or not isinstance(row[0], str):
+            return False
+        return " ".join(row[0].lower().split()) == _APPROVAL_RECORD_INDEX_SQL
 
     def _create_schema(self) -> None:
         # ``row_digest`` binds (namespace, key, json) so a raw single-row edit

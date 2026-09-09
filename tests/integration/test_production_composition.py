@@ -154,6 +154,24 @@ def test_unknown_graph_checkpoint_schema_fails_closed_no_migration() -> None:
             root.start()
 
 
+def test_missing_approval_uniqueness_index_fails_closed_no_migration() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = str(Path(tmp) / "missing-approval-index.db")
+        database = Database(db_path)
+        database.connection.execute("DROP INDEX uq_approval_record_request")
+        database.close()
+        plan = ProductionStartupPlan(
+            activation_lock_path=str(Path(tmp) / "act.lock"),
+            application_db_path=db_path,
+            topology=_single_host(),
+            witness=_production_witness(),
+            key_provider=_ProdKeyProvider(),
+        )
+        root = ProductionCompositionRoot(plan)
+        with pytest.raises(SchemaMigrationRequiredError, match="approval-record uniqueness index"):
+            root.start()
+
+
 def test_production_witness_without_tpm2_tools_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("PATH", "")
     with tempfile.TemporaryDirectory() as tmp:

@@ -81,6 +81,11 @@ def check_schema_read_only(database: Database) -> None:
             "normal startup found an unknown LangGraph checkpoint schema; "
             "an explicit stopped-worker migration is required"
         )
+    if not database.approval_record_schema_is_current():
+        raise SchemaMigrationRequiredError(
+            "normal startup found a missing/unknown approval-record uniqueness index; "
+            "an explicit stopped-worker migration is required"
+        )
 
 
 def check_tpm_witness(witness: NvExtendDigestWitness) -> None:
