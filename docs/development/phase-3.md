@@ -6,8 +6,8 @@
 - 設計改訂: `system-design-v1-r3` / `ai-control-v1-r3`
 - 基点: Phase 2 受入コミット `d89739a`（`docs/development/phase-2.md` / `docs/reviews/phase-2-common-gate-66f55ba.md`、Phase 3移行 `PERMITTED`）
 - 実装ブランチ: `codex/phase-3-human-approval-durable-resume`
-- 実装対象コミット: `897f553badfcf5debcc1eab9d3c7d803cc083090`（初版 実装 + 試験）、`99437ef294a9a40dda5861f1a87f80aa10e3c747`（第1次レビュー対応: LangGraph Checkpoint駆動のDurable Resumeへ改修）、`a8820705619ec8475299e0df5e85476e7a7f5299`（第2次レビュー対応: 全未完了Execution照合・実Checkpoint内容検証・graph内FINALIZING引継ぎ）
-- 最終独立レビュー: `docs/reviews/phase-3-common-gate-a882070.md`、Common Gate `PASS`、Phase 3 `ACCEPTED`
+- 実装対象コミット: `897f553badfcf5debcc1eab9d3c7d803cc083090`（初版 実装 + 試験）、`99437ef294a9a40dda5861f1a87f80aa10e3c747`（第1次レビュー対応: LangGraph Checkpoint駆動のDurable Resumeへ改修）、`a8820705619ec8475299e0df5e85476e7a7f5299`（第2次レビュー対応: 全未完了Execution照合・実Checkpoint内容検証・graph内FINALIZING引継ぎ）、`dfe3d11a8fc11122545760c7d0e2f6ce22bdfe51`（受入後再レビュー対応: Approval単一割当・同一pass finalization・local-result非Adapter照合）
+- 独立レビュー状態: `a882070`は`docs/reviews/phase-3-common-gate-a882070.md`でCommon Gate `PASS`。その後の再レビュー指摘を修正した`dfe3d11`は新しい独立Common Gate待ちであり、Phase 4移行判定は保留する。
 - 実装範囲: Phase 0A〜2 の型・Test Double境界を保存したまま、Human Approval の完全表示・厳密Binding強制と、停止 / レビュー中Mission の Durable Resume 照合・引継ぎを実装する。新しいWorkflow状態・Graph・永続Record・認可経路・重複Serviceは追加しない。実 C2 / MCP / 外部Target / Credential / Payload / Implant / Detection Evasion 機構は実装しない。Phase 4 / 5 は実装しない。
 
 ## 実装方針
@@ -78,11 +78,21 @@ PATH=<isolated-swtpm>/usr/bin:$PATH ... pytest -o addopts= -q -ra  PASS: 816 pas
   - graph state に `mission_revision` / `run_id` を追加し通常Planningが書込む。`durable_resume` は `SqliteSaver` の実Checkpoint `channel_values` を現在Repository・Canonical threadへ照合し、foreign mission / wrong revision / wrong run / corrupt を DB変更・Adapter Read前に `MissionRevisionConflictError` でFail Closed。
   - WAITING_HUMAN_REVIEW -> FINALIZING 引継ぎを graph finalization node（Mission Manager + 元の durable intent）内へ移し、LangGraph を単一Workflow所有者として維持。認証済みOperator Triggerは維持。
   - 決定論的Regression（複数Execution各1回照合・binding一致、実Checkpoint内容拒否、zero Planner / zero Analyzer）を追加。file-backed restart Testは引き続きPASS。
-- 上記対応後、Codexが最終実装`a882070`を再レビューし、swtpm 7件を含む全816件、branch coverage、ruff、configured / direct strict mypy、compileall、boundary検証、SHA256SUMS、依存整合性を独立に再実行した。指摘残数はBLOCKER / HIGH / MEDIUM / LOWすべて0、Common Gate `PASS`、Phase 3 `ACCEPTED`。詳細は`docs/reviews/phase-3-common-gate-a882070.md`。
+- 上記対応後、Codexが実装`a882070`を再レビューし、swtpm 7件を含む全816件、branch coverage、ruff、configured / direct strict mypy、compileall、boundary検証、SHA256SUMS、依存整合性を独立に再実行した。指摘残数はBLOCKER / HIGH / MEDIUM / LOWすべて0、Common Gate `PASS`、Phase 3 `ACCEPTED`。詳細は`docs/reviews/phase-3-common-gate-a882070.md`。
+
+## 受入後再レビュー対応（2026-09-09）
+
+`a882070`受入後の再レビューでBLOCKER 1件・HIGH 2件を検出し、`dfe3d11a8fc11122545760c7d0e2f6ce22bdfe51`で修正した。
+
+- ApprovalRequestごとのHuman DecisionをSQLiteの部分Unique IndexとRepository検査で単一割当にし、矛盾するAPPROVED / REJECTED Recordを順序・caller指定IDに関係なく拒否する。DB一意制約を競合時の線形化点とする。
+- planning graphの`reconciliation`から既存`finalization` nodeへ接続し、最後のExecutionが同じ照合passでterminalになった場合も、全Item RESOLVEDなら追加Triggerなしで`WAITING_HUMAN_REVIEW -> FINALIZING`へ進める。
+- `LocalResultBinding`は`ExecutionAdapter.reconcile()`へ渡さず、durable capture / receipt / control metadataだけで照合する。確定済みmetadataはterminalへ収束し、不完全captureはAdapter非接触で`OUTCOME_UNKNOWN`とする。
+- 回帰試験を6件追加し、Phase 3専用36件をPASS。全体は815 passed / 7 skipped（ローカル環境にswtpm / tpm2-toolsがないためWitness 7件をskip）、ruff、configured mypy 196 files、direct strict mypy 193 files、compileall、boundary検証、SHA256SUMS、依存整合性をPASSした。
+- `dfe3d11`を対象とするswtpm 7件込みの独立Common Gate、branch coverage、指摘ゼロ確認は未実施。旧`a882070`の受入記録を新実装へ自動継承せず、Phase 4は新しいGate完了まで保留する。
 
 ## 受入根拠・残課題
 
-- Phase 3 の全受入条件（承認境界・Epoch単調増加・非再利用・LangGraph Checkpoint->App DB->Adapter照合・不明Outcome非再送・停止 / レビュー状態保存・並行変化の写像・§21.1.3 引継ぎ）を実コードと決定論Testで確認済み。Common Gate `PASS`によりPhase 3は受入済み。
+- `a882070`に対する旧Common Gateは`PASS`。再レビュー修正版`dfe3d11`はローカル検証済みだが、新しい独立Common Gate待ちのためPhase 3再受入・Phase 4移行は保留する。
 - 残課題 / 未検証:
   - D4 実機消去は引き続き `NOT_EVALUATED`。Production採用は別条件。
   - Phase 4（承認済み C2 Adapter）/ Phase 5（承認済み MCP Adapter）は本Phase対象外で未実装。実Adapter / Provider Human Gate は保持する。
