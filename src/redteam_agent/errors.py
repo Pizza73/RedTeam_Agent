@@ -310,6 +310,23 @@ class ArchitectureViolationError(AuthorizationKernelError):
     direction (architecture ownership/import check)."""
 
 
+class C2AdapterUnavailableError(AuthorizationKernelError):
+    """A C2 adapter is not activated because its immutable provider contract,
+    connection identity, authentication reference, or isolation gate is incomplete."""
+
+
+class C2AdapterContractError(AuthorizationKernelError):
+    """A provider operation, identifier, or wire shape violated the pinned C2 contract."""
+
+
+class C2AdapterTransportError(AuthorizationKernelError):
+    """A fixed C2 transport failed without exposing response or credential content."""
+
+
+class C2AdapterQualificationError(AuthorizationKernelError):
+    """C2 adapter qualification evidence is incomplete, forged, or not production-grade."""
+
+
 class SchemaMigrationRequiredError(AuthorizationKernelError):
     """Normal startup found an unknown/missing schema; it must not auto-migrate. An
     explicit stopped-worker migration under the same activation lock is required."""

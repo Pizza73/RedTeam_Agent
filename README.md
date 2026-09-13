@@ -1,7 +1,7 @@
 # RedTeam Agent — 設計資料と段階実装
 
-許可された隔離演習向け支援AIエージェントの設計資料と、Phase 0A〜3の段階実装を保持するリポジトリ。
-Phase 3までの実ネットワークは閉域Local LLM資格に限定し、実C2/MCP/Target接続・Payload生成・汎用Shell実行は含まない。Phase 3はHuman ApprovalとDurable Resumeを追加するが、実Adapterは持たない。
+許可された隔離演習向け支援AIエージェントの設計資料と、Phase 0A〜4の段階実装を保持するリポジトリ。
+実ネットワークは閉域Local LLM資格に限定し、実C2/MCP/Target接続・Payload生成・汎用Shell実行は含まない。Phase 4はTuoni 0.16.1 Adapterのオフライン開発受入まで完了し、Production Activationだけを保留している。
 
 ## 担当方針
 
@@ -25,6 +25,7 @@ Phase 3までの実ネットワークは閉域Local LLM資格に限定し、実C
 | [docs/development/phase-0a.md](docs/development/phase-0a.md) | Phase 0A の開発記録（対象・要件・試験・残課題・独立レビュー） |
 | [docs/development/phase-2.md](docs/development/phase-2.md) | Phase 2 Local LLM の開発・実モデル資格・独立レビュー記録 |
 | [docs/development/phase-3.md](docs/development/phase-3.md) | Phase 3 Human Approval / Durable Resume の開発記録（対象・要件・試験・残課題） |
+| [docs/development/phase-4.md](docs/development/phase-4.md) | Phase 4 Tuoni Adapter の確定事項・オフライン実装・Activation Blocker |
 
 設計改訂は`system-design-v1-r3` / `ai-control-v1-r3`。
 AIの意味・判断は別冊を先に読み、安全基盤と接続Schemaは正本で確認する。
@@ -78,7 +79,7 @@ Payload / Implant 操作も持たない。開発記録は [docs/development/phas
 `a612cecefe8fd7db0a21842212ed245c113fe38d`で修正した。隔離swtpmを含む全823件をskip 0でPASSし、
 branch coverage 86.549272870882%、ruff / mypy / boundary検証にも合格。未解決指摘0でPhase 3を再受入した。
 詳細は [Phase 3修正版独立レビュー](docs/reviews/phase-3-common-gate-a612cec.md) を参照する。
-Phase 4は承認済みC2 ProviderのProvider Human Gate完了まで未着手とする。
+Phase 4のProvider Human Gateで確定済みの範囲とオフライン開発受入は完了済み。実接続・Activationは未完了項目を解決するまで禁止する。
 
 - `REQUIRE_APPROVAL` は一致する有効な `APPROVED` Record がなければ Dispatch できず、`DENY` は Record があっても
   実行不可、Plan / Intent 変更・期限切れ・Replay・誤Digest・誤Epoch / Revision・誤Bindingはすべて Fail Closed する
@@ -95,6 +96,15 @@ Phase 4は承認済みC2 ProviderのProvider Human Gate完了まで未着手と�
   写像し（並行の正当な変化も拒否せず写像）、WAITING_HUMAN_REVIEW は全Item解決時にだけ graph finalization node 内で
   Mission Manager が §21.1.3 の既存 FINALIZING へ進める（`Phase1AgentWorkflow.durable_resume` /
   `FinalizationService.advance_from_human_review`）。
+
+## Phase 4 Tuoni Adapter（オフライン開発受入完了）
+
+Commercial Tuoni 0.16.1のRelease、Source Commit、Server Image Digestを固定し、実環境OpenAPI Digestを未解決Blockerとして分離したうえで、Provider中立の
+`C2Adapter`境界、閉じたJSON-only送信契約、Session / Task Control応答の厳密な正規化を実装している。Ubuntu 24.04
+LTS / x86_64のControl VM上でTuoniと同居するone-shot process Transport、最小権限Account検査、固定Production
+Composition、状態付きTest Doubleによる全操作Scenarioも実装し、実C2 / Targetへの通信は行わない。
+確定事項とActivation Blockerは
+[Phase 4開発記録](docs/development/phase-4.md)を参照する。
 
 ## Phase 2 Local LLM（Capability / 300-Run Qualification）
 

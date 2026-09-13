@@ -253,6 +253,26 @@ _DEFINITIONS: tuple[DigestDefinition, ...] = (
     # commit, profile/model, tokenizer, chat template, runtime, output mode and the
     # prompt / schema / contract / corpus digests plus passed capability results.
     _obj("agent_quality_evaluation_binding_digest", "quality", exclude_self="binding_digest"),
+    # --- Phase 4 preparation: approved C2 provider contract --------------
+    # The release artifacts are pinned offline. The profile remains
+    # non-activatable until every deployment-specific external identity is pinned.
+    _obj("tuoni_provider_profile_digest", "tuoni_adapter", exclude_self="profile_digest"),
+    _obj("tuoni_api_contract_digest", "tuoni_adapter"),
+    _obj(
+        "tuoni_transport_attestation_digest",
+        "tuoni_adapter",
+        exclude_self="attestation_digest",
+    ),
+    _obj(
+        "tuoni_adapter_identity_digest",
+        "tuoni_adapter",
+        exclude_self="adapter_identity_digest",
+    ),
+    _obj(
+        "tuoni_offline_readiness_report_digest",
+        "tuoni_adapter",
+        exclude_self="report_digest",
+    ),
 )
 
 
