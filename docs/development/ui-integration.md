@@ -5,7 +5,7 @@
 The Operator Console from [nathanhoma/RedTeam_Agent](https://github.com/nathanhoma/RedTeam_Agent), commit
 `68caad5e219162f47be4fe364a87f28c805b69fb`, is integrated as `frontend/`. The source repository and this repository use GPL-3.0.
 
-The integration is complete for offline development: the production frontend uses the local Python API, reads durable Mission / Approval / Knowledge state, stores non-authoritative drafts, and presents the Phase 4 Tuoni and Phase 5 Impacket boundaries. No real Tuoni, vCenter, vLLM, or Target connection is required for these functions.
+The integration is complete for offline development: the production frontend uses the local Python API, reads durable Mission / Approval / Knowledge state, stores non-authoritative drafts, and presents the Phase 4 Tuoni / Sliver and Phase 5 Impacket boundaries. No real C2, vCenter, vLLM, or Target connection is required for these functions.
 
 ## Architecture
 
@@ -48,6 +48,7 @@ All mutations require exact same-origin proof. Draft endpoints persist only non-
 ## Provider boundary
 
 - Tuoni: Commercial, version shown as `latest`, existing deployment, access unconfigured.
+- Sliver: v1.7.3, operator `joe`, HTTP Beacon transport, no Beacon currently present. Selection exposes inventory and existing Beacon Task read/cancel only.
 - Impacket: installed package version reported at runtime; MCP server `redteam-impacket-mcp`.
 - Exposed operations: SMB negotiate, SMB authenticate, SMB list shares, RPC endpoint map.
 - Default egress description: TCP/445 and TCP/135 only; actual OS / vCenter isolation qualification remains an Activation Blocker.
@@ -86,4 +87,4 @@ For development, run `redteam-ui --api-only` and `npm run dev` separately. Vite 
 
 ## Remaining production-only work
 
-The UI itself does not remove the existing Phase 4 / 5 Activation Blockers. Production requires the real Tuoni identity and OpenAPI / image binding, authenticated Control VM access, actual vCenter / OS egress evidence, Target qualification, and composition of the UI with authenticated Approval and Phase 2 Capability owner services. Until then, real dispatch remains disabled.
+The UI itself does not remove the existing Phase 4 / 5 Activation Blockers. Production requires either the real Tuoni identity and OpenAPI / image binding or the pinned Sliver operator/server identities and an approved HTTP Beacon, plus actual isolation evidence and composition of the UI with authenticated Approval and Phase 2 Capability owner services. Until then, real dispatch remains disabled.

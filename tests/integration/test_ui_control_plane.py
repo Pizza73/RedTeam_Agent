@@ -65,6 +65,16 @@ def test_empty_provisioned_database_and_drafts_are_managed_without_activation(tm
     assert str(mission_result["draftId"]).startswith("mission-draft-")
     assert str(provider_result["draftId"]).startswith("provider-draft-")
     provider_status = control.provider_status()
+    sliver_status = provider_status["sliver"]
+    assert isinstance(sliver_status, dict)
+    assert sliver_status == {
+        "version": "1.7.3",
+        "operator": "joe",
+        "operatorConfigLocation": "downloads",
+        "operatorAccess": "unconfigured",
+        "implantTransport": "http",
+        "beaconPresent": False,
+    }
     latest = provider_status["latestDraft"]
     assert isinstance(latest, dict)
     assert latest["draft"]["c2"]["providerId"] == "tuoni"

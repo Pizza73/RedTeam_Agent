@@ -273,6 +273,25 @@ _DEFINITIONS: tuple[DigestDefinition, ...] = (
         "tuoni_adapter",
         exclude_self="report_digest",
     ),
+    # Sliver is an additional C2 provider. Its first contract is deliberately
+    # limited to inventory plus existing Beacon Task read/cancel operations.
+    _obj("sliver_provider_profile_digest", "sliver_adapter", exclude_self="profile_digest"),
+    _obj("sliver_rpc_contract_digest", "sliver_adapter"),
+    _obj(
+        "sliver_transport_attestation_digest",
+        "sliver_adapter",
+        exclude_self="attestation_digest",
+    ),
+    _obj(
+        "sliver_adapter_identity_digest",
+        "sliver_adapter",
+        exclude_self="adapter_identity_digest",
+    ),
+    _obj(
+        "sliver_offline_readiness_report_digest",
+        "sliver_adapter",
+        exclude_self="report_digest",
+    ),
     # --- Phase 5: pinned MCP 2026-07-28 offline adapter -----------------
     _obj("mcp_server_config_digest", "mcp_adapter", exclude_self="config_digest"),
     _obj("mcp_provider_profile_digest", "mcp_adapter", exclude_self="profile_digest"),

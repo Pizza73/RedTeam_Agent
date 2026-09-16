@@ -84,7 +84,7 @@ export const vllmCapabilityResultSchema = z.object({
 export type VllmCapabilityResult = z.infer<typeof vllmCapabilityResultSchema>;
 export type VllmScenario = "success" | "incompatible" | "unreachable" | "timeout";
 
-export const c2ProviderIdSchema = z.enum(["none", "tuoni"]);
+export const c2ProviderIdSchema = z.enum(["none", "tuoni", "sliver"]);
 export const mcpServerIdSchema = z.enum(["impacket_mcp"]);
 export const toolPolicyStateSchema = z.enum(["allowed", "approval_required", "disabled"]);
 export const impacketOperationIds = [
@@ -266,6 +266,14 @@ export type Dashboard = z.infer<typeof dashboardSchema>;
 export const providerStatusSchema = z.object({
   mode: z.literal("live"),
   tuoni: z.object({ edition: z.literal("commercial"), version: z.string(), access: z.string() }).strict(),
+  sliver: z.object({
+    version: z.literal("1.7.3"),
+    operator: z.literal("joe"),
+    operatorConfigLocation: z.literal("downloads"),
+    operatorAccess: z.string(),
+    implantTransport: z.literal("http"),
+    beaconPresent: z.boolean(),
+  }).strict(),
   impacket: z.object({
     installed: z.boolean(),
     version: z.string().nullable(),

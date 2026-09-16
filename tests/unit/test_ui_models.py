@@ -44,7 +44,7 @@ def test_mission_draft_rejects_unzoned_expiry_and_non_network_port() -> None:
         MissionDraftInput.from_untrusted_json(_MISSION.replace(b'"type":"network"', b'"type":"host"'))
 
 
-def test_provider_policy_is_closed_to_tuoni_and_impacket_allowlist() -> None:
+def test_provider_policy_is_closed_to_registered_c2_and_impacket_allowlist() -> None:
     valid = b"""{
       "missionRevision":1,
       "c2":{"providerId":"tuoni","registryReference":"registry://c2/tuoni/latest-commercial"},
@@ -57,7 +57,18 @@ def test_provider_policy_is_closed_to_tuoni_and_impacket_allowlist() -> None:
       ]
     }"""
     assert ProviderPolicyDraftInput.from_untrusted_json(valid).c2.providerId == "tuoni"
+    sliver = valid.replace(
+        b'"providerId":"tuoni","registryReference":"registry://c2/tuoni/latest-commercial"',
+        b'"providerId":"sliver","registryReference":"registry://c2/sliver/v1.7.3-read-control"',
+    )
+    assert ProviderPolicyDraftInput.from_untrusted_json(sliver).c2.providerId == "sliver"
     with pytest.raises(PydanticBoundaryValidationError):
         ProviderPolicyDraftInput.from_untrusted_json(valid.replace(b"impacket_mcp", b"arbitrary_mcp", 1))
     with pytest.raises(PydanticBoundaryValidationError):
         ProviderPolicyDraftInput.from_untrusted_json(valid.replace(b"false", b"true"))
+    with pytest.raises(PydanticBoundaryValidationError):
+        ProviderPolicyDraftInput.from_untrusted_json(
+            sliver.replace(
+                b'"registry://c2/sliver/v1.7.3-read-control"', b"null"
+            )
+        )

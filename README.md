@@ -1,7 +1,7 @@
 # RedTeam Agent — 設計資料と段階実装
 
 許可された隔離演習向け支援AIエージェントの設計資料と、Phase 0A〜5の段階実装を保持するリポジトリ。
-実ネットワークは閉域Local LLM資格に限定し、実C2/MCP/Target接続・Payload生成・汎用Shell実行は含まない。Phase 4はTuoni 0.16.1、Phase 5はMCP 2026-07-28のオフライン実装まで完了し、Production Activationだけを保留している。
+実ネットワークは閉域Local LLM資格と承認済みImpacket Target試験に限定し、実C2接続・Payload生成・汎用Shell実行は含まない。Phase 4はTuoni 0.16.1とSliver 1.7.3、Phase 5はMCP 2026-07-28のオフライン実装まで完了し、Production Activationだけを保留している。
 
 ## 担当方針
 
@@ -26,6 +26,7 @@
 | [docs/development/phase-2.md](docs/development/phase-2.md) | Phase 2 Local LLM の開発・実モデル資格・独立レビュー記録 |
 | [docs/development/phase-3.md](docs/development/phase-3.md) | Phase 3 Human Approval / Durable Resume の開発記録（対象・要件・試験・残課題） |
 | [docs/development/phase-4.md](docs/development/phase-4.md) | Phase 4 Tuoni Adapter の確定事項・オフライン実装・Activation Blocker |
+| [docs/development/phase-4-sliver.md](docs/development/phase-4-sliver.md) | Phase 4 Sliver Adapter、HTTP Beacon方針、Operator接続とActivation Blocker |
 | [docs/development/phase-5.md](docs/development/phase-5.md) | Phase 5 MCP Adapter のProtocol Pin・オフライン実装・Activation Blocker |
 | [docs/development/phase-5-impacket-mcp.md](docs/development/phase-5-impacket-mcp.md) | Impacket MCP Server の固定Tool、Target / Secret境界、導入・Activation条件 |
 | [docs/development/ui-integration.md](docs/development/ui-integration.md) | Operator UI統合、同一Origin API、管理範囲、起動・検証手順 |
@@ -100,7 +101,7 @@ Phase 4のProvider Human Gateで確定済みの範囲とオフライン開発受
   Mission Manager が §21.1.3 の既存 FINALIZING へ進める（`Phase1AgentWorkflow.durable_resume` /
   `FinalizationService.advance_from_human_review`）。
 
-## Phase 4 Tuoni Adapter（オフライン開発受入完了）
+## Phase 4 C2 Adapters（オフライン開発受入完了）
 
 Commercial Tuoni 0.16.1のRelease、Source Commit、Server Image Digestを固定し、実環境OpenAPI Digestを未解決Blockerとして分離したうえで、Provider中立の
 `C2Adapter`境界、閉じたJSON-only送信契約、Session / Task Control応答の厳密な正規化を実装している。Ubuntu 24.04
@@ -108,6 +109,12 @@ LTS / x86_64のControl VM上でTuoniと同居するone-shot process Transport、
 Composition、状態付きTest Doubleによる全操作Scenarioも実装し、実C2 / Targetへの通信は行わない。
 確定事項とActivation Blockerは
 [Phase 4開発記録](docs/development/phase-4.md)を参照する。
+
+SliverはTuoniを置き換えず第2 Providerとして追加した。公式v1.7.3 / Source Commitを固定し、HTTP Beaconを対象に、
+Version、Session / Beacon Inventory、既存Beacon TaskのRead / Cancelだけを許可する。Operator `.cfg`はone-shot gRPC/mTLS
+Workerだけがsystemd credentialから読み、Payload生成、Listener作成、Shell、Upload、Injection、Pivotは契約外である。
+現在はOperator設定の正確な絶対パス、Server Identity、実HTTP BeaconがないためActivationしない。詳細は
+[Sliver開発記録](docs/development/phase-4-sliver.md)を参照する。
 
 ## Phase 5 MCP Adapter（オフライン実装完了）
 
@@ -123,7 +130,7 @@ Authentication / Share List / RPC Endpoint Mapだけを公開するone-shot stdi
 ## Operator UI（オフライン統合完了）
 
 指定された`nathanhoma/RedTeam_Agent`のOperator Consoleを`frontend/`へ取り込み、Mock本番表示を同一Originの
-ローカルControl Plane APIへ置き換えた。実Mission / Approval / Knowledge状態の表示、非権威Mission Draft、Tuoni Commercialと
+ローカルControl Plane APIへ置き換えた。実Mission / Approval / Knowledge状態の表示、非権威Mission Draft、Tuoni Commercial / Sliverと
 4つのImpacket MCP操作に限定したProvider Policy Draftを管理できる。単体CLIではApproval writeと実VLLM Probeを無効化し、
 既存の信頼済みOwner Serviceを注入した構成でだけ有効にする。実C2 / vCenter / Targetへの接続やProduction Activationは行わない。
 

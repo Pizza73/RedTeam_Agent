@@ -41,6 +41,14 @@ test("tool command templates stay collapsed until requested", async ({ page }) =
   await expect(impacket.getByText("impacket-secretsdump", { exact: true })).toHaveCount(0);
 });
 
+test("Sliver is the default C2 draft but remains blocked without a Beacon", async ({ page }) => {
+  await page.goto("/settings/providers");
+  await expect(page.getByLabel("Preferred C2")).toHaveValue("sliver");
+  await expect(page.getByRole("heading", { name: "Sliver", exact: true })).toBeVisible();
+  await expect(page.getByText("not present", { exact: true })).toBeVisible();
+  await expect(page.getByText(/live HTTP Beacon pass the Provider Human Gate/)).toBeVisible();
+});
+
 test("primary operator surfaces have no serious accessibility violations", async ({ page }) => {
   for (const route of ["/dashboard", "/missions/new", "/interventions", "/knowledge", "/settings/providers", "/settings/llm"]) {
     await page.goto(route);

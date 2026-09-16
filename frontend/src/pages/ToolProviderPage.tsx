@@ -11,6 +11,7 @@ type PolicyTab = "c2" | "tools" | "review";
 const c2Options: Record<C2ProviderId, { label: string; description: string; registryReference: string | null }> = {
   none: { label: "No C2 adapter", description: "C2 session and task routing is disabled for this Mission revision.", registryReference: null },
   tuoni: { label: "Tuoni Commercial", description: "Existing Tuoni deployment through the typed Phase 4 adapter.", registryReference: "registry://c2/tuoni/latest-commercial" },
+  sliver: { label: "Sliver", description: "Pinned Sliver v1.7.3 inventory and existing Beacon Task control over operator gRPC/mTLS.", registryReference: "registry://c2/sliver/v1.7.3-read-control" },
 };
 
 const operations = [
@@ -22,7 +23,7 @@ const operations = [
 
 const initialDraft: ProviderPolicyDraft = providerPolicyDraftSchema.parse({
   missionRevision: 1,
-  c2: { providerId: "tuoni", registryReference: c2Options.tuoni.registryReference },
+  c2: { providerId: "sliver", registryReference: c2Options.sliver.registryReference },
   enabledMcpServers: ["impacket_mcp"],
   operations: operations.map(({ id, state }) => ({ id, source: "impacket_mcp", state, arbitraryArguments: false })),
 });
@@ -71,7 +72,7 @@ export function ToolProviderPage() {
 
   return (
     <div className="page-content provider-policy-page">
-      <PageHeader eyebrow={`MISSION POLICY · REVISION ${draft.missionRevision}`} title="C2 and tool access policy" description="Manage Tuoni and the Phase 5 Impacket MCP allowlist. Saving a draft never authorizes execution." actions={<Badge tone={gatewayMode === "live" ? "green" : "amber"}>{gatewayMode === "live" ? "LIVE CONTROL" : "MOCK MODE"}</Badge>} />
+      <PageHeader eyebrow={`MISSION POLICY · REVISION ${draft.missionRevision}`} title="C2 and tool access policy" description="Manage Tuoni, Sliver, and the Phase 5 Impacket MCP allowlist. Saving a draft never authorizes execution." actions={<Badge tone={gatewayMode === "live" ? "green" : "amber"}>{gatewayMode === "live" ? "LIVE CONTROL" : "MOCK MODE"}</Badge>} />
       <div className="inline-alert provider-principle"><ShieldAlert size={16}/><span><b>Provider access is not execution authorization.</b> Arbitrary commands, unrestricted arguments, payload generation, credential dumping, and native C2 commands remain unavailable.</span></div>
 
       <section className="panel provider-policy-shell">
@@ -82,12 +83,12 @@ export function ToolProviderPage() {
         </div>
 
         {tab === "c2" && <div className="provider-tab-panel" role="tabpanel">
-          <div className="provider-card-heading"><div className="provider-icon"><RadioTower size={18}/></div><div><p className="eyebrow">EXECUTION ADAPTER</p><h2>Tuoni C2 Adapter</h2><p>Choose whether the current Mission draft references the existing Tuoni deployment.</p></div><Badge tone={draft.c2.providerId === "none" ? "neutral" : "amber"}>{draft.c2.providerId === "none" ? "NOT SELECTED" : "HUMAN GATE"}</Badge></div>
+          <div className="provider-card-heading"><div className="provider-icon"><RadioTower size={18}/></div><div><p className="eyebrow">EXECUTION ADAPTER</p><h2>C2 Adapter</h2><p>Choose the typed C2 provider referenced by the current Mission draft.</p></div><Badge tone={draft.c2.providerId === "none" ? "neutral" : "amber"}>{draft.c2.providerId === "none" ? "NOT SELECTED" : "HUMAN GATE"}</Badge></div>
           <div className="c2-selection-grid">
             <label className="field"><span>Preferred C2</span><select aria-label="Preferred C2" value={draft.c2.providerId} onChange={(event) => selectC2(event.target.value as C2ProviderId)}>{Object.entries(c2Options).map(([id, option]) => <option key={id} value={id}>{option.label}</option>)}</select></label>
-            <dl className="provider-facts"><div><dt>Edition</dt><dd>{status?.tuoni.edition ?? "commercial"}</dd></div><div><dt>Version</dt><dd>{status?.tuoni.version ?? "latest"}</dd></div><div><dt>Control VM access</dt><dd>{status?.tuoni.access ?? "unconfigured"}</dd></div><div><dt>External egress</dt><dd>Default deny</dd></div></dl>
+            {draft.c2.providerId === "sliver" ? <dl className="provider-facts"><div><dt>Version</dt><dd>{status?.sliver.version ?? "1.7.3"}</dd></div><div><dt>Operator</dt><dd>{status?.sliver.operator ?? "joe"}</dd></div><div><dt>Implant transport</dt><dd>{status?.sliver.implantTransport.toUpperCase() ?? "HTTP"}</dd></div><div><dt>Beacon</dt><dd>{status?.sliver.beaconPresent ? "present" : "not present"}</dd></div></dl> : <dl className="provider-facts"><div><dt>Edition</dt><dd>{status?.tuoni.edition ?? "commercial"}</dd></div><div><dt>Version</dt><dd>{status?.tuoni.version ?? "latest"}</dd></div><div><dt>Control VM access</dt><dd>{status?.tuoni.access ?? "unconfigured"}</dd></div><div><dt>External egress</dt><dd>Default deny</dd></div></dl>}
           </div>
-          <div className="c2-selection-detail" aria-live="polite"><h3>{selectedC2.label}</h3><p>{selectedC2.description}</p><div className="capability-grid"><span><Check size={14}/>Session inventory</span><span><Check size={14}/>Typed task status</span><span><Check size={14}/>Redacted results</span><span><Check size={14}/>Cancellation</span><span><Check size={14}/>Reconciliation</span><span className="unavailable"><LockKeyhole size={14}/>Payload generation</span></div>{draft.c2.providerId !== "none" && <div className="inline-alert"><AlertTriangle size={15}/><span>Selection remains inactive until the real Control VM access, authentication, vCenter isolation, and exact capability mapping pass the Phase 4 Human Gate.</span></div>}</div>
+          <div className="c2-selection-detail" aria-live="polite"><h3>{selectedC2.label}</h3><p>{selectedC2.description}</p><div className="capability-grid"><span><Check size={14}/>Session inventory</span><span><Check size={14}/>Typed task status</span><span className={draft.c2.providerId === "sliver" ? "unavailable" : undefined}>{draft.c2.providerId === "sliver" ? <LockKeyhole size={14}/> : <Check size={14}/>}Redacted results</span><span><Check size={14}/>Cancellation</span><span><Check size={14}/>Reconciliation</span><span className="unavailable"><LockKeyhole size={14}/>Payload generation</span></div>{draft.c2.providerId !== "none" && <div className="inline-alert"><AlertTriangle size={15}/><span>{draft.c2.providerId === "sliver" ? "Selection remains inactive until the exact operator config, gRPC/mTLS server identity, and a live HTTP Beacon pass the Provider Human Gate." : "Selection remains inactive until the real Control VM access, authentication, vCenter isolation, and exact capability mapping pass the Phase 4 Human Gate."}</span></div>}</div>
         </div>}
 
         {tab === "tools" && <div className="provider-tab-panel" role="tabpanel">
@@ -100,7 +101,7 @@ export function ToolProviderPage() {
 
         {tab === "review" && <div className="provider-tab-panel" role="tabpanel">
           <div className="policy-review-grid"><div><span>Preferred C2</span><b>{selectedC2.label}</b><small>{draft.c2.providerId === "none" ? "No gate required" : "Human Gate required"}</small></div><div><span>Primary runtime</span><b>Impacket MCP</b><small>Arbitrary commands disabled</small></div><div><span>Version</span><b>{status?.impacket.version ?? "unavailable"}</b><small>Runtime package</small></div><div><span>Operation policy</span><b>{draft.operations.length} typed operations</b><small>{operationCounts.disabled} explicitly disabled</small></div></div>
-          <ul className="policy-review-list"><li>Tuoni selection is an adapter preference, not authority to execute.</li><li>Impacket is exposed only through four reviewed purpose-specific operations.</li><li>Secrets remain references and are resolved only at trusted dispatch.</li><li>Saving this record does not create a Policy Decision or activate a Mission.</li></ul>
+          <ul className="policy-review-list"><li>C2 selection is an adapter preference, not authority to execute.</li><li>Sliver is limited to inventory and existing Beacon Task read/cancel operations.</li><li>Impacket is exposed only through four reviewed purpose-specific operations.</li><li>Secrets remain references and are resolved only at trusted dispatch.</li><li>Saving this record does not create a Policy Decision or activate a Mission.</li></ul>
           {validationError && <div className="inline-alert error" role="alert"><AlertTriangle size={15}/><span>{validationError}</span></div>}
           {saveMutation.isSuccess && <div className="inline-alert success"><Check size={15}/><span>Draft {saveMutation.data.draftId} saved at {formatUtcTime(saveMutation.data.savedAt)} UTC. No Mission was activated.</span></div>}
           <div className="provider-actions"><span>Saving does not create a Policy Decision.</span><Button onClick={() => saveMutation.mutate()} disabled={saveMutation.isPending}><Save size={15}/>{saveMutation.isPending ? "Saving draft" : "Save policy draft"}</Button></div>

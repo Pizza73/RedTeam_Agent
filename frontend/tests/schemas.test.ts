@@ -80,6 +80,11 @@ describe("frontend trust-boundary schemas", () => {
       ],
     });
     expect(draft.c2.providerId).toBe("tuoni");
+    const sliver = providerPolicyDraftSchema.parse({
+      ...draft,
+      c2: { providerId: "sliver", registryReference: "registry://c2/sliver/v1.7.3-read-control" },
+    });
+    expect(sliver.c2.providerId).toBe("sliver");
   });
 
   it("rejects arbitrary arguments and unregistered MCP servers", () => {

@@ -190,6 +190,14 @@ export const mockGateway: FrontendGateway = {
     return providerStatusSchema.parse({
       mode: "live",
       tuoni: { edition: "commercial", version: "latest", access: "unconfigured" },
+      sliver: {
+        version: "1.7.3",
+        operator: "joe",
+        operatorConfigLocation: "downloads",
+        operatorAccess: "unconfigured",
+        implantTransport: "http",
+        beaconPresent: false,
+      },
       impacket: {
         installed: true,
         version: "0.13.1",

@@ -64,15 +64,15 @@ class ProviderOperationDraft(StrictImmutableBoundaryModel):
 
 
 class C2Draft(StrictImmutableBoundaryModel):
-    providerId: Literal["none", "tuoni"]
+    providerId: Literal["none", "tuoni", "sliver"]
     registryReference: str | None = Field(default=None, max_length=500)
 
     @model_validator(mode="after")
     def _reference_matches_selection(self) -> C2Draft:
         if self.providerId == "none" and self.registryReference is not None:
             raise ValueError("unselected C2 cannot carry a registry reference")
-        if self.providerId == "tuoni" and self.registryReference is None:
-            raise ValueError("Tuoni selection requires a registry reference")
+        if self.providerId != "none" and self.registryReference is None:
+            raise ValueError("C2 selection requires a registry reference")
         return self
 
 

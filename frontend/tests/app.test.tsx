@@ -94,7 +94,11 @@ describe("operator console", () => {
     expect(await screen.findByRole("tab", { name: "C2 Selection", selected: true })).toBeInTheDocument();
     const c2Select = screen.getByLabelText("Preferred C2");
     expect(c2Select).toHaveTextContent("Tuoni");
+    expect(c2Select).toHaveTextContent("Sliver");
     expect(c2Select).not.toHaveTextContent("Cobalt Strike");
+    expect(c2Select).toHaveValue("sliver");
+    expect(screen.getByRole("heading", { name: "Sliver" })).toBeInTheDocument();
+    expect(screen.getByText("not present")).toBeInTheDocument();
     await user.selectOptions(c2Select, "tuoni");
     expect(screen.getByRole("heading", { name: "Tuoni Commercial" })).toBeInTheDocument();
 

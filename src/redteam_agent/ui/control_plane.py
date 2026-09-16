@@ -385,6 +385,14 @@ class UIControlPlane:
             return {
                 "mode": "live",
                 "tuoni": {"edition": "commercial", "version": "latest", "access": "unconfigured"},
+                "sliver": {
+                    "version": "1.7.3",
+                    "operator": "joe",
+                    "operatorConfigLocation": "downloads",
+                    "operatorAccess": "unconfigured",
+                    "implantTransport": "http",
+                    "beaconPresent": False,
+                },
                 "impacket": {
                     "installed": impacket_version is not None,
                     "version": impacket_version,

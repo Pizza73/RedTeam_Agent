@@ -42,7 +42,7 @@ Viteは`/api`を`http://127.0.0.1:18000`へProxyします。`npm run test`だけ
 | `New Mission` | 非権威のMission Draftを保存 |
 | `Interventions` | 永続Approval Requestを表示。信頼済みApproval Service注入時だけ承認 / 拒否 |
 | `Knowledge` | Entity、Relationship、Verified Finding、Redacted Artifact参照を表示 |
-| `C2 & Tools` | TuoniとImpacket MCPの非権威Policy Draftを保存 |
+| `C2 & Tools` | Tuoni / SliverとImpacket MCPの非権威Policy Draftを保存 |
 | `VLLM Settings` | 信頼済みPhase 2 Capability Port注入時だけ実Capability Check |
 
 Draft保存はMission Activation、Policy Decision、Tool Dispatchを行いません。Missionの作成・検証・開始は既存の信頼済みMission Workflowが所有します。
@@ -53,8 +53,10 @@ Draft保存はMission Activation、Policy Decision、Tool Dispatchを行いま�
 
 `C2 & Tools`は次の固定範囲だけを扱います。
 
-- C2: `none`または既存の`Tuoni Commercial`。
+- C2: `none`、既存の`Tuoni Commercial`、または`Sliver 1.7.3`。
 - Tuoni Version: `latest`表示。実接続前にRelease / Image / OpenAPI Digestの固定が必要。
+- Sliver: Operator `joe`、HTTP Beacon、Session / Beacon Inventoryと既存Beacon Task Read / Cancelだけを表示する。現在は
+  Operator設定の正確な絶対パスと実BeaconがないためActivation不可。
 - Control VM access: 未設定のままDraft保存可能。Production Activationは不可。
 - MCP Server: `impacket_mcp`のみ。
 - Operations: `impacket.smb.negotiate`、`impacket.smb.authenticate`、`impacket.smb.list_shares`、`impacket.rpc.endpoint_map`の4件のみ。

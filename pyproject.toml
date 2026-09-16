@@ -29,6 +29,9 @@ impacket-mcp = [
     # 26.x requires cryptography >=49 and conflicts with the project pin.
     "pyOpenSSL==25.3.0",
 ]
+sliver-c2 = [
+    "grpcio==1.84.0",
+]
 
 [project.scripts]
 redteam-impacket-mcp = "redteam_agent.mcp_servers.impacket_server:main"
