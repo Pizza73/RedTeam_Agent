@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from redteam_agent.adapters.sliver import SliverFoundationProfile
 from redteam_agent.adapters.sliver_adapter import SliverAdapter
-from redteam_agent.adapters.sliver_contract import SliverRpcContractV173
+from redteam_agent.adapters.sliver_contract import SliverRpcContractV177
 from redteam_agent.adapters.sliver_linux_transport import SliverLinuxProcessTransport
 from redteam_agent.adapters.sliver_transport import SliverTransportAttestation
 from redteam_agent.canonical.digest_service import DigestService
@@ -27,7 +27,7 @@ def build_sliver_linux_adapter(
         raise C2AdapterUnavailableError(
             "Sliver Linux composition requires production-eligible live evidence"
         )
-    contract = SliverRpcContractV173()
+    contract = SliverRpcContractV177()
     transport = SliverLinuxProcessTransport(attestation)
     return SliverAdapter(
         profile=profile,

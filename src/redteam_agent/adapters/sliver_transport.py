@@ -20,10 +20,10 @@ class SliverTransportAttestation(StrictImmutableBoundaryModel):
     channel_type: Literal["grpc_mtls_direct"] = "grpc_mtls_direct"
     adapter_profile_digest: str = Field(pattern=_SHA256_PATTERN)
     contract_digest: str = Field(pattern=_SHA256_PATTERN)
-    provider_version: Literal["1.7.3"] = "1.7.3"
+    provider_version: Literal["1.7.7"] = "1.7.7"
     provider_source_commit: Literal[
-        "3bbaf805104dcc4a75414ee0084e8de50702cad4"
-    ] = "3bbaf805104dcc4a75414ee0084e8de50702cad4"
+        "0aa7e5bf962414823f12c3a8ea1f667f61b19ce2"
+    ] = "0aa7e5bf962414823f12c3a8ea1f667f61b19ce2"
     operator_name: Literal["joe"] = "joe"
     operator_config_secret_version_id: str = Field(min_length=1, max_length=512)
     operator_config_sha256: str = Field(pattern=_SHA256_PATTERN)

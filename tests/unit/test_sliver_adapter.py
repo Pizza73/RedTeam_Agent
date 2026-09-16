@@ -9,7 +9,7 @@ import pytest
 import support
 from redteam_agent.adapters.sliver import SliverConnectionPolicy, build_sliver_foundation_profile
 from redteam_agent.adapters.sliver_adapter import SliverAdapter
-from redteam_agent.adapters.sliver_contract import SliverRpcContractV173, SliverWireRequest
+from redteam_agent.adapters.sliver_contract import SliverRpcContractV177, SliverWireRequest
 from redteam_agent.adapters.sliver_response import decode_sessions
 from redteam_agent.adapters.sliver_transport import (
     SliverTransportAttestation,
@@ -48,9 +48,9 @@ class SliverTestTransport:
             "hostname": "WIN11",
             "username": "LAB\\joe",
             "os": "windows",
-            "arch": "x86_64",
+            "arch": "amd64",
             "transport": "http(s)",
-            "active_c2": "http://10.0.10.212",
+            "active_c2": "https://10.0.10.212:8080",
             "last_checkin": int(support.T0.timestamp()),
             "is_dead": False,
         }
@@ -59,8 +59,8 @@ class SliverTestTransport:
             "get_version": {
                 "major": 1,
                 "minor": 7,
-                "patch": 3,
-                "commit": "3bbaf805",
+                "patch": 7,
+                "commit": "0aa7e5bf",
                 "dirty": False,
                 "os": "linux",
                 "arch": "amd64",
@@ -111,7 +111,7 @@ def _adapter() -> tuple[SliverAdapter, SliverTestTransport]:
     profile = build_sliver_foundation_profile(
         digest_service=digests, connection=connection
     )
-    contract = SliverRpcContractV173()
+    contract = SliverRpcContractV177()
     attestation = finalize_sliver_transport_attestation(
         SliverTransportAttestation(
             evidence_kind="test_double",
@@ -164,6 +164,7 @@ def test_sessions_and_http_beacons_are_projected_to_provider_neutral_observation
         "beacon:beacon-1",
     ]
     assert all(item.provider_status == "active" for item in observations)
+    assert all(item.architecture == "x86_64" for item in observations)
     assert all("sliver.transport.http" in item.capabilities for item in observations)
     assert adapter.get_session("beacon:beacon-1").host == "WIN11"
 

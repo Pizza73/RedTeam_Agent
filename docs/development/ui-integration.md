@@ -5,7 +5,7 @@
 The Operator Console from [nathanhoma/RedTeam_Agent](https://github.com/nathanhoma/RedTeam_Agent), commit
 `68caad5e219162f47be4fe364a87f28c805b69fb`, is integrated as `frontend/`. The source repository and this repository use GPL-3.0.
 
-The integration is complete for offline development: the production frontend uses the local Python API, reads durable Mission / Approval / Knowledge state, stores non-authoritative drafts, and presents the Phase 4 Tuoni / Sliver and Phase 5 Impacket boundaries. No real C2, vCenter, vLLM, or Target connection is required for these functions.
+The integration is complete for offline development: the production frontend uses the local Python API, reads durable Mission / Approval / Knowledge state, stores non-authoritative drafts, and presents the Phase 4 Tuoni / Sliver and Phase 5 Impacket boundaries. No real C2, vCenter, vLLM, or Target connection is required for those functions. When explicitly enabled at server startup, VLLM Settings additionally runs the real Phase 2 attestation and schema capability evaluation.
 
 ## Architecture
 
@@ -35,6 +35,7 @@ Read endpoints:
 - `GET /api/v1/interventions`
 - `GET /api/v1/knowledge`
 - `GET /api/v1/providers`
+- `GET /api/v1/vllm/config`
 
 Mutation endpoints:
 
@@ -43,12 +44,12 @@ Mutation endpoints:
 - `POST /api/v1/interventions/{id}/decision`
 - `POST /api/v1/vllm/capability`
 
-All mutations require exact same-origin proof. Draft endpoints persist only non-authoritative UI drafts. Approval decisions are delegated to an injected `ApprovalDecisionPort`; VLLM checks are delegated to an injected `VLLMCapabilityPort`. The standalone CLI intentionally injects neither and reports both capabilities disabled.
+All mutations require exact same-origin proof. Draft endpoints persist only non-authoritative UI drafts. Approval decisions are delegated to an injected `ApprovalDecisionPort`. The standalone CLI reports VLLM checks disabled unless all trusted `--vllm-*` startup inputs are supplied. When enabled, the browser can only replay the server-published endpoint/model/mode; it cannot select an arbitrary URL, read the API key, or replace the signed artifact identity. The backend performs direct-network server attestation and the complete Phase 2 schema corpus through the bounded gateway, then durably stores only real capability evidence.
 
 ## Provider boundary
 
 - Tuoni: Commercial, version shown as `latest`, existing deployment, access unconfigured.
-- Sliver: v1.7.3, operator `joe`, HTTP Beacon transport, no Beacon currently present. Selection exposes inventory and existing Beacon Task read/cancel only.
+- Sliver: v1.7.7, operator `joe`, HTTP Beacon transport, no Beacon currently present. Selection exposes inventory and existing Beacon Task read/cancel only.
 - Impacket: installed package version reported at runtime; MCP server `redteam-impacket-mcp`.
 - Exposed operations: SMB negotiate, SMB authenticate, SMB list shares, RPC endpoint map.
 - Default egress description: TCP/445 and TCP/135 only; actual OS / vCenter isolation qualification remains an Activation Blocker.
@@ -66,6 +67,19 @@ cd ..
 .venv/bin/redteam-ui --database /absolute/path/to/redteam-agent.db
 ```
 
+Real VLLM capability integration:
+
+```sh
+.venv/bin/redteam-ui \
+  --database /absolute/path/to/redteam-agent.db \
+  --vllm-base-url http://10.0.6.181:8100/v1 \
+  --vllm-model gemma-4-31B-it \
+  --vllm-api-key-file /absolute/path/to/vllm-api.key \
+  --vllm-manifest /absolute/path/to/gemma-4-31b.manifest.json \
+  --vllm-public-key /absolute/path/to/attestation-signing-public.pem \
+  --vllm-tokenizer-directory /absolute/path/to/gemma-4-31b-tokenizer
+```
+
 Open `http://127.0.0.1:18000/dashboard`.
 
 For development, run `redteam-ui --api-only` and `npm run dev` separately. Vite proxies `/api` to the loopback API. Mock data is compiled only when Vitest sets `MODE=test`; production builds always use `apiGateway`.
@@ -78,13 +92,14 @@ For development, run `redteam-ui --api-only` and `npm run dev` separately. Vite 
 - UI timestamps accept RFC 3339 `Z` and numeric UTC offsets; Python emits offset-aware ISO values.
 - Knowledge projections verify stored integrity digests and expose only redacted Artifact metadata.
 - Static missing assets return 404 and cannot fall through to the SPA document; extensionless routes do use the SPA fallback.
+- The VLLM API key remains in a mode-restricted server-side file; only the fixed public profile is returned to the browser, and capability runs are single-flight and finite.
 
 ## Offline verification
 
-- Frontend: TypeScript, ESLint, 24 Vitest tests, 10 Playwright route / accessibility tests, production Vite build.
+- Frontend: TypeScript, ESLint, 26 Vitest tests, 11 Playwright route / accessibility tests, production Vite build.
 - Backend: strict boundary unit tests and SQLite / Approval Service / HTTP integration tests.
 - Browser: built SPA verified against a seeded real application DB and local API. Dashboard Mission state, lifecycle, Authorization boundary, Tuoni status, Impacket operation count, and zero browser warnings / errors were confirmed.
 
 ## Remaining production-only work
 
-The UI itself does not remove the existing Phase 4 / 5 Activation Blockers. Production requires either the real Tuoni identity and OpenAPI / image binding or the pinned Sliver operator/server identities and an approved HTTP Beacon, plus actual isolation evidence and composition of the UI with authenticated Approval and Phase 2 Capability owner services. Until then, real dispatch remains disabled.
+The UI itself does not remove the existing Phase 4 / 5 Activation Blockers. Production requires either the real Tuoni identity and OpenAPI / image binding or the pinned Sliver operator/server identities and an approved HTTP Beacon, plus actual isolation evidence and composition of the UI with the authenticated Approval owner service. Phase 2 VLLM Capability is now available through the trusted CLI composition, but Mission activation and real dispatch remain disabled until their separate gates pass.

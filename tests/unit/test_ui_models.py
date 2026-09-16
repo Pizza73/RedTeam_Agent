@@ -59,7 +59,7 @@ def test_provider_policy_is_closed_to_registered_c2_and_impacket_allowlist() -> 
     assert ProviderPolicyDraftInput.from_untrusted_json(valid).c2.providerId == "tuoni"
     sliver = valid.replace(
         b'"providerId":"tuoni","registryReference":"registry://c2/tuoni/latest-commercial"',
-        b'"providerId":"sliver","registryReference":"registry://c2/sliver/v1.7.3-read-control"',
+        b'"providerId":"sliver","registryReference":"registry://c2/sliver/v1.7.7-read-control"',
     )
     assert ProviderPolicyDraftInput.from_untrusted_json(sliver).c2.providerId == "sliver"
     with pytest.raises(PydanticBoundaryValidationError):
@@ -69,6 +69,6 @@ def test_provider_policy_is_closed_to_registered_c2_and_impacket_allowlist() -> 
     with pytest.raises(PydanticBoundaryValidationError):
         ProviderPolicyDraftInput.from_untrusted_json(
             sliver.replace(
-                b'"registry://c2/sliver/v1.7.3-read-control"', b"null"
+                b'"registry://c2/sliver/v1.7.7-read-control"', b"null"
             )
         )

@@ -6,13 +6,15 @@ import http.client
 import json
 import threading
 
+import pytest
+
 import support
 from redteam_agent.composition.testing import build_test_kernel
 from redteam_agent.policy.scope_models import IpTargetReference
 from redteam_agent.runtime.clock import ManualClock
 from redteam_agent.storage.database import Database
 from redteam_agent.ui.control_plane import UIControlPlane
-from redteam_agent.ui.models import MissionDraftInput, ProviderPolicyDraftInput
+from redteam_agent.ui.models import MissionDraftInput, ProviderPolicyDraftInput, VllmConfigInput
 from redteam_agent.ui.server import build_server
 
 
@@ -45,6 +47,15 @@ def _provider_draft() -> ProviderPolicyDraftInput:
     }""")
 
 
+def _vllm_config() -> VllmConfigInput:
+    return VllmConfigInput(
+        baseUrl="http://10.0.6.181:8100/v1",
+        modelName="gemma-4-31B-it",
+        wireApi="chat_completions",
+        structuredOutputMode="native",
+    )
+
+
 def test_empty_provisioned_database_and_drafts_are_managed_without_activation(tmp_path) -> None:
     path = tmp_path / "app.db"
     Database(str(path)).close()
@@ -68,7 +79,7 @@ def test_empty_provisioned_database_and_drafts_are_managed_without_activation(tm
     sliver_status = provider_status["sliver"]
     assert isinstance(sliver_status, dict)
     assert sliver_status == {
-        "version": "1.7.3",
+        "version": "1.7.7",
         "operator": "joe",
         "operatorConfigLocation": "downloads",
         "operatorAccess": "unconfigured",
@@ -78,6 +89,46 @@ def test_empty_provisioned_database_and_drafts_are_managed_without_activation(tm
     latest = provider_status["latestDraft"]
     assert isinstance(latest, dict)
     assert latest["draft"]["c2"]["providerId"] == "tuoni"
+
+
+def test_vllm_check_uses_attached_port_and_publishes_only_managed_configuration(tmp_path) -> None:
+    path = tmp_path / "app.db"
+    Database(str(path)).close()
+    calls: list[VllmConfigInput] = []
+
+    def capability(config: VllmConfigInput) -> dict[str, object]:
+        calls.append(config)
+        return {
+            "status": "passed",
+            "summary": "Attested capability passed.",
+            "latencyMs": 12,
+            "checkedAt": support.T0.isoformat(),
+            "checks": [{"name": "planner_output", "status": "passed", "detail": "10/10"}],
+        }
+
+    config = _vllm_config()
+    control = UIControlPlane(
+        database_path=str(path),
+        vllm_capability_port=capability,
+        vllm_public_config=config,
+        clock=lambda: support.T0,
+    )
+
+    assert control.health()["vllmChecksEnabled"] is True
+    assert control.vllm_configuration() == {
+        "enabled": True,
+        "config": config.model_dump(mode="json"),
+    }
+    assert control.check_vllm(config)["status"] == "passed"
+    assert calls == [config]
+
+
+def test_vllm_port_and_public_configuration_must_be_attached_together(tmp_path) -> None:
+    path = tmp_path / "app.db"
+    Database(str(path)).close()
+
+    with pytest.raises(ValueError, match="attached together"):
+        UIControlPlane(database_path=str(path), vllm_public_config=_vllm_config())
 
 
 def test_dashboard_projects_real_mission_state_and_lifecycle(tmp_path) -> None:

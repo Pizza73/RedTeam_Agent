@@ -157,6 +157,17 @@ const knowledge: KnowledgeGraph = knowledgeGraphSchema.parse({
 const checks = ["Transport", "Nested model", "Enums", "Optional fields", "Lists", "Discriminated union", "Unknown-field rejection", "Strict typing", "Timeout", "Cancellation"];
 
 export const mockGateway: FrontendGateway = {
+  async getVllmConfiguration() {
+    return {
+      enabled: true as const,
+      config: {
+        baseUrl: "http://10.0.6.181:8100/v1",
+        modelName: "gemma-4-31B-it",
+        wireApi: "chat_completions" as const,
+        structuredOutputMode: "native" as const,
+      },
+    };
+  },
   async getHealth() {
     return healthSchema.parse({
       status: "healthy",
@@ -191,7 +202,7 @@ export const mockGateway: FrontendGateway = {
       mode: "live",
       tuoni: { edition: "commercial", version: "latest", access: "unconfigured" },
       sliver: {
-        version: "1.7.3",
+        version: "1.7.7",
         operator: "joe",
         operatorConfigLocation: "downloads",
         operatorAccess: "unconfigured",

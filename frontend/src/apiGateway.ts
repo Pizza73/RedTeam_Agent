@@ -6,6 +6,7 @@ import {
   healthSchema,
   interventionSchema,
   knowledgeGraphSchema,
+  managedVllmConfigSchema,
   providerStatusSchema,
   timestampSchema,
   vllmCapabilityResultSchema,
@@ -41,6 +42,9 @@ function zonedUtc(value: string): string {
 }
 
 export const apiGateway: FrontendGateway = {
+  async getVllmConfiguration() {
+    return managedVllmConfigSchema.parse(await request("/api/v1/vllm/config"));
+  },
   async getHealth() {
     return healthSchema.parse(await request("/api/v1/health"));
   },

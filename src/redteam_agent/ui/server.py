@@ -53,6 +53,8 @@ class UIRouter:
             return ApiResponse(HTTPStatus.OK, self._control_plane.knowledge())
         if method == "GET" and path == "/api/v1/providers":
             return ApiResponse(HTTPStatus.OK, self._control_plane.provider_status())
+        if method == "GET" and path == "/api/v1/vllm/config":
+            return ApiResponse(HTTPStatus.OK, self._control_plane.vllm_configuration())
         if method == "POST" and path == "/api/v1/mission-drafts":
             mission_draft = MissionDraftInput.from_untrusted_json(body)
             return ApiResponse(HTTPStatus.CREATED, self._control_plane.save_mission_draft(mission_draft))
@@ -278,10 +280,65 @@ def main() -> int:
     parser.add_argument("--port", default=18000, type=int)
     parser.add_argument("--static-dir", default="frontend/dist", help="Built frontend directory")
     parser.add_argument("--api-only", action="store_true", help="Serve only the JSON API")
+    parser.add_argument("--vllm-base-url", help="Enable the trusted Phase 2 vLLM gateway at this URL")
+    parser.add_argument("--vllm-model", default="gemma-4-31B-it")
+    parser.add_argument("--vllm-api-key-file", type=Path)
+    parser.add_argument("--vllm-manifest", type=Path)
+    parser.add_argument("--vllm-public-key", type=Path)
+    parser.add_argument("--vllm-manifest-key-id", default="llm001-gemma4-2026")
+    parser.add_argument("--vllm-tokenizer-directory", type=Path)
+    parser.add_argument("--vllm-profile-revision", default="gemma-4-31b-it-vllm-0.25.1-r2")
+    parser.add_argument("--vllm-max-context-tokens", type=int, default=131072)
+    parser.add_argument("--vllm-max-output-tokens", type=int, default=1024)
+    parser.add_argument("--vllm-structured-output-mode", choices=("native", "tool_output"), default="native")
+    parser.add_argument("--vllm-attestation-timeout", type=int, default=60)
+    parser.add_argument("--vllm-capability-deadline", type=int, default=900)
     args = parser.parse_args()
     if not 1 <= args.port <= 65535:
         parser.error("port must be between 1 and 65535")
-    control_plane = UIControlPlane(database_path=args.database)
+    vllm_port = None
+    vllm_public_config = None
+    if args.vllm_base_url is not None:
+        required = {
+            "--vllm-api-key-file": args.vllm_api_key_file,
+            "--vllm-manifest": args.vllm_manifest,
+            "--vllm-public-key": args.vllm_public_key,
+            "--vllm-tokenizer-directory": args.vllm_tokenizer_directory,
+        }
+        missing = [name for name, value in required.items() if value is None]
+        if missing:
+            parser.error(f"{', '.join(missing)} required when --vllm-base-url is set")
+        from redteam_agent.ui.vllm_capability import (
+            Phase2VllmCapabilityPort,
+            Phase2VllmCapabilitySettings,
+        )
+
+        try:
+            settings = Phase2VllmCapabilitySettings(
+                database_path=Path(args.database),
+                base_url=args.vllm_base_url,
+                model=args.vllm_model,
+                api_key_file=args.vllm_api_key_file,
+                manifest_path=args.vllm_manifest,
+                public_key_path=args.vllm_public_key,
+                manifest_key_id=args.vllm_manifest_key_id,
+                tokenizer_directory=args.vllm_tokenizer_directory,
+                profile_revision=args.vllm_profile_revision,
+                max_context_tokens=args.vllm_max_context_tokens,
+                max_output_tokens=args.vllm_max_output_tokens,
+                structured_output_mode=args.vllm_structured_output_mode,
+                attestation_timeout_seconds=args.vllm_attestation_timeout,
+                capability_deadline_seconds=args.vllm_capability_deadline,
+            )
+            vllm_port = Phase2VllmCapabilityPort(settings=settings)
+            vllm_public_config = vllm_port.public_config
+        except (AuthorizationKernelError, OSError, ValueError) as exc:
+            parser.error(f"invalid trusted vLLM configuration: {type(exc).__name__}")
+    control_plane = UIControlPlane(
+        database_path=args.database,
+        vllm_capability_port=vllm_port,
+        vllm_public_config=vllm_public_config,
+    )
     static_root = None if args.api_only else Path(args.static_dir)
     server = build_server(control_plane=control_plane, host=args.host, port=args.port, static_root=static_root)
     try:
@@ -290,6 +347,8 @@ def main() -> int:
         pass
     finally:
         server.server_close()
+        if vllm_port is not None:
+            vllm_port.close()
     return 0
 
 

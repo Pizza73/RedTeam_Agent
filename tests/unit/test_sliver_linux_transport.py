@@ -14,7 +14,7 @@ import pytest
 import redteam_agent.adapters.sliver_linux_transport as linux_transport
 import redteam_agent.adapters.sliver_worker as worker
 import support
-from redteam_agent.adapters.sliver_contract import SliverRpcContractV173
+from redteam_agent.adapters.sliver_contract import SliverRpcContractV177
 from redteam_agent.adapters.sliver_linux_transport import (
     SliverLinuxProcessTransport,
     SliverWorkerRequest,
@@ -71,7 +71,7 @@ def _attestation() -> SliverTransportAttestation:
 
 def _worker_request(operation: str = "get_version") -> SliverWorkerRequest:
     attestation = _attestation()
-    contract = SliverRpcContractV173()
+    contract = SliverRpcContractV177()
     wire = {
         "get_version": contract.get_version(),
         "list_sessions": contract.list_sessions(),
@@ -119,7 +119,7 @@ def test_parent_uses_a_fixed_worker_and_never_sends_operator_secret(
     monkeypatch.setattr(linux_transport.subprocess, "run", fake_run)
     transport = SliverLinuxProcessTransport(_attestation())
     response = transport.request(
-        SliverRpcContractV173().list_sessions(), timeout_seconds=30, max_response_bytes=4096
+        SliverRpcContractV177().list_sessions(), timeout_seconds=30, max_response_bytes=4096
     )
 
     assert response.body == b'{"sessions":[]}'
@@ -158,7 +158,7 @@ def test_worker_rejects_unknown_config_fields_without_echoing_secrets(tmp_path: 
 
 
 def test_worker_builds_empty_and_id_only_protobuf_requests() -> None:
-    contract = SliverRpcContractV173()
+    contract = SliverRpcContractV177()
     assert worker._protobuf_request(contract.get_version()) == b""
     encoded = worker._protobuf_request(contract.get_beacon("beacon-1"))
     assert encoded == _field(1, "beacon-1")
@@ -177,7 +177,7 @@ def test_worker_normalizes_version_without_returning_credentials() -> None:
     )
     raw_version = b"".join(
         (
-            _field(1, 1), _field(2, 7), _field(3, 3), _field(4, "3bbaf805"),
+            _field(1, 1), _field(2, 7), _field(3, 7), _field(4, "0aa7e5bf"),
             _field(5, 0), _field(7, "linux"), _field(8, "amd64"),
         )
     )
@@ -190,7 +190,7 @@ def test_worker_normalizes_version_without_returning_credentials() -> None:
     normalized = base64.b64decode(response.body_base64)
 
     assert b'"major":1' in normalized
-    assert b'"commit":"3bbaf805"' in normalized
+    assert b'"commit":"0aa7e5bf"' in normalized
     assert b"operator-token" not in normalized
     assert b"PRIVATE KEY" not in normalized
 
@@ -205,17 +205,17 @@ def test_worker_normalizes_session_and_http_beacon_inventory() -> None:
         )
     )
     sessions = worker._normalize_response(
-        SliverRpcContractV173().list_sessions(), _field(1, endpoint)
+        SliverRpcContractV177().list_sessions(), _field(1, endpoint)
     )
     beacons = worker._normalize_response(
-        SliverRpcContractV173().list_beacons(), _field(2, endpoint)
+        SliverRpcContractV177().list_beacons(), _field(2, endpoint)
     )
     assert b'"transport":"http(s)"' in sessions
     assert b'"next_checkin":20' in beacons
 
 
 def test_worker_rejects_malformed_or_duplicated_protobuf_scalars() -> None:
-    request = SliverRpcContractV173().get_version()
+    request = SliverRpcContractV177().get_version()
     with pytest.raises(C2AdapterTransportError):
         worker._normalize_response(request, b"\x80")
     duplicate = _field(1, 1) + _field(1, 2)

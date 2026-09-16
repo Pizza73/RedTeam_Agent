@@ -69,6 +69,12 @@ export const vllmConfigSchema = z.object({
 });
 export type VllmConfig = z.infer<typeof vllmConfigSchema>;
 
+export const managedVllmConfigSchema = z.discriminatedUnion("enabled", [
+  z.object({ enabled: z.literal(false), config: z.null() }).strict(),
+  z.object({ enabled: z.literal(true), config: vllmConfigSchema }).strict(),
+]);
+export type ManagedVllmConfig = z.infer<typeof managedVllmConfigSchema>;
+
 export const capabilityCheckSchema = z.object({
   name: z.string(),
   status: z.enum(["passed", "failed", "not_run"]),
@@ -267,7 +273,7 @@ export const providerStatusSchema = z.object({
   mode: z.literal("live"),
   tuoni: z.object({ edition: z.literal("commercial"), version: z.string(), access: z.string() }).strict(),
   sliver: z.object({
-    version: z.literal("1.7.3"),
+    version: z.literal("1.7.7"),
     operator: z.literal("joe"),
     operatorConfigLocation: z.literal("downloads"),
     operatorAccess: z.string(),
@@ -299,6 +305,7 @@ export type Health = z.infer<typeof healthSchema>;
 
 export interface FrontendGateway {
   testVllmConnection(config: VllmConfig, scenario?: VllmScenario): Promise<VllmCapabilityResult>;
+  getVllmConfiguration(): Promise<ManagedVllmConfig>;
   getHealth(): Promise<Health>;
   getDashboard(): Promise<Dashboard>;
   getProviderStatus(): Promise<ProviderStatus>;

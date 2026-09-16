@@ -22,6 +22,21 @@ cd ..
 .venv/bin/redteam-ui --database /absolute/path/to/redteam-agent.db
 ```
 
+VLLM Settingsから実Capability Checkを行う場合は、接続先と署名済みモデルIdentityをサーバ側で固定して起動します。
+
+```sh
+.venv/bin/redteam-ui \
+  --database /absolute/path/to/redteam-agent.db \
+  --vllm-base-url http://10.0.6.181:8100/v1 \
+  --vllm-model gemma-4-31B-it \
+  --vllm-api-key-file /absolute/path/to/vllm-api.key \
+  --vllm-manifest /absolute/path/to/gemma-4-31b.manifest.json \
+  --vllm-public-key /absolute/path/to/attestation-signing-public.pem \
+  --vllm-tokenizer-directory /absolute/path/to/gemma-4-31b-tokenizer
+```
+
+APIキーの値はCLI引数やブラウザへ渡しません。ブラウザには固定Endpoint、Model、Wire API、Structured Output Modeだけが公開され、別のURLへ変更できません。
+
 ブラウザで`http://127.0.0.1:18000/dashboard`を開きます。サーバは`127.0.0.1`または`localhost`以外へBindできません。
 
 開発時はAPIとViteを別プロセスで起動できます。
@@ -47,13 +62,13 @@ Viteは`/api`を`http://127.0.0.1:18000`へProxyします。`npm run test`だけ
 
 Draft保存はMission Activation、Policy Decision、Tool Dispatchを行いません。Missionの作成・検証・開始は既存の信頼済みMission Workflowが所有します。
 
-単体の`redteam-ui`コマンドではApproval writeとVLLM network checkを無効化しています。これらは、認証済みActorやSecret境界を迂回しないよう、実行中の信頼済みCompositionから対応Portを注入した場合だけ有効になります。
+単体の`redteam-ui`コマンドではApproval writeを無効化し、VLLM network checkも`--vllm-*`構成を省略した場合は無効です。VLLMを有効にすると、署名済みManifest、固定Tokenizer、Secret-fileを使い、Phase 2と同じServer Attestationと全Schema Capability Corpusを有界・single-flightで実行します。
 
 ## 3. C2 / MCP
 
 `C2 & Tools`は次の固定範囲だけを扱います。
 
-- C2: `none`、既存の`Tuoni Commercial`、または`Sliver 1.7.3`。
+- C2: `none`、既存の`Tuoni Commercial`、または`Sliver 1.7.7`。
 - Tuoni Version: `latest`表示。実接続前にRelease / Image / OpenAPI Digestの固定が必要。
 - Sliver: Operator `joe`、HTTP Beacon、Session / Beacon Inventoryと既存Beacon Task Read / Cancelだけを表示する。現在は
   Operator設定の正確な絶対パスと実BeaconがないためActivation不可。

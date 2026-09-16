@@ -5,7 +5,7 @@ from __future__ import annotations
 import shutil
 
 from redteam_agent.adapters.sliver import build_sliver_foundation_profile
-from redteam_agent.adapters.sliver_contract import SliverRpcContractV173
+from redteam_agent.adapters.sliver_contract import SliverRpcContractV177
 from redteam_agent.adapters.sliver_readiness import build_sliver_offline_readiness_report
 from redteam_agent.canonical.digest_service import DigestService
 from redteam_agent.runtime.clock import SystemUtcClock
@@ -19,7 +19,7 @@ def main() -> int:
     )
     report = build_sliver_offline_readiness_report(
         profile=build_sliver_foundation_profile(digest_service=digest_service),
-        contract=SliverRpcContractV173(),
+        contract=SliverRpcContractV177(),
         binary_discovered=binary_discovered,
         beacon_present=False,
         clock=SystemUtcClock(),

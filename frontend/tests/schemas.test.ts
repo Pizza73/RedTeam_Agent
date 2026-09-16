@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { agentActivitySchema, dashboardSchema, interventionSchema, missionDraftSchema, providerPolicyDraftSchema, vllmConfigSchema } from "../src/types";
+import { agentActivitySchema, dashboardSchema, interventionSchema, managedVllmConfigSchema, missionDraftSchema, providerPolicyDraftSchema, vllmConfigSchema } from "../src/types";
 
 const validDraft = {
   name: "Lab Mission",
@@ -15,6 +15,11 @@ const validDraft = {
 } as const;
 
 describe("frontend trust-boundary schemas", () => {
+  it("binds enabled VLLM state to a complete managed configuration", () => {
+    expect(() => managedVllmConfigSchema.parse({ enabled: true, config: null })).toThrow();
+    expect(managedVllmConfigSchema.parse({ enabled: false, config: null }).enabled).toBe(false);
+  });
+
   it("accepts a typed Mission draft", () => {
     expect(missionDraftSchema.parse(validDraft).targets[0]?.port).toBe(443);
   });
@@ -82,7 +87,7 @@ describe("frontend trust-boundary schemas", () => {
     expect(draft.c2.providerId).toBe("tuoni");
     const sliver = providerPolicyDraftSchema.parse({
       ...draft,
-      c2: { providerId: "sliver", registryReference: "registry://c2/sliver/v1.7.3-read-control" },
+      c2: { providerId: "sliver", registryReference: "registry://c2/sliver/v1.7.7-read-control" },
     });
     expect(sliver.c2.providerId).toBe("sliver");
   });

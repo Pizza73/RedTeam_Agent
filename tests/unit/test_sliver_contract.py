@@ -1,17 +1,17 @@
-"""Exact Sliver v1.7.3 RPC allowlist tests."""
+"""Exact Sliver v1.7.7 RPC allowlist tests."""
 
 from __future__ import annotations
 
 import pytest
 from pydantic import ValidationError
 
-from redteam_agent.adapters.sliver_contract import SliverRpcContractV173, SliverWireRequest
+from redteam_agent.adapters.sliver_contract import SliverRpcContractV177, SliverWireRequest
 from redteam_agent.canonical.digest_service import DigestService
 from redteam_agent.errors import C2AdapterContractError
 
 
 def test_contract_contains_only_inventory_and_existing_task_control() -> None:
-    contract = SliverRpcContractV173()
+    contract = SliverRpcContractV177()
 
     assert contract.allowed_operations() == (
         "get_version",
@@ -32,7 +32,7 @@ def test_contract_contains_only_inventory_and_existing_task_control() -> None:
 @pytest.mark.parametrize("value", ("", "../task", "task/one", " task", "task\n"))
 def test_provider_ids_are_canonical(value: str) -> None:
     with pytest.raises(C2AdapterContractError):
-        SliverRpcContractV173.cancel_beacon_task(value)
+        SliverRpcContractV177.cancel_beacon_task(value)
 
 
 def test_rpc_method_cannot_be_replaced_by_a_high_risk_method() -> None:

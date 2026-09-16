@@ -175,7 +175,7 @@ def endpoint_observation(
         provider_status=status,
         host=endpoint.hostname or None,
         os=os_value,
-        architecture=endpoint.arch or None,
+        architecture=_normalize_architecture(endpoint.arch),
         current_principal=endpoint.username or None,
         capabilities=capabilities,
         observed_at=observed_at.astimezone(UTC),
@@ -186,8 +186,18 @@ def _normalizes_to_http(transport: str, active_c2: str) -> bool:
     normalized = transport.lower().strip()
     active = active_c2.lower().strip()
     return normalized in {"http", "http(s)"} and (
-        active.startswith("http://") or (not active and normalized == "http")
+        active.startswith(("http://", "https://"))
+        or (not active and normalized == "http")
     )
+
+
+def _normalize_architecture(value: str) -> str | None:
+    normalized = value.lower().strip()
+    if not normalized:
+        return None
+    if normalized in {"amd64", "x86_64"}:
+        return "x86_64"
+    return normalized
 
 
 def _require_unique_ids(endpoints: tuple[SliverEndpointRecord, ...]) -> None:

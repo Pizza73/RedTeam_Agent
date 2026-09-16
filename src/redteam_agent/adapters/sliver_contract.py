@@ -1,4 +1,4 @@
-"""Closed, transport-free RPC allowlist for Sliver v1.7.3."""
+"""Closed, transport-free RPC allowlist for Sliver v1.7.7."""
 
 from __future__ import annotations
 
@@ -16,8 +16,8 @@ from redteam_agent.canonical.immutable import CanonicalJsonObject
 from redteam_agent.errors import C2AdapterContractError
 from redteam_agent.models.base import StrictImmutableBoundaryModel
 
-SLIVER_RPC_CONTRACT_REVISION: Literal["sliver-grpc-1.7.3-read-control-v1"] = (
-    "sliver-grpc-1.7.3-read-control-v1"
+SLIVER_RPC_CONTRACT_REVISION: Literal["sliver-grpc-1.7.7-read-control-v1"] = (
+    "sliver-grpc-1.7.7-read-control-v1"
 )
 
 type SliverOperation = Literal[
@@ -43,7 +43,7 @@ _ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
 
 class SliverWireRequest(StrictImmutableBoundaryModel):
-    contract_revision: Literal["sliver-grpc-1.7.3-read-control-v1"] = (
+    contract_revision: Literal["sliver-grpc-1.7.7-read-control-v1"] = (
         SLIVER_RPC_CONTRACT_REVISION
     )
     operation: SliverOperation
@@ -72,7 +72,7 @@ def _canonical_id(value: str, label: str) -> str:
     return value
 
 
-class SliverRpcContractV173:
+class SliverRpcContractV177:
     """Only inventory, task metadata, and task cancellation RPCs are reachable."""
 
     @staticmethod
@@ -171,6 +171,6 @@ def _request(
 __all__ = [
     "SLIVER_RPC_CONTRACT_REVISION",
     "SliverOperation",
-    "SliverRpcContractV173",
+    "SliverRpcContractV177",
     "SliverWireRequest",
 ]

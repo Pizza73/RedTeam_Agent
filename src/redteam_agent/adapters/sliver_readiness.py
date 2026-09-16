@@ -1,4 +1,4 @@
-"""Digest-bound offline readiness evidence for Sliver v1.7.3."""
+"""Digest-bound offline readiness evidence for Sliver v1.7.7."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from redteam_agent.adapters.sliver import (
     SLIVER_VERSION_PIN,
     SliverFoundationProfile,
 )
-from redteam_agent.adapters.sliver_contract import SliverOperation, SliverRpcContractV173
+from redteam_agent.adapters.sliver_contract import SliverOperation, SliverRpcContractV177
 from redteam_agent.canonical.digest_service import DigestService
 from redteam_agent.errors import C2AdapterQualificationError
 from redteam_agent.models.base import StrictImmutableBoundaryModel
@@ -44,10 +44,10 @@ class SliverOfflineReadinessReport(StrictImmutableBoundaryModel):
     report_revision: Literal["sliver-offline-readiness-v1"] = "sliver-offline-readiness-v1"
     evidence_kind: Literal["test_double"] = "test_double"
     provider_product: Literal["sliver"] = "sliver"
-    provider_version: Literal["1.7.3"] = "1.7.3"
+    provider_version: Literal["1.7.7"] = "1.7.7"
     source_commit: Literal[
-        "3bbaf805104dcc4a75414ee0084e8de50702cad4"
-    ] = "3bbaf805104dcc4a75414ee0084e8de50702cad4"
+        "0aa7e5bf962414823f12c3a8ea1f667f61b19ce2"
+    ] = "0aa7e5bf962414823f12c3a8ea1f667f61b19ce2"
     implant_transport: Literal["http"] = "http"
     profile_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
     contract_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -81,7 +81,7 @@ class SliverOfflineReadinessReport(StrictImmutableBoundaryModel):
 def build_sliver_offline_readiness_report(
     *,
     profile: SliverFoundationProfile,
-    contract: SliverRpcContractV173,
+    contract: SliverRpcContractV177,
     binary_discovered: bool,
     beacon_present: bool,
     clock: Clock,

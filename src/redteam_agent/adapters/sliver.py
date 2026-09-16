@@ -35,9 +35,9 @@ from redteam_agent.execution.secret_binding import EphemeralSecretBinding
 from redteam_agent.execution.sink import RawResultSink
 from redteam_agent.models.base import StrictImmutableBoundaryModel
 
-SLIVER_VERSION_PIN = "1.7.3"
-SLIVER_SOURCE_TAG_PIN = "v1.7.3"
-SLIVER_SOURCE_COMMIT_PIN = "3bbaf805104dcc4a75414ee0084e8de50702cad4"
+SLIVER_VERSION_PIN = "1.7.7"
+SLIVER_SOURCE_TAG_PIN = "v1.7.7"
+SLIVER_SOURCE_COMMIT_PIN = "0aa7e5bf962414823f12c3a8ea1f667f61b19ce2"
 SLIVER_OPERATOR_NAME: Literal["joe"] = "joe"
 SLIVER_OPERATOR_CONFIG_LOCATION_HINT: Literal["downloads"] = "downloads"
 
@@ -47,8 +47,8 @@ _GIT_COMMIT_PATTERN = r"^[0-9a-f]{40}$"
 
 class SliverProviderPin(StrictImmutableBoundaryModel):
     product: Literal["sliver"] = "sliver"
-    version: Literal["1.7.3"] = "1.7.3"
-    source_tag: Literal["v1.7.3"] = "v1.7.3"
+    version: Literal["1.7.7"] = "1.7.7"
+    source_tag: Literal["v1.7.7"] = "v1.7.7"
     source_commit: str = Field(
         default=SLIVER_SOURCE_COMMIT_PIN, pattern=_GIT_COMMIT_PATTERN
     )

@@ -4,6 +4,23 @@ import { apiGateway } from "../src/apiGateway";
 afterEach(() => vi.unstubAllGlobals());
 
 describe("same-origin API gateway", () => {
+  it("loads only a strict server-managed VLLM profile", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      enabled: true,
+      config: {
+        baseUrl: "http://10.0.6.181:8100/v1",
+        modelName: "gemma-4-31B-it",
+        wireApi: "chat_completions",
+        structuredOutputMode: "native",
+      },
+    }), { status: 200, headers: { "Content-Type": "application/json" } })));
+
+    const managed = await apiGateway.getVllmConfiguration();
+
+    expect(managed.enabled).toBe(true);
+    expect(managed.config?.modelName).toBe("gemma-4-31B-it");
+  });
+
   it("sends a zoned Mission draft with the UI mutation proof", async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
       draftId: "mission-draft-1",

@@ -75,6 +75,7 @@ class UIControlPlane:
         database_path: str,
         approval_decision_port: ApprovalDecisionPort | None = None,
         vllm_capability_port: VllmCapabilityPort | None = None,
+        vllm_public_config: VllmConfigInput | None = None,
         clock: Clock = _utc_now,
     ) -> None:
         if database_path == ":memory:":
@@ -82,6 +83,9 @@ class UIControlPlane:
         self._database_path = str(Path(database_path).expanduser().resolve())
         self._approval_decision_port = approval_decision_port
         self._vllm_capability_port = vllm_capability_port
+        self._vllm_public_config = vllm_public_config
+        if (vllm_capability_port is None) != (vllm_public_config is None):
+            raise ValueError("vLLM capability port and public configuration must be attached together")
         self._clock = clock
         self._digests = DigestService()
 
@@ -112,6 +116,14 @@ class UIControlPlane:
             }
         finally:
             database.close()
+
+    def vllm_configuration(self) -> dict[str, object]:
+        if self._vllm_public_config is None:
+            return {"enabled": False, "config": None}
+        return {
+            "enabled": True,
+            "config": self._vllm_public_config.model_dump(mode="json"),
+        }
 
     def save_mission_draft(self, draft: MissionDraftInput) -> dict[str, object]:
         return self._save_draft(namespace=_MISSION_DRAFT_NS, prefix="mission-draft", draft=draft)
@@ -386,7 +398,7 @@ class UIControlPlane:
                 "mode": "live",
                 "tuoni": {"edition": "commercial", "version": "latest", "access": "unconfigured"},
                 "sliver": {
-                    "version": "1.7.3",
+                    "version": "1.7.7",
                     "operator": "joe",
                     "operatorConfigLocation": "downloads",
                     "operatorAccess": "unconfigured",

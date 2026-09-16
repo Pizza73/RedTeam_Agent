@@ -6,7 +6,7 @@ import pytest
 
 import support
 from redteam_agent.adapters.sliver import build_sliver_foundation_profile
-from redteam_agent.adapters.sliver_contract import SliverRpcContractV173
+from redteam_agent.adapters.sliver_contract import SliverRpcContractV177
 from redteam_agent.adapters.sliver_readiness import (
     build_sliver_offline_readiness_report,
     verify_sliver_offline_readiness_report,
@@ -20,7 +20,7 @@ def test_offline_report_records_current_environment_blockers() -> None:
     digests = DigestService()
     report = build_sliver_offline_readiness_report(
         profile=build_sliver_foundation_profile(digest_service=digests),
-        contract=SliverRpcContractV173(),
+        contract=SliverRpcContractV177(),
         binary_discovered=False,
         beacon_present=False,
         clock=ManualClock(support.T0),
@@ -40,7 +40,7 @@ def test_readiness_digest_detects_tampering() -> None:
     digests = DigestService()
     report = build_sliver_offline_readiness_report(
         profile=build_sliver_foundation_profile(digest_service=digests),
-        contract=SliverRpcContractV173(),
+        contract=SliverRpcContractV177(),
         binary_discovered=False,
         beacon_present=False,
         clock=ManualClock(support.T0),

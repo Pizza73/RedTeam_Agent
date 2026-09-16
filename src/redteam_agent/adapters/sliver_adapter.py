@@ -1,4 +1,4 @@
-"""Read/control-only Sliver v1.7.3 adapter over an attested transport."""
+"""Read/control-only Sliver v1.7.7 adapter over an attested transport."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from redteam_agent.adapters.sliver import (
     SLIVER_VERSION_PIN,
     SliverFoundationProfile,
 )
-from redteam_agent.adapters.sliver_contract import SliverRpcContractV173, SliverWireRequest
+from redteam_agent.adapters.sliver_contract import SliverRpcContractV177, SliverWireRequest
 from redteam_agent.adapters.sliver_response import (
     SliverBeaconTaskRecord,
     decode_beacon,
@@ -59,7 +59,7 @@ class SliverAdapter:
         self,
         *,
         profile: SliverFoundationProfile,
-        contract: SliverRpcContractV173,
+        contract: SliverRpcContractV177,
         transport: SliverTransport,
         clock: Clock,
         digest_service: DigestService,
@@ -148,7 +148,7 @@ class SliverAdapter:
             adapter_id="sliver-c2",
             adapter_type="c2",
             execution_location="managed_remote",
-            capability_revision="sliver-capabilities-1.7.3-read-control-v1",
+            capability_revision="sliver-capabilities-1.7.7-read-control-v1",
             capabilities=frozenset(
                 {
                     "session.list",

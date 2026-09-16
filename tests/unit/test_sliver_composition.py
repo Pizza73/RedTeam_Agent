@@ -12,7 +12,7 @@ from redteam_agent.adapters.sliver import (
     build_sliver_foundation_profile,
 )
 from redteam_agent.adapters.sliver_composition import build_sliver_linux_adapter
-from redteam_agent.adapters.sliver_contract import SliverRpcContractV173
+from redteam_agent.adapters.sliver_contract import SliverRpcContractV177
 from redteam_agent.adapters.sliver_transport import (
     SliverTransportAttestation,
     finalize_sliver_transport_attestation,
@@ -50,7 +50,7 @@ def test_offline_attestation_cannot_enter_the_production_composition() -> None:
             evidence_kind="test_double",
             production_eligible=False,
             adapter_profile_digest=profile.profile_digest,
-            contract_digest=SliverRpcContractV173().contract_digest(digests),
+            contract_digest=SliverRpcContractV177().contract_digest(digests),
             operator_config_secret_version_id="secret://sliver/operator#v1",
             operator_config_sha256="1" * 64,
             server_address="10.0.0.2",
