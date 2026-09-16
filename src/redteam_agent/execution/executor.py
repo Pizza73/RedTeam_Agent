@@ -523,10 +523,13 @@ class Executor:
             tool_ref=decision.tool_ref,
             adapter_id=decision.resolved_adapter_id,
             provider_tool_name=tool.provider_tool_name,
-            result_delivery_mode="provider_task" if tool.adapter != "local" else "local_result",
+            result_delivery_mode=(
+                "provider_task" if tool.adapter == "c2" else "local_result"
+            ),
             idempotency_key=record.idempotency_key,
             timeout_seconds=tool.default_timeout_seconds,
             arguments=plan.proposal.arguments,
+            target_dispatch_bindings=decision.target_dispatch_bindings,
         )
 
     def _new_record(

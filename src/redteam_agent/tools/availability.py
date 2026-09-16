@@ -10,17 +10,21 @@ planning; any drift is fail-closed and stale.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 
 from pydantic import Field
 
 from redteam_agent.adapters.capabilities import AdapterCapabilities
+from redteam_agent.adapters.mcp import MCPTrustPolicy, compute_mcp_trust_policy_digest
+from redteam_agent.adapters.mcp_contract import mcp_tool_capability_id
 from redteam_agent.canonical.digest_service import DigestService
 from redteam_agent.canonical.immutable import CanonicalJsonObject
 from redteam_agent.errors import (
     AuthorizationTtlError,
     AvailableToolSnapshotStaleError,
+    MCPContractError,
+    RemoteMCPTrustError,
     SandboxCapabilityStaleError,
 )
 from redteam_agent.mission.models import MissionRevision
@@ -82,6 +86,7 @@ class ToolAvailabilityInputs:
     sandbox_capabilities: dict[str, SandboxCapabilities]
     session_snapshots: dict[str, SessionSecurityContextSnapshot]
     remote_mcp_trust_policy_digest: str
+    mcp_trust_policies: dict[str, MCPTrustPolicy] = field(default_factory=dict)
 
 
 def compute_execution_scope_digest(revision: MissionRevision, digest_service: DigestService) -> str:
@@ -139,6 +144,19 @@ def _adapter_available(tool: ToolDefinition, inputs: ToolAvailabilityInputs) -> 
         return False
     if not tool.required_adapter_capabilities <= adapter.capabilities:
         return False
+    if tool.adapter == "mcp":
+        if tool.provider_definition_revision is None:
+            return False
+        try:
+            expected_capability = mcp_tool_capability_id(
+                name=tool.provider_tool_name,
+                tool_list_revision=tool.provider_definition_revision,
+                input_schema_digest=tool.provider_schema_digest,
+            )
+        except MCPContractError:
+            return False
+        if expected_capability not in tool.required_adapter_capabilities:
+            return False
     if tool.target_mode != "none":
         mode = select_binding_mode(tool.required_target_binding_modes, adapter.target_binding_modes)
         if mode is None:
@@ -174,6 +192,33 @@ def _sandbox_ok(tool: ToolDefinition, inputs: ToolAvailabilityInputs) -> bool:
     return sandbox.satisfies(tool.sandbox_requirement)
 
 
+def _mcp_trust_ok(tool: ToolDefinition, inputs: ToolAvailabilityInputs) -> bool:
+    """Require an explicit location-bound policy for every MCP tool.
+
+    The adapter's exact per-tool schema capability is checked separately by
+    ``_adapter_available``.  This predicate prevents an MCP registry entry from
+    becoming usable merely because a generic adapter is present.
+    """
+    if tool.adapter != "mcp":
+        return True
+    adapter = inputs.adapters.get(tool.adapter_id)
+    policy = inputs.mcp_trust_policies.get(tool.adapter_id)
+    if (
+        adapter is None
+        or policy is None
+        or policy.adapter_id != tool.adapter_id
+        or policy.execution_location != adapter.execution_location
+    ):
+        return False
+    if tool.side_effect == "state_change" and not policy.allow_state_change:
+        return False
+    if tool.side_effect == "destructive" and not policy.allow_destructive:
+        return False
+    if tool.minimum_risk_level == "high" and not policy.allow_high_risk:
+        return False
+    return not tool.secret_argument_paths or policy.allow_secret_resolution
+
+
 def _tool_available(
     tool: ToolDefinition, inputs: ToolAvailabilityInputs, revision: MissionRevision, now: datetime
 ) -> bool:
@@ -182,6 +227,8 @@ def _tool_available(
     if not _scope_compatible(tool, revision):
         return False
     if not _sandbox_ok(tool, inputs):
+        return False
+    if not _mcp_trust_ok(tool, inputs):
         return False
     return not (tool.requires_session and not _eligible_sessions(tool, inputs, now))
 
@@ -249,6 +296,14 @@ def build_available_tool_snapshot(
     created_at: datetime,
     ttl_seconds: int = 900,
 ) -> AvailableToolSnapshot:
+    if inputs.mcp_trust_policies or any(
+        tool.adapter == "mcp" for tool in inputs.registry.tools
+    ):
+        actual_trust_digest = compute_mcp_trust_policy_digest(
+            tuple(inputs.mcp_trust_policies.values()), digest_service
+        )
+        if actual_trust_digest != inputs.remote_mcp_trust_policy_digest:
+            raise RemoteMCPTrustError("MCP trust policy digest is stale or mismatched")
     views = resolve_available_tools(inputs, revision, created_at)
     session_contexts = tuple(snapshot.context for snapshot in inputs.session_snapshots.values())
     binding = {

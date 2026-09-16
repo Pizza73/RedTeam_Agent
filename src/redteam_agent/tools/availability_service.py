@@ -7,6 +7,7 @@ snapshot.
 
 from __future__ import annotations
 
+from redteam_agent.adapters.mcp import MCPTrustPolicy
 from redteam_agent.canonical.digest_service import DigestService
 from redteam_agent.errors import RepositoryIntegrityError
 from redteam_agent.runtime.clock import Clock
@@ -44,6 +45,7 @@ class ToolAvailabilityService:
         registry_revision: int,
         remote_mcp_trust_policy_digest: str,
         policy_version: str,
+        mcp_trust_policies: dict[str, MCPTrustPolicy] | None = None,
         ttl_seconds: int = 900,
     ) -> None:
         self._states = state_repository
@@ -59,6 +61,7 @@ class ToolAvailabilityService:
         self._registry_revision = registry_revision
         self._remote_trust_digest = remote_mcp_trust_policy_digest
         self._policy_version = policy_version
+        self._mcp_trust_policies = dict(mcp_trust_policies or {})
         self._ttl_seconds = ttl_seconds
         snapshot_repository.bind_owner(write_guard)
 
@@ -76,6 +79,7 @@ class ToolAvailabilityService:
             sandbox_capabilities=self._sandbox.all_capabilities(),
             session_snapshots=self._sessions.all_snapshots(),
             remote_mcp_trust_policy_digest=self._remote_trust_digest,
+            mcp_trust_policies=self._mcp_trust_policies,
         )
         snapshot = build_available_tool_snapshot(
             snapshot_id=snapshot_id,

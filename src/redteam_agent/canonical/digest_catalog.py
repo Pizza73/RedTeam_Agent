@@ -273,6 +273,27 @@ _DEFINITIONS: tuple[DigestDefinition, ...] = (
         "tuoni_adapter",
         exclude_self="report_digest",
     ),
+    # --- Phase 5: pinned MCP 2026-07-28 offline adapter -----------------
+    _obj("mcp_server_config_digest", "mcp_adapter", exclude_self="config_digest"),
+    _obj("mcp_provider_profile_digest", "mcp_adapter", exclude_self="profile_digest"),
+    _obj("mcp_transport_identity_set_digest", "mcp_adapter"),
+    _obj(
+        "mcp_transport_attestation_digest",
+        "mcp_adapter",
+        exclude_self="attestation_digest",
+    ),
+    _obj("mcp_discover_result_digest", "mcp_adapter", exclude_self="discover_digest"),
+    _obj("mcp_server_info_digest", "mcp_adapter", exclude_self="server_info_digest"),
+    _obj("mcp_approved_tool_schema_digest", "mcp_adapter"),
+    _obj("mcp_api_contract_digest", "mcp_adapter"),
+    _obj("mcp_live_tool_catalog_digest", "mcp_adapter"),
+    _obj("mcp_candidate_tool_definition_digest", "mcp_adapter", exclude_self="candidate_digest"),
+    _obj("mcp_adapter_identity_digest", "mcp_adapter"),
+    _obj(
+        "mcp_offline_readiness_report_digest",
+        "mcp_adapter",
+        exclude_self="report_digest",
+    ),
 )
 
 

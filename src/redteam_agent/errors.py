@@ -327,6 +327,38 @@ class C2AdapterQualificationError(AuthorizationKernelError):
     """C2 adapter qualification evidence is incomplete, forged, or not production-grade."""
 
 
+class MCPAdapterUnavailableError(AuthorizationKernelError):
+    """The configured MCP adapter is not qualified for the requested operation."""
+
+
+class MCPContractError(AuthorizationKernelError):
+    """An MCP request, response, tool, or JSON-RPC binding violated the pinned contract."""
+
+
+class MCPTransportError(AuthorizationKernelError):
+    """An MCP transport failed without exposing provider content or credentials."""
+
+
+class MCPProtocolRevisionMismatchError(MCPContractError):
+    """A server does not support the exact configured MCP protocol revision."""
+
+
+class MCPServerIdentityMismatchError(MCPContractError):
+    """Self-reported logical server identity changed from its approved binding."""
+
+
+class MCPTransportIdentityMismatchError(MCPAdapterUnavailableError):
+    """The cryptographic or executable MCP transport identity did not match."""
+
+
+class MCPTaskCapabilityError(MCPAdapterUnavailableError):
+    """MCP Tasks was used without the required server, extension, and client support."""
+
+
+class RemoteMCPTrustError(MCPAdapterUnavailableError):
+    """Remote MCP trust or enforcement capability was missing or stale."""
+
+
 class SchemaMigrationRequiredError(AuthorizationKernelError):
     """Normal startup found an unknown/missing schema; it must not auto-migrate. An
     explicit stopped-worker migration under the same activation lock is required."""

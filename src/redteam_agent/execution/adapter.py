@@ -36,6 +36,7 @@ from redteam_agent.execution.secret_binding import EphemeralSecretBinding
 from redteam_agent.execution.sink import RawResultSink
 from redteam_agent.models.base import StrictImmutableBoundaryModel
 from redteam_agent.models.common import ToolRef
+from redteam_agent.policy.target_binding import TargetDispatchBinding
 
 
 class ExecutionRequest(StrictImmutableBoundaryModel):
@@ -54,6 +55,10 @@ class ExecutionRequest(StrictImmutableBoundaryModel):
     idempotency_key: str = Field(min_length=1)
     timeout_seconds: int = Field(gt=0)
     arguments: CanonicalJsonObject
+    # These bindings are produced by the authorization kernel, not by the
+    # planner or MCP server.  Network-capable adapters must use them as the
+    # authoritative destinations and reject any argument/binding mismatch.
+    target_dispatch_bindings: tuple[TargetDispatchBinding, ...] = ()
 
 
 class AdapterIdentity(StrictImmutableBoundaryModel):

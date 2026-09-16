@@ -1,7 +1,7 @@
 # RedTeam Agent — 設計資料と段階実装
 
-許可された隔離演習向け支援AIエージェントの設計資料と、Phase 0A〜4の段階実装を保持するリポジトリ。
-実ネットワークは閉域Local LLM資格に限定し、実C2/MCP/Target接続・Payload生成・汎用Shell実行は含まない。Phase 4はTuoni 0.16.1 Adapterのオフライン開発受入まで完了し、Production Activationだけを保留している。
+許可された隔離演習向け支援AIエージェントの設計資料と、Phase 0A〜5の段階実装を保持するリポジトリ。
+実ネットワークは閉域Local LLM資格に限定し、実C2/MCP/Target接続・Payload生成・汎用Shell実行は含まない。Phase 4はTuoni 0.16.1、Phase 5はMCP 2026-07-28のオフライン実装まで完了し、Production Activationだけを保留している。
 
 ## 担当方針
 
@@ -26,6 +26,9 @@
 | [docs/development/phase-2.md](docs/development/phase-2.md) | Phase 2 Local LLM の開発・実モデル資格・独立レビュー記録 |
 | [docs/development/phase-3.md](docs/development/phase-3.md) | Phase 3 Human Approval / Durable Resume の開発記録（対象・要件・試験・残課題） |
 | [docs/development/phase-4.md](docs/development/phase-4.md) | Phase 4 Tuoni Adapter の確定事項・オフライン実装・Activation Blocker |
+| [docs/development/phase-5.md](docs/development/phase-5.md) | Phase 5 MCP Adapter のProtocol Pin・オフライン実装・Activation Blocker |
+| [docs/development/phase-5-impacket-mcp.md](docs/development/phase-5-impacket-mcp.md) | Impacket MCP Server の固定Tool、Target / Secret境界、導入・Activation条件 |
+| [docs/development/ui-integration.md](docs/development/ui-integration.md) | Operator UI統合、同一Origin API、管理範囲、起動・検証手順 |
 
 設計改訂は`system-design-v1-r3` / `ai-control-v1-r3`。
 AIの意味・判断は別冊を先に読み、安全基盤と接続Schemaは正本で確認する。
@@ -105,6 +108,35 @@ LTS / x86_64のControl VM上でTuoniと同居するone-shot process Transport、
 Composition、状態付きTest Doubleによる全操作Scenarioも実装し、実C2 / Targetへの通信は行わない。
 確定事項とActivation Blockerは
 [Phase 4開発記録](docs/development/phase-4.md)を参照する。
+
+## Phase 5 MCP Adapter（オフライン実装完了）
+
+公式MCP Specification `2026-07-28`をSource Commit / Schema SHA-256とともに完全固定し、Logical / Transport
+Identity分離、Execution Location別Trust Policy、Tool Candidate隔離、Live Schema一致による可用性判定、
+`local_result` Adapter、状態付きTest Serverを実装している。加えてFortra Impacket `0.13.1`向けに、SMB Negotiation /
+Authentication / Share List / RPC Endpoint Mapだけを公開するone-shot stdio MCP Server、Exact IP Binding、JIT Secret境界、
+固定Tool Registry Source、Process Transportを実装した。Tasks Extensionは無効であり、Task / Cancel / Reconcile Provider APIを
+呼ばない。実Target試験とOS / vCenter Egress資格まではProduction Activationしない。詳細は
+[Phase 5開発記録](docs/development/phase-5.md)と
+[Impacket MCP開発記録](docs/development/phase-5-impacket-mcp.md)を参照する。
+
+## Operator UI（オフライン統合完了）
+
+指定された`nathanhoma/RedTeam_Agent`のOperator Consoleを`frontend/`へ取り込み、Mock本番表示を同一Originの
+ローカルControl Plane APIへ置き換えた。実Mission / Approval / Knowledge状態の表示、非権威Mission Draft、Tuoni Commercialと
+4つのImpacket MCP操作に限定したProvider Policy Draftを管理できる。単体CLIではApproval writeと実VLLM Probeを無効化し、
+既存の信頼済みOwner Serviceを注入した構成でだけ有効にする。実C2 / vCenter / Targetへの接続やProduction Activationは行わない。
+
+```sh
+cd frontend
+npm ci
+npm run build
+cd ..
+.venv/bin/redteam-ui --database /absolute/path/to/redteam-agent.db
+```
+
+`http://127.0.0.1:18000/dashboard`で開く。詳細は[UI統合記録](docs/development/ui-integration.md)と
+[UI操作ガイド](frontend/UI_GUIDE.md)を参照する。
 
 ## Phase 2 Local LLM（Capability / 300-Run Qualification）
 
