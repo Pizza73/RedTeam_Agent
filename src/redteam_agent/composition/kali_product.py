@@ -65,7 +65,7 @@ class KaliProductSettings(StrictImmutableBoundaryModel):
     operatorPrincipal: str = Field(default="redteam-operator", min_length=1, max_length=200)
     uiHost: Literal["127.0.0.1", "localhost", "0.0.0.0"] = "127.0.0.1"  # noqa: S104
     uiPort: int = Field(default=18000, ge=1, le=65535)
-    uiOriginPolicy: Literal["exact", "rfc1918_same_origin"] = "exact"
+    uiOriginPolicy: Literal["exact", "rfc1918_same_origin", "local_ipv4_same_origin"] = "exact"
     uiAllowedOrigins: tuple[str, ...] = ()
     vllmBaseUrl: Literal["http://10.0.6.181:8100/v1"] = "http://10.0.6.181:8100/v1"
     vllmModel: Literal["gemma-4-31B-it"] = "gemma-4-31B-it"
@@ -125,13 +125,13 @@ class KaliProductSettings(StrictImmutableBoundaryModel):
         if self.operatorPrincipal != self.operatorPrincipal.strip():
             raise ValueError("operator principal must be canonical")
         direct_origins = validate_direct_ui_origins(self.uiAllowedOrigins)
-        dynamic_origin = self.uiOriginPolicy == "rfc1918_same_origin"
+        dynamic_origin = self.uiOriginPolicy in {"rfc1918_same_origin", "local_ipv4_same_origin"}
         if self.uiHost == DIRECT_EXTERNAL_BIND_HOST and not direct_origins and not dynamic_origin:
-            raise ValueError("direct external UI bind requires an exact origin or RFC1918 same-origin mode")
+            raise ValueError("direct external UI bind requires an exact origin or a same-origin mode")
         if direct_origins and dynamic_origin:
-            raise ValueError("exact UI origins cannot be combined with RFC1918 same-origin mode")
+            raise ValueError("exact UI origins cannot be combined with a dynamic same-origin mode")
         if self.uiHost != DIRECT_EXTERNAL_BIND_HOST and dynamic_origin:
-            raise ValueError("RFC1918 same-origin mode requires direct external UI bind")
+            raise ValueError("dynamic same-origin mode requires direct external UI bind")
         if self.uiHost == DIRECT_EXTERNAL_BIND_HOST and any(
             int(origin.rsplit(":", 1)[1]) != self.uiPort for origin in direct_origins
         ):
@@ -283,6 +283,7 @@ def serve_kali_product(application: KaliProductApplication) -> None:
         authenticator=application.authenticator,
         allowed_origins=application.settings.uiAllowedOrigins,
         allow_rfc1918_same_origin=application.settings.uiOriginPolicy == "rfc1918_same_origin",
+        allow_local_ipv4_same_origin=application.settings.uiOriginPolicy == "local_ipv4_same_origin",
     )
     try:
         server.serve_forever()

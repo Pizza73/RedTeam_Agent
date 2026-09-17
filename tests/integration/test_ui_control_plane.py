@@ -5,6 +5,7 @@ from __future__ import annotations
 import http.client
 import json
 import threading
+from ipaddress import IPv4Address
 
 import pytest
 
@@ -21,7 +22,12 @@ from redteam_agent.ui.auth import OperatorSessionAuthenticator
 from redteam_agent.ui.control_plane import UIActionBlockedError, UIConflictError, UIControlPlane
 from redteam_agent.ui.mission_commands import MissionCommandOwner
 from redteam_agent.ui.models import MissionDraftInput, ProviderPolicyDraftInput, VllmConfigInput
-from redteam_agent.ui.server import UIRouter, build_server, validate_direct_ui_origins
+from redteam_agent.ui.server import (
+    UIRouter,
+    build_server,
+    discover_local_ipv4_addresses,
+    validate_direct_ui_origins,
+)
 
 
 def _mission_draft() -> MissionDraftInput:
@@ -548,7 +554,7 @@ def test_explicit_origin_accepts_all_ipv4_and_rejects_malformed_urls(tmp_path) -
     path = tmp_path / "app.db"
     Database(str(path)).close()
     control = UIControlPlane(database_path=str(path), clock=lambda: support.T0)
-    with pytest.raises(ValueError, match="exact origin or RFC1918"):
+    with pytest.raises(ValueError, match="exact origin or a same-origin"):
         build_server(control_plane=control, host="0.0.0.0", port=18000, static_root=None)
     assert validate_direct_ui_origins(
         (
@@ -645,6 +651,67 @@ def test_http_server_can_derive_origin_from_the_requested_runtime_rfc1918_ip(tmp
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+def test_http_server_can_derive_origin_from_an_ipv4_assigned_to_this_server(tmp_path) -> None:
+    path = tmp_path / "app.db"
+    Database(str(path)).close()
+    control = UIControlPlane(database_path=str(path), clock=lambda: support.T0)
+    server = build_server(
+        control_plane=control,
+        host="0.0.0.0",
+        port=0,
+        static_root=None,
+        allow_local_ipv4_same_origin=True,
+        local_ipv4_addresses=frozenset({IPv4Address("100.101.210.70")}),
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    _, port = server.server_address
+    body = json.dumps(_mission_draft().model_dump(mode="json")).encode()
+    try:
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        connection.request(
+            "POST",
+            "/api/v1/mission-drafts",
+            body,
+            {
+                "Content-Type": "application/json",
+                "Host": "100.101.210.70:18000",
+                "Origin": "http://100.101.210.70:18000",
+                "X-RedTeam-UI": "1",
+            },
+        )
+        assert connection.getresponse().status == 201
+        connection.close()
+
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        connection.request("GET", "/api/v1/health", headers={"Host": "100.101.210.71:18000"})
+        assert connection.getresponse().status == 400
+        connection.close()
+
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        connection.request(
+            "POST",
+            "/api/v1/mission-drafts",
+            body,
+            {
+                "Content-Type": "application/json",
+                "Host": "100.101.210.70:18000",
+                "Origin": "http://100.101.210.71:18000",
+                "X-RedTeam-UI": "1",
+            },
+        )
+        assert connection.getresponse().status == 403
+        connection.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_local_ipv4_discovery_includes_loopback_on_linux() -> None:
+    assert IPv4Address("127.0.0.1") in discover_local_ipv4_addresses()
 
 
 def test_http_server_falls_back_only_for_spa_routes(tmp_path) -> None:

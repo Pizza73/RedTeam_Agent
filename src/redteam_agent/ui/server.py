@@ -1,11 +1,15 @@
-"""Dependency-free HTTP server for loopback or explicitly gated RFC1918 access."""
+"""Dependency-free HTTP server with explicit and local-interface origin gates."""
 
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import mimetypes
+import os
 import re
+import socket
+import struct
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.cookies import CookieError, SimpleCookie
@@ -54,6 +58,7 @@ _RFC1918_NETWORKS = (
     IPv4Network("172.16.0.0/12"),
     IPv4Network("192.168.0.0/16"),
 )
+_SIOCGIFADDR = 0x8915
 
 
 @dataclass(frozen=True)
@@ -290,7 +295,7 @@ def validate_direct_ui_origins(origins: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(validated)
 
 
-def _rfc1918_origin_for_host(host: str, *, expected_port: int) -> str | None:
+def _ipv4_origin_for_host(host: str, *, expected_port: int) -> tuple[str, IPv4Address] | None:
     parsed = urlsplit(f"http://{host}")
     try:
         port = parsed.port
@@ -302,10 +307,53 @@ def _rfc1918_origin_for_host(host: str, *, expected_port: int) -> str | None:
         address = IPv4Address(parsed.hostname)
     except ValueError:
         return None
+    origin = f"http://{address}:{port}"
+    return (origin, address) if host == origin.removeprefix("http://") else None
+
+
+def _rfc1918_origin_for_host(host: str, *, expected_port: int) -> str | None:
+    parsed = _ipv4_origin_for_host(host, expected_port=expected_port)
+    if parsed is None:
+        return None
+    origin, address = parsed
     if not any(address in network for network in _RFC1918_NETWORKS):
         return None
-    origin = f"http://{address}:{port}"
-    return origin if host == origin.removeprefix("http://") else None
+    return origin
+
+
+def discover_local_ipv4_addresses() -> frozenset[IPv4Address]:
+    """Return IPv4 addresses assigned to Linux interfaces at server startup."""
+    addresses: set[IPv4Address] = set()
+    try:
+        interfaces = socket.if_nameindex()
+    except OSError as exc:
+        raise ValueError("local IPv4 interfaces are unavailable") from exc
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+        for _, name in interfaces:
+            encoded_name = os.fsencode(name)
+            if not encoded_name or len(encoded_name) > 15:
+                continue
+            try:
+                response = fcntl.ioctl(probe.fileno(), _SIOCGIFADDR, struct.pack("256s", encoded_name))
+            except OSError:
+                continue
+            addresses.add(IPv4Address(response[20:24]))
+    if not addresses:
+        raise ValueError("no local IPv4 interface address is available")
+    return frozenset(addresses)
+
+
+def _local_ipv4_origin_for_host(
+    host: str,
+    *,
+    expected_port: int,
+    local_addresses: frozenset[IPv4Address],
+) -> str | None:
+    parsed = _ipv4_origin_for_host(host, expected_port=expected_port)
+    if parsed is None:
+        return None
+    origin, address = parsed
+    return origin if address in local_addresses else None
 
 
 def build_handler(
@@ -314,6 +362,8 @@ def build_handler(
     static_root: Path | None,
     allowed_origins: tuple[str, ...] = (),
     allow_rfc1918_same_origin: bool = False,
+    allow_local_ipv4_same_origin: bool = False,
+    local_ipv4_addresses: frozenset[IPv4Address] = frozenset(),
     bind_port: int = 0,
 ) -> type[BaseHTTPRequestHandler]:
     root = static_root.resolve() if static_root is not None else None
@@ -327,6 +377,12 @@ def build_handler(
             return configured
         if allow_rfc1918_same_origin:
             return _rfc1918_origin_for_host(host, expected_port=bind_port)
+        if allow_local_ipv4_same_origin:
+            return _local_ipv4_origin_for_host(
+                host,
+                expected_port=bind_port,
+                local_addresses=local_ipv4_addresses,
+            )
         return None
 
     class OperatorUIHandler(BaseHTTPRequestHandler):
@@ -557,20 +613,28 @@ def build_server(
     authenticator: OperatorSessionAuthenticator | None = None,
     allowed_origins: tuple[str, ...] = (),
     allow_rfc1918_same_origin: bool = False,
+    allow_local_ipv4_same_origin: bool = False,
+    local_ipv4_addresses: frozenset[IPv4Address] | None = None,
 ) -> ThreadingHTTPServer:
     if host not in {"127.0.0.1", "localhost", DIRECT_EXTERNAL_BIND_HOST}:
         raise ValueError("operator UI bind address is not allowed")
     validated_origins = validate_direct_ui_origins(allowed_origins)
-    if host == DIRECT_EXTERNAL_BIND_HOST and not validated_origins and not allow_rfc1918_same_origin:
-        raise ValueError("direct external UI bind requires an exact origin or RFC1918 same-origin mode")
-    if validated_origins and allow_rfc1918_same_origin:
-        raise ValueError("exact UI origins cannot be combined with RFC1918 same-origin mode")
+    same_origin_mode_count = int(allow_rfc1918_same_origin) + int(allow_local_ipv4_same_origin)
+    if host == DIRECT_EXTERNAL_BIND_HOST and not validated_origins and same_origin_mode_count == 0:
+        raise ValueError("direct external UI bind requires an exact origin or a same-origin mode")
+    if same_origin_mode_count > 1:
+        raise ValueError("only one dynamic UI same-origin mode may be enabled")
+    if validated_origins and same_origin_mode_count:
+        raise ValueError("exact UI origins cannot be combined with a dynamic same-origin mode")
     if (
         host == DIRECT_EXTERNAL_BIND_HOST
         and port != 0
         and any(urlsplit(origin).port != port for origin in validated_origins)
     ):
         raise ValueError("direct external UI origin port must match the bind port")
+    resolved_local_addresses = local_ipv4_addresses
+    if allow_local_ipv4_same_origin and resolved_local_addresses is None:
+        resolved_local_addresses = discover_local_ipv4_addresses()
     return ThreadingHTTPServer(
         (host, port),
         build_handler(
@@ -578,6 +642,8 @@ def build_server(
             static_root=static_root,
             allowed_origins=validated_origins,
             allow_rfc1918_same_origin=allow_rfc1918_same_origin,
+            allow_local_ipv4_same_origin=allow_local_ipv4_same_origin,
+            local_ipv4_addresses=resolved_local_addresses or frozenset(),
             bind_port=port,
         ),
     )
@@ -602,6 +668,11 @@ def main() -> int:
         "--allow-rfc1918-same-origin",
         action="store_true",
         help="Allow the requested canonical RFC1918 Host when the browser Origin exactly matches it",
+    )
+    parser.add_argument(
+        "--allow-local-ipv4-same-origin",
+        action="store_true",
+        help="Allow a Host assigned to this server when the browser Origin exactly matches it",
     )
     parser.add_argument("--static-dir", default="frontend/dist", help="Built frontend directory")
     parser.add_argument("--api-only", action="store_true", help="Serve only the JSON API")
@@ -696,6 +767,7 @@ def main() -> int:
             authenticator=authenticator,
             allowed_origins=tuple(args.allowed_origin),
             allow_rfc1918_same_origin=args.allow_rfc1918_same_origin,
+            allow_local_ipv4_same_origin=args.allow_local_ipv4_same_origin,
         )
     except ValueError as exc:
         parser.error(f"invalid UI network configuration: {exc}")
