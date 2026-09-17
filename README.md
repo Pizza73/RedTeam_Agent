@@ -240,8 +240,8 @@ sudo chmod -R go-w /opt/redteam-agent/gemma-4-31b-tokenizer
 | `databasePath` | `/var/lib/redteam-agent/redteam-agent.db`を推奨。`StateDirectory=redteam-agent`が親directoryを作成する |
 | `staticDirectory` | build済みFrontendの絶対path。標準Unitでは`/opt/redteam-agent/frontend/dist` |
 | `uiHost` / `uiPort` | loopbackは`127.0.0.1:18000`。隔離LANへ直接公開する場合だけ`0.0.0.0:18000` |
-| `uiOriginPolicy` | 別環境へ配置する場合は`rfc1918_same_origin`。要求された実行環境のRFC1918 IPを動的に検証する |
-| `uiAllowedOrigins` | `exact` policyで固定URLを使う場合だけ設定する。動的policyでは空配列にする |
+| `uiOriginPolicy` | `exact`、`rfc1918_same_origin`、`local_ipv4_same_origin`から選ぶ。別環境へ移設する場合は`local_ipv4_same_origin`を推奨する |
+| `uiAllowedOrigins` | `exact` policyで固定URLを使う場合だけ設定する。任意の正規IPv4を指定でき、動的policyでは空配列にする |
 | `vllmAllowedCidrs` | UIから登録を許可するLLMサーバのIPv4 CIDR。必要最小限にする |
 | `vllmSettingsDirectory` | UIで有効化した接続先とservice-owned keyを保存するdirectory。標準は`/var/lib/redteam-agent/llm-settings` |
 | `adCollectorEnabled` | 実DCを評価する場合だけ`true`。未準備なら`false` |
@@ -353,25 +353,55 @@ ssh -L 18000:127.0.0.1:18000 operator@CONTROL_VM_IP
 LLMを変更する場合は`VLLM Settings`で`Register candidate`→`Test connection & capabilities`→
 `Activate candidate`の順に実行する。HTTP接続ではBearer keyがnetwork上で暗号化されないため、隔離network以外ではHTTPSを使用する。
 
-隔離LANから直接アクセスする場合、サンプルの動的Origin設定を使用できる。特定IPへ固定していないため、
-別のControl VMへ配置した場合も設定変更は不要である。
+隔離networkから直接アクセスする場合は、Origin modeを一つだけ選択する。各modeは排他的であり、
+`--allowed-origin`、`--allow-rfc1918-same-origin`、`--allow-local-ipv4-same-origin`を同時に指定してはいけない。
+
+| mode | `redteam-ui`の起動引数 | 許可範囲 |
+| --- | --- | --- |
+| 固定 | `--allowed-origin http://IPv4:PORT` | 明示した正規IPv4 URLだけ。RFC1918外も指定可能 |
+| RFC1918動的 | `--allow-rfc1918-same-origin` | 要求HostがRFC1918で、Originと一致する場合 |
+| Local IPv4動的 | `--allow-local-ipv4-same-origin` | 起動時にサーバのinterfaceへ割り当てられていたIPv4で、HostとOriginが一致する場合 |
+
+`100.101.210.70:18000`へ固定する場合の直接起動例は次のとおり。
+
+```sh
+/opt/redteam-agent/venv/bin/redteam-ui \
+  --database /var/lib/redteam-agent/redteam-agent.db \
+  --host 0.0.0.0 \
+  --port 18000 \
+  --allowed-origin http://100.101.210.70:18000 \
+  --operator-token-file /run/credentials/redteam-agent.service/ui-operator.token \
+  --static-dir /opt/redteam-agent/frontend/dist
+```
+
+別のサーバへ移設してもOriginを固定しない場合は、上記の`--allowed-origin`行を次の引数へ置き換える。
+`100.101.210.70`を使用する場合、そのIPが実際にサーバのinterfaceへ割り当てられている必要がある。
+
+```text
+--allow-local-ipv4-same-origin
+```
+
+Ansibleが生成するsystemd Unitで`redteam-ui`を直接起動する場合も、同じ引数を`ExecStart=`へ設定する。
+変更後は`systemctl daemon-reload`と`systemctl restart redteam-agent.service`を実行する。
+
+標準の`redteam-product --config`方式では、`product.json`を次のように設定する。
 
 ```json
 {
   "uiHost": "0.0.0.0",
   "uiPort": 18000,
-  "uiOriginPolicy": "rfc1918_same_origin",
+  "uiOriginPolicy": "local_ipv4_same_origin",
   "uiAllowedOrigins": []
 }
 ```
 
-1. 実行環境で`ip -4 -brief address show scope global`を実行し、アクセスに使用するRFC1918 IPv4を確認する。
+1. 実行環境で`ip -4 -brief address show scope global`を実行し、アクセスに使用するIPv4がinterfaceへ割り当てられていることを確認する。
 2. 全IPv4から到達可能にする場合はsystemd Unitを`IPAddressAllow=0.0.0.0/0`とする。接続元を絞る場合は管理端末CIDRへ置き換える。
 3. `systemctl restart redteam-agent.service`後、管理端末から`http://実行環境のIPv4:18000`を開く。
 
-動的policyは要求のHostから実行環境のアクセス先を判定し、同じ値のブラウザOriginだけを許可する。
-RFC1918のliteral IPv4とbind portに限定し、DNS名、wildcard、public IPv4、Originと異なるHost headerを要求時に拒否する。
-一方、`IPAddressAllow=0.0.0.0/0`では接続元IPv4を制限しない。
+Local IPv4動的policyは起動時にサーバ自身のIPv4を取得し、要求Hostと同じ値のブラウザOriginだけを許可する。
+未割当IP、DNS名、wildcard、Originと異なるHost headerを拒否する。固定policyでは明示したURLだけを許可し、
+RFC1918動的policyの許可範囲はRFC1918のままである。一方、`IPAddressAllow=0.0.0.0/0`では接続元IPv4を制限しない。
 直接HTTPではUI tokenとsession cookieが暗号化されないため、internetへ直接公開せず、network側の隔離を別途用意する。
 
 #### 5. 更新・backup・障害確認
