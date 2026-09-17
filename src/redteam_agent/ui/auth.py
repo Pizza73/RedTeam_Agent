@@ -1,4 +1,4 @@
-"""In-memory, loopback-only operator sessions for the local UI.
+"""In-memory operator sessions for the local or isolated-LAN UI.
 
 The long-lived bootstrap token is supplied by the composition root from an
 owner-private credential file.  The browser exchanges it once for an opaque

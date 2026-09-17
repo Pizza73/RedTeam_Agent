@@ -34,7 +34,7 @@ from redteam_agent.ui.auth import OperatorSessionAuthenticator, read_operator_to
 from redteam_agent.ui.control_plane import UIControlPlane
 from redteam_agent.ui.kali_provider_status import KaliProviderStatusPort
 from redteam_agent.ui.mission_commands import MissionCommandOwner
-from redteam_agent.ui.server import build_server
+from redteam_agent.ui.server import DIRECT_EXTERNAL_BIND_HOST, build_server, validate_direct_ui_origins
 from redteam_agent.ui.vllm_capability import (
     Phase2VllmCapabilityPort,
     Phase2VllmCapabilitySettings,
@@ -63,8 +63,9 @@ class KaliProductSettings(StrictImmutableBoundaryModel):
     staticDirectory: str = "/opt/redteam-agent/frontend/dist"
     operatorTokenFile: str = "/run/credentials/redteam-agent.service/ui-operator.token"
     operatorPrincipal: str = Field(default="redteam-operator", min_length=1, max_length=200)
-    uiHost: Literal["127.0.0.1", "localhost"] = "127.0.0.1"
+    uiHost: Literal["127.0.0.1", "localhost", "0.0.0.0"] = "127.0.0.1"  # noqa: S104
     uiPort: int = Field(default=18000, ge=1, le=65535)
+    uiAllowedOrigins: tuple[str, ...] = ()
     vllmBaseUrl: Literal["http://10.0.6.181:8100/v1"] = "http://10.0.6.181:8100/v1"
     vllmModel: Literal["gemma-4-31B-it"] = "gemma-4-31B-it"
     vllmApiKeyFile: str = "/run/credentials/redteam-agent.service/vllm-api.key"
@@ -122,6 +123,13 @@ class KaliProductSettings(StrictImmutableBoundaryModel):
             raise ValueError("vLLM allowed CIDRs must contain at least one IPv4 network")
         if self.operatorPrincipal != self.operatorPrincipal.strip():
             raise ValueError("operator principal must be canonical")
+        direct_origins = validate_direct_ui_origins(self.uiAllowedOrigins)
+        if self.uiHost == DIRECT_EXTERNAL_BIND_HOST and not direct_origins:
+            raise ValueError("direct external UI bind requires at least one exact allowed origin")
+        if self.uiHost == DIRECT_EXTERNAL_BIND_HOST and any(
+            int(origin.rsplit(":", 1)[1]) != self.uiPort for origin in direct_origins
+        ):
+            raise ValueError("direct external UI origin port must match uiPort")
         if len(set(self.approvedSessionRefs)) != len(self.approvedSessionRefs):
             raise ValueError("approved session references must be unique")
         if any(
@@ -267,6 +275,7 @@ def serve_kali_product(application: KaliProductApplication) -> None:
         port=application.settings.uiPort,
         static_root=Path(application.settings.staticDirectory),
         authenticator=application.authenticator,
+        allowed_origins=application.settings.uiAllowedOrigins,
     )
     try:
         server.serve_forever()

@@ -38,6 +38,7 @@ CapabilityBoundingSet=
 SystemCallArchitectures=native
 IPAddressDeny=any
 IPAddressAllow=localhost
+IPAddressAllow=10.0.1.0/24
 IPAddressAllow=10.0.6.0/24
 IPAddressAllow=10.0.10.212/32
 Restart=on-failure

@@ -1,4 +1,4 @@
-"""Dependency-free localhost HTTP server for the operator console."""
+"""Dependency-free HTTP server for loopback or explicitly gated RFC1918 access."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from ipaddress import IPv4Address, IPv4Network
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlsplit
@@ -47,6 +48,12 @@ _MAX_REQUEST_BYTES = 1_048_576
 _SAFE_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,200}$")
 _ALLOWED_HOSTS = frozenset({"127.0.0.1", "localhost", "[::1]"})
 _SESSION_COOKIE = "redteam_operator_session"
+DIRECT_EXTERNAL_BIND_HOST = "0.0.0.0"  # noqa: S104 - explicit direct-access mode with origin gates
+_RFC1918_NETWORKS = (
+    IPv4Network("10.0.0.0/8"),
+    IPv4Network("172.16.0.0/12"),
+    IPv4Network("192.168.0.0/16"),
+)
 
 
 @dataclass(frozen=True)
@@ -248,8 +255,53 @@ def _host_name(host_header: str) -> str:
     return host_header.split(":", 1)[0]
 
 
-def build_handler(*, router: UIRouter, static_root: Path | None) -> type[BaseHTTPRequestHandler]:
+def validate_direct_ui_origins(origins: tuple[str, ...]) -> tuple[str, ...]:
+    """Validate exact HTTP origins for direct RFC1918 UI access."""
+    if len(set(origins)) != len(origins):
+        raise ValueError("UI allowed origins must be unique")
+    validated: list[str] = []
+    for origin in origins:
+        if not origin or origin != origin.strip() or len(origin) > 200:
+            raise ValueError("UI allowed origin is not canonical")
+        parsed = urlsplit(origin)
+        try:
+            port = parsed.port
+        except ValueError:
+            raise ValueError("UI allowed origin port is invalid") from None
+        if (
+            parsed.scheme != "http"
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path
+            or parsed.query
+            or parsed.fragment
+            or parsed.hostname is None
+            or port is None
+        ):
+            raise ValueError("direct UI origin must be an exact HTTP origin with an explicit port")
+        try:
+            address = IPv4Address(parsed.hostname)
+        except ValueError:
+            raise ValueError("direct UI origin host must be a literal IPv4 address") from None
+        if not any(address in network for network in _RFC1918_NETWORKS):
+            raise ValueError("direct UI origin must use an RFC1918 address")
+        canonical = f"http://{address}:{port}"
+        if origin != canonical:
+            raise ValueError("UI allowed origin is not canonical")
+        validated.append(canonical)
+    return tuple(validated)
+
+
+def build_handler(
+    *,
+    router: UIRouter,
+    static_root: Path | None,
+    allowed_origins: tuple[str, ...] = (),
+) -> type[BaseHTTPRequestHandler]:
     root = static_root.resolve() if static_root is not None else None
+    external_origins = {
+        urlsplit(origin).netloc: origin for origin in validate_direct_ui_origins(allowed_origins)
+    }
 
     class OperatorUIHandler(BaseHTTPRequestHandler):
         server_version = "RedTeamAgentUI/1"
@@ -305,12 +357,16 @@ def build_handler(*, router: UIRouter, static_root: Path | None) -> type[BaseHTT
 
         def _host_allowed(self) -> bool:
             host = self.headers.get("Host", "")
-            return _host_name(host) in _ALLOWED_HOSTS
+            return _host_name(host) in _ALLOWED_HOSTS or host in external_origins
 
         def _mutation_allowed(self) -> bool:
             host = self.headers.get("Host", "")
             origin = self.headers.get("Origin", "")
-            return self.headers.get("X-RedTeam-UI") == "1" and origin == f"http://{host}"
+            if self.headers.get("X-RedTeam-UI") != "1":
+                return False
+            if host in external_origins:
+                return origin == external_origins[host]
+            return _host_name(host) in _ALLOWED_HOSTS and origin == f"http://{host}"
 
         def _read_json_body(self) -> bytes | None:
             if self.headers.get_content_type() != "application/json":
@@ -472,14 +528,25 @@ def build_server(
     port: int,
     static_root: Path | None,
     authenticator: OperatorSessionAuthenticator | None = None,
+    allowed_origins: tuple[str, ...] = (),
 ) -> ThreadingHTTPServer:
-    if host not in {"127.0.0.1", "localhost"}:
-        raise ValueError("operator UI may bind only to loopback")
+    if host not in {"127.0.0.1", "localhost", DIRECT_EXTERNAL_BIND_HOST}:
+        raise ValueError("operator UI bind address is not allowed")
+    validated_origins = validate_direct_ui_origins(allowed_origins)
+    if host == DIRECT_EXTERNAL_BIND_HOST and not validated_origins:
+        raise ValueError("direct external UI bind requires at least one exact allowed origin")
+    if (
+        host == DIRECT_EXTERNAL_BIND_HOST
+        and port != 0
+        and any(urlsplit(origin).port != port for origin in validated_origins)
+    ):
+        raise ValueError("direct external UI origin port must match the bind port")
     return ThreadingHTTPServer(
         (host, port),
         build_handler(
             router=UIRouter(control_plane, authenticator=authenticator),
             static_root=static_root,
+            allowed_origins=validated_origins,
         ),
     )
 
@@ -487,8 +554,18 @@ def build_server(
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run the local RedTeam Agent operator UI")
     parser.add_argument("--database", required=True, help="Provisioned RedTeam Agent SQLite database")
-    parser.add_argument("--host", default="127.0.0.1", choices=("127.0.0.1", "localhost"))
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        choices=("127.0.0.1", "localhost", DIRECT_EXTERNAL_BIND_HOST),
+    )
     parser.add_argument("--port", default=18000, type=int)
+    parser.add_argument(
+        "--allowed-origin",
+        action="append",
+        default=[],
+        help="Exact RFC1918 HTTP origin allowed for direct external access; repeat for multiple URLs",
+    )
     parser.add_argument("--static-dir", default="frontend/dist", help="Built frontend directory")
     parser.add_argument("--api-only", action="store_true", help="Serve only the JSON API")
     parser.add_argument(
@@ -573,13 +650,17 @@ def main() -> int:
         vllm_public_config=vllm_public_config,
     )
     static_root = None if args.api_only else Path(args.static_dir)
-    server = build_server(
-        control_plane=control_plane,
-        host=args.host,
-        port=args.port,
-        static_root=static_root,
-        authenticator=authenticator,
-    )
+    try:
+        server = build_server(
+            control_plane=control_plane,
+            host=args.host,
+            port=args.port,
+            static_root=static_root,
+            authenticator=authenticator,
+            allowed_origins=tuple(args.allowed_origin),
+        )
+    except ValueError as exc:
+        parser.error(f"invalid UI network configuration: {exc}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

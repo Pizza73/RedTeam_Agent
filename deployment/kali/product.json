@@ -4,8 +4,11 @@
   "staticDirectory": "/opt/redteam-agent/frontend/dist",
   "operatorTokenFile": "/run/credentials/redteam-agent.service/ui-operator.token",
   "operatorPrincipal": "redteam-operator",
-  "uiHost": "127.0.0.1",
+  "uiHost": "0.0.0.0",
   "uiPort": 18000,
+  "uiAllowedOrigins": [
+    "http://10.0.1.109:18000"
+  ],
   "vllmBaseUrl": "http://10.0.6.181:8100/v1",
   "vllmModel": "gemma-4-31B-it",
   "vllmApiKeyFile": "/run/credentials/redteam-agent.service/vllm-api.key",

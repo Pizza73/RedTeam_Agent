@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from redteam_agent.canonical.digest_service import DigestService
 from redteam_agent.composition import kali_product
 from redteam_agent.composition.kali_product import KaliProductSettings
@@ -86,6 +88,29 @@ def test_kali_product_wires_auth_and_persistent_owner_without_enabling_execution
         assert second.settings.productionEligible is False
     finally:
         second.close()
+
+
+def test_kali_product_direct_bind_requires_exact_matching_origin(tmp_path: Path) -> None:
+    base = _settings(tmp_path)
+    with pytest.raises(ValueError, match="requires at least one"):
+        KaliProductSettings.model_validate({**base.model_dump(), "uiHost": "0.0.0.0"})
+    with pytest.raises(ValueError, match="must match uiPort"):
+        KaliProductSettings.model_validate(
+            {
+                **base.model_dump(),
+                "uiHost": "0.0.0.0",
+                "uiAllowedOrigins": ("http://10.0.1.109:18001",),
+            }
+        )
+
+    settings = KaliProductSettings.model_validate(
+        {
+            **base.model_dump(),
+            "uiHost": "0.0.0.0",
+            "uiAllowedOrigins": ("http://10.0.1.109:18000",),
+        }
+    )
+    assert settings.uiAllowedOrigins == ("http://10.0.1.109:18000",)
 
 
 def test_kali_product_attaches_server_owned_ad_collector_when_enabled(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]

@@ -183,7 +183,7 @@ Kali向けの統合入口は、秘密値を含まない固定設定で起動す�
 ### 別環境へのsystemd配備
 
 この手順は、RedTeam Agentを別のKali LinuxまたはsystemdベースのLinuxへ配置し、1台のControl VM上で
-loopback UIとして管理する場合を対象とする。`LoadCredentialEncrypted=`を使用するためsystemd 250以上が必要で、
+loopbackまたは隔離LAN向けUIとして管理する場合を対象とする。`LoadCredentialEncrypted=`を使用するためsystemd 250以上が必要で、
 Python 3.12以上、SQLite、LLMサーバへの閉域到達性が必要である。Node.js/npmはFrontendを配備先でbuildする場合だけ必要となる。
 
 この製品構成は`productionEligible=false`であり、systemdで正常起動してもMissionの`start`/`resume`は有効にならない。
@@ -239,7 +239,8 @@ sudo chmod -R go-w /opt/redteam-agent/gemma-4-31b-tokenizer
 | --- | --- |
 | `databasePath` | `/var/lib/redteam-agent/redteam-agent.db`を推奨。`StateDirectory=redteam-agent`が親directoryを作成する |
 | `staticDirectory` | build済みFrontendの絶対path。標準Unitでは`/opt/redteam-agent/frontend/dist` |
-| `uiHost` / `uiPort` | `127.0.0.1:18000`を推奨。現行schemaは外部interfaceへのbindを拒否する |
+| `uiHost` / `uiPort` | loopbackは`127.0.0.1:18000`。隔離LANへ直接公開する場合だけ`0.0.0.0:18000` |
+| `uiAllowedOrigins` | 外部bind時に許可する完全一致URL。RFC1918のliteral IPv4、`http`、明示portだけを許可する |
 | `vllmAllowedCidrs` | UIから登録を許可するLLMサーバのIPv4 CIDR。必要最小限にする |
 | `vllmSettingsDirectory` | UIで有効化した接続先とservice-owned keyを保存するdirectory。標準は`/var/lib/redteam-agent/llm-settings` |
 | `adCollectorEnabled` | 実DCを評価する場合だけ`true`。未準備なら`false` |
@@ -327,7 +328,7 @@ sudo systemctl status --no-pager redteam-agent.service
 
 | 用途 | `product.json` | systemd Unit |
 | --- | --- | --- |
-| UI | `uiHost=127.0.0.1` | `IPAddressAllow=localhost` |
+| UI | `uiHost`、`uiAllowedOrigins` | loopbackと許可する管理端末CIDRの`IPAddressAllow=` |
 | LLM | `vllmAllowedCidrs` | 同じCIDRの`IPAddressAllow=` |
 | AD Collector | `adCollectorServerIp` | 同じIPv4 `/32`の`IPAddressAllow=` |
 
@@ -338,7 +339,7 @@ curl --fail --silent --show-error http://127.0.0.1:18000/api/v1/health
 sudo journalctl -u redteam-agent.service --since today --no-pager
 ```
 
-別端末からUIを使用する場合も外部bindへ変更せず、SSH port forwardingを使用する。
+推奨はSSH port forwardingであり、アプリをloopbackに維持する。
 
 ```sh
 ssh -L 18000:127.0.0.1:18000 operator@CONTROL_VM_IP
@@ -347,6 +348,24 @@ ssh -L 18000:127.0.0.1:18000 operator@CONTROL_VM_IP
 接続後、ローカルブラウザで`http://127.0.0.1:18000`を開き、保管したUI tokenでloginする。
 LLMを変更する場合は`VLLM Settings`で`Register candidate`→`Test connection & capabilities`→
 `Activate candidate`の順に実行する。HTTP接続ではBearer keyがnetwork上で暗号化されないため、隔離network以外ではHTTPSを使用する。
+
+隔離LANから直接アクセスする場合は、次の3点を同時に変更する。サンプルは現在のControl VM
+`10.0.1.109:18000`向けに設定済みである。
+
+```json
+{
+  "uiHost": "0.0.0.0",
+  "uiPort": 18000,
+  "uiAllowedOrigins": ["http://10.0.1.109:18000"]
+}
+```
+
+1. `product.json`の`uiAllowedOrigins`を実際にブラウザで開くURLへ完全一致させる。
+2. systemd Unitの`IPAddressAllow=`へ管理端末の送信元CIDRを追加し、host firewallでもTCP/18000を同じCIDRだけに許可する。
+3. `systemctl restart redteam-agent.service`後、管理端末から`http://10.0.1.109:18000`を開く。
+
+外部bindはRFC1918のliteral IPv4に限定し、DNS名、wildcard、public IPv4、Originと異なるHost headerを起動時または要求時に拒否する。
+直接HTTPではUI tokenとsession cookieが暗号化されないため、信頼済み隔離LANまたはVPN内だけで使用する。internetへ直接公開しない。
 
 #### 5. 更新・backup・障害確認
 

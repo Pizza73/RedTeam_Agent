@@ -21,7 +21,7 @@ from redteam_agent.ui.auth import OperatorSessionAuthenticator
 from redteam_agent.ui.control_plane import UIActionBlockedError, UIConflictError, UIControlPlane
 from redteam_agent.ui.mission_commands import MissionCommandOwner
 from redteam_agent.ui.models import MissionDraftInput, ProviderPolicyDraftInput, VllmConfigInput
-from redteam_agent.ui.server import UIRouter, build_server
+from redteam_agent.ui.server import UIRouter, build_server, validate_direct_ui_origins
 
 
 def _mission_draft() -> MissionDraftInput:
@@ -461,6 +461,83 @@ def test_http_server_requires_same_origin_proof_for_mutations(tmp_path) -> None:
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+def test_http_server_direct_bind_requires_and_enforces_exact_rfc1918_origin(tmp_path) -> None:
+    path = tmp_path / "app.db"
+    Database(str(path)).close()
+    control = UIControlPlane(database_path=str(path), clock=lambda: support.T0)
+    authenticator = OperatorSessionAuthenticator(
+        principal_id="redteam-operator",
+        operator_token=bytearray(b"a" * 32),
+        clock=lambda: support.T0,
+        token_factory=lambda: "s" * 32,
+    )
+    origin = "http://10.0.1.109:18000"
+    server = build_server(
+        control_plane=control,
+        host="0.0.0.0",
+        port=0,
+        static_root=None,
+        authenticator=authenticator,
+        allowed_origins=(origin,),
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    _, port = server.server_address
+    try:
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        connection.request("GET", "/api/v1/health", headers={"Host": "attacker.example:18000"})
+        assert connection.getresponse().status == 400
+        connection.close()
+
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        connection.request(
+            "POST",
+            "/api/v1/session",
+            json.dumps({"token": "a" * 32}),
+            {
+                "Content-Type": "application/json",
+                "Host": "10.0.1.109:18000",
+                "Origin": "http://10.0.1.110:18000",
+                "X-RedTeam-UI": "1",
+            },
+        )
+        assert connection.getresponse().status == 403
+        connection.close()
+
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        connection.request(
+            "POST",
+            "/api/v1/session",
+            json.dumps({"token": "a" * 32}),
+            {
+                "Content-Type": "application/json",
+                "Host": "10.0.1.109:18000",
+                "Origin": origin,
+                "X-RedTeam-UI": "1",
+            },
+        )
+        response = connection.getresponse()
+        assert response.status == 200
+        assert "HttpOnly" in (response.getheader("Set-Cookie") or "")
+        connection.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_direct_bind_rejects_missing_or_non_private_origins(tmp_path) -> None:
+    path = tmp_path / "app.db"
+    Database(str(path)).close()
+    control = UIControlPlane(database_path=str(path), clock=lambda: support.T0)
+    with pytest.raises(ValueError, match="requires at least one"):
+        build_server(control_plane=control, host="0.0.0.0", port=18000, static_root=None)
+    with pytest.raises(ValueError, match="RFC1918"):
+        validate_direct_ui_origins(("http://203.0.113.10:18000",))
+    with pytest.raises(ValueError, match="literal IPv4"):
+        validate_direct_ui_origins(("http://redteam-agent.example:18000",))
 
 
 def test_http_server_falls_back_only_for_spa_routes(tmp_path) -> None:
