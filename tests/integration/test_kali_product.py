@@ -99,7 +99,7 @@ def test_kali_product_direct_bind_requires_exact_matching_origin(tmp_path: Path)
             {
                 **base.model_dump(),
                 "uiHost": "0.0.0.0",
-                "uiAllowedOrigins": ("http://10.0.1.109:18001",),
+                "uiAllowedOrigins": ("http://100.101.210.70:18001",),
             }
         )
 
@@ -107,10 +107,10 @@ def test_kali_product_direct_bind_requires_exact_matching_origin(tmp_path: Path)
         {
             **base.model_dump(),
             "uiHost": "0.0.0.0",
-            "uiAllowedOrigins": ("http://10.0.1.109:18000",),
+            "uiAllowedOrigins": ("http://100.101.210.70:18000",),
         }
     )
-    assert settings.uiAllowedOrigins == ("http://10.0.1.109:18000",)
+    assert settings.uiAllowedOrigins == ("http://100.101.210.70:18000",)
 
     dynamic = KaliProductSettings.model_validate(
         {

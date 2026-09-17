@@ -256,7 +256,7 @@ def _host_name(host_header: str) -> str:
 
 
 def validate_direct_ui_origins(origins: tuple[str, ...]) -> tuple[str, ...]:
-    """Validate exact HTTP origins for direct RFC1918 UI access."""
+    """Validate explicitly allowlisted exact HTTP origins across IPv4."""
     if len(set(origins)) != len(origins):
         raise ValueError("UI allowed origins must be unique")
     validated: list[str] = []
@@ -283,8 +283,6 @@ def validate_direct_ui_origins(origins: tuple[str, ...]) -> tuple[str, ...]:
             address = IPv4Address(parsed.hostname)
         except ValueError:
             raise ValueError("direct UI origin host must be a literal IPv4 address") from None
-        if not any(address in network for network in _RFC1918_NETWORKS):
-            raise ValueError("direct UI origin must use an RFC1918 address")
         canonical = f"http://{address}:{port}"
         if origin != canonical:
             raise ValueError("UI allowed origin is not canonical")
@@ -598,7 +596,7 @@ def main() -> int:
         "--allowed-origin",
         action="append",
         default=[],
-        help="Exact RFC1918 HTTP origin allowed for direct external access; repeat for multiple URLs",
+        help="Exact IPv4 HTTP origin allowed for direct external access; repeat for multiple URLs",
     )
     parser.add_argument(
         "--allow-rfc1918-same-origin",

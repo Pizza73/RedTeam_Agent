@@ -463,7 +463,7 @@ def test_http_server_requires_same_origin_proof_for_mutations(tmp_path) -> None:
         thread.join(timeout=5)
 
 
-def test_http_server_direct_bind_requires_and_enforces_exact_rfc1918_origin(tmp_path) -> None:
+def test_http_server_direct_bind_enforces_explicit_non_rfc1918_origin_and_authentication(tmp_path) -> None:
     path = tmp_path / "app.db"
     Database(str(path)).close()
     control = UIControlPlane(database_path=str(path), clock=lambda: support.T0)
@@ -473,7 +473,7 @@ def test_http_server_direct_bind_requires_and_enforces_exact_rfc1918_origin(tmp_
         clock=lambda: support.T0,
         token_factory=lambda: "s" * 32,
     )
-    origin = "http://10.0.1.109:18000"
+    origin = "http://100.101.210.70:18000"
     server = build_server(
         control_plane=control,
         host="0.0.0.0",
@@ -487,8 +487,13 @@ def test_http_server_direct_bind_requires_and_enforces_exact_rfc1918_origin(tmp_
     _, port = server.server_address
     try:
         connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
-        connection.request("GET", "/api/v1/health", headers={"Host": "attacker.example:18000"})
+        connection.request("GET", "/api/v1/health", headers={"Host": "100.101.210.71:18000"})
         assert connection.getresponse().status == 400
+        connection.close()
+
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        connection.request("GET", "/api/v1/dashboard", headers={"Host": "100.101.210.70:18000"})
+        assert connection.getresponse().status == 401
         connection.close()
 
         connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
@@ -498,8 +503,8 @@ def test_http_server_direct_bind_requires_and_enforces_exact_rfc1918_origin(tmp_
             json.dumps({"token": "a" * 32}),
             {
                 "Content-Type": "application/json",
-                "Host": "10.0.1.109:18000",
-                "Origin": "http://10.0.1.110:18000",
+                "Host": "100.101.210.70:18000",
+                "Origin": "http://100.101.210.71:18000",
                 "X-RedTeam-UI": "1",
             },
         )
@@ -513,14 +518,25 @@ def test_http_server_direct_bind_requires_and_enforces_exact_rfc1918_origin(tmp_
             json.dumps({"token": "a" * 32}),
             {
                 "Content-Type": "application/json",
-                "Host": "10.0.1.109:18000",
+                "Host": "100.101.210.70:18000",
                 "Origin": origin,
                 "X-RedTeam-UI": "1",
             },
         )
         response = connection.getresponse()
         assert response.status == 200
-        assert "HttpOnly" in (response.getheader("Set-Cookie") or "")
+        cookie = response.getheader("Set-Cookie") or ""
+        assert "HttpOnly" in cookie
+        session_cookie = cookie.split(";", 1)[0]
+        connection.close()
+
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        connection.request(
+            "GET",
+            "/api/v1/dashboard",
+            headers={"Host": "100.101.210.70:18000", "Cookie": session_cookie},
+        )
+        assert connection.getresponse().status == 200
         connection.close()
     finally:
         server.shutdown()
@@ -528,16 +544,51 @@ def test_http_server_direct_bind_requires_and_enforces_exact_rfc1918_origin(tmp_
         thread.join(timeout=5)
 
 
-def test_direct_bind_rejects_missing_or_non_private_origins(tmp_path) -> None:
+def test_explicit_origin_accepts_all_ipv4_and_rejects_malformed_urls(tmp_path) -> None:
     path = tmp_path / "app.db"
     Database(str(path)).close()
     control = UIControlPlane(database_path=str(path), clock=lambda: support.T0)
     with pytest.raises(ValueError, match="exact origin or RFC1918"):
         build_server(control_plane=control, host="0.0.0.0", port=18000, static_root=None)
-    with pytest.raises(ValueError, match="RFC1918"):
-        validate_direct_ui_origins(("http://203.0.113.10:18000",))
-    with pytest.raises(ValueError, match="literal IPv4"):
-        validate_direct_ui_origins(("http://redteam-agent.example:18000",))
+    assert validate_direct_ui_origins(
+        (
+            "http://100.101.210.70:18000",
+            "http://203.0.113.10:18000",
+            "http://8.8.8.8:18000",
+            "http://0.0.0.0:18000",
+            "http://255.255.255.255:18000",
+        )
+    ) == (
+        "http://100.101.210.70:18000",
+        "http://203.0.113.10:18000",
+        "http://8.8.8.8:18000",
+        "http://0.0.0.0:18000",
+        "http://255.255.255.255:18000",
+    )
+    for invalid_host in ("redteam-agent.example", "*", "999.1.1.1"):
+        with pytest.raises(ValueError, match="literal IPv4"):
+            validate_direct_ui_origins((f"http://{invalid_host}:18000",))
+    for malformed in (
+        "https://100.101.210.70:18000",
+        "http://100.101.210.70",
+        "http://100.101.210.70:18000/",
+        "http://100.101.210.70:18000/dashboard",
+        "http://user@100.101.210.70:18000",
+        "http://100.101.210.70:18000?query=1",
+        "http://100.101.210.70:18000#fragment",
+    ):
+        with pytest.raises(ValueError, match="exact HTTP origin"):
+            validate_direct_ui_origins((malformed,))
+    with pytest.raises(ValueError, match="must be unique"):
+        validate_direct_ui_origins(("http://100.101.210.70:18000", "http://100.101.210.70:18000"))
+    with pytest.raises(ValueError, match="port must match"):
+        build_server(
+            control_plane=control,
+            host="0.0.0.0",
+            port=18000,
+            static_root=None,
+            allowed_origins=("http://100.101.210.70:18001",),
+        )
 
 
 def test_http_server_can_derive_origin_from_the_requested_runtime_rfc1918_ip(tmp_path) -> None:
@@ -584,6 +635,11 @@ def test_http_server_can_derive_origin_from_the_requested_runtime_rfc1918_ip(tmp
             },
         )
         assert connection.getresponse().status == 403
+        connection.close()
+
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        connection.request("GET", "/api/v1/health", headers={"Host": "100.101.210.70:18000"})
+        assert connection.getresponse().status == 400
         connection.close()
     finally:
         server.shutdown()
