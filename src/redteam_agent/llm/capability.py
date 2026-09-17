@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
@@ -28,9 +28,12 @@ from redteam_agent.canonical.digest_service import DigestService
 from redteam_agent.canonical.json_boundary import parse_json_no_duplicate_keys
 from redteam_agent.errors import (
     AuthorizationKernelError,
+    LLMAttestationError,
     LLMCapabilityError,
     RepositoryIntegrityError,
 )
+from redteam_agent.llm.attestation import require_attestation_binding
+from redteam_agent.llm.attestation_store import ServerAttestationRepository
 from redteam_agent.llm.profile import LocalLLMProfile
 from redteam_agent.llm.schemas import (
     ACTUAL_SCHEMA_NAMES,
@@ -627,11 +630,17 @@ class MissionCapabilityVerifier:
         digest_service: DigestService,
         corpus: SchemaCapabilityCorpus,
         required_schemas: tuple[ActualSchemaName, ...] = ACTUAL_SCHEMA_NAMES,
+        attestation_repository: ServerAttestationRepository | None = None,
+        endpoint_provider: Callable[[], str] | None = None,
     ) -> None:
+        if (attestation_repository is None) != (endpoint_provider is None):
+            raise ValueError("attestation repository and endpoint provider must be configured together")
         self._repo = repository
         self._ds = digest_service
         self._corpus = corpus
         self._required = required_schemas
+        self._attestations = attestation_repository
+        self._endpoint_provider = endpoint_provider
 
     def verify_mission_capability(self, profile: LocalLLMProfile, revision: MissionRevision) -> None:
         from redteam_agent.llm.schemas import compute_schema_digest
@@ -662,6 +671,23 @@ class MissionCapabilityVerifier:
                 raise LLMCapabilityError(
                     f"capability result for {schema_name} carries no server attestation"
                 )
+            if self._attestations is not None and self._endpoint_provider is not None:
+                attestation = self._attestations.get(result.server_attestation_digest)
+                if attestation is None:
+                    raise LLMCapabilityError(
+                        f"capability result for {schema_name} references no stored server attestation"
+                    )
+                try:
+                    require_attestation_binding(
+                        attestation,
+                        profile=profile,
+                        base_url=self._endpoint_provider(),
+                        digest_service=self._ds,
+                    )
+                except LLMAttestationError:
+                    raise LLMCapabilityError(
+                        f"capability result for {schema_name} is not bound to the active endpoint"
+                    ) from None
             if not result.passed:
                 raise LLMCapabilityError(f"capability result did not pass for schema {schema_name}")
             if result.valid_within_retry_budget / result.sample_count < MIN_VALID_RATIO:

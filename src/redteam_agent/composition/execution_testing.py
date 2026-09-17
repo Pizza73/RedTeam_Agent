@@ -18,7 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from redteam_agent.composition.testing import DEFAULT_REGISTRY_REVISION, Phase0AKernel, build_test_kernel
-from redteam_agent.execution.adapter import MockExecutionAdapter
+from redteam_agent.execution.adapter import ExecutionAdapter, MockExecutionAdapter
 from redteam_agent.execution.budget import MissionExecutionBudgetService
 from redteam_agent.execution.collection import ResultCollectionCoordinator
 from redteam_agent.execution.dispatch_port import FixedTrustedAdapterDispatchPort
@@ -56,6 +56,7 @@ class Phase0BKernel:
     phase0a: Phase0AKernel
     execution_guard: WriteGuard
     mock_adapter: MockExecutionAdapter
+    adapters: dict[str, ExecutionAdapter]
     _secret_source: StaticTrustedSecretSource
     # repositories
     execution_repository: ExecutionRecordRepository
@@ -93,6 +94,7 @@ def build_phase0b_kernel(
     result_delivery_mode: str = "provider_task",
     phase0a: Phase0AKernel | None = None,
     mock_adapter: MockExecutionAdapter | None = None,
+    additional_adapters: tuple[ExecutionAdapter, ...] = (),
 ) -> Phase0BKernel:
     kernel = phase0a if phase0a is not None else build_test_kernel(
         db_path=db_path, registry_revision=registry_revision, clock=clock
@@ -125,7 +127,12 @@ def build_phase0b_kernel(
         result_delivery_mode=result_delivery_mode,  # type: ignore[arg-type]
         clock_value=kernel.clock.now(),
     )
-    adapters = {adapter_id: adapter}
+    adapters: dict[str, ExecutionAdapter] = {adapter_id: adapter}
+    for additional in additional_adapters:
+        identity = additional.identity()
+        if identity.adapter_id in adapters:
+            raise ValueError("execution adapter IDs must be unique")
+        adapters[identity.adapter_id] = additional
     secret_source = StaticTrustedSecretSource()
     dispatch_port = FixedTrustedAdapterDispatchPort(adapters)
 
@@ -180,6 +187,7 @@ def build_phase0b_kernel(
         phase0a=kernel,
         execution_guard=exec_guard,
         mock_adapter=adapter,
+        adapters=adapters,
         _secret_source=secret_source,
         execution_repository=execution_repo,
         claim_repository=claim_repo,

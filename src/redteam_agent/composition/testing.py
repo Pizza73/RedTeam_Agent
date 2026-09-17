@@ -11,7 +11,7 @@ the single write guard created here.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from redteam_agent.approval.service import ApprovalService
 from redteam_agent.auth.models import AuthenticatedPrincipal
@@ -140,6 +140,7 @@ def build_test_kernel(
     clock: Clock | None = None,
     allowed_profile_types: frozenset[str] = frozenset({"mock"}),
     capability_verifier: LLMCapabilityVerifier | None = None,
+    registered_session_refs: frozenset[str] = frozenset({"sess-1"}),
 ) -> Phase0AKernel:
     database = Database(db_path)
     digest_service = DigestService()
@@ -199,7 +200,10 @@ def build_test_kernel(
     validation_policy = MissionValidationPolicy(
         max_recovery_window_seconds=DEFAULT_MAX_RECOVERY_WINDOW_SECONDS,
         evidence_retention_policy=build_evidence_retention_policy(digest_service),
-        semantic_catalog=default_semantic_catalog(RepositorySessionGoalSource(session_repo)),
+        semantic_catalog=replace(
+            default_semantic_catalog(RepositorySessionGoalSource(session_repo)),
+            registered_session_refs=registered_session_refs,
+        ),
         allowed_profile_types=allowed_profile_types,
         capability_verifier=capability_verifier,
     )

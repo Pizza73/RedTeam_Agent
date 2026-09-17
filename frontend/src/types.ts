@@ -75,6 +75,28 @@ export const managedVllmConfigSchema = z.discriminatedUnion("enabled", [
 ]);
 export type ManagedVllmConfig = z.infer<typeof managedVllmConfigSchema>;
 
+const vllmManagedEndpointSchema = z.object({
+  version: z.number().int().positive(),
+  config: vllmConfigSchema,
+  apiKeyConfigured: z.boolean(),
+  transportSecurity: z.enum(["encrypted", "isolated_network_required"]),
+}).strict();
+
+export const vllmSettingsSchema = z.object({
+  enabled: z.literal(true),
+  active: vllmManagedEndpointSchema.extend({
+    activatedAt: timestampSchema.nullable(),
+  }).strict(),
+  candidate: vllmManagedEndpointSchema.extend({
+    testStatus: z.enum(["not_run", "passed", "failed", "timeout"]),
+    testedAt: timestampSchema.nullable(),
+  }).strict().nullable(),
+  allowedCidrs: z.array(z.string().min(1)).min(1),
+  settingsMutable: z.boolean(),
+  modelMutable: z.literal(false),
+}).strict();
+export type VllmSettings = z.infer<typeof vllmSettingsSchema>;
+
 export const capabilityCheckSchema = z.object({
   name: z.string(),
   status: z.enum(["passed", "failed", "not_run"]),
@@ -88,6 +110,15 @@ export const vllmCapabilityResultSchema = z.object({
   checks: z.array(capabilityCheckSchema),
 }).strict();
 export type VllmCapabilityResult = z.infer<typeof vllmCapabilityResultSchema>;
+export const vllmCandidateTestResultSchema = z.object({
+  settings: vllmSettingsSchema,
+  capability: vllmCapabilityResultSchema,
+}).strict();
+export type VllmCandidateTestResult = z.infer<typeof vllmCandidateTestResultSchema>;
+export const vllmCandidateActivationResultSchema = vllmCandidateTestResultSchema.extend({
+  activated: z.boolean(),
+}).strict();
+export type VllmCandidateActivationResult = z.infer<typeof vllmCandidateActivationResultSchema>;
 export type VllmScenario = "success" | "incompatible" | "unreachable" | "timeout";
 
 export const c2ProviderIdSchema = z.enum(["none", "tuoni", "sliver"]);
@@ -201,6 +232,15 @@ export const missionDraftSchema = z.object({
 }).strict();
 export type MissionDraft = z.infer<typeof missionDraftSchema>;
 
+export const missionStateSchema = z.object({
+  missionId: z.string().min(1),
+  missionRevision: z.number().int().positive(),
+  missionStateVersion: z.number().int().nonnegative(),
+  authorizationEpoch: z.number().int().nonnegative(),
+  state: z.enum(["DRAFT", "VALIDATED", "RUNNING", "PAUSED", "FINALIZING", "WAITING_HUMAN_REVIEW", "COMPLETED", "COMPLETED_WITH_UNRESOLVED_ITEMS", "FAILED", "ABORTED"]),
+}).strict();
+export type MissionState = z.infer<typeof missionStateSchema>;
+
 export const knowledgeNodeSchema = z.object({
   id: z.string(),
   label: z.string(),
@@ -271,20 +311,35 @@ export type Dashboard = z.infer<typeof dashboardSchema>;
 
 export const providerStatusSchema = z.object({
   mode: z.literal("live"),
+  runtime: z.object({
+    productionEligible: z.literal(false),
+    missionExecutionEnabled: z.literal(false),
+    tpmKeyProviderAttested: z.literal(false),
+    blockers: z.array(z.string()),
+  }).strict().optional(),
   tuoni: z.object({ edition: z.literal("commercial"), version: z.string(), access: z.string() }).strict(),
   sliver: z.object({
     version: z.literal("1.7.7"),
     operator: z.literal("joe"),
-    operatorConfigLocation: z.literal("downloads"),
+    operatorConfigLocation: z.enum(["downloads", "systemd_credential"]),
     operatorAccess: z.string(),
     implantTransport: z.literal("http"),
     beaconPresent: z.boolean(),
+    credentialPresent: z.boolean().optional(),
+    identityAttested: z.literal(false).optional(),
+    productionEligible: z.literal(false).optional(),
+    blockers: z.array(z.string()).optional(),
   }).strict(),
   impacket: z.object({
     installed: z.boolean(),
     version: z.string().nullable(),
     server: z.string(),
     operations: z.array(z.string()),
+    executablePresent: z.boolean().optional(),
+    allowedTargets: z.array(z.string()).optional(),
+    sandboxAttested: z.literal(false).optional(),
+    productionEligible: z.literal(false).optional(),
+    blockers: z.array(z.string()).optional(),
   }).strict(),
   latestDraft: z.object({
     draftId: z.string().min(1),
@@ -294,25 +349,190 @@ export const providerStatusSchema = z.object({
 }).strict();
 export type ProviderStatus = z.infer<typeof providerStatusSchema>;
 
+export const adAssessmentCategorySchema = z.enum([
+  "privileged_access_configuration",
+  "kerberos_service_account_configuration",
+  "kerberos_preauth_configuration",
+  "adcs_esc_configuration",
+  "delegation_configuration",
+]);
+const adAssessmentStatusSchema = z.enum([
+  "misconfiguration_detected",
+  "no_misconfiguration_detected",
+  "indeterminate",
+]);
+const adAssessmentFindingSchema = z.object({
+  rule_id: z.string().regex(/^AD-[A-Z0-9-]+$/),
+  category: adAssessmentCategorySchema,
+  severity: z.enum(["low", "medium", "high", "critical"]),
+  title: z.string().min(1),
+  affected_object_count: z.number().int().positive(),
+  evidence_artifact_ids: z.array(z.string().min(1)),
+}).strict();
+export const adAssessmentCatalogSchema = z.object({
+  catalogRevision: z.literal("ad-assessment-readonly-v1"),
+  mode: z.literal("read_only_configuration_assessment"),
+  plannerRole: z.literal("select_next_registered_inspection"),
+  evaluationRole: z.literal("classify_all_five_then_verify_consensus"),
+  decisionAuthority: z.literal("deterministic_verifier"),
+  liveCollectorStatus: z.enum(["attached", "not_attached"]),
+  simulatorStatus: z.literal("ready"),
+  prohibitedActions: z.array(z.string().min(1)).min(1),
+  operations: z.array(z.object({
+    id: z.string().regex(/^ad\.audit\.[a-z0-9_.-]+$/),
+    category: adAssessmentCategorySchema,
+    title: z.string().min(1),
+    description: z.string().min(1),
+    readOnly: z.literal(true),
+    llmSelectable: z.literal(true),
+    evidenceField: z.enum(["privileged_access", "kerberos_service_accounts", "kerberos_preauth", "adcs", "delegation"]),
+  }).strict()).length(5),
+}).strict();
+export type ADAssessmentCatalog = z.infer<typeof adAssessmentCatalogSchema>;
+
+export const adAssessmentResultSchema = z.object({
+  result_id: z.string().min(1),
+  snapshot_id: z.string().min(1),
+  domain_ref: z.string().min(1),
+  evidence_source_type: z.literal("simulator"),
+  decision_authority: z.literal("deterministic_verifier"),
+  evaluated_at: timestampSchema,
+  checks: z.array(z.object({
+    operation_id: z.string().regex(/^ad\.audit\.[a-z0-9_.-]+$/),
+    category: adAssessmentCategorySchema,
+    status: adAssessmentStatusSchema,
+    reason_codes: z.array(z.string().min(1)),
+    finding_rule_ids: z.array(z.string().min(1)),
+  }).strict()).length(5),
+  findings: z.array(adAssessmentFindingSchema),
+}).strict();
+export type ADAssessmentResult = z.infer<typeof adAssessmentResultSchema>;
+
+export const adAssessmentConsensusResultSchema = z.object({
+  result_id: z.string().min(1),
+  snapshot_id: z.string().min(1),
+  domain_ref: z.string().min(1),
+  evidence_source_type: z.enum(["simulator", "verified_ldap_snapshot"]),
+  evaluation_mode: z.literal("local_llm_plus_deterministic_verifier"),
+  status: z.enum(["completed", "blocked"]),
+  decision_authority: z.literal("deterministic_verifier"),
+  output_schema: z.literal("planner_output"),
+  evaluated_at: timestampSchema,
+  category_results: z.array(z.object({
+    operation_id: z.string().regex(/^ad\.audit\.[a-z0-9_.-]+$/),
+    category: adAssessmentCategorySchema,
+    llm_status: adAssessmentStatusSchema,
+    verifier_status: adAssessmentStatusSchema,
+    consensus: z.enum(["agreed", "disagreed"]),
+    verified_rule_ids: z.array(z.string().min(1)),
+  }).strict()).length(5),
+  findings: z.array(adAssessmentFindingSchema),
+}).strict().superRefine((value, context) => {
+  const categories = new Set(value.category_results.map((item) => item.category));
+  const valid = value.category_results.every((item) => (
+    item.consensus === (item.llm_status === item.verifier_status ? "agreed" : "disagreed")
+  ));
+  const complete = valid && categories.size === 5 && value.category_results.every((item) => (
+    item.consensus === "agreed" && item.verifier_status !== "indeterminate"
+  ));
+  if (!valid || (value.status === "completed") !== complete) {
+    context.addIssue({ code: "custom", message: "assessment consensus is inconsistent" });
+  }
+});
+export type ADAssessmentConsensusResult = z.infer<typeof adAssessmentConsensusResultSchema>;
+
+export const adAssessmentRecommendationSchema = z.object({
+  operation_id: z.string().regex(/^ad\.audit\.[a-z0-9_.-]+$/),
+  category: adAssessmentCategorySchema,
+  title: z.string().min(1),
+  description: z.string().min(1),
+  output_schema: z.literal("planner_output"),
+  authority: z.literal("recommendation_only"),
+  candidate_count: z.number().int().min(1).max(5),
+  generated_at: timestampSchema,
+}).strict();
+export type ADAssessmentRecommendation = z.infer<typeof adAssessmentRecommendationSchema>;
+
+export const executionReadinessSchema = z.object({
+  status: z.enum(["ready", "blocked"]),
+  stage: z.string().min(1),
+  summary: z.string().min(1),
+  blockerCount: z.number().int().nonnegative(),
+  blockers: z.array(z.object({
+    id: z.string().min(1),
+    category: z.string().min(1),
+    title: z.string().min(1),
+    detail: z.string().min(1),
+    resolution: z.string().min(1),
+  }).strict()),
+  checks: z.array(z.object({
+    id: z.string().min(1),
+    title: z.string().min(1),
+    detail: z.string().min(1),
+  }).strict()),
+}).strict().superRefine((value, context) => {
+  if (value.blockerCount !== value.blockers.length) {
+    context.addIssue({ code: "custom", message: "blocker count does not match the blocker list" });
+  }
+  if ((value.status === "ready") !== (value.blockerCount === 0)) {
+    context.addIssue({ code: "custom", message: "readiness status does not match the blocker list" });
+  }
+});
+export type ExecutionReadiness = z.infer<typeof executionReadinessSchema>;
+
 export const healthSchema = z.object({
   status: z.literal("healthy"),
   mode: z.literal("live"),
   database: z.literal("connected"),
   approvalActionsEnabled: z.boolean(),
+  missionActionsEnabled: z.boolean(),
+  missionExecutionEnabled: z.boolean(),
   vllmChecksEnabled: z.boolean(),
+  adAssessmentReasoningEnabled: z.boolean(),
+  adAssessmentEvaluationEnabled: z.boolean(),
+  adAssessmentCollectorEnabled: z.boolean(),
 }).strict();
 export type Health = z.infer<typeof healthSchema>;
 
+export const operatorSessionSchema = z.discriminatedUnion("authenticated", [
+  z.object({
+    authenticated: z.literal(true),
+    principalId: z.string().min(1),
+    expiresAt: timestampSchema.nullable(),
+  }).strict(),
+  z.object({
+    authenticated: z.literal(false),
+    principalId: z.null(),
+    expiresAt: z.null(),
+  }).strict(),
+]);
+export type OperatorSession = z.infer<typeof operatorSessionSchema>;
+
 export interface FrontendGateway {
+  getOperatorSession(): Promise<OperatorSession>;
+  loginOperator(token: string): Promise<OperatorSession>;
+  logoutOperator(): Promise<OperatorSession>;
   testVllmConnection(config: VllmConfig, scenario?: VllmScenario): Promise<VllmCapabilityResult>;
   getVllmConfiguration(): Promise<ManagedVllmConfig>;
+  getVllmSettings(): Promise<VllmSettings>;
+  stageVllmCandidate(baseUrl: string, apiKey: string): Promise<VllmSettings>;
+  testVllmCandidate(version: number, scenario?: VllmScenario): Promise<VllmCandidateTestResult>;
+  activateVllmCandidate(version: number): Promise<VllmCandidateActivationResult>;
   getHealth(): Promise<Health>;
   getDashboard(): Promise<Dashboard>;
   getProviderStatus(): Promise<ProviderStatus>;
+  getADAssessmentCatalog(): Promise<ADAssessmentCatalog>;
+  runADAssessmentSimulation(): Promise<ADAssessmentResult>;
+  runCompleteADAssessment(): Promise<ADAssessmentConsensusResult>;
+  runLiveADAssessment(): Promise<ADAssessmentConsensusResult>;
+  recommendADAssessment(): Promise<ADAssessmentRecommendation>;
+  getExecutionReadiness(): Promise<ExecutionReadiness>;
   getInterventions(): Promise<Intervention[]>;
   resolveApproval(id: string, decision: "approved" | "rejected", presentationDigest: string): Promise<Intervention>;
   selectCandidate(id: string, candidateId: string): Promise<Intervention>;
   saveMissionDraft(draft: MissionDraft): Promise<{ draftId: string; savedAt: string }>;
+  createMission(draftId: string): Promise<MissionState>;
+  transitionMission(missionId: string, expectedVersion: number, action: "validate" | "start" | "pause" | "resume" | "finalize" | "complete" | "abort"): Promise<MissionState>;
   getKnowledgeGraph(): Promise<KnowledgeGraph>;
   getPhaseProgress(): Promise<AttackPhaseProgress[]>;
   getAgentActivity(): Promise<AgentActivity | null>;

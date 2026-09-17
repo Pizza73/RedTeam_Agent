@@ -30,6 +30,8 @@
 | [docs/development/phase-5.md](docs/development/phase-5.md) | Phase 5 MCP Adapter のProtocol Pin・オフライン実装・Activation Blocker |
 | [docs/development/phase-5-impacket-mcp.md](docs/development/phase-5-impacket-mcp.md) | Impacket MCP Server の固定Tool、Target / Secret境界、導入・Activation条件 |
 | [docs/development/ui-integration.md](docs/development/ui-integration.md) | Operator UI統合、同一Origin API、管理範囲、起動・検証手順 |
+| [docs/development/kali-product.md](docs/development/kali-product.md) | Kaliローカル製品構成、systemd hardening、Credential、実環境待ちGate |
+| [docs/development/ad-assessment.md](docs/development/ad-assessment.md) | AD設定監査、固定LDAPS Collector、LLM候補制約、決定論的判定 |
 
 設計改訂は`system-design-v1-r3` / `ai-control-v1-r3`。
 AIの意味・判断は別冊を先に読み、安全基盤と接続Schemaは正本で確認する。
@@ -113,7 +115,7 @@ Composition、状態付きTest Doubleによる全操作Scenarioも実装し、�
 SliverはTuoniを置き換えず第2 Providerとして追加した。公式v1.7.7 / Source Commitを固定し、HTTP Beaconを対象に、
 Version、Session / Beacon Inventory、既存Beacon TaskのRead / Cancelだけを許可する。Operator `.cfg`はone-shot gRPC/mTLS
 Workerだけがsystemd credentialから読み、Payload生成、Listener作成、Shell、Upload、Injection、Pivotは契約外である。
-現在はOperator設定の正確な絶対パス、Server Identity、実HTTP BeaconがないためActivationしない。詳細は
+Operator設定はsystemd credentialの固定pathへ移し、Server Identityと実HTTP BeaconがないためActivationしない。詳細は
 [Sliver開発記録](docs/development/phase-4-sliver.md)を参照する。
 
 ## Phase 5 MCP Adapter（オフライン実装完了）
@@ -127,20 +129,32 @@ Authentication / Share List / RPC Endpoint Mapだけを公開するone-shot stdi
 [Phase 5開発記録](docs/development/phase-5.md)と
 [Impacket MCP開発記録](docs/development/phase-5-impacket-mcp.md)を参照する。
 
-## Operator UI（オフライン統合完了）
+## Operator UI / Kaliローカル構成
 
 指定された`nathanhoma/RedTeam_Agent`のOperator Consoleを`frontend/`へ取り込み、Mock本番表示を同一Originの
-ローカルControl Plane APIへ置き換えた。実Mission / Approval / Knowledge状態の表示、非権威Mission Draft、Tuoni Commercial / Sliverと
+ローカルControl Plane APIへ置き換えた。実Mission / Approval / Knowledge状態の表示、認証済みowner serviceによるMission作成・検証・
+状態遷移、Tuoni Commercial / Sliverと
 4つのImpacket MCP操作に限定したProvider Policy Draftを管理できる。Approval writeは既存の信頼済みOwner Serviceを注入した
-構成でだけ有効にする。VLLM Settingsはサーバ起動時に署名済みManifest、固定Tokenizer、Secret-fileと許可Endpointを指定した場合、
-Phase 2と同じAttestation / Capability Gatewayを実行する。実C2 / vCenter / Targetへの接続やProduction Activationは行わない。
+構成でだけ有効にする。長期UI tokenはHttpOnlyの再起動時失効sessionへ交換し、ブラウザやDBへ保存しない。
+VLLM Settingsは署名済みManifest、固定Tokenizer、固定モデルIdentityを維持しながら、配備時の許可CIDR内で接続先と
+API keyを候補登録・試験・有効化できる。keyはブラウザへ戻さずservice-owned `0600`ファイルに保存し、候補がPhase 2と
+同じAttestation / Capability Gatewayを完走した場合だけactive設定と証跡を交換する。実C2 / vCenter / Targetへの接続やProduction Activationは行わない。
+
+AD Assessmentタブでは、特権設定、KerberosのSPNアカウント/事前認証、AD CS ESC1〜ESC8、Delegationを
+読み取り専用の設定監査として扱う。Local LLM Plannerは登録済みの次の検査候補の選択に加えて、5領域すべてを
+有限の状態候補で分類する。全分類が独立したVerifierと一致し、Evidence欠落がない場合だけ評価完了となり、検出結果は
+型付きEvidenceに対する決定論的Ruleだけが確定する。Simulator、厳密なVerifier、LLM Consensus API/UIに加え、固定IPv4・
+証明書検証済みLDAPSと固定Certipy列挙による実環境Collectorを接続した。現在指定済みの`10.0.10.212`はWS01でTCP 636が到達不能なため、実DC IPv4と発行CAの設定待ちである。Ticket取得、Crack、証明書Enrollment/認証、Delegation悪用、Directory変更は
+この機能の契約外である。詳細は[AD設定監査記録](docs/development/ad-assessment.md)を参照する。
 
 ```sh
 cd frontend
 npm ci
 npm run build
 cd ..
-.venv/bin/redteam-ui --database /absolute/path/to/redteam-agent.db
+.venv/bin/redteam-ui \
+  --database /absolute/path/to/redteam-agent.db \
+  --operator-token-file /absolute/private/path/ui-operator.token
 ```
 
 現在の閉域LLMをUIからCapability Checkする場合は次の固定構成で起動する。APIキー値は引数やブラウザへ渡さない。
@@ -148,6 +162,7 @@ cd ..
 ```sh
 .venv/bin/redteam-ui \
   --database /absolute/path/to/redteam-agent.db \
+  --operator-token-file /absolute/private/path/ui-operator.token \
   --vllm-base-url http://10.0.6.181:8100/v1 \
   --vllm-model gemma-4-31B-it \
   --vllm-api-key-file /absolute/path/to/vllm-api.key \
@@ -158,6 +173,192 @@ cd ..
 
 `http://127.0.0.1:18000/dashboard`で開く。詳細は[UI統合記録](docs/development/ui-integration.md)と
 [UI操作ガイド](frontend/UI_GUIDE.md)を参照する。
+
+Kali向けの統合入口は、秘密値を含まない固定設定で起動する。
+
+```sh
+.venv/bin/redteam-product --config deployment/kali/product.json
+```
+
+### 別環境へのsystemd配備
+
+この手順は、RedTeam Agentを別のKali LinuxまたはsystemdベースのLinuxへ配置し、1台のControl VM上で
+loopback UIとして管理する場合を対象とする。`LoadCredentialEncrypted=`を使用するためsystemd 250以上が必要で、
+Python 3.12以上、SQLite、LLMサーバへの閉域到達性が必要である。Node.js/npmはFrontendを配備先でbuildする場合だけ必要となる。
+
+この製品構成は`productionEligible=false`であり、systemdで正常起動してもMissionの`start`/`resume`は有効にならない。
+live Beacon、TPM-backed key provider、Phase 5 worker sandboxなどのActivation Gateを満たしたことにはならない。
+
+#### 1. Buildと配置
+
+リポジトリを取得した一般ユーザーでPython/Frontendを検証・buildし、その成果物だけをroot所有領域へ配置する。
+
+```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.lock
+.venv/bin/python -m pip install . --no-build-isolation
+
+cd frontend
+npm ci
+npm run build
+cd ..
+
+sudo useradd --system --home-dir /var/lib/redteam-agent --shell /usr/sbin/nologin redteam-agent
+sudo install -d -o root -g root -m 0755 /opt/redteam-agent /opt/redteam-agent/frontend
+sudo python3 -m venv /opt/redteam-agent/venv
+sudo /opt/redteam-agent/venv/bin/python -m pip install -r requirements.lock
+sudo /opt/redteam-agent/venv/bin/python -m pip install . --no-build-isolation
+sudo cp -a frontend/dist /opt/redteam-agent/frontend/
+sudo chown -R root:root /opt/redteam-agent
+sudo chmod -R go-w /opt/redteam-agent
+```
+
+`redteam-agent`ユーザーが既に存在する場合、`useradd`は実行しない。Python packageをwheelとして配布する運用では、
+配備先でsource treeから`pip install .`する代わりに、検証済みwheelと固定依存を同じvenvへinstallする。
+
+#### 2. 公開設定とLLM artifact
+
+sample設定をコピーし、配備先固有値を編集する。JSONへAPI key、password、Sliver/Tuoni credentialを記載してはいけない。
+
+```sh
+sudo install -d -o root -g root -m 0755 /etc/redteam-agent
+sudo install -o root -g root -m 0644 deployment/kali/product.json /etc/redteam-agent/product.json
+sudoedit /etc/redteam-agent/product.json
+
+sudo install -o root -g root -m 0644 /path/to/gemma-4-31b.manifest.json /etc/redteam-agent/gemma-4-31b.manifest.json
+sudo install -o root -g root -m 0644 /path/to/attestation-signing-public.pem /etc/redteam-agent/attestation-signing-public.pem
+sudo install -d -o root -g root -m 0755 /opt/redteam-agent/gemma-4-31b-tokenizer
+sudo cp -a /path/to/gemma-4-31b-tokenizer/. /opt/redteam-agent/gemma-4-31b-tokenizer/
+sudo chown -R root:root /opt/redteam-agent/gemma-4-31b-tokenizer
+sudo chmod -R go-w /opt/redteam-agent/gemma-4-31b-tokenizer
+```
+
+主な設定項目は次のとおり。
+
+| 項目 | 設定内容 |
+| --- | --- |
+| `databasePath` | `/var/lib/redteam-agent/redteam-agent.db`を推奨。`StateDirectory=redteam-agent`が親directoryを作成する |
+| `staticDirectory` | build済みFrontendの絶対path。標準Unitでは`/opt/redteam-agent/frontend/dist` |
+| `uiHost` / `uiPort` | `127.0.0.1:18000`を推奨。現行schemaは外部interfaceへのbindを拒否する |
+| `vllmAllowedCidrs` | UIから登録を許可するLLMサーバのIPv4 CIDR。必要最小限にする |
+| `vllmSettingsDirectory` | UIで有効化した接続先とservice-owned keyを保存するdirectory。標準は`/var/lib/redteam-agent/llm-settings` |
+| `adCollectorEnabled` | 実DCを評価する場合だけ`true`。未準備なら`false` |
+| `adCollectorServerIp` / `adCollectorDomain` | 実DCの固定IPv4とAD domain。DC以外のWindows端末を指定しない |
+| `adCollectorTlsCaFile` | LDAPS発行CAのPEM絶対path。OS trust storeを使う場合だけ`null` |
+| `approvedSessionRefs` | live C2 inventoryで確認済みのexact session referenceだけを登録する |
+
+現行Revisionでは`vllmModel=gemma-4-31B-it`、初期`vllmBaseUrl=http://10.0.6.181:8100/v1`、
+`impacketAllowedTargets=10.0.10.212/32`、LDAPS port 636などが閉じた型として固定されている。
+別のLLM接続先は、`vllmAllowedCidrs`とsystemd egressを先に設定したうえで、初回起動後に
+`VLLM Settings`から候補登録・試験・有効化する。固定TargetやモデルIdentityを変更する場合はJSONだけを書き換えず、
+対応する境界model、signed manifest、test、systemd egressを更新して新しいbuildとして再受入する必要がある。
+
+#### 3. systemd encrypted credential
+
+標準UnitはUI token、初期vLLM API key、AD Collector credentialを暗号化credentialとして読み込む。
+平文staging directoryはrootだけが読めるようにし、UI tokenは暗号化前にpassword managerなどへ安全に保管する。
+`adCollectorEnabled=false`としてAD credentialを配備しない場合は、配備先用Unitから
+`LoadCredentialEncrypted=ad-collector-credential.json:...`の行も削除する。存在しないcredentialの参照を残すとserviceは起動に失敗する。
+
+```sh
+sudo install -d -o root -g root -m 0700 /root/redteam-agent-credential-input
+sudo install -d -o root -g root -m 0700 /etc/credstore.encrypted
+sudo sh -c 'umask 077; openssl rand -base64 48 > /root/redteam-agent-credential-input/ui-operator.token'
+sudoedit /root/redteam-agent-credential-input/vllm-api.key
+sudoedit /root/redteam-agent-credential-input/ad-collector-credential.json
+sudo chmod 0600 /root/redteam-agent-credential-input/*
+
+sudo systemd-creds encrypt --name=ui-operator.token \
+  /root/redteam-agent-credential-input/ui-operator.token \
+  /etc/credstore.encrypted/redteam-agent-ui-operator.credential
+sudo systemd-creds encrypt --name=vllm-api.key \
+  /root/redteam-agent-credential-input/vllm-api.key \
+  /etc/credstore.encrypted/redteam-agent-vllm-api-key.credential
+sudo systemd-creds encrypt --name=ad-collector-credential.json \
+  /root/redteam-agent-credential-input/ad-collector-credential.json \
+  /etc/credstore.encrypted/redteam-agent-ad-collector.credential
+```
+
+AD Collector credentialは次の3 fieldだけを持つ。専用の最小権限アカウントを使用する。
+
+```json
+{
+  "domain": "example.local",
+  "username": "ad-audit-reader",
+  "password": "REPLACE_IN_PRIVATE_STAGING_FILE"
+}
+```
+
+`systemd-creds encrypt`の出力は原則として暗号化したhost/TPMへbindされるため、別hostへそのままコピーしない。
+平文staging fileは暗号化credentialの起動確認後に安全に廃棄する。UIで後から登録したLLM API keyは
+`vllmSettingsDirectory`へmode `0600`で保存されるが、systemd encrypted credentialではないため、配備先diskの暗号化と
+root/service account保護を前提とする。
+
+SliverまたはTuoni credentialを渡す場合は、対応する暗号化credentialとdrop-inを追加する。
+
+```sh
+sudo install -d -o root -g root -m 0755 /etc/systemd/system/redteam-agent.service.d
+sudo install -o root -g root -m 0644 \
+  deployment/systemd/redteam-agent.service.d/sliver-operator.conf \
+  /etc/systemd/system/redteam-agent.service.d/sliver-operator.conf
+```
+
+Sliver用暗号化fileは`sliver-operator.cfg`というcredential名で
+`/etc/credstore.encrypted/redteam-agent-sliver-operator.credential`へ作成する。Tuoniを使用する場合も同様に
+`tuoni-credential.json`と`tuoni-credential.conf`を使用する。drop-inの存在だけではC2 identityやBeaconをAttested扱いにしない。
+
+#### 4. Unitのegress設定と起動
+
+標準Unitをコピーし、`IPAddressAllow=`を配備先へ合わせる。`product.json`の`vllmAllowedCidrs`はUnitで許可した
+LLM範囲と同じか、それより狭くする。AD Collectorは実DCの`/32`だけを許可し、`IPAddressDeny=any`を削除しない。
+
+```sh
+sudo install -o root -g root -m 0644 \
+  deployment/systemd/redteam-agent.service \
+  /etc/systemd/system/redteam-agent.service
+sudoedit /etc/systemd/system/redteam-agent.service
+sudo systemd-analyze verify /etc/systemd/system/redteam-agent.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now redteam-agent.service
+sudo systemctl status --no-pager redteam-agent.service
+```
+
+最低限、次の対応関係を維持する。
+
+| 用途 | `product.json` | systemd Unit |
+| --- | --- | --- |
+| UI | `uiHost=127.0.0.1` | `IPAddressAllow=localhost` |
+| LLM | `vllmAllowedCidrs` | 同じCIDRの`IPAddressAllow=` |
+| AD Collector | `adCollectorServerIp` | 同じIPv4 `/32`の`IPAddressAllow=` |
+
+起動後はhealthとlogを確認する。
+
+```sh
+curl --fail --silent --show-error http://127.0.0.1:18000/api/v1/health
+sudo journalctl -u redteam-agent.service --since today --no-pager
+```
+
+別端末からUIを使用する場合も外部bindへ変更せず、SSH port forwardingを使用する。
+
+```sh
+ssh -L 18000:127.0.0.1:18000 operator@CONTROL_VM_IP
+```
+
+接続後、ローカルブラウザで`http://127.0.0.1:18000`を開き、保管したUI tokenでloginする。
+LLMを変更する場合は`VLLM Settings`で`Register candidate`→`Test connection & capabilities`→
+`Activate candidate`の順に実行する。HTTP接続ではBearer keyがnetwork上で暗号化されないため、隔離network以外ではHTTPSを使用する。
+
+#### 5. 更新・backup・障害確認
+
+- 更新前に`/var/lib/redteam-agent/redteam-agent.db`と`/etc/redteam-agent`を停止状態でbackupする。
+- 新しいwheel/sourceと`frontend/dist`を配置後、`systemctl restart redteam-agent.service`で反映する。
+- `status=203/EXEC`は`ExecStart` pathまたは実行権限、起動直後の失敗は設定JSON、artifact path、credential名、file modeを確認する。
+- LLM候補だけ到達不能な場合、`vllmAllowedCidrs`、`IPAddressAllow=`、route/firewall、`/v1` pathを順に確認する。
+- Manifest、Tokenizer、runtime、model IDのどれかが一致しなければCapability Checkは意図的にfail-closedとなる。
+- `vllmSettingsDirectory`を別hostへ復元する場合は保存済み平文keyをコピーせず、新host上でAPI keyを再登録する。
+
+配備fileの詳細は[systemd Unit](deployment/systemd/redteam-agent.service)、
+[sample product.json](deployment/kali/product.json)、[Kali製品構成](docs/development/kali-product.md)を参照する。
 
 ## Phase 2 Local LLM（Capability / 300-Run Qualification）
 

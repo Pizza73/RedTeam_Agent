@@ -8,39 +8,126 @@ import mimetypes
 import re
 from dataclasses import dataclass
 from http import HTTPStatus
+from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
+from redteam_agent.ad_assessment.models import ADAssessmentSnapshot
 from redteam_agent.errors import AuthorizationKernelError
-from redteam_agent.ui.control_plane import UIConflictError, UIControlPlane, UIControlPlaneError
+from redteam_agent.ui.auth import (
+    DEFAULT_SESSION_TTL_SECONDS,
+    OperatorSessionAuthenticator,
+    UIAuthenticationError,
+    read_operator_token,
+)
+from redteam_agent.ui.control_plane import (
+    UIActionBlockedError,
+    UIConflictError,
+    UIControlPlane,
+    UIControlPlaneError,
+)
 from redteam_agent.ui.models import (
+    ADAssessmentCollectionInput,
+    ADAssessmentRecommendationInput,
     ApprovalDecisionInput,
     CandidateSelectionInput,
+    MissionCreateInput,
     MissionDraftInput,
+    MissionTransitionInput,
+    OperatorLoginInput,
     ProviderPolicyDraftInput,
+    VllmCandidateInput,
+    VllmCandidateVersionInput,
     VllmConfigInput,
 )
 
 _MAX_REQUEST_BYTES = 1_048_576
 _SAFE_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,200}$")
 _ALLOWED_HOSTS = frozenset({"127.0.0.1", "localhost", "[::1]"})
+_SESSION_COOKIE = "redteam_operator_session"
 
 
 @dataclass(frozen=True)
 class ApiResponse:
     status: int
     body: object
+    headers: tuple[tuple[str, str], ...] = ()
 
 
 class UIRouter:
-    def __init__(self, control_plane: UIControlPlane) -> None:
+    def __init__(
+        self,
+        control_plane: UIControlPlane,
+        authenticator: OperatorSessionAuthenticator | None = None,
+    ) -> None:
         self._control_plane = control_plane
+        self._authenticator = authenticator
 
-    def dispatch(self, *, method: str, path: str, body: bytes = b"") -> ApiResponse:
+    def dispatch(
+        self,
+        *,
+        method: str,
+        path: str,
+        body: bytes = b"",
+        session_id: str | None = None,
+    ) -> ApiResponse:
         if method == "GET" and path == "/api/v1/health":
             return ApiResponse(HTTPStatus.OK, self._control_plane.health())
+        if method == "GET" and path == "/api/v1/session":
+            if self._authenticator is None:
+                return ApiResponse(
+                    HTTPStatus.OK,
+                    {"authenticated": True, "principalId": "local-development", "expiresAt": None},
+                )
+            session = self._authenticator.authenticate(session_id)
+            if session is None:
+                return ApiResponse(
+                    HTTPStatus.OK,
+                    {"authenticated": False, "principalId": None, "expiresAt": None},
+                )
+            return ApiResponse(
+                HTTPStatus.OK,
+                {
+                    "authenticated": True,
+                    "principalId": session.principal_id,
+                    "expiresAt": session.expires_at.isoformat(),
+                },
+            )
+        if method == "POST" and path == "/api/v1/session":
+            if self._authenticator is None:
+                raise UIAuthenticationError("operator authentication is managed externally")
+            credentials = OperatorLoginInput.from_untrusted_json(body)
+            issued_id, session = self._authenticator.login(credentials.token)
+            cookie = (
+                f"{_SESSION_COOKIE}={issued_id}; Path=/; HttpOnly; SameSite=Strict; "
+                f"Max-Age={self._authenticator.session_ttl_seconds}"
+            )
+            return ApiResponse(
+                HTTPStatus.OK,
+                {
+                    "authenticated": True,
+                    "principalId": session.principal_id,
+                    "expiresAt": session.expires_at.isoformat(),
+                },
+                headers=(("Set-Cookie", cookie),),
+            )
+        if method == "DELETE" and path == "/api/v1/session":
+            if self._authenticator is not None:
+                self._authenticator.logout(session_id)
+            return ApiResponse(
+                HTTPStatus.OK,
+                {"authenticated": False, "principalId": None, "expiresAt": None},
+                headers=(
+                    (
+                        "Set-Cookie",
+                        f"{_SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0",
+                    ),
+                ),
+            )
+        if self._authenticator is not None and self._authenticator.authenticate(session_id) is None:
+            raise UIAuthenticationError("operator session is required")
         if method == "GET" and path == "/api/v1/dashboard":
             return ApiResponse(HTTPStatus.OK, self._control_plane.dashboard())
         if method == "GET" and path == "/api/v1/phases":
@@ -53,17 +140,65 @@ class UIRouter:
             return ApiResponse(HTTPStatus.OK, self._control_plane.knowledge())
         if method == "GET" and path == "/api/v1/providers":
             return ApiResponse(HTTPStatus.OK, self._control_plane.provider_status())
+        if method == "GET" and path == "/api/v1/readiness":
+            return ApiResponse(HTTPStatus.OK, self._control_plane.readiness())
+        if method == "GET" and path == "/api/v1/ad-assessment/catalog":
+            return ApiResponse(HTTPStatus.OK, self._control_plane.ad_assessment_catalog())
         if method == "GET" and path == "/api/v1/vllm/config":
             return ApiResponse(HTTPStatus.OK, self._control_plane.vllm_configuration())
+        if method == "GET" and path == "/api/v1/vllm/settings":
+            return ApiResponse(HTTPStatus.OK, self._control_plane.vllm_settings())
         if method == "POST" and path == "/api/v1/mission-drafts":
             mission_draft = MissionDraftInput.from_untrusted_json(body)
             return ApiResponse(HTTPStatus.CREATED, self._control_plane.save_mission_draft(mission_draft))
+        if method == "POST" and path == "/api/v1/missions":
+            create_request = MissionCreateInput.from_untrusted_json(body)
+            return ApiResponse(
+                HTTPStatus.CREATED,
+                self._control_plane.create_mission(draft_id=create_request.draftId),
+            )
         if method == "POST" and path == "/api/v1/provider-policy-drafts":
             provider_draft = ProviderPolicyDraftInput.from_untrusted_json(body)
             return ApiResponse(HTTPStatus.CREATED, self._control_plane.save_provider_policy_draft(provider_draft))
         if method == "POST" and path == "/api/v1/vllm/capability":
             config = VllmConfigInput.from_untrusted_json(body)
             return ApiResponse(HTTPStatus.OK, self._control_plane.check_vllm(config))
+        if method == "POST" and path == "/api/v1/vllm/candidate":
+            candidate_request = VllmCandidateInput.from_untrusted_json(body)
+            return ApiResponse(
+                HTTPStatus.CREATED,
+                self._control_plane.stage_vllm_candidate(candidate_request),
+            )
+        if method == "POST" and path == "/api/v1/vllm/candidate/test":
+            candidate_version = VllmCandidateVersionInput.from_untrusted_json(body)
+            return ApiResponse(
+                HTTPStatus.OK,
+                self._control_plane.test_vllm_candidate(expected_version=candidate_version.version),
+            )
+        if method == "POST" and path == "/api/v1/vllm/candidate/activate":
+            candidate_version = VllmCandidateVersionInput.from_untrusted_json(body)
+            return ApiResponse(
+                HTTPStatus.OK,
+                self._control_plane.activate_vllm_candidate(expected_version=candidate_version.version),
+            )
+        if method == "POST" and path == "/api/v1/ad-assessment/evaluate":
+            snapshot = ADAssessmentSnapshot.from_untrusted_json(body)
+            return ApiResponse(HTTPStatus.OK, self._control_plane.evaluate_ad_assessment(snapshot))
+        if method == "POST" and path == "/api/v1/ad-assessment/evaluate-with-llm":
+            snapshot = ADAssessmentSnapshot.from_untrusted_json(body)
+            return ApiResponse(
+                HTTPStatus.OK,
+                self._control_plane.evaluate_ad_assessment_with_llm(snapshot),
+            )
+        if method == "POST" and path == "/api/v1/ad-assessment/collect-and-evaluate":
+            ADAssessmentCollectionInput.from_untrusted_json(body)
+            return ApiResponse(
+                HTTPStatus.OK,
+                self._control_plane.collect_and_evaluate_ad_assessment(),
+            )
+        if method == "POST" and path == "/api/v1/ad-assessment/recommendation":
+            ADAssessmentRecommendationInput.from_untrusted_json(body)
+            return ApiResponse(HTTPStatus.OK, self._control_plane.recommend_ad_assessment())
         match = re.fullmatch(r"/api/v1/interventions/([^/]+)/decision", path)
         if method == "POST" and match is not None:
             request_id = unquote(match.group(1))
@@ -76,6 +211,20 @@ class UIRouter:
                     approval_request_id=request_id,
                     presentation_digest=decision.presentationDigest,
                     verdict=decision.decision,
+                ),
+            )
+        match = re.fullmatch(r"/api/v1/missions/([^/]+)/transitions", path)
+        if method == "POST" and match is not None:
+            mission_id = unquote(match.group(1))
+            if _SAFE_ID.fullmatch(mission_id) is None:
+                return ApiResponse(HTTPStatus.BAD_REQUEST, {"error": "invalid request", "code": "INVALID_ID"})
+            transition_request = MissionTransitionInput.from_untrusted_json(body)
+            return ApiResponse(
+                HTTPStatus.OK,
+                self._control_plane.transition_mission(
+                    mission_id=mission_id,
+                    expected_version=transition_request.expectedVersion,
+                    action=transition_request.action,
                 ),
             )
         match = re.fullmatch(r"/api/v1/interventions/([^/]+)/selection", path)
@@ -104,6 +253,9 @@ def build_handler(*, router: UIRouter, static_root: Path | None) -> type[BaseHTT
 
     class OperatorUIHandler(BaseHTTPRequestHandler):
         server_version = "RedTeamAgentUI/1"
+
+        def version_string(self) -> str:
+            return self.server_version
 
         def log_message(self, format: str, *args: Any) -> None:
             return
@@ -137,6 +289,16 @@ def build_handler(*, router: UIRouter, static_root: Path | None) -> type[BaseHTT
                 return
             path = urlsplit(self.path).path
             self._handle_api("POST", path)
+
+        def do_DELETE(self) -> None:
+            if not self._host_allowed():
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid host", "code": "INVALID_HOST"})
+                return
+            if not self._mutation_allowed():
+                self._send_json(HTTPStatus.FORBIDDEN, {"error": "same-origin proof required", "code": "CSRF"})
+                return
+            path = urlsplit(self.path).path
+            self._handle_api("DELETE", path)
 
         def do_OPTIONS(self) -> None:
             self._send_json(HTTPStatus.METHOD_NOT_ALLOWED, {"error": "cross-origin access denied", "code": "CORS"})
@@ -182,7 +344,26 @@ def build_handler(*, router: UIRouter, static_root: Path | None) -> type[BaseHTT
                     return
                 body = loaded
             try:
-                response = router.dispatch(method=method, path=path, body=body)
+                response = router.dispatch(
+                    method=method,
+                    path=path,
+                    body=body,
+                    session_id=self._session_id(),
+                )
+            except UIAuthenticationError:
+                response = ApiResponse(
+                    HTTPStatus.UNAUTHORIZED,
+                    {"error": "operator authentication required", "code": "UNAUTHENTICATED"},
+                )
+            except UIActionBlockedError as exc:
+                response = ApiResponse(
+                    HTTPStatus.CONFLICT,
+                    {
+                        "error": exc.user_message,
+                        "code": exc.code,
+                        "resolution": exc.resolution,
+                    },
+                )
             except UIConflictError:
                 response = ApiResponse(
                     HTTPStatus.CONFLICT,
@@ -198,14 +379,35 @@ def build_handler(*, router: UIRouter, static_root: Path | None) -> type[BaseHTT
                     HTTPStatus.BAD_REQUEST,
                     {"error": "request failed strict validation", "code": "INVALID_REQUEST"},
                 )
-            self._send_json(response.status, response.body)
+            self._send_json(response.status, response.body, headers=response.headers)
 
-        def _send_json(self, status: int, body: object) -> None:
+        def _session_id(self) -> str | None:
+            raw = self.headers.get("Cookie")
+            if raw is None or len(raw) > 4096:
+                return None
+            try:
+                cookies = SimpleCookie()
+                cookies.load(raw)
+            except CookieError:
+                return None
+            morsel = cookies.get(_SESSION_COOKIE)
+            return None if morsel is None else morsel.value
+
+        def _send_json(
+            self,
+            status: int,
+            body: object,
+            *,
+            headers: tuple[tuple[str, str], ...] = (),
+        ) -> None:
             payload = _json_bytes(body)
             self.send_response(status)
             self._security_headers()
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Cache-Control", "no-store")
+            self.send_header("Vary", "Cookie")
+            for name, value in headers:
+                self.send_header(name, value)
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
             if self.command != "HEAD":
@@ -241,9 +443,7 @@ def build_handler(*, router: UIRouter, static_root: Path | None) -> type[BaseHTT
             self.send_response(HTTPStatus.OK)
             self._security_headers()
             content_type = f"{media_type}; charset=utf-8" if media_type.startswith("text/") else media_type
-            cache_control = (
-                "no-store" if candidate.name == "index.html" else "public, max-age=31536000, immutable"
-            )
+            cache_control = "no-store" if candidate.name == "index.html" else "public, max-age=31536000, immutable"
             self.send_header("Content-Type", content_type)
             self.send_header("Cache-Control", cache_control)
             self.send_header("Content-Length", str(len(payload)))
@@ -266,11 +466,22 @@ def build_handler(*, router: UIRouter, static_root: Path | None) -> type[BaseHTT
 
 
 def build_server(
-    *, control_plane: UIControlPlane, host: str, port: int, static_root: Path | None
+    *,
+    control_plane: UIControlPlane,
+    host: str,
+    port: int,
+    static_root: Path | None,
+    authenticator: OperatorSessionAuthenticator | None = None,
 ) -> ThreadingHTTPServer:
     if host not in {"127.0.0.1", "localhost"}:
         raise ValueError("operator UI may bind only to loopback")
-    return ThreadingHTTPServer((host, port), build_handler(router=UIRouter(control_plane), static_root=static_root))
+    return ThreadingHTTPServer(
+        (host, port),
+        build_handler(
+            router=UIRouter(control_plane, authenticator=authenticator),
+            static_root=static_root,
+        ),
+    )
 
 
 def main() -> int:
@@ -280,6 +491,14 @@ def main() -> int:
     parser.add_argument("--port", default=18000, type=int)
     parser.add_argument("--static-dir", default="frontend/dist", help="Built frontend directory")
     parser.add_argument("--api-only", action="store_true", help="Serve only the JSON API")
+    parser.add_argument(
+        "--operator-token-file",
+        type=Path,
+        help="Owner-private operator token file; required unless unsafe development mode is explicit",
+    )
+    parser.add_argument("--operator-principal", default="redteam-operator")
+    parser.add_argument("--operator-session-ttl", type=int, default=DEFAULT_SESSION_TTL_SECONDS)
+    parser.add_argument("--unsafe-disable-auth", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--vllm-base-url", help="Enable the trusted Phase 2 vLLM gateway at this URL")
     parser.add_argument("--vllm-model", default="gemma-4-31B-it")
     parser.add_argument("--vllm-api-key-file", type=Path)
@@ -296,6 +515,20 @@ def main() -> int:
     args = parser.parse_args()
     if not 1 <= args.port <= 65535:
         parser.error("port must be between 1 and 65535")
+    if args.unsafe_disable_auth and args.operator_token_file is not None:
+        parser.error("--unsafe-disable-auth cannot be combined with --operator-token-file")
+    if not args.unsafe_disable_auth and args.operator_token_file is None:
+        parser.error("--operator-token-file is required")
+    authenticator = None
+    if args.operator_token_file is not None:
+        try:
+            authenticator = OperatorSessionAuthenticator(
+                principal_id=args.operator_principal,
+                operator_token=read_operator_token(args.operator_token_file),
+                session_ttl_seconds=args.operator_session_ttl,
+            )
+        except (UIAuthenticationError, ValueError) as exc:
+            parser.error(f"invalid operator authentication configuration: {type(exc).__name__}")
     vllm_port = None
     vllm_public_config = None
     if args.vllm_base_url is not None:
@@ -340,7 +573,13 @@ def main() -> int:
         vllm_public_config=vllm_public_config,
     )
     static_root = None if args.api_only else Path(args.static_dir)
-    server = build_server(control_plane=control_plane, host=args.host, port=args.port, static_root=static_root)
+    server = build_server(
+        control_plane=control_plane,
+        host=args.host,
+        port=args.port,
+        static_root=static_root,
+        authenticator=authenticator,
+    )
     try:
         server.serve_forever()
     except KeyboardInterrupt:

@@ -1,12 +1,12 @@
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { AlertTriangle, Check, Database, LockKeyhole, RadioTower, Save, ShieldAlert, TerminalSquare } from "lucide-react";
+import { AlertTriangle, BrainCircuit, Check, Database, LockKeyhole, Play, RadioTower, Save, ShieldAlert, TerminalSquare } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { Badge, Button, PageHeader } from "../components/ui";
 import { gateway, gatewayMode } from "../gateway";
 import { formatUtcTime } from "../lib/time";
 import { providerPolicyDraftSchema, type C2ProviderId, type ProviderPolicyDraft, type ToolPolicyState } from "../types";
 
-type PolicyTab = "c2" | "tools" | "review";
+type PolicyTab = "c2" | "tools" | "assessment" | "review";
 
 const c2Options: Record<C2ProviderId, { label: string; description: string; registryReference: string | null }> = {
   none: { label: "No C2 adapter", description: "C2 session and task routing is disabled for this Mission revision.", registryReference: null },
@@ -33,6 +33,7 @@ export function ToolProviderPage() {
   const [draft, setDraft] = useState<ProviderPolicyDraft>(initialDraft);
   const [validationError, setValidationError] = useState("");
   const { data: status } = useQuery({ queryKey: ["provider-status"], queryFn: () => gateway.getProviderStatus() });
+  const { data: assessmentCatalog } = useQuery({ queryKey: ["ad-assessment-catalog"], queryFn: () => gateway.getADAssessmentCatalog() });
   const { data: dashboard } = useQuery({ queryKey: ["dashboard"], queryFn: () => gateway.getDashboard() });
   useEffect(() => {
     const loaded = status?.latestDraft?.draft ?? initialDraft;
@@ -48,6 +49,10 @@ export function ToolProviderPage() {
     onMutate: () => setValidationError(""),
     onError: (error: Error) => setValidationError(error.message),
   });
+  const assessmentSimulation = useMutation({ mutationFn: () => gateway.runADAssessmentSimulation() });
+  const completeAssessment = useMutation({ mutationFn: () => gateway.runCompleteADAssessment() });
+  const liveAssessment = useMutation({ mutationFn: () => gateway.runLiveADAssessment() });
+  const assessmentRecommendation = useMutation({ mutationFn: () => gateway.recommendADAssessment() });
 
   const selectedC2 = c2Options[draft.c2.providerId];
   const operationCounts = useMemo(() => ({
@@ -74,11 +79,13 @@ export function ToolProviderPage() {
     <div className="page-content provider-policy-page">
       <PageHeader eyebrow={`MISSION POLICY · REVISION ${draft.missionRevision}`} title="C2 and tool access policy" description="Manage Tuoni, Sliver, and the Phase 5 Impacket MCP allowlist. Saving a draft never authorizes execution." actions={<Badge tone={gatewayMode === "live" ? "green" : "amber"}>{gatewayMode === "live" ? "LIVE CONTROL" : "MOCK MODE"}</Badge>} />
       <div className="inline-alert provider-principle"><ShieldAlert size={16}/><span><b>Provider access is not execution authorization.</b> Arbitrary commands, unrestricted arguments, payload generation, credential dumping, and native C2 commands remain unavailable.</span></div>
+      {status?.runtime && <div className="inline-alert"><AlertTriangle size={16}/><span><b>Mission execution is fail-closed.</b> {status.runtime.blockers.join(" ")}</span></div>}
 
       <section className="panel provider-policy-shell">
         <div className="provider-tabs" role="tablist" aria-label="Provider policy sections">
           <button type="button" role="tab" aria-selected={tab === "c2"} onClick={() => setTab("c2")}>C2 Selection</button>
           <button type="button" role="tab" aria-selected={tab === "tools"} onClick={() => setTab("tools")}>Tools (MCP) Control</button>
+          <button type="button" role="tab" aria-selected={tab === "assessment"} onClick={() => setTab("assessment")}>AD Assessment</button>
           <button type="button" role="tab" aria-selected={tab === "review"} onClick={() => setTab("review")}>Review Policy</button>
         </div>
 
@@ -97,6 +104,26 @@ export function ToolProviderPage() {
 
           <section className="registered-operations" aria-labelledby="operations-heading"><div className="section-title"><div><p className="eyebrow">TOOL REGISTRY</p><h2 id="operations-heading">Registered Impacket functions</h2></div><span className="operation-summary">{operationCounts.allowed} allowed · {operationCounts.approval} approval · {operationCounts.disabled} disabled</span></div><div className="tool-operation-list"><details className="tool-operation-group" data-tool="Impacket"><summary><div><h3>Impacket</h3><p>Purpose-specific SMB and RPC operations; the suite itself is never exposed.</p></div><span className="tool-summary-meta"><Badge tone="green">AVAILABLE</Badge><small>{operations.length} functions</small></span></summary><div>{operations.map((definition) => { const policy = draft.operations.find((operation) => operation.id === definition.id); return <article className="tool-function-row" key={definition.id}><div className="tool-function-title"><div><b>{definition.function}</b><span>via <code>{definition.id}</code></span></div><code>{definition.id}</code></div><div className="command-template"><span>MCP operation</span><code>{definition.id}(target_ref=&lt;approved-target-ref&gt;)</code><small>References are resolved by the trusted adapter; values are not free-form commands.</small></div><dl className="tool-function-details"><div><dt>Required inputs</dt><dd>{definition.inputs}</dd></div><div><dt>Produces</dt><dd>{definition.output}</dd></div><div><dt>Safety constraint</dt><dd>{definition.constraint}</dd></div></dl><label className="operation-policy-field"><span>Policy state</span><select aria-label={`Policy for ${definition.function}`} value={policy?.state} onChange={(event) => updateOperation(definition.id, event.target.value as ToolPolicyState)}><option value="allowed">Allowed</option><option value="approval_required">Approval required</option><option value="disabled">Disabled</option></select></label></article>; })}</div></details></div></section>
           <div className="offline-note"><Database size={17}/><div><b>Closed allowlist</b><p>secretsdump, service execution, arbitrary flags, uploads, and deletes are not registered and cannot be selected here.</p></div></div>
+        </div>}
+
+        {tab === "assessment" && <div className="provider-tab-panel" role="tabpanel">
+          <div className="provider-card-heading"><div className="provider-icon"><BrainCircuit size={18}/></div><div><p className="eyebrow">LOCAL LLM · READ-ONLY REASONING</p><h2>Active Directory configuration assessment</h2><p>The local LLM classifies all five configuration areas. The result completes only when every classification agrees with deterministic verification.</p></div><Badge tone={assessmentCatalog?.liveCollectorStatus === "attached" ? "green" : "amber"}>{assessmentCatalog?.liveCollectorStatus === "attached" ? "COLLECTOR ATTACHED" : "LIVE COLLECTOR REQUIRED"}</Badge></div>
+          <dl className="runtime-facts"><div><dt>Simulator</dt><dd>{assessmentCatalog?.simulatorStatus === "ready" ? "Ready" : "Loading"}</dd></div><div><dt>Live collector</dt><dd>{assessmentCatalog?.liveCollectorStatus === "attached" ? "Server-owned LDAPS" : "Not attached"}</dd></div><div><dt>LLM role</dt><dd>Five-area classification</dd></div><div><dt>Decision authority</dt><dd>Deterministic verifier</dd></div></dl>
+          <section className="registered-operations" aria-labelledby="ad-assessment-heading"><div className="section-title"><div><p className="eyebrow">CLOSED ASSESSMENT CATALOG</p><h2 id="ad-assessment-heading">Configuration checks</h2></div><span className="operation-summary">{assessmentCatalog?.operations.length ?? 5} read-only checks</span></div><div className="tool-operation-list"><details className="tool-operation-group" open><summary><div><h3>Active Directory</h3><p>Normalized configuration evidence only; no credential material is collected.</p></div><span className="tool-summary-meta"><Badge tone="green">SIMULATOR READY</Badge><small>LLM selectable</small></span></summary><div>{assessmentCatalog?.operations.map((operation) => <article className="tool-function-row" key={operation.id}><div className="tool-function-title"><div><b>{operation.title}</b><span>{operation.description}</span></div><code>{operation.id}</code></div><dl className="tool-function-details"><div><dt>Evidence</dt><dd>{operation.evidenceField}</dd></div><div><dt>Execution mode</dt><dd>Read-only configuration inspection</dd></div><div><dt>Finding authority</dt><dd>Deterministic rule match</dd></div></dl></article>)}</div></details></div></section>
+          <div className="provider-actions"><span>Connects only to the server-owned DC over certificate-validated LDAPS and runs fixed read-only searches.</span><Button onClick={() => liveAssessment.mutate()} disabled={liveAssessment.isPending || assessmentCatalog?.liveCollectorStatus !== "attached"}><Database size={15}/>{liveAssessment.isPending ? "Collecting and evaluating AD" : "Collect and evaluate live AD"}</Button></div>
+          {liveAssessment.isSuccess && <div className={`inline-alert ${liveAssessment.data.status === "completed" ? "success" : "error"}`} role="status">{liveAssessment.data.status === "completed" ? <Check size={15}/> : <AlertTriangle size={15}/>}<span><b>Live AD evaluation: {liveAssessment.data.status}.</b> {liveAssessment.data.category_results.filter((item) => item.consensus === "agreed").length}/5 classifications agree; {liveAssessment.data.findings.length} deterministic findings. Evidence source: verified LDAPS snapshot.</span></div>}
+          {liveAssessment.isError && <div className="inline-alert error" role="alert"><AlertTriangle size={15}/><span>{liveAssessment.error.message}</span></div>}
+          <div className="provider-actions"><span>Runs local synthetic evidence only; no target connection is made.</span><Button onClick={() => assessmentSimulation.mutate()} disabled={assessmentSimulation.isPending}><Play size={15}/>{assessmentSimulation.isPending ? "Running simulator" : "Run verifier simulator"}</Button></div>
+          {assessmentSimulation.isSuccess && <div className="inline-alert success" role="status"><Check size={15}/><span><b>Simulator result:</b> {assessmentSimulation.data.findings.length} deterministic findings across {assessmentSimulation.data.checks.length} checks. Evidence source: simulator.</span></div>}
+          {assessmentSimulation.isError && <div className="inline-alert error" role="alert"><AlertTriangle size={15}/><span>The verifier simulator failed closed. No result was accepted.</span></div>}
+          <div className="provider-actions"><span>Makes five bounded local-LLM calls and independently verifies every category.</span><Button onClick={() => completeAssessment.mutate()} disabled={completeAssessment.isPending}><BrainCircuit size={15}/>{completeAssessment.isPending ? "Evaluating all five areas" : "Run complete local LLM evaluation"}</Button></div>
+          {completeAssessment.isSuccess && <div className={`inline-alert ${completeAssessment.data.status === "completed" ? "success" : "error"}`} role="status">{completeAssessment.data.status === "completed" ? <Check size={15}/> : <AlertTriangle size={15}/>}<span><b>Complete evaluation: {completeAssessment.data.status}.</b> {completeAssessment.data.category_results.filter((item) => item.consensus === "agreed").length}/5 classifications agree with the verifier; {completeAssessment.data.findings.length} deterministic findings. LLM output did not become finding authority.</span></div>}
+          {completeAssessment.isSuccess && <div className="tool-operation-list">{completeAssessment.data.category_results.map((item) => <article className="tool-function-row" key={item.operation_id}><div className="tool-function-title"><div><b>{item.category.replaceAll("_", " ")}</b><span>LLM: {item.llm_status} · Verifier: {item.verifier_status}</span></div><Badge tone={item.consensus === "agreed" ? "green" : "red"}>{item.consensus.toUpperCase()}</Badge></div></article>)}</div>}
+          {completeAssessment.isError && <div className="inline-alert error" role="alert"><AlertTriangle size={15}/><span>{completeAssessment.error.message}</span></div>}
+          <div className="provider-actions"><span>Uses the qualified <code>planner_output</code> schema and returns trusted catalog metadata only.</span><Button onClick={() => assessmentRecommendation.mutate()} disabled={assessmentRecommendation.isPending}><BrainCircuit size={15}/>{assessmentRecommendation.isPending ? "Asking local LLM" : "Ask local LLM for next check"}</Button></div>
+          {assessmentRecommendation.isSuccess && <div className="inline-alert success" role="status"><Check size={15}/><span><b>Advisory recommendation:</b> {assessmentRecommendation.data.title} (<code>{assessmentRecommendation.data.operation_id}</code>). This does not confirm a finding or authorize execution.</span></div>}
+          {assessmentRecommendation.isError && <div className="inline-alert error" role="alert"><AlertTriangle size={15}/><span>{assessmentRecommendation.error.message}</span></div>}
+          <div className="offline-note"><LockKeyhole size={17}/><div><b>Exploit paths are outside this feature</b><p>{assessmentCatalog?.prohibitedActions.join(" · ") ?? "Ticket acquisition, cracking, certificate enrollment, impersonation, directory writes, and arbitrary commands are disabled."}</p></div></div>
         </div>}
 
         {tab === "review" && <div className="provider-tab-panel" role="tabpanel">

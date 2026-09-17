@@ -17,7 +17,7 @@ from redteam_agent.composition.phase0c import build_phase0c_kernel
 from redteam_agent.composition.phase1 import Phase1Kernel, build_phase1_kernel
 from redteam_agent.composition.testing import build_test_kernel
 from redteam_agent.errors import LLMCapabilityError, LLMEvaluationError
-from redteam_agent.execution.adapter import MockExecutionAdapter
+from redteam_agent.execution.adapter import ExecutionAdapter, MockExecutionAdapter
 from redteam_agent.llm.adapters import (
     LocalLLMAnalyzer,
     LocalLLMPlanner,
@@ -748,6 +748,7 @@ def build_phase2_kernel(
     dependency_lock_digest: str | None = None,
     db_path: str = ":memory:",
     _scenario_mock_adapter: MockExecutionAdapter | None = None,
+    additional_adapters: tuple[ExecutionAdapter, ...] = (),
 ) -> Phase2Kernel:
     if qualification_commit_id is not None and (
         len(qualification_commit_id) not in (40, 64)
@@ -775,6 +776,7 @@ def build_phase2_kernel(
             else "provider_task"
         ),
         adapter_id=(_scenario_mock_adapter.identity().adapter_id if _scenario_mock_adapter is not None else "c2-main"),
+        additional_adapters=additional_adapters,
     )
     phase0c = build_phase0c_kernel(phase0b=phase0b)
     phase1 = build_phase1_kernel(phase0c=phase0c)

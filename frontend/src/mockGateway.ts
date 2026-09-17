@@ -1,4 +1,8 @@
 import {
+  adAssessmentCatalogSchema,
+  adAssessmentConsensusResultSchema,
+  adAssessmentRecommendationSchema,
+  adAssessmentResultSchema,
   agentActivitySchema,
   attackPhaseProgressSchema,
   dashboardSchema,
@@ -8,24 +12,45 @@ import {
   missionDraftSchema,
   providerPolicyDraftSchema,
   providerStatusSchema,
+  executionReadinessSchema,
   vllmCapabilityResultSchema,
+  vllmCandidateActivationResultSchema,
+  vllmCandidateTestResultSchema,
   vllmConfigSchema,
+  vllmSettingsSchema,
   type AgentActivity,
   type AttackPhaseProgress,
   type FrontendGateway,
   type Intervention,
   type KnowledgeGraph,
   type MissionDraft,
+  type MissionState,
   type ProviderPolicyDraft,
   type VllmCapabilityResult,
   type VllmConfig,
   type VllmScenario,
+  type VllmSettings,
 } from "./types";
 
 const pause = (duration = 350) => new Promise((resolve) => setTimeout(resolve, duration));
 const future = (minutes: number) => new Date(Date.now() + minutes * 60_000).toISOString();
 const past = (minutes: number) => new Date(Date.now() - minutes * 60_000).toISOString();
 const pastSeconds = (seconds: number) => new Date(Date.now() - seconds * 1_000).toISOString();
+
+let mockVllmSettings: VllmSettings = vllmSettingsSchema.parse({
+  enabled: true,
+  active: {
+    version: 1,
+    config: { baseUrl: "http://10.0.6.181:8100/v1", modelName: "gemma-4-31B-it", wireApi: "chat_completions", structuredOutputMode: "native" },
+    apiKeyConfigured: true,
+    activatedAt: null,
+    transportSecurity: "isolated_network_required",
+  },
+  candidate: null,
+  allowedCidrs: ["10.0.6.0/24"],
+  settingsMutable: true,
+  modelMutable: false,
+});
 
 let interventions: Intervention[] = [
   {
@@ -155,8 +180,24 @@ const knowledge: KnowledgeGraph = knowledgeGraphSchema.parse({
 });
 
 const checks = ["Transport", "Nested model", "Enums", "Optional fields", "Lists", "Discriminated union", "Unknown-field rejection", "Strict typing", "Timeout", "Cancellation"];
+let missionState: MissionState = {
+  missionId: "mission-ui-demo",
+  missionRevision: 1,
+  missionStateVersion: 0,
+  authorizationEpoch: 0,
+  state: "DRAFT",
+};
 
 export const mockGateway: FrontendGateway = {
+  async getOperatorSession() {
+    return { authenticated: true as const, principalId: "redteam-operator", expiresAt: null };
+  },
+  async loginOperator() {
+    return { authenticated: true as const, principalId: "redteam-operator", expiresAt: null };
+  },
+  async logoutOperator() {
+    return { authenticated: false as const, principalId: null, expiresAt: null };
+  },
   async getVllmConfiguration() {
     return {
       enabled: true as const,
@@ -168,13 +209,62 @@ export const mockGateway: FrontendGateway = {
       },
     };
   },
+  async getVllmSettings() {
+    return vllmSettingsSchema.parse(mockVllmSettings);
+  },
+  async stageVllmCandidate(baseUrl: string, apiKey: string) {
+    if (!apiKey.trim()) throw new Error("API key is required.");
+    mockVllmSettings = vllmSettingsSchema.parse({
+      ...mockVllmSettings,
+      candidate: {
+        version: Math.max(mockVllmSettings.active.version, mockVllmSettings.candidate?.version ?? 0) + 1,
+        config: { ...mockVllmSettings.active.config, baseUrl },
+        apiKeyConfigured: true,
+        testStatus: "not_run",
+        testedAt: null,
+        transportSecurity: baseUrl.startsWith("https://") ? "encrypted" : "isolated_network_required",
+      },
+    });
+    return mockVllmSettings;
+  },
+  async testVllmCandidate(version: number, scenario: VllmScenario = "success") {
+    if (mockVllmSettings.candidate?.version !== version) throw new Error("Candidate is stale.");
+    const capability = await mockGateway.testVllmConnection(mockVllmSettings.candidate.config, scenario);
+    mockVllmSettings = vllmSettingsSchema.parse({
+      ...mockVllmSettings,
+      candidate: { ...mockVllmSettings.candidate, testStatus: capability.status, testedAt: new Date().toISOString() },
+    });
+    return vllmCandidateTestResultSchema.parse({ settings: mockVllmSettings, capability });
+  },
+  async activateVllmCandidate(version: number) {
+    const candidate = mockVllmSettings.candidate;
+    if (candidate?.version !== version || candidate.testStatus !== "passed") throw new Error("A passing candidate test is required.");
+    const capability = await mockGateway.testVllmConnection(candidate.config, "success");
+    mockVllmSettings = vllmSettingsSchema.parse({
+      ...mockVllmSettings,
+      active: {
+        version: candidate.version,
+        config: candidate.config,
+        apiKeyConfigured: true,
+        activatedAt: new Date().toISOString(),
+        transportSecurity: candidate.transportSecurity,
+      },
+      candidate: null,
+    });
+    return vllmCandidateActivationResultSchema.parse({ activated: true, settings: mockVllmSettings, capability });
+  },
   async getHealth() {
     return healthSchema.parse({
       status: "healthy",
       mode: "live",
       database: "connected",
       approvalActionsEnabled: true,
+      missionActionsEnabled: true,
+      missionExecutionEnabled: false,
       vllmChecksEnabled: true,
+      adAssessmentReasoningEnabled: true,
+      adAssessmentEvaluationEnabled: true,
+      adAssessmentCollectorEnabled: true,
     });
   },
   async getDashboard() {
@@ -200,6 +290,12 @@ export const mockGateway: FrontendGateway = {
   async getProviderStatus() {
     return providerStatusSchema.parse({
       mode: "live",
+      runtime: {
+        productionEligible: false,
+        missionExecutionEnabled: false,
+        tpmKeyProviderAttested: false,
+        blockers: ["Live provider attestations are not present in mock mode."],
+      },
       tuoni: { edition: "commercial", version: "latest", access: "unconfigured" },
       sliver: {
         version: "1.7.7",
@@ -208,6 +304,7 @@ export const mockGateway: FrontendGateway = {
         operatorAccess: "unconfigured",
         implantTransport: "http",
         beaconPresent: false,
+        identityAttested: false,
       },
       impacket: {
         installed: true,
@@ -216,6 +313,148 @@ export const mockGateway: FrontendGateway = {
         operations: ["impacket.smb.negotiate", "impacket.smb.authenticate", "impacket.smb.list_shares", "impacket.rpc.endpoint_map"],
       },
       latestDraft: null,
+    });
+  },
+  async getADAssessmentCatalog() {
+    return adAssessmentCatalogSchema.parse({
+      catalogRevision: "ad-assessment-readonly-v1",
+      mode: "read_only_configuration_assessment",
+      plannerRole: "select_next_registered_inspection",
+      evaluationRole: "classify_all_five_then_verify_consensus",
+      decisionAuthority: "deterministic_verifier",
+      liveCollectorStatus: "attached",
+      simulatorStatus: "ready",
+      prohibitedActions: [
+        "Kerberos ticket acquisition or export",
+        "password or hash cracking",
+        "certificate enrollment or authentication",
+        "delegation impersonation",
+        "directory modification",
+        "arbitrary command execution",
+      ],
+      operations: [
+        { id: "ad.audit.privileged_access", category: "privileged_access_configuration", title: "Privileged access configuration", description: "Inspect tier-zero membership, stale privileged identities, and delegated administration metadata.", readOnly: true, llmSelectable: true, evidenceField: "privileged_access" },
+        { id: "ad.audit.kerberos_service_accounts", category: "kerberos_service_account_configuration", title: "Kerberos service-account configuration", description: "Inspect SPN account encryption, password-age, and managed-identity metadata without requesting tickets.", readOnly: true, llmSelectable: true, evidenceField: "kerberos_service_accounts" },
+        { id: "ad.audit.kerberos_preauth", category: "kerberos_preauth_configuration", title: "Kerberos preauthentication configuration", description: "Inspect the preauthentication-required account setting without requesting AS-REP material.", readOnly: true, llmSelectable: true, evidenceField: "kerberos_preauth" },
+        { id: "ad.audit.adcs_esc", category: "adcs_esc_configuration", title: "AD CS ESC configuration", description: "Inspect normalized certificate-template, CA, ACL, and enrollment endpoint configuration for ESC1-ESC8.", readOnly: true, llmSelectable: true, evidenceField: "adcs" },
+        { id: "ad.audit.delegation", category: "delegation_configuration", title: "Kerberos delegation configuration", description: "Inspect unconstrained, constrained, protocol-transition, and RBCD configuration metadata.", readOnly: true, llmSelectable: true, evidenceField: "delegation" },
+      ],
+    });
+  },
+  async runADAssessmentSimulation() {
+    await pause();
+    return adAssessmentResultSchema.parse({
+      result_id: "ad-assessment-ui-simulator-1",
+      snapshot_id: "ui-simulator-1",
+      domain_ref: "domain:simulated.local",
+      evidence_source_type: "simulator",
+      decision_authority: "deterministic_verifier",
+      evaluated_at: new Date().toISOString(),
+      checks: [
+        { operation_id: "ad.audit.privileged_access", category: "privileged_access_configuration", status: "misconfiguration_detected", reason_codes: ["DETERMINISTIC_RULE_MATCH"], finding_rule_ids: ["AD-PRIV-TIER0"] },
+        { operation_id: "ad.audit.kerberos_service_accounts", category: "kerberos_service_account_configuration", status: "misconfiguration_detected", reason_codes: ["DETERMINISTIC_RULE_MATCH"], finding_rule_ids: ["AD-KRB-WEAK-ENC", "AD-KRB-UNMANAGED"] },
+        { operation_id: "ad.audit.kerberos_preauth", category: "kerberos_preauth_configuration", status: "misconfiguration_detected", reason_codes: ["DETERMINISTIC_RULE_MATCH"], finding_rule_ids: ["AD-KRB-PREAUTH"] },
+        { operation_id: "ad.audit.adcs_esc", category: "adcs_esc_configuration", status: "misconfiguration_detected", reason_codes: ["DETERMINISTIC_RULE_MATCH"], finding_rule_ids: ["AD-ADCS-ESC1"] },
+        { operation_id: "ad.audit.delegation", category: "delegation_configuration", status: "misconfiguration_detected", reason_codes: ["DETERMINISTIC_RULE_MATCH"], finding_rule_ids: ["AD-DELEG-BROAD"] },
+      ],
+      findings: [
+        { rule_id: "AD-PRIV-TIER0", category: "privileged_access_configuration", severity: "high", title: "Unexpected tier-zero membership", affected_object_count: 1, evidence_artifact_ids: ["artifact-ui-simulator-1"] },
+        { rule_id: "AD-KRB-WEAK-ENC", category: "kerberos_service_account_configuration", severity: "high", title: "Service account permits weak Kerberos encryption", affected_object_count: 1, evidence_artifact_ids: ["artifact-ui-simulator-1"] },
+        { rule_id: "AD-KRB-UNMANAGED", category: "kerberos_service_account_configuration", severity: "medium", title: "SPN account is not managed", affected_object_count: 1, evidence_artifact_ids: ["artifact-ui-simulator-1"] },
+        { rule_id: "AD-KRB-PREAUTH", category: "kerberos_preauth_configuration", severity: "high", title: "Kerberos preauthentication is disabled", affected_object_count: 1, evidence_artifact_ids: ["artifact-ui-simulator-1"] },
+        { rule_id: "AD-ADCS-ESC1", category: "adcs_esc_configuration", severity: "high", title: "AD CS ESC1 configuration exposure", affected_object_count: 1, evidence_artifact_ids: ["artifact-ui-simulator-1"] },
+        { rule_id: "AD-DELEG-BROAD", category: "delegation_configuration", severity: "medium", title: "Constrained delegation scope is broad", affected_object_count: 1, evidence_artifact_ids: ["artifact-ui-simulator-1"] },
+      ],
+    });
+  },
+  async recommendADAssessment() {
+    await pause();
+    return adAssessmentRecommendationSchema.parse({
+      operation_id: "ad.audit.kerberos_preauth",
+      category: "kerberos_preauth_configuration",
+      title: "Kerberos preauthentication configuration",
+      description: "Inspect the preauthentication-required account setting without requesting AS-REP material.",
+      output_schema: "planner_output",
+      authority: "recommendation_only",
+      candidate_count: 5,
+      generated_at: new Date().toISOString(),
+    });
+  },
+  async runCompleteADAssessment() {
+    await pause();
+    return adAssessmentConsensusResultSchema.parse({
+      result_id: "ad-assessment-consensus-ui-simulator-1",
+      snapshot_id: "ui-simulator-1",
+      domain_ref: "domain:simulated.local",
+      evidence_source_type: "simulator",
+      evaluation_mode: "local_llm_plus_deterministic_verifier",
+      status: "completed",
+      decision_authority: "deterministic_verifier",
+      output_schema: "planner_output",
+      evaluated_at: new Date().toISOString(),
+      category_results: [
+        { operation_id: "ad.audit.privileged_access", category: "privileged_access_configuration", llm_status: "misconfiguration_detected", verifier_status: "misconfiguration_detected", consensus: "agreed", verified_rule_ids: ["AD-PRIV-TIER0"] },
+        { operation_id: "ad.audit.kerberos_service_accounts", category: "kerberos_service_account_configuration", llm_status: "misconfiguration_detected", verifier_status: "misconfiguration_detected", consensus: "agreed", verified_rule_ids: ["AD-KRB-WEAK-ENC", "AD-KRB-UNMANAGED"] },
+        { operation_id: "ad.audit.kerberos_preauth", category: "kerberos_preauth_configuration", llm_status: "misconfiguration_detected", verifier_status: "misconfiguration_detected", consensus: "agreed", verified_rule_ids: ["AD-KRB-PREAUTH"] },
+        { operation_id: "ad.audit.adcs_esc", category: "adcs_esc_configuration", llm_status: "misconfiguration_detected", verifier_status: "misconfiguration_detected", consensus: "agreed", verified_rule_ids: ["AD-ADCS-ESC1"] },
+        { operation_id: "ad.audit.delegation", category: "delegation_configuration", llm_status: "misconfiguration_detected", verifier_status: "misconfiguration_detected", consensus: "agreed", verified_rule_ids: ["AD-DELEG-BROAD"] },
+      ],
+      findings: [
+        { rule_id: "AD-PRIV-TIER0", category: "privileged_access_configuration", severity: "high", title: "Unexpected tier-zero membership", affected_object_count: 1, evidence_artifact_ids: ["artifact-ui-simulator-1"] },
+        { rule_id: "AD-KRB-WEAK-ENC", category: "kerberos_service_account_configuration", severity: "high", title: "Service account permits weak Kerberos encryption", affected_object_count: 1, evidence_artifact_ids: ["artifact-ui-simulator-1"] },
+        { rule_id: "AD-KRB-UNMANAGED", category: "kerberos_service_account_configuration", severity: "medium", title: "SPN account is not managed", affected_object_count: 1, evidence_artifact_ids: ["artifact-ui-simulator-1"] },
+        { rule_id: "AD-KRB-PREAUTH", category: "kerberos_preauth_configuration", severity: "high", title: "Kerberos preauthentication is disabled", affected_object_count: 1, evidence_artifact_ids: ["artifact-ui-simulator-1"] },
+        { rule_id: "AD-ADCS-ESC1", category: "adcs_esc_configuration", severity: "high", title: "AD CS ESC1 configuration exposure", affected_object_count: 1, evidence_artifact_ids: ["artifact-ui-simulator-1"] },
+        { rule_id: "AD-DELEG-BROAD", category: "delegation_configuration", severity: "medium", title: "Constrained delegation scope is broad", affected_object_count: 1, evidence_artifact_ids: ["artifact-ui-simulator-1"] },
+      ],
+    });
+  },
+  async runLiveADAssessment() {
+    const result = await this.runCompleteADAssessment();
+    return adAssessmentConsensusResultSchema.parse({
+      ...result,
+      result_id: "ad-assessment-consensus-live-1",
+      snapshot_id: "verified-ldap-1",
+      domain_ref: "domain:intern.local",
+      evidence_source_type: "verified_ldap_snapshot",
+      findings: result.findings.map((finding) => ({
+        ...finding,
+        evidence_artifact_ids: ["collector-evidence:mock-digest"],
+      })),
+    });
+  },
+  async getExecutionReadiness() {
+    return executionReadinessSchema.parse({
+      status: "blocked",
+      stage: "mission_configuration",
+      summary: "Mission execution is blocked by 3 unresolved item(s).",
+      blockerCount: 3,
+      blockers: [
+        {
+          id: "SESSION_REFERENCE_UNAPPROVED",
+          category: "session",
+          title: "Session reference is not approved",
+          detail: "No session registered by live C2 inventory matches the Mission condition.",
+          resolution: "Verify an authorized live Beacon and register its exact session reference.",
+        },
+        {
+          id: "IMPACKET_SANDBOX_UNATTESTED",
+          category: "tool",
+          title: "Impacket worker isolation is not attested",
+          detail: "OS-level target and port egress enforcement has not been proven.",
+          resolution: "Run the worker under the approved egress sandbox and record live evidence.",
+        },
+        {
+          id: "EXECUTION_RUNTIME_DISABLED",
+          category: "runtime",
+          title: "Mission execution worker is disabled",
+          detail: "The control plane cannot dispatch actions.",
+          resolution: "Attach the qualified execution composition after every live gate passes.",
+        },
+      ],
+      checks: [
+        { id: "MISSION_DRAFT_SAVED", title: "Mission draft saved", detail: "A reviewed draft exists." },
+      ],
     });
   },
   async testVllmConnection(config: VllmConfig, scenario: VllmScenario = "success"): Promise<VllmCapabilityResult> {
@@ -259,6 +498,21 @@ export const mockGateway: FrontendGateway = {
     missionDraftSchema.parse(draft);
     await pause();
     return { draftId: "draft-mission-024", savedAt: new Date().toISOString() };
+  },
+  async createMission() {
+    missionState = { ...missionState, missionStateVersion: 0, authorizationEpoch: 0, state: "DRAFT" };
+    return missionState;
+  },
+  async transitionMission(_missionId, expectedVersion, action) {
+    if (expectedVersion !== missionState.missionStateVersion) throw new Error("Mission state is stale.");
+    const next = action === "validate" ? "VALIDATED" : action === "start" || action === "resume" ? "RUNNING" : action === "pause" ? "PAUSED" : action === "finalize" ? "FINALIZING" : action === "complete" ? "COMPLETED" : "ABORTED";
+    missionState = {
+      ...missionState,
+      missionStateVersion: missionState.missionStateVersion + 1,
+      authorizationEpoch: missionState.authorizationEpoch + (["pause", "resume", "finalize"].includes(action) ? 1 : 0),
+      state: next,
+    };
+    return missionState;
   },
   async getKnowledgeGraph() {
     await pause(180);

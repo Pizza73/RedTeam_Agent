@@ -25,6 +25,14 @@ test("mock capability check completes without external dispatch", async ({ page 
   await expect(page.getByText("Profile meets the required capability contract.")).toBeVisible();
 });
 
+test("execution blockers name the deficiency and next action", async ({ page }) => {
+  await page.goto("/missions/new");
+  await expect(page.getByRole("heading", { name: "Execution readiness" })).toBeVisible();
+  await expect(page.getByText("Session reference is not approved")).toBeVisible();
+  await expect(page.getByText(/Next: Verify an authorized live Beacon/)).toBeVisible();
+  await expect(page.getByRole("link", { name: "Execution blocked · 3" })).toBeVisible();
+});
+
 test("tool command templates stay collapsed until requested", async ({ page }) => {
   await page.goto("/settings/providers");
   await page.getByRole("tab", { name: "Tools (MCP) Control" }).click();
@@ -47,6 +55,23 @@ test("Sliver is the default C2 draft but remains blocked without a Beacon", asyn
   await expect(page.getByRole("heading", { name: "Sliver", exact: true })).toBeVisible();
   await expect(page.getByText("not present", { exact: true })).toBeVisible();
   await expect(page.getByText(/live HTTP Beacon pass the Provider Human Gate/)).toBeVisible();
+});
+
+test("AD assessment exposes only read-only configuration checks", async ({ page }) => {
+  await page.goto("/settings/providers");
+  await page.getByRole("tab", { name: "AD Assessment" }).click();
+  await expect(page.getByRole("heading", { name: "Active Directory configuration assessment" })).toBeVisible();
+  await expect(page.getByText("ad.audit.kerberos_service_accounts", { exact: true })).toBeVisible();
+  await expect(page.getByText("ad.audit.adcs_esc", { exact: true })).toBeVisible();
+  await expect(page.getByText(/Kerberos ticket acquisition or export/)).toBeVisible();
+  await expect(page.getByText(/request_tickets/i)).toHaveCount(0);
+  await page.getByRole("button", { name: "Collect and evaluate live AD" }).click();
+  await expect(page.getByText(/Live AD evaluation: completed/)).toBeVisible();
+  await page.getByRole("button", { name: "Run complete local LLM evaluation" }).click();
+  await expect(page.getByText(/Complete evaluation: completed/)).toBeVisible();
+  await expect(page.getByText("AGREED", { exact: true })).toHaveCount(5);
+  await page.getByRole("button", { name: "Ask local LLM for next check" }).click();
+  await expect(page.getByText(/Advisory recommendation:/)).toBeVisible();
 });
 
 test("primary operator surfaces have no serious accessibility violations", async ({ page }) => {

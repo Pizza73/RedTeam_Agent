@@ -32,10 +32,14 @@ impacket-mcp = [
 sliver-c2 = [
     "grpcio==1.84.0",
 ]
+ad-collector = [
+    "ldap3==2.9.1",
+]
 
 [project.scripts]
 redteam-impacket-mcp = "redteam_agent.mcp_servers.impacket_server:main"
 redteam-ui = "redteam_agent.ui.server:main"
+redteam-product = "redteam_agent.product_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -66,7 +70,7 @@ disallow_any_explicit = false
 # environment, treat its imports as untyped rather than failing the run. The
 # runtime still fails closed via EncryptionUnavailableError when it is absent.
 [[tool.mypy.overrides]]
-module = ["cryptography.*"]
+module = ["cryptography.*", "certipy.*", "ldap3.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

@@ -1,10 +1,8 @@
 """Trusted Phase 2 vLLM capability adapter for the local operator UI.
 
-The browser may request a check, but it never selects an arbitrary network target or
-receives the API credential.  Endpoint, model identity, signed artifact manifest and
-tokenizer are fixed by the UI server's startup configuration.  The adapter then reuses
-the same attestation, bounded gateway and schema corpus as the formal Phase 2 entry
-point and persists only direct-network capability evidence.
+Endpoint selection and API-key custody remain server-side.  A settings owner may build
+an isolated candidate adapter, run a non-persisting qualification, and promote it only
+after the same signed manifest, tokenizer and model identity have been attested.
 """
 
 from __future__ import annotations
@@ -18,17 +16,27 @@ from pathlib import Path
 from typing import Literal
 from uuid import uuid4
 
+from redteam_agent.ad_assessment.consensus import ADAssessmentLLMConsensusEvaluator
+from redteam_agent.ad_assessment.models import ADAssessmentSnapshot
+from redteam_agent.ad_assessment.reasoning import ADAssessmentReasoner
 from redteam_agent.canonical.digest_service import DigestService
-from redteam_agent.errors import AuthorizationKernelError, LLMEvaluationError, LLMTransportError
+from redteam_agent.errors import (
+    AuthorizationKernelError,
+    LLMCapabilityError,
+    LLMEvaluationError,
+    LLMTransportError,
+)
+from redteam_agent.llm.adapters import LocalLLMPlanner
 from redteam_agent.llm.artifact_manifest import load_and_verify_remote_model_artifact_manifest
 from redteam_agent.llm.attestation import (
     HttpServerMetadataProvider,
     SignedManifestArtifactSource,
     attest_local_llm_server,
+    require_attestation_binding,
 )
 from redteam_agent.llm.attestation_store import ServerAttestationRepository
 from redteam_agent.llm.budget import build_request_budget_policy
-from redteam_agent.llm.capability import CapabilityRepository
+from redteam_agent.llm.capability import MIN_VALID_RATIO, CapabilityRepository
 from redteam_agent.llm.capability_corpus import build_schema_capability_corpus
 from redteam_agent.llm.client import VLLMChatClient
 from redteam_agent.llm.config import LocalLLMEndpointConfig
@@ -39,7 +47,8 @@ from redteam_agent.llm.evaluation import (
     build_evaluation_run_budget,
 )
 from redteam_agent.llm.evaluation_gateway import EvaluationGateway
-from redteam_agent.llm.profile import build_local_llm_profile
+from redteam_agent.llm.profile import LocalLLMProfile, build_local_llm_profile
+from redteam_agent.llm.schemas import compute_schema_digest
 from redteam_agent.llm.secrets import FileAPIKeySource
 from redteam_agent.llm.tokenizer import HuggingFaceTokenCounter
 from redteam_agent.runtime.clock import SystemMonotonicClock
@@ -169,7 +178,25 @@ class Phase2VllmCapabilityPort:
     def public_config(self) -> VllmConfigInput:
         return self._settings.public_config()
 
+    @property
+    def profile(self) -> LocalLLMProfile:
+        """Immutable model identity used by the Mission owner composition."""
+        return self._profile
+
     def __call__(self, config: VllmConfigInput) -> dict[str, object]:
+        return self.evaluate_capability(config, persist_results=True)
+
+    def evaluate_capability(
+        self,
+        config: VllmConfigInput,
+        *,
+        persist_results: bool,
+    ) -> dict[str, object]:
+        """Run the bounded corpus, optionally publishing qualification evidence.
+
+        Candidate settings use ``persist_results=False`` so an endpoint that has not
+        been activated cannot authorize Planner use or a Mission transition.
+        """
         expected = self.public_config
         if config != expected:
             raise UIConflictError("vLLM capability request does not match server-managed configuration")
@@ -177,11 +204,128 @@ class Phase2VllmCapabilityPort:
             raise UIConflictError("a vLLM capability evaluation is already running")
         started = time.monotonic()
         try:
-            return self._evaluate(started=started)
+            return self._evaluate(started=started, persist_results=persist_results)
         finally:
             self._single_flight.release()
 
-    def _evaluate(self, *, started: float) -> dict[str, object]:
+    def recommend_ad_assessment(self) -> dict[str, object]:
+        """Produce one non-authoritative, exact-candidate recommendation."""
+
+        if not self._single_flight.acquire(blocking=False):
+            raise UIConflictError("a vLLM capability or reasoning request is already running")
+        database = None
+        try:
+            database = Database(str(self._settings.database_path), create_schema=False)
+            digest_service = DigestService()
+            self._require_current_planner_capability(database, digest_service)
+            reasoning_clock = SystemMonotonicClock()
+            planner = self._build_planner(clock=reasoning_clock, digest_service=digest_service)
+            recommendation = ADAssessmentReasoner(
+                planner=planner,
+                capability_checker=lambda: None,
+                clock=reasoning_clock,
+                digest_service=digest_service,
+            ).recommend()
+            return recommendation.model_dump(mode="json")
+        finally:
+            if database is not None:
+                database.close()
+            self._single_flight.release()
+
+    def evaluate_ad_assessment_with_llm(
+        self,
+        snapshot: ADAssessmentSnapshot,
+    ) -> dict[str, object]:
+        """Classify all five categories, then require deterministic consensus."""
+
+        if not self._single_flight.acquire(blocking=False):
+            raise UIConflictError("a vLLM capability or reasoning request is already running")
+        database = None
+        try:
+            database = Database(str(self._settings.database_path), create_schema=False)
+            digest_service = DigestService()
+            self._require_current_planner_capability(database, digest_service)
+            reasoning_clock = SystemMonotonicClock()
+            planner = self._build_planner(clock=reasoning_clock, digest_service=digest_service)
+            result = ADAssessmentLLMConsensusEvaluator(
+                planner=planner,
+                capability_checker=lambda: None,
+                clock=reasoning_clock,
+                digest_service=digest_service,
+            ).evaluate(snapshot)
+            return result.model_dump(mode="json")
+        finally:
+            if database is not None:
+                database.close()
+            self._single_flight.release()
+
+    def _build_planner(
+        self,
+        *,
+        clock: SystemMonotonicClock,
+        digest_service: DigestService,
+    ) -> LocalLLMPlanner:
+        return LocalLLMPlanner(
+            profile=self._profile,
+            policy=build_request_budget_policy(
+                profile=self._profile,
+                request_timeout_seconds=min(60, self._settings.attestation_timeout_seconds),
+                digest_service=digest_service,
+            ),
+            client=VLLMChatClient(
+                base_url=self._settings.base_url,
+                api_key_source=self._key_source,
+            ),
+            token_counter=self._token_counter,
+            clock=clock,
+            digest_service=digest_service,
+        )
+
+    def _require_current_planner_capability(
+        self,
+        database: Database,
+        digest_service: DigestService,
+    ) -> None:
+        corpus = build_schema_capability_corpus()
+        result = CapabilityRepository(database=database, digest_service=digest_service).get(
+            profile_digest=self._profile.profile_digest,
+            model_hash=self._profile.model_hash,
+            runtime_version=self._profile.runtime_version,
+            tokenizer_revision=self._profile.tokenizer_revision,
+            chat_template_digest=self._profile.chat_template_digest,
+            schema_name="planner_output",
+            schema_digest=compute_schema_digest("planner_output", digest_service),
+            corpus_version=corpus.corpus_version,
+            corpus_digest=corpus.corpus_digest(digest_service),
+            prompt_set_digest=corpus.prompt_set_digest("planner_output", digest_service),
+            structured_output_mode=self._profile.structured_output_mode,
+        )
+        if (
+            result is None
+            or not result.passed
+            or result.evidence_kind != "real_local_llm"
+            or result.server_attestation_digest is None
+            or result.valid_within_retry_budget / result.sample_count < MIN_VALID_RATIO
+            or result.unsafe_boundary_acceptances != 0
+            or result.cancellation_failures != 0
+        ):
+            raise LLMCapabilityError("current Planner capability evidence is required")
+        attestation = ServerAttestationRepository(database, digest_service).get(
+            result.server_attestation_digest
+        )
+        if attestation is None:
+            raise LLMCapabilityError("current Planner server attestation is unavailable")
+        try:
+            require_attestation_binding(
+                attestation,
+                profile=self._profile,
+                base_url=self._settings.base_url,
+                digest_service=digest_service,
+            )
+        except AuthorizationKernelError:
+            raise LLMCapabilityError("current Planner capability is bound to another endpoint") from None
+
+    def _evaluate(self, *, started: float, persist_results: bool) -> dict[str, object]:
         database = None
         try:
             # Compose only the dedicated Phase 2 evaluation boundary here.  Constructing
@@ -238,30 +382,35 @@ class Phase2VllmCapabilityPort:
             ).run_capability(profile=self._profile, probe=probe)
             if probe.evidence_kind != "real_local_llm":
                 raise LLMEvaluationError("UI capability evaluation did not produce direct-network evidence")
-            repository = CapabilityRepository(database=database, digest_service=digest_service)
-            for result in results:
-                repository.save(result)
+            if persist_results:
+                repository = CapabilityRepository(database=database, digest_service=digest_service)
+                for result in results:
+                    repository.save(result)
         except AuthorizationKernelError as exc:
             return self._failure_view(exc=exc, started=started)
         finally:
             if database is not None:
                 database.close()
 
-        checks: list[dict[str, object]] = [{
-            "name": "Server attestation",
-            "status": "passed",
-            "detail": "Health, runtime, model identity and structured-output probe are bound.",
-        }]
+        checks: list[dict[str, object]] = [
+            {
+                "name": "Server attestation",
+                "status": "passed",
+                "detail": "Health, runtime, model identity and structured-output probe are bound.",
+            }
+        ]
         for result in results:
-            checks.append({
-                "name": result.schema_name,
-                "status": "passed" if result.passed else "failed",
-                "detail": (
-                    f"{result.valid_within_retry_budget}/{result.sample_count} valid; "
-                    f"unsafe {result.unsafe_boundary_acceptances}; "
-                    f"cancellation failures {result.cancellation_failures}."
-                ),
-            })
+            checks.append(
+                {
+                    "name": result.schema_name,
+                    "status": "passed" if result.passed else "failed",
+                    "detail": (
+                        f"{result.valid_within_retry_budget}/{result.sample_count} valid; "
+                        f"unsafe {result.unsafe_boundary_acceptances}; "
+                        f"cancellation failures {result.cancellation_failures}."
+                    ),
+                }
+            )
         passed = all(result.passed for result in results)
         return {
             "status": "passed" if passed else "failed",
@@ -286,11 +435,13 @@ class Phase2VllmCapabilityPort:
             ),
             "latencyMs": max(0, round((time.monotonic() - started) * 1000)),
             "checkedAt": self._clock().astimezone(UTC).isoformat(),
-            "checks": [{
-                "name": "Trusted Phase 2 gateway",
-                "status": "failed",
-                "detail": f"{type(exc).__name__}; no capability was granted.",
-            }],
+            "checks": [
+                {
+                    "name": "Trusted Phase 2 gateway",
+                    "status": "failed",
+                    "detail": f"{type(exc).__name__}; no capability was granted.",
+                }
+            ],
         }
 
     def close(self) -> None:

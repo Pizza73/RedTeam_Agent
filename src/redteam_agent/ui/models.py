@@ -11,7 +11,7 @@ from datetime import datetime
 from typing import Literal
 from urllib.parse import urlsplit
 
-from pydantic import Field, model_validator
+from pydantic import Field, SecretStr, model_validator
 
 from redteam_agent.canonical.immutable import CanonicalJsonObject
 from redteam_agent.models.base import StrictBoundaryModel, StrictImmutableBoundaryModel
@@ -19,9 +19,7 @@ from redteam_agent.models.base import StrictBoundaryModel, StrictImmutableBounda
 
 class MissionDraftTarget(StrictImmutableBoundaryModel):
     id: str = Field(min_length=1, max_length=100)
-    type: Literal[
-        "network", "host", "session", "hostname", "domain", "url", "remote_filesystem", "other"
-    ]
+    type: Literal["network", "host", "session", "hostname", "domain", "url", "remote_filesystem", "other"]
     value: str = Field(min_length=1, max_length=2048)
     port: int | None = Field(default=None, ge=1, le=65535)
     protocol: Literal["tcp", "udp"] | None
@@ -107,8 +105,29 @@ class ApprovalDecisionInput(StrictImmutableBoundaryModel):
     presentationDigest: str = Field(min_length=1, max_length=256)
 
 
+class OperatorLoginInput(StrictImmutableBoundaryModel):
+    token: str = Field(min_length=32, max_length=4096)
+
+
+class MissionCreateInput(StrictImmutableBoundaryModel):
+    draftId: str = Field(pattern=r"^mission-draft-[A-Za-z0-9-]{1,200}$")
+
+
+class MissionTransitionInput(StrictImmutableBoundaryModel):
+    action: Literal["validate", "start", "pause", "resume", "finalize", "complete", "abort"]
+    expectedVersion: int = Field(ge=0)
+
+
 class CandidateSelectionInput(StrictImmutableBoundaryModel):
     candidateId: str = Field(min_length=1, max_length=200)
+
+
+class ADAssessmentRecommendationInput(StrictImmutableBoundaryModel):
+    """Empty request: catalog, target and model identity are all server-owned."""
+
+
+class ADAssessmentCollectionInput(StrictImmutableBoundaryModel):
+    """Empty request: DC, domain, transport, credential and thresholds are server-owned."""
 
 
 class VllmConfigInput(StrictImmutableBoundaryModel):
@@ -120,9 +139,43 @@ class VllmConfigInput(StrictImmutableBoundaryModel):
     @model_validator(mode="after")
     def _http_url_only(self) -> VllmConfigInput:
         parsed = urlsplit(self.baseUrl)
-        if parsed.scheme not in {"http", "https"} or parsed.hostname is None or parsed.username is not None:
+        if (
+            parsed.scheme not in {"http", "https"}
+            or parsed.hostname is None
+            or parsed.username is not None
+            or parsed.password is not None
+        ):
             raise ValueError("baseUrl must use HTTP or HTTPS")
         return self
+
+
+class VllmCandidateInput(StrictImmutableBoundaryModel):
+    """One-shot candidate registration; the secret must never be serialized back."""
+
+    baseUrl: str = Field(min_length=1, max_length=2048)
+    apiKey: SecretStr
+
+    @model_validator(mode="after")
+    def _bounded_candidate(self) -> VllmCandidateInput:
+        parsed = urlsplit(self.baseUrl)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or parsed.hostname is None
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or parsed.path.rstrip("/") != "/v1"
+        ):
+            raise ValueError("baseUrl must be an HTTP(S) /v1 endpoint without credentials or query data")
+        key = self.apiKey.get_secret_value()
+        if not 1 <= len(key) <= 4096 or key != key.strip() or not key.isascii() or not key.isprintable():
+            raise ValueError("apiKey must be 1-4096 printable ASCII characters without surrounding whitespace")
+        return self
+
+
+class VllmCandidateVersionInput(StrictImmutableBoundaryModel):
+    version: int = Field(ge=1)
 
 
 class StoredDraft(StrictImmutableBoundaryModel):

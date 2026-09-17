@@ -9,13 +9,19 @@ import threading
 import pytest
 
 import support
+from redteam_agent.ad_assessment.collector import ADCollectorError
+from redteam_agent.ad_assessment.models import ADAssessmentSnapshot
 from redteam_agent.composition.testing import build_test_kernel
+from redteam_agent.errors import LLMCapabilityError
+from redteam_agent.llm.profile import build_mock_agent_profile
 from redteam_agent.policy.scope_models import IpTargetReference
 from redteam_agent.runtime.clock import ManualClock
 from redteam_agent.storage.database import Database
-from redteam_agent.ui.control_plane import UIControlPlane
+from redteam_agent.ui.auth import OperatorSessionAuthenticator
+from redteam_agent.ui.control_plane import UIActionBlockedError, UIConflictError, UIControlPlane
+from redteam_agent.ui.mission_commands import MissionCommandOwner
 from redteam_agent.ui.models import MissionDraftInput, ProviderPolicyDraftInput, VllmConfigInput
-from redteam_agent.ui.server import build_server
+from redteam_agent.ui.server import UIRouter, build_server
 
 
 def _mission_draft() -> MissionDraftInput:
@@ -85,10 +91,173 @@ def test_empty_provisioned_database_and_drafts_are_managed_without_activation(tm
         "operatorAccess": "unconfigured",
         "implantTransport": "http",
         "beaconPresent": False,
+        "identityAttested": False,
     }
     latest = provider_status["latestDraft"]
     assert isinstance(latest, dict)
     assert latest["draft"]["c2"]["providerId"] == "tuoni"
+
+
+def test_ad_assessment_catalog_and_offline_verifier_are_available_without_live_ad(tmp_path) -> None:
+    path = tmp_path / "app.db"
+    Database(str(path)).close()
+    control = UIControlPlane(database_path=str(path), clock=lambda: support.T0)
+    snapshot = ADAssessmentSnapshot.from_untrusted_json(b"""{
+      "snapshot_id":"snapshot-ui-1",
+      "domain_ref":"domain:intern.local",
+      "source_type":"simulator",
+      "source_artifact_ids":["artifact-directory-1"],
+      "collected_at":"2026-01-01T00:00:00Z",
+      "privileged_access":null,
+      "kerberos_service_accounts":null,
+      "kerberos_preauth":{"preauthentication_disabled_account_count":1},
+      "adcs":null,
+      "delegation":null
+    }""")
+
+    catalog = control.ad_assessment_catalog()
+    result = control.evaluate_ad_assessment(snapshot)
+
+    assert catalog["plannerRole"] == "select_next_registered_inspection"
+    assert catalog["liveCollectorStatus"] == "not_attached"
+    assert result["decision_authority"] == "deterministic_verifier"
+    assert result["evidence_source_type"] == "simulator"
+    assert result["findings"][0]["rule_id"] == "AD-KRB-PREAUTH"
+
+    spoofed = snapshot.model_copy(update={"source_type": "verified_ldap_snapshot"})
+    with pytest.raises(UIConflictError, match="trusted collector"):
+        control.evaluate_ad_assessment(spoofed)
+
+
+def test_ad_assessment_llm_recommendation_is_advisory_and_capability_gated(tmp_path) -> None:
+    path = tmp_path / "app.db"
+    Database(str(path)).close()
+    expected = {
+        "operation_id": "ad.audit.kerberos_preauth",
+        "category": "kerberos_preauth_configuration",
+        "title": "Kerberos preauthentication configuration",
+        "description": "Read-only inspection.",
+        "output_schema": "planner_output",
+        "authority": "recommendation_only",
+        "candidate_count": 5,
+        "generated_at": support.T0.isoformat(),
+    }
+    control = UIControlPlane(
+        database_path=str(path),
+        ad_assessment_reasoning_port=lambda: expected,
+        clock=lambda: support.T0,
+    )
+
+    assert control.health()["adAssessmentReasoningEnabled"] is True
+    assert control.recommend_ad_assessment() == expected
+
+    def not_qualified() -> dict[str, object]:
+        raise LLMCapabilityError("test capability is missing")
+
+    blocked = UIControlPlane(
+        database_path=str(path),
+        ad_assessment_reasoning_port=not_qualified,
+        clock=lambda: support.T0,
+    )
+    with pytest.raises(UIActionBlockedError) as caught:
+        blocked.recommend_ad_assessment()
+    assert caught.value.code == "AD_ASSESSMENT_LLM_CAPABILITY_REQUIRED"
+
+
+def test_complete_ad_assessment_is_simulator_only_and_capability_gated(tmp_path) -> None:
+    path = tmp_path / "app.db"
+    Database(str(path)).close()
+    snapshot = ADAssessmentSnapshot.from_untrusted_json(b"""{
+      "snapshot_id":"snapshot-consensus-ui-1",
+      "domain_ref":"domain:simulated.local",
+      "source_type":"simulator",
+      "source_artifact_ids":["artifact-directory-1"],
+      "collected_at":"2026-01-01T00:00:00Z",
+      "privileged_access":{"unexpected_tier_zero_membership_count":0,"stale_privileged_account_count":0,"excessive_delegated_admin_count":0},
+      "kerberos_service_accounts":{"service_account_with_spn_count":0,"weak_encryption_service_account_count":0,"stale_password_service_account_count":0,"unmanaged_service_account_count":0},
+      "kerberos_preauth":{"preauthentication_disabled_account_count":0},
+      "adcs":{"exposure_counts":[]},
+      "delegation":{"unconstrained_delegation_account_count":0,"broad_constrained_delegation_account_count":0,"protocol_transition_account_count":0,"risky_rbcd_acl_count":0}
+    }""")
+    expected = {"status": "completed", "category_results": ["all-five"]}
+    control = UIControlPlane(
+        database_path=str(path),
+        ad_assessment_evaluation_port=lambda supplied: (expected if supplied == snapshot else {"status": "blocked"}),
+        clock=lambda: support.T0,
+    )
+
+    assert control.health()["adAssessmentEvaluationEnabled"] is True
+    assert control.evaluate_ad_assessment_with_llm(snapshot) == expected
+    with pytest.raises(UIConflictError, match="trusted collector"):
+        control.evaluate_ad_assessment_with_llm(
+            snapshot.model_copy(update={"source_type": "verified_directory_export"})
+        )
+
+    def not_qualified(_snapshot: ADAssessmentSnapshot) -> dict[str, object]:
+        raise LLMCapabilityError("test capability is missing")
+
+    blocked = UIControlPlane(
+        database_path=str(path),
+        ad_assessment_evaluation_port=not_qualified,
+        clock=lambda: support.T0,
+    )
+    with pytest.raises(UIActionBlockedError) as caught:
+        blocked.evaluate_ad_assessment_with_llm(snapshot)
+    assert caught.value.code == "AD_ASSESSMENT_LLM_CAPABILITY_REQUIRED"
+
+
+def test_live_ad_collector_is_server_owned_and_reports_actionable_failures(tmp_path) -> None:
+    path = tmp_path / "app.db"
+    Database(str(path)).close()
+    expected = {"status": "completed", "evidence_source_type": "verified_ldap_snapshot"}
+    control = UIControlPlane(
+        database_path=str(path),
+        ad_assessment_collector_port=lambda: expected,
+        clock=lambda: support.T0,
+    )
+
+    assert control.health()["adAssessmentCollectorEnabled"] is True
+    assert control.ad_assessment_catalog()["liveCollectorStatus"] == "attached"
+    assert control.collect_and_evaluate_ad_assessment() == expected
+
+    def unreachable() -> dict[str, object]:
+        raise ADCollectorError(
+            code="AD_COLLECTOR_LDAPS_UNREACHABLE",
+            message="The configured domain controller LDAPS endpoint is unreachable or untrusted.",
+            resolution="Provide the DC IP, allow TCP/636, and install its issuing CA certificate.",
+        )
+
+    blocked = UIControlPlane(
+        database_path=str(path),
+        ad_assessment_collector_port=unreachable,
+        clock=lambda: support.T0,
+    )
+    with pytest.raises(UIActionBlockedError) as caught:
+        blocked.collect_and_evaluate_ad_assessment()
+    assert caught.value.code == "AD_COLLECTOR_LDAPS_UNREACHABLE"
+    assert "TCP/636" in caught.value.resolution
+
+
+def test_readiness_explains_each_unresolved_activation_requirement(tmp_path) -> None:
+    path = tmp_path / "app.db"
+    Database(str(path)).close()
+    control = UIControlPlane(database_path=str(path), clock=lambda: support.T0)
+    control.save_mission_draft(_mission_draft())
+
+    readiness = control.readiness()
+    blocker_ids = {item["id"] for item in readiness["blockers"]}
+    assert readiness["status"] == "blocked"
+    assert readiness["blockerCount"] == len(readiness["blockers"])
+    assert {
+        "SUCCESS_CONDITION_UNSUPPORTED",
+        "MISSION_NOT_CREATED",
+        "PROVIDER_POLICY_DRAFT_MISSING",
+        "LLM_GATEWAY_UNAVAILABLE",
+        "SLIVER_IDENTITY_UNATTESTED",
+        "TPM_KEY_PROVIDER_UNAVAILABLE",
+    }.issubset(blocker_ids)
+    unsupported = next(item for item in readiness["blockers"] if item["id"] == "SUCCESS_CONDITION_UNSUPPORTED")
+    assert "Active session exists" in unsupported["resolution"]
 
 
 def test_vllm_check_uses_attached_port_and_publishes_only_managed_configuration(tmp_path) -> None:
@@ -129,6 +298,62 @@ def test_vllm_port_and_public_configuration_must_be_attached_together(tmp_path) 
 
     with pytest.raises(ValueError, match="attached together"):
         UIControlPlane(database_path=str(path), vllm_public_config=_vllm_config())
+
+
+def test_vllm_settings_routes_never_return_registered_api_key(tmp_path) -> None:
+    path = tmp_path / "app.db"
+    Database(str(path)).close()
+    calls: list[tuple[str, object]] = []
+
+    class SettingsPort:
+        def state(self) -> dict[str, object]:
+            return {
+                "enabled": True,
+                "active": {"version": 1, "config": _vllm_config().model_dump(mode="json")},
+                "candidate": None,
+            }
+
+        def public_state(self) -> dict[str, object]:
+            return self.state()
+
+        def stage(self, request: object) -> dict[str, object]:
+            calls.append(("stage", request.apiKey.get_secret_value()))  # type: ignore[attr-defined]
+            return self.state()
+
+        def test_candidate(self, *, expected_version: int) -> dict[str, object]:
+            calls.append(("test", expected_version))
+            return {"settings": self.state(), "capability": {"status": "passed"}}
+
+        def activate_candidate(self, *, expected_version: int) -> dict[str, object]:
+            calls.append(("activate", expected_version))
+            return {"activated": True, "settings": self.state(), "capability": {"status": "passed"}}
+
+    settings = SettingsPort()
+    control = UIControlPlane(
+        database_path=str(path),
+        vllm_capability_port=lambda config: {"status": "passed"},
+        vllm_public_config=_vllm_config(),
+        vllm_settings_port=settings,
+    )
+    router = UIRouter(control)
+
+    staged = router.dispatch(
+        method="POST",
+        path="/api/v1/vllm/candidate",
+        body=b'{"baseUrl":"http://10.0.6.182:8100/v1","apiKey":"one-shot-secret"}',
+    )
+    tested = router.dispatch(
+        method="POST", path="/api/v1/vllm/candidate/test", body=b'{"version":2}'
+    )
+    activated = router.dispatch(
+        method="POST", path="/api/v1/vllm/candidate/activate", body=b'{"version":2}'
+    )
+
+    assert staged.status == 201
+    assert "one-shot-secret" not in json.dumps(staged.body)
+    assert tested.status == 200
+    assert activated.status == 200
+    assert calls == [("stage", "one-shot-secret"), ("test", 2), ("activate", 2)]
 
 
 def test_dashboard_projects_real_mission_state_and_lifecycle(tmp_path) -> None:
@@ -190,9 +415,7 @@ def test_approval_decision_uses_injected_owner_service_and_exact_presentation(tm
             verdict=verdict,
         )
 
-    control = UIControlPlane(
-        database_path=str(path), approval_decision_port=submit, clock=lambda: support.T0
-    )
+    control = UIControlPlane(database_path=str(path), approval_decision_port=submit, clock=lambda: support.T0)
     pending = control.interventions()[0]
     assert pending["actionable"] is True
 
@@ -269,3 +492,148 @@ def test_http_server_falls_back_only_for_spa_routes(tmp_path) -> None:
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+def test_http_server_exchanges_operator_token_for_httponly_session(tmp_path) -> None:
+    path = tmp_path / "app.db"
+    Database(str(path)).close()
+    control = UIControlPlane(database_path=str(path), clock=lambda: support.T0)
+    authenticator = OperatorSessionAuthenticator(
+        principal_id="redteam-operator",
+        operator_token=bytearray(b"a" * 32),
+        clock=lambda: support.T0,
+        token_factory=lambda: "s" * 32,
+    )
+    server = build_server(
+        control_plane=control,
+        host="127.0.0.1",
+        port=0,
+        static_root=None,
+        authenticator=authenticator,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    origin = f"http://{host}:{port}"
+    try:
+        connection = http.client.HTTPConnection(host, port, timeout=5)
+        connection.request("GET", "/api/v1/dashboard")
+        response = connection.getresponse()
+        assert response.status == 401
+        assert json.loads(response.read())["code"] == "UNAUTHENTICATED"
+        connection.close()
+
+        connection = http.client.HTTPConnection(host, port, timeout=5)
+        connection.request(
+            "POST",
+            "/api/v1/session",
+            json.dumps({"token": "a" * 32}),
+            {
+                "Content-Type": "application/json",
+                "Origin": origin,
+                "X-RedTeam-UI": "1",
+            },
+        )
+        response = connection.getresponse()
+        assert response.status == 200
+        assert json.loads(response.read())["principalId"] == "redteam-operator"
+        cookie = response.getheader("Set-Cookie")
+        assert cookie is not None and "HttpOnly" in cookie and "SameSite=Strict" in cookie
+        session_cookie = cookie.split(";", 1)[0]
+        connection.close()
+
+        connection = http.client.HTTPConnection(host, port, timeout=5)
+        connection.request("GET", "/api/v1/dashboard", headers={"Cookie": session_cookie})
+        response = connection.getresponse()
+        assert response.status == 200
+        assert json.loads(response.read())["mission"] is None
+        connection.close()
+
+        connection = http.client.HTTPConnection(host, port, timeout=5)
+        connection.request("GET", "/api/v1/readiness", headers={"Cookie": session_cookie})
+        response = connection.getresponse()
+        assert response.status == 200
+        readiness = json.loads(response.read())
+        assert readiness["status"] == "blocked"
+        assert readiness["blockerCount"] == len(readiness["blockers"])
+        connection.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_ui_mission_owner_creates_validates_and_starts_reviewed_draft(tmp_path) -> None:
+    path = tmp_path / "app.db"
+    kernel = build_test_kernel(db_path=str(path), clock=ManualClock(support.T0))
+    profile = build_mock_agent_profile(digest_service=kernel.digest_service)
+    owner = MissionCommandOwner(kernel=kernel, profile=profile, execution_enabled=True)
+    control = UIControlPlane(
+        database_path=str(path),
+        mission_command_port=owner,
+        approval_decision_port=owner.submit_approval,
+        clock=lambda: support.T0,
+    )
+    draft = _mission_draft().model_copy(update={"successType": "session_exists", "successValue": "sess-1"})
+    saved = control.save_mission_draft(draft)
+
+    created = control.create_mission(draft_id=str(saved["draftId"]))
+    assert created["state"] == "DRAFT"
+    assert control.create_mission(draft_id=str(saved["draftId"])) == created
+
+    validated = control.transition_mission(
+        mission_id=str(created["missionId"]),
+        expected_version=0,
+        action="validate",
+    )
+    assert validated["state"] == "VALIDATED"
+    running = control.transition_mission(
+        mission_id=str(created["missionId"]),
+        expected_version=1,
+        action="start",
+    )
+    assert running["state"] == "RUNNING"
+    assert control.health()["missionActionsEnabled"] is True
+    assert control.health()["missionExecutionEnabled"] is True
+    kernel.database.close()
+
+
+def test_ui_mission_owner_rejects_unimplemented_success_authority(tmp_path) -> None:
+    path = tmp_path / "app.db"
+    kernel = build_test_kernel(db_path=str(path), clock=ManualClock(support.T0))
+    owner = MissionCommandOwner(
+        kernel=kernel,
+        profile=build_mock_agent_profile(digest_service=kernel.digest_service),
+    )
+    control = UIControlPlane(database_path=str(path), mission_command_port=owner, clock=lambda: support.T0)
+    saved = control.save_mission_draft(_mission_draft())
+    with pytest.raises(UIActionBlockedError) as caught:
+        control.create_mission(draft_id=str(saved["draftId"]))
+    assert caught.value.code == "MISSION_DRAFT_NOT_ACTIVATABLE"
+    assert "Execution readiness" in caught.value.resolution
+    kernel.database.close()
+
+
+def test_ui_mission_owner_blocks_start_without_an_attached_execution_runtime(tmp_path) -> None:
+    path = tmp_path / "app.db"
+    kernel = build_test_kernel(db_path=str(path), clock=ManualClock(support.T0))
+    owner = MissionCommandOwner(
+        kernel=kernel,
+        profile=build_mock_agent_profile(digest_service=kernel.digest_service),
+    )
+    control = UIControlPlane(database_path=str(path), mission_command_port=owner, clock=lambda: support.T0)
+    saved = control.save_mission_draft(
+        _mission_draft().model_copy(update={"successType": "session_exists", "successValue": "sess-1"})
+    )
+    created = control.create_mission(draft_id=str(saved["draftId"]))
+    validated = control.transition_mission(mission_id=str(created["missionId"]), expected_version=0, action="validate")
+
+    with pytest.raises(UIActionBlockedError) as caught:
+        control.transition_mission(
+            mission_id=str(created["missionId"]),
+            expected_version=int(validated["missionStateVersion"]),
+            action="start",
+        )
+    assert caught.value.code == "MISSION_VALIDATION_BLOCKED"
+    assert "Execution readiness" in caught.value.resolution
+    kernel.database.close()

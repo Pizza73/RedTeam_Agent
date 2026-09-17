@@ -27,6 +27,28 @@ describe("operator console", () => {
     expect(screen.getByText("Unknown-field rejection")).toBeInTheDocument();
   });
 
+  it("registers, tests, and activates a redacted LLM candidate", async () => {
+    const user = userEvent.setup();
+    renderRoute("/settings/llm");
+    const baseUrl = await screen.findByLabelText(/^Base URL/);
+    const apiKey = screen.getByLabelText(/^API key/);
+    await screen.findByText("Key registered · generation 1");
+    await user.clear(baseUrl);
+    await user.type(baseUrl, "http://10.0.6.182:8100/v1");
+    await user.type(apiKey, "browser-only-test-secret");
+    await user.click(screen.getByRole("button", { name: /register candidate/i }));
+
+    expect(await screen.findByText("Key registered · test not run")).toBeInTheDocument();
+    expect(apiKey).toHaveValue("");
+    expect(screen.queryByText("browser-only-test-secret")).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: /test connection & capabilities/i }));
+    expect(await screen.findByText("The candidate passed. Activation reruns the contract and keeps the old endpoint if that final check fails.", {}, { timeout: 2000 })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: /activate candidate/i }));
+    expect(await screen.findByText("Key registered · generation 2", {}, { timeout: 2000 })).toBeInTheDocument();
+    expect(baseUrl).toHaveValue("http://10.0.6.182:8100/v1");
+  });
+
   it("shows complete approval bindings before an operator decision", async () => {
     const user = userEvent.setup();
     renderRoute("/interventions");
@@ -50,6 +72,14 @@ describe("operator console", () => {
     renderRoute("/missions/new");
     await user.selectOptions(await screen.findByLabelText("Target type"), "other");
     expect(screen.getByText(/stored as an unresolved draft/i)).toBeInTheDocument();
+  });
+
+  it("shows actionable execution blockers instead of a generic failure", async () => {
+    renderRoute("/missions/new");
+    expect(await screen.findByRole("heading", { name: "Execution readiness" })).toBeInTheDocument();
+    expect(await screen.findByText("Session reference is not approved")).toBeInTheDocument();
+    expect(screen.getByText(/Verify an authorized live Beacon/)).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Execution blocked · 3" })).toBeInTheDocument();
   });
 
   it("presents the knowledge graph as focused relationship views", async () => {
@@ -120,6 +150,34 @@ describe("operator console", () => {
     expect(policy).toBeEnabled();
     await user.selectOptions(policy, "disabled");
     expect(policy).toHaveValue("disabled");
+  });
+
+  it("shows the closed read-only AD assessment catalog and its live gap", async () => {
+    const user = userEvent.setup();
+    renderRoute("/settings/providers");
+    await user.click(await screen.findByRole("tab", { name: "AD Assessment" }));
+
+    expect(screen.getByRole("heading", { name: "Active Directory configuration assessment" })).toBeInTheDocument();
+    expect(screen.getByText("ad.audit.kerberos_service_accounts")).toBeInTheDocument();
+    expect(screen.getByText("ad.audit.kerberos_preauth")).toBeInTheDocument();
+    expect(screen.getByText("ad.audit.adcs_esc")).toBeInTheDocument();
+    expect(screen.getByText("ad.audit.delegation")).toBeInTheDocument();
+    expect(screen.getByText("COLLECTOR ATTACHED")).toBeInTheDocument();
+    expect(screen.getByText(/Kerberos ticket acquisition or export/)).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Run verifier simulator" }));
+    expect(await screen.findByText(/6 deterministic findings across 5 checks/)).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Run complete local LLM evaluation" }));
+    expect(await screen.findByText(/Complete evaluation: completed/)).toBeInTheDocument();
+    expect(screen.getAllByText("AGREED")).toHaveLength(5);
+
+    await user.click(screen.getByRole("button", { name: "Collect and evaluate live AD" }));
+    expect(await screen.findByText(/Live AD evaluation: completed/)).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Ask local LLM for next check" }));
+    expect(await screen.findByText(/Advisory recommendation:/)).toBeInTheDocument();
+    expect(screen.getByText(/does not confirm a finding or authorize execution/)).toBeInTheDocument();
   });
 
   it("collapses tool groups and reveals read-only command templates on demand", async () => {

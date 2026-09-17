@@ -1,0 +1,47 @@
+[Unit]
+Description=RedTeam Agent authenticated local control plane
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=redteam-agent
+Group=redteam-agent
+ExecStart=/opt/redteam-agent/venv/bin/redteam-product --config /etc/redteam-agent/product.json
+WorkingDirectory=/var/lib/redteam-agent
+Environment=PYTHONDONTWRITEBYTECODE=1
+LoadCredentialEncrypted=ui-operator.token:/etc/credstore.encrypted/redteam-agent-ui-operator.credential
+LoadCredentialEncrypted=vllm-api.key:/etc/credstore.encrypted/redteam-agent-vllm-api-key.credential
+LoadCredentialEncrypted=ad-collector-credential.json:/etc/credstore.encrypted/redteam-agent-ad-collector.credential
+StateDirectory=redteam-agent
+RuntimeDirectory=redteam-agent
+UMask=0077
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/redteam-agent
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+IPAddressDeny=any
+IPAddressAllow=localhost
+IPAddressAllow=10.0.6.0/24
+IPAddressAllow=10.0.10.212/32
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

@@ -492,9 +492,7 @@ def build_phase0c_kernel(
         nv_identity_digest=witness.identity("deployment_epoch").identity_digest,
         provider_identity=key_provider.provider_identity, established_at_iso="2026-01-15T12:00:00Z",
     )
-    adapters: dict[str, ExecutionAdapter] = {
-        kernel.mock_adapter.identity().adapter_id: kernel.mock_adapter,
-    }
+    adapters = kernel.adapters
     collection_facade = _SecureCollectionFacade(collection_service, kernel, adapters)
     ingestion_facade = _SecureIngestionFacade(ingestion_service, kernel)
     secret_source = _SecretLifecycleSource(secret_store)

@@ -1,0 +1,37 @@
+{
+  "schemaVersion": "kali-product-v1",
+  "databasePath": "/var/lib/redteam-agent/redteam-agent.db",
+  "staticDirectory": "/opt/redteam-agent/frontend/dist",
+  "operatorTokenFile": "/run/credentials/redteam-agent.service/ui-operator.token",
+  "operatorPrincipal": "redteam-operator",
+  "uiHost": "127.0.0.1",
+  "uiPort": 18000,
+  "vllmBaseUrl": "http://10.0.6.181:8100/v1",
+  "vllmModel": "gemma-4-31B-it",
+  "vllmApiKeyFile": "/run/credentials/redteam-agent.service/vllm-api.key",
+  "vllmSettingsDirectory": "/var/lib/redteam-agent/llm-settings",
+  "vllmAllowedCidrs": [
+    "10.0.6.0/24"
+  ],
+  "vllmManifest": "/etc/redteam-agent/gemma-4-31b.manifest.json",
+  "vllmPublicKey": "/etc/redteam-agent/attestation-signing-public.pem",
+  "vllmTokenizerDirectory": "/opt/redteam-agent/gemma-4-31b-tokenizer",
+  "impacketExecutable": "/opt/redteam-agent/venv/bin/redteam-impacket-mcp",
+  "impacketAllowedTargets": [
+    "10.0.10.212/32"
+  ],
+  "sliverOperatorCredential": "/run/credentials/redteam-agent.service/sliver-operator.cfg",
+  "adCollectorEnabled": true,
+  "adCollectorServerIp": "10.0.10.212",
+  "adCollectorPort": 636,
+  "adCollectorDomain": "intern.local",
+  "adCollectorCredentialFile": "/run/credentials/redteam-agent.service/ad-collector-credential.json",
+  "adCollectorTlsCaFile": null,
+  "adCollectorCertipyPython": "/usr/bin/python3",
+  "adCollectorExpectedTierZeroNames": [],
+  "adCollectorStalePasswordDays": 180,
+  "adCollectorMaxConstrainedDelegationTargets": 10,
+  "adCollectorTimeoutSeconds": 15,
+  "approvedSessionRefs": [],
+  "productionEligible": false
+}

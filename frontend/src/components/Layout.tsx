@@ -108,6 +108,7 @@ export function Layout() {
   const { pathname } = useLocation();
   const [eyebrow, title] = routeTitles[pathname] ?? routeTitles["/dashboard"];
   const { data: health, isError: healthError } = useQuery({ queryKey: ["health"], queryFn: () => gateway.getHealth(), refetchInterval: 5_000 });
+  const { data: readiness, isError: readinessError } = useQuery({ queryKey: ["execution-readiness"], queryFn: () => gateway.getExecutionReadiness(), refetchInterval: 5_000 });
   const { data: dashboard } = useQuery({ queryKey: ["dashboard"], queryFn: () => gateway.getDashboard() });
   const resolvedTitle = pathname === "/dashboard" ? dashboard?.mission?.title ?? title : title;
   return (
@@ -116,7 +117,7 @@ export function Layout() {
       <main>
         <header className="topbar">
           <div><p className="eyebrow">{eyebrow}</p><h1>{resolvedTitle}</h1></div>
-          <div className="topbar-actions"><button className="ghost-button"><Activity size={15}/> {healthError ? "System unavailable" : health ? "System healthy" : "Checking system"}</button><button className="flow-toggle" onClick={() => setMobileFlow(true)}><Menu size={16}/> Mission flow</button></div>
+          <div className="topbar-actions"><NavLink className={`ghost-button ${readiness?.status === "blocked" || readinessError ? "blocked" : ""}`} to="/missions/new"><Activity size={15}/> {healthError ? "System unavailable" : readinessError ? "Readiness unavailable" : readiness?.status === "blocked" ? `Execution blocked · ${readiness.blockerCount}` : health && readiness ? "Execution ready" : "Checking system"}</NavLink><button className="flow-toggle" onClick={() => setMobileFlow(true)}><Menu size={16}/> Mission flow</button></div>
         </header>
         <Outlet />
       </main>
