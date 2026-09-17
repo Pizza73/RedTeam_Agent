@@ -6,9 +6,8 @@
   "operatorPrincipal": "redteam-operator",
   "uiHost": "0.0.0.0",
   "uiPort": 18000,
-  "uiAllowedOrigins": [
-    "http://10.0.1.109:18000"
-  ],
+  "uiOriginPolicy": "rfc1918_same_origin",
+  "uiAllowedOrigins": [],
   "vllmBaseUrl": "http://10.0.6.181:8100/v1",
   "vllmModel": "gemma-4-31B-it",
   "vllmApiKeyFile": "/run/credentials/redteam-agent.service/vllm-api.key",

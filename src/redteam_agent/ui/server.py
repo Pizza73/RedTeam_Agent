@@ -292,16 +292,44 @@ def validate_direct_ui_origins(origins: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(validated)
 
 
+def _rfc1918_origin_for_host(host: str, *, expected_port: int) -> str | None:
+    parsed = urlsplit(f"http://{host}")
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    if parsed.hostname is None or port is None or (expected_port != 0 and port != expected_port):
+        return None
+    try:
+        address = IPv4Address(parsed.hostname)
+    except ValueError:
+        return None
+    if not any(address in network for network in _RFC1918_NETWORKS):
+        return None
+    origin = f"http://{address}:{port}"
+    return origin if host == origin.removeprefix("http://") else None
+
+
 def build_handler(
     *,
     router: UIRouter,
     static_root: Path | None,
     allowed_origins: tuple[str, ...] = (),
+    allow_rfc1918_same_origin: bool = False,
+    bind_port: int = 0,
 ) -> type[BaseHTTPRequestHandler]:
     root = static_root.resolve() if static_root is not None else None
     external_origins = {
         urlsplit(origin).netloc: origin for origin in validate_direct_ui_origins(allowed_origins)
     }
+
+    def external_origin_for_host(host: str) -> str | None:
+        configured = external_origins.get(host)
+        if configured is not None:
+            return configured
+        if allow_rfc1918_same_origin:
+            return _rfc1918_origin_for_host(host, expected_port=bind_port)
+        return None
 
     class OperatorUIHandler(BaseHTTPRequestHandler):
         server_version = "RedTeamAgentUI/1"
@@ -357,15 +385,16 @@ def build_handler(
 
         def _host_allowed(self) -> bool:
             host = self.headers.get("Host", "")
-            return _host_name(host) in _ALLOWED_HOSTS or host in external_origins
+            return _host_name(host) in _ALLOWED_HOSTS or external_origin_for_host(host) is not None
 
         def _mutation_allowed(self) -> bool:
             host = self.headers.get("Host", "")
             origin = self.headers.get("Origin", "")
             if self.headers.get("X-RedTeam-UI") != "1":
                 return False
-            if host in external_origins:
-                return origin == external_origins[host]
+            external_origin = external_origin_for_host(host)
+            if external_origin is not None:
+                return origin == external_origin
             return _host_name(host) in _ALLOWED_HOSTS and origin == f"http://{host}"
 
         def _read_json_body(self) -> bytes | None:
@@ -529,12 +558,15 @@ def build_server(
     static_root: Path | None,
     authenticator: OperatorSessionAuthenticator | None = None,
     allowed_origins: tuple[str, ...] = (),
+    allow_rfc1918_same_origin: bool = False,
 ) -> ThreadingHTTPServer:
     if host not in {"127.0.0.1", "localhost", DIRECT_EXTERNAL_BIND_HOST}:
         raise ValueError("operator UI bind address is not allowed")
     validated_origins = validate_direct_ui_origins(allowed_origins)
-    if host == DIRECT_EXTERNAL_BIND_HOST and not validated_origins:
-        raise ValueError("direct external UI bind requires at least one exact allowed origin")
+    if host == DIRECT_EXTERNAL_BIND_HOST and not validated_origins and not allow_rfc1918_same_origin:
+        raise ValueError("direct external UI bind requires an exact origin or RFC1918 same-origin mode")
+    if validated_origins and allow_rfc1918_same_origin:
+        raise ValueError("exact UI origins cannot be combined with RFC1918 same-origin mode")
     if (
         host == DIRECT_EXTERNAL_BIND_HOST
         and port != 0
@@ -547,6 +579,8 @@ def build_server(
             router=UIRouter(control_plane, authenticator=authenticator),
             static_root=static_root,
             allowed_origins=validated_origins,
+            allow_rfc1918_same_origin=allow_rfc1918_same_origin,
+            bind_port=port,
         ),
     )
 
@@ -565,6 +599,11 @@ def main() -> int:
         action="append",
         default=[],
         help="Exact RFC1918 HTTP origin allowed for direct external access; repeat for multiple URLs",
+    )
+    parser.add_argument(
+        "--allow-rfc1918-same-origin",
+        action="store_true",
+        help="Allow the requested canonical RFC1918 Host when the browser Origin exactly matches it",
     )
     parser.add_argument("--static-dir", default="frontend/dist", help="Built frontend directory")
     parser.add_argument("--api-only", action="store_true", help="Serve only the JSON API")
@@ -658,6 +697,7 @@ def main() -> int:
             static_root=static_root,
             authenticator=authenticator,
             allowed_origins=tuple(args.allowed_origin),
+            allow_rfc1918_same_origin=args.allow_rfc1918_same_origin,
         )
     except ValueError as exc:
         parser.error(f"invalid UI network configuration: {exc}")

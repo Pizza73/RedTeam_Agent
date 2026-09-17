@@ -532,12 +532,63 @@ def test_direct_bind_rejects_missing_or_non_private_origins(tmp_path) -> None:
     path = tmp_path / "app.db"
     Database(str(path)).close()
     control = UIControlPlane(database_path=str(path), clock=lambda: support.T0)
-    with pytest.raises(ValueError, match="requires at least one"):
+    with pytest.raises(ValueError, match="exact origin or RFC1918"):
         build_server(control_plane=control, host="0.0.0.0", port=18000, static_root=None)
     with pytest.raises(ValueError, match="RFC1918"):
         validate_direct_ui_origins(("http://203.0.113.10:18000",))
     with pytest.raises(ValueError, match="literal IPv4"):
         validate_direct_ui_origins(("http://redteam-agent.example:18000",))
+
+
+def test_http_server_can_derive_origin_from_the_requested_runtime_rfc1918_ip(tmp_path) -> None:
+    path = tmp_path / "app.db"
+    Database(str(path)).close()
+    control = UIControlPlane(database_path=str(path), clock=lambda: support.T0)
+    server = build_server(
+        control_plane=control,
+        host="0.0.0.0",
+        port=0,
+        static_root=None,
+        allow_rfc1918_same_origin=True,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    _, port = server.server_address
+    body = json.dumps(_mission_draft().model_dump(mode="json")).encode()
+    try:
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        connection.request(
+            "POST",
+            "/api/v1/mission-drafts",
+            body,
+            {
+                "Content-Type": "application/json",
+                "Host": "10.20.30.40:18000",
+                "Origin": "http://10.20.30.40:18000",
+                "X-RedTeam-UI": "1",
+            },
+        )
+        assert connection.getresponse().status == 201
+        connection.close()
+
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        connection.request(
+            "POST",
+            "/api/v1/mission-drafts",
+            body,
+            {
+                "Content-Type": "application/json",
+                "Host": "10.20.30.40:18000",
+                "Origin": "http://10.20.30.41:18000",
+                "X-RedTeam-UI": "1",
+            },
+        )
+        assert connection.getresponse().status == 403
+        connection.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
 
 
 def test_http_server_falls_back_only_for_spa_routes(tmp_path) -> None:

@@ -92,7 +92,7 @@ def test_kali_product_wires_auth_and_persistent_owner_without_enabling_execution
 
 def test_kali_product_direct_bind_requires_exact_matching_origin(tmp_path: Path) -> None:
     base = _settings(tmp_path)
-    with pytest.raises(ValueError, match="requires at least one"):
+    with pytest.raises(ValueError, match="exact origin or RFC1918"):
         KaliProductSettings.model_validate({**base.model_dump(), "uiHost": "0.0.0.0"})
     with pytest.raises(ValueError, match="must match uiPort"):
         KaliProductSettings.model_validate(
@@ -111,6 +111,17 @@ def test_kali_product_direct_bind_requires_exact_matching_origin(tmp_path: Path)
         }
     )
     assert settings.uiAllowedOrigins == ("http://10.0.1.109:18000",)
+
+    dynamic = KaliProductSettings.model_validate(
+        {
+            **base.model_dump(),
+            "uiHost": "0.0.0.0",
+            "uiOriginPolicy": "rfc1918_same_origin",
+            "uiAllowedOrigins": (),
+        }
+    )
+    assert dynamic.uiOriginPolicy == "rfc1918_same_origin"
+    assert dynamic.uiAllowedOrigins == ()
 
 
 def test_kali_product_attaches_server_owned_ad_collector_when_enabled(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]

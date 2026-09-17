@@ -41,8 +41,8 @@ VLLM Settingsから実Capability Checkを行う場合は、初期接続先、許
 APIキーの値はCLI引数やブラウザへ渡しません。ブラウザには固定Endpoint、Model、Wire API、Structured Output Modeだけが公開され、別のURLへ変更できません。
 
 ブラウザで`http://127.0.0.1:18000/dashboard`を開きます。隔離LANへ直接公開する場合は
-`--host 0.0.0.0 --allowed-origin http://CONTROL_VM_RFC1918_IP:18000`を指定します。
-外部OriginはRFC1918のliteral IPv4と明示portへ限定され、Host/Origin完全一致が必要です。
+`--host 0.0.0.0 --allow-rfc1918-same-origin`を指定します。ブラウザで実際に使用した実行環境IPを動的に採用するため、
+IPの固定設定は不要です。外部OriginはRFC1918のliteral IPv4とbind portへ限定され、Host/Origin完全一致が必要です。
 
 開発時はAPIとViteを別プロセスで起動できます。
 
@@ -124,7 +124,9 @@ Mission FlowとAgent Activityも、型付きOperation、状態、Reference ID、
 - UIは既存DBを自動Provisionせず、存在するSchemaへFail Closedで接続します。
 - Browser表示はExecution Authorityではありません。
 
-直接外部bindは信頼済み隔離LANまたはVPN内のHTTP利用だけを対象とします。送信元CIDRをsystemdとhost firewallで制限し、internetへ直接公開しないでください。Reverse Proxy、TLS、SSO / RBAC統合はこのオフライン実装の対象外です。Production利用には認証を含む別のHuman Gateと設計レビューが必要です。
+直接外部bindは隔離networkでのHTTP利用だけを対象とします。現在のsystemdサンプルは`0.0.0.0/0`からのIPv4接続を許可するため、
+internetへ直接公開しないでください。Reverse Proxy、TLS、SSO / RBAC統合はこのオフライン実装の対象外です。
+Production利用には認証を含む別のHuman Gateと設計レビューが必要です。
 
 ## 7. 検証
 

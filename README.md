@@ -240,7 +240,8 @@ sudo chmod -R go-w /opt/redteam-agent/gemma-4-31b-tokenizer
 | `databasePath` | `/var/lib/redteam-agent/redteam-agent.db`を推奨。`StateDirectory=redteam-agent`が親directoryを作成する |
 | `staticDirectory` | build済みFrontendの絶対path。標準Unitでは`/opt/redteam-agent/frontend/dist` |
 | `uiHost` / `uiPort` | loopbackは`127.0.0.1:18000`。隔離LANへ直接公開する場合だけ`0.0.0.0:18000` |
-| `uiAllowedOrigins` | 外部bind時に許可する完全一致URL。RFC1918のliteral IPv4、`http`、明示portだけを許可する |
+| `uiOriginPolicy` | 別環境へ配置する場合は`rfc1918_same_origin`。要求された実行環境のRFC1918 IPを動的に検証する |
+| `uiAllowedOrigins` | `exact` policyで固定URLを使う場合だけ設定する。動的policyでは空配列にする |
 | `vllmAllowedCidrs` | UIから登録を許可するLLMサーバのIPv4 CIDR。必要最小限にする |
 | `vllmSettingsDirectory` | UIで有効化した接続先とservice-owned keyを保存するdirectory。標準は`/var/lib/redteam-agent/llm-settings` |
 | `adCollectorEnabled` | 実DCを評価する場合だけ`true`。未準備なら`false` |
@@ -310,8 +311,10 @@ Sliver用暗号化fileは`sliver-operator.cfg`というcredential名で
 
 #### 4. Unitのegress設定と起動
 
-標準Unitをコピーし、`IPAddressAllow=`を配備先へ合わせる。`product.json`の`vllmAllowedCidrs`はUnitで許可した
-LLM範囲と同じか、それより狭くする。AD Collectorは実DCの`/32`だけを許可し、`IPAddressDeny=any`を削除しない。
+標準Unitをコピーし、`IPAddressAllow=`を配備先へ合わせる。現在のサンプルは外部から直接アクセスできるよう
+`IPAddressAllow=0.0.0.0/0`として全IPv4を許可する。この設定ではsystemdによるIPv4のingress/egress制限は実質なくなる。
+接続元を限定する配備では、`0.0.0.0/0`を管理端末、LLM、実DCの必要最小CIDRへ置き換え、
+`product.json`の`vllmAllowedCidrs`をそのLLM範囲と同じか、それより狭くする。`IPAddressDeny=any`は削除しない。
 
 ```sh
 sudo install -o root -g root -m 0644 \
@@ -328,9 +331,10 @@ sudo systemctl status --no-pager redteam-agent.service
 
 | 用途 | `product.json` | systemd Unit |
 | --- | --- | --- |
-| UI | `uiHost`、`uiAllowedOrigins` | loopbackと許可する管理端末CIDRの`IPAddressAllow=` |
-| LLM | `vllmAllowedCidrs` | 同じCIDRの`IPAddressAllow=` |
-| AD Collector | `adCollectorServerIp` | 同じIPv4 `/32`の`IPAddressAllow=` |
+| IPv4全許可 | `uiHost=0.0.0.0` | `IPAddressAllow=0.0.0.0/0` |
+| UI Origin | `uiOriginPolicy`、`uiAllowedOrigins` | systemdではHost/Originを検証しない。アプリが同一Originを検証する |
+| 制限構成のLLM | `vllmAllowedCidrs` | `0.0.0.0/0`を使わない場合は同じCIDRの`IPAddressAllow=` |
+| 制限構成のAD Collector | `adCollectorServerIp` | `0.0.0.0/0`を使わない場合は同じIPv4 `/32`の`IPAddressAllow=` |
 
 起動後はhealthとlogを確認する。
 
@@ -349,23 +353,26 @@ ssh -L 18000:127.0.0.1:18000 operator@CONTROL_VM_IP
 LLMを変更する場合は`VLLM Settings`で`Register candidate`→`Test connection & capabilities`→
 `Activate candidate`の順に実行する。HTTP接続ではBearer keyがnetwork上で暗号化されないため、隔離network以外ではHTTPSを使用する。
 
-隔離LANから直接アクセスする場合は、次の3点を同時に変更する。サンプルは現在のControl VM
-`10.0.1.109:18000`向けに設定済みである。
+隔離LANから直接アクセスする場合、サンプルの動的Origin設定を使用できる。特定IPへ固定していないため、
+別のControl VMへ配置した場合も設定変更は不要である。
 
 ```json
 {
   "uiHost": "0.0.0.0",
   "uiPort": 18000,
-  "uiAllowedOrigins": ["http://10.0.1.109:18000"]
+  "uiOriginPolicy": "rfc1918_same_origin",
+  "uiAllowedOrigins": []
 }
 ```
 
-1. `product.json`の`uiAllowedOrigins`を実際にブラウザで開くURLへ完全一致させる。
-2. systemd Unitの`IPAddressAllow=`へ管理端末の送信元CIDRを追加し、host firewallでもTCP/18000を同じCIDRだけに許可する。
-3. `systemctl restart redteam-agent.service`後、管理端末から`http://10.0.1.109:18000`を開く。
+1. 実行環境で`ip -4 -brief address show scope global`を実行し、アクセスに使用するRFC1918 IPv4を確認する。
+2. 全IPv4から到達可能にする場合はsystemd Unitを`IPAddressAllow=0.0.0.0/0`とする。接続元を絞る場合は管理端末CIDRへ置き換える。
+3. `systemctl restart redteam-agent.service`後、管理端末から`http://実行環境のIPv4:18000`を開く。
 
-外部bindはRFC1918のliteral IPv4に限定し、DNS名、wildcard、public IPv4、Originと異なるHost headerを起動時または要求時に拒否する。
-直接HTTPではUI tokenとsession cookieが暗号化されないため、信頼済み隔離LANまたはVPN内だけで使用する。internetへ直接公開しない。
+動的policyは要求のHostから実行環境のアクセス先を判定し、同じ値のブラウザOriginだけを許可する。
+RFC1918のliteral IPv4とbind portに限定し、DNS名、wildcard、public IPv4、Originと異なるHost headerを要求時に拒否する。
+一方、`IPAddressAllow=0.0.0.0/0`では接続元IPv4を制限しない。
+直接HTTPではUI tokenとsession cookieが暗号化されないため、internetへ直接公開せず、network側の隔離を別途用意する。
 
 #### 5. 更新・backup・障害確認
 
