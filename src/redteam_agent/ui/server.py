@@ -684,9 +684,18 @@ def main() -> int:
     parser.add_argument("--operator-principal", default="redteam-operator")
     parser.add_argument("--operator-session-ttl", type=int, default=DEFAULT_SESSION_TTL_SECONDS)
     parser.add_argument("--unsafe-disable-auth", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--vllm-base-url", help="Enable the trusted Phase 2 vLLM gateway at this URL")
-    parser.add_argument("--vllm-model", default="gemma-4-31B-it")
-    parser.add_argument("--vllm-api-key-file", type=Path)
+    parser.add_argument(
+        "--llm-base-url", "--vllm-base-url", dest="vllm_base_url",
+        help="Enable the Phase 2 OpenAI-compatible gateway",
+    )
+    parser.add_argument(
+        "--llm-endpoint-kind",
+        choices=("shared_gateway", "direct_vllm"),
+        default="shared_gateway",
+        help="Use a shared multiplexing gateway, or opt into legacy direct-vLLM attestation",
+    )
+    parser.add_argument("--llm-model", "--vllm-model", dest="vllm_model", default="gemma-4-31B-it")
+    parser.add_argument("--llm-api-key-file", "--vllm-api-key-file", dest="vllm_api_key_file", type=Path)
     parser.add_argument("--vllm-manifest", type=Path)
     parser.add_argument("--vllm-public-key", type=Path)
     parser.add_argument("--vllm-manifest-key-id", default="llm001-gemma4-2026")
@@ -717,12 +726,13 @@ def main() -> int:
     vllm_port = None
     vllm_public_config = None
     if args.vllm_base_url is not None:
-        required = {
-            "--vllm-api-key-file": args.vllm_api_key_file,
-            "--vllm-manifest": args.vllm_manifest,
-            "--vllm-public-key": args.vllm_public_key,
-            "--vllm-tokenizer-directory": args.vllm_tokenizer_directory,
-        }
+        required = {"--vllm-api-key-file": args.vllm_api_key_file}
+        if args.llm_endpoint_kind == "direct_vllm":
+            required.update({
+                "--vllm-manifest": args.vllm_manifest,
+                "--vllm-public-key": args.vllm_public_key,
+                "--vllm-tokenizer-directory": args.vllm_tokenizer_directory,
+            })
         missing = [name for name, value in required.items() if value is None]
         if missing:
             parser.error(f"{', '.join(missing)} required when --vllm-base-url is set")
@@ -737,6 +747,7 @@ def main() -> int:
                 base_url=args.vllm_base_url,
                 model=args.vllm_model,
                 api_key_file=args.vllm_api_key_file,
+                endpoint_kind=args.llm_endpoint_kind,
                 manifest_path=args.vllm_manifest,
                 public_key_path=args.vllm_public_key,
                 manifest_key_id=args.vllm_manifest_key_id,
@@ -751,7 +762,7 @@ def main() -> int:
             vllm_port = Phase2VllmCapabilityPort(settings=settings)
             vllm_public_config = vllm_port.public_config
         except (AuthorizationKernelError, OSError, ValueError) as exc:
-            parser.error(f"invalid trusted vLLM configuration: {type(exc).__name__}")
+            parser.error(f"invalid LLM gateway configuration: {type(exc).__name__}: {exc}")
     control_plane = UIControlPlane(
         database_path=args.database,
         vllm_capability_port=vllm_port,

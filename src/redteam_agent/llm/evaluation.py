@@ -63,7 +63,7 @@ from redteam_agent.llm.evaluation_gateway import EvaluationGateway, EvaluationRu
 from redteam_agent.llm.profile import LocalLLMProfile
 from redteam_agent.llm.schemas import validate_actual_schema
 from redteam_agent.llm.structured_output import build_chat_request, extract_raw_output
-from redteam_agent.llm.tokenizer import HuggingFaceTokenCounter, TokenCounter
+from redteam_agent.llm.tokenizer import HuggingFaceTokenCounter, SharedGatewayTokenCounter, TokenCounter
 from redteam_agent.runtime.clock import Clock
 
 _EVAL_SYSTEM = (
@@ -216,7 +216,7 @@ class LiveCapabilityProbe:
             "real_local_llm"
             if self._client.uses_direct_network_transport
             and attestation_is_real(self._attestation)
-            and type(self._tokens) is HuggingFaceTokenCounter
+            and type(self._tokens) in (HuggingFaceTokenCounter, SharedGatewayTokenCounter)
             else "test_double"
         )
 

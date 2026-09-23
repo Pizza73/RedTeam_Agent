@@ -96,12 +96,14 @@ class ServerMetadataProvider(Protocol):
         ...
 
 
-def structured_output_probe_payload(model: str, structured_output_mode: str) -> dict[str, Any]:
+def structured_output_probe_payload(
+    model: str, structured_output_mode: str, *, max_tokens: int = 16
+) -> dict[str, Any]:
     """The fixed, context-free structured-output probe request body (no secrets)."""
     payload: dict[str, Any] = {
         "model": model,
         "messages": [{"role": "user", "content": _PROBE_USER}],
-        "max_tokens": 16,
+        "max_tokens": max_tokens,
         "temperature": 0.0,
         "stream": False,
     }
@@ -136,9 +138,13 @@ class HttpServerMetadataProvider:
         *,
         api_key_source: APIKeySource | None = None,
         transport: httpx.BaseTransport | None = None,
+        probe_max_tokens: int = 16,
     ) -> None:
+        if probe_max_tokens <= 0:
+            raise ValueError("probe_max_tokens must be positive")
         self._transport = transport if transport is not None else httpx.HTTPTransport(retries=0)
         self._api_key_source = api_key_source
+        self._probe_max_tokens = probe_max_tokens
 
     @property
     def uses_direct_network_transport(self) -> bool:
@@ -162,7 +168,9 @@ class HttpServerMetadataProvider:
                 models = client.get(f"{base}/models")
                 probe = client.post(
                     f"{base}/chat/completions",
-                    json=structured_output_probe_payload(model, structured_output_mode),
+                    json=structured_output_probe_payload(
+                        model, structured_output_mode, max_tokens=self._probe_max_tokens
+                    ),
                 )
         except httpx.HTTPError:
             raise LLMAttestationError("server metadata request failed") from None
@@ -351,7 +359,9 @@ def derive_attestation_provenance(
     return "test_double"
 
 
-def _require_served_model(models: object, model: str) -> dict[str, Any]:
+def _require_served_model(
+    models: object, model: str, *, require_artifact_root: bool = True
+) -> dict[str, Any]:
     if not isinstance(models, dict) or not isinstance(models.get("data"), list):
         raise LLMAttestationError("server model list is missing or malformed")
     matches = [
@@ -365,9 +375,10 @@ def _require_served_model(models: object, model: str) -> dict[str, Any]:
     entry = matches[0]
     if entry.get("object", "model") != "model":
         raise LLMAttestationError("served model entry is not a model card")
-    root = entry.get("root")
-    if not isinstance(root, str) or not root:
-        raise LLMAttestationError("served model card carries no artifact root")
+    if require_artifact_root:
+        root = entry.get("root")
+        if not isinstance(root, str) or not root:
+            raise LLMAttestationError("served model card carries no artifact root")
     return entry
 
 
@@ -379,10 +390,12 @@ def _require_version(version: object, runtime_version: str) -> str:
     return str(version["version"])
 
 
-def _verify_probe(body: object, *, model: str, mode: str) -> None:
+def _verify_probe(
+    body: object, *, model: str, mode: str, require_response_model: bool = True
+) -> None:
     if not isinstance(body, dict):
         raise LLMAttestationError("structured-output probe response is missing or malformed")
-    if "model" in body and body["model"] != model:
+    if require_response_model and "model" in body and body["model"] != model:
         raise LLMAttestationError("structured-output probe was answered by another model")
     choices = body.get("choices")
     if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
@@ -484,6 +497,80 @@ def attest_local_llm_server(
     return ServerAttestation(**fields, attestation_digest=attestation_digest)  # type: ignore[arg-type]
 
 
+def attest_shared_gateway(
+    *,
+    profile: LocalLLMProfile,
+    endpoint: LocalLLMEndpointConfig,
+    provider: ServerMetadataProvider,
+    digest_service: DigestService,
+    timeout_seconds: float = 10.0,
+) -> ServerAttestation:
+    """Attest a trusted multiplexing gateway without backend filesystem artifacts.
+
+    This is intentionally a weaker contract than local-vLLM attestation.  It binds
+    evidence to the authenticated HTTPS endpoint and provider-qualified model name,
+    then proves the configured structured-output mode over the real network path.
+    """
+    verify_profile_digest(profile, digest_service)
+    if endpoint.base_url is None:
+        raise LLMAttestationError("no shared gateway endpoint is configured")
+    if endpoint.model != profile.model_name or endpoint.wire_api != profile.wire_api:
+        raise LLMAttestationError("endpoint does not bind the shared gateway profile")
+    base_url = endpoint.base_url.rstrip("/")
+    evidence = provider.collect(
+        base_url=base_url,
+        model=endpoint.model,
+        structured_output_mode=profile.structured_output_mode,
+        timeout_seconds=timeout_seconds,
+    )
+    if evidence.health_status != 200:
+        raise LLMAttestationError("shared gateway health check did not succeed")
+    card = _require_served_model(
+        evidence.models, endpoint.model, require_artifact_root=False
+    )
+    _verify_probe(
+        evidence.structured_output_probe,
+        model=endpoint.model,
+        mode=profile.structured_output_mode,
+        require_response_model=False,
+    )
+    gateway_version = "unknown"
+    if isinstance(evidence.version, dict) and isinstance(evidence.version.get("version"), str):
+        gateway_version = str(evidence.version["version"])
+    fields: dict[str, object] = {
+        "profile_digest": profile.profile_digest,
+        "base_url": base_url,
+        "endpoint_model": endpoint.model,
+        "wire_api": endpoint.wire_api,
+        "served_model_id": str(card["id"]),
+        "model_root": f"shared-gateway:{endpoint.model}",
+        "model_hash": profile.model_hash,
+        "tokenizer_revision": profile.tokenizer_revision,
+        "chat_template_digest": profile.chat_template_digest,
+        "runtime_version": profile.runtime_version,
+        "max_model_len": None,
+        "artifact_manifest_digest": None,
+        "snapshot_revision": None,
+        "container_image_digest": None,
+        "structured_output_mode": profile.structured_output_mode,
+        "structured_output_verified": True,
+        "evidence_sources": (
+            "/health",
+            f"/version#gateway={gateway_version}",
+            "/v1/models",
+            "/v1/chat/completions#probe",
+        ),
+        "provenance": (
+            "direct_network"
+            if type(provider) is HttpServerMetadataProvider
+            and provider.uses_direct_network_transport
+            else "test_double"
+        ),
+    }
+    attestation_digest = digest_service.compute("llm_server_attestation_digest", fields)
+    return ServerAttestation(**fields, attestation_digest=attestation_digest)  # type: ignore[arg-type]
+
+
 def verify_server_attestation(attestation: ServerAttestation, digest_service: DigestService) -> None:
     digest_service.verify(
         "llm_server_attestation_digest",
@@ -532,6 +619,7 @@ __all__ = [
     "ServerMetadataProvider",
     "SignedManifestArtifactSource",
     "attest_local_llm_server",
+    "attest_shared_gateway",
     "attestation_is_real",
     "derive_attestation_provenance",
     "require_attestation_binding",

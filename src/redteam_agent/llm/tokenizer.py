@@ -143,6 +143,35 @@ class HuggingFaceTokenCounter:
         return len(encoded)
 
 
+class SharedGatewayTokenCounter:
+    """Conservative request counter for a remote shared OpenAI-compatible gateway.
+
+    The gateway owns the exact backend tokenizer.  Counting UTF-8 bytes plus a fixed
+    framing allowance deliberately overestimates normal BPE tokenization and keeps the
+    local request budget useful without copying model artifacts to every agent host.
+    """
+
+    def __init__(self, *, tokenizer_revision: str) -> None:
+        if not tokenizer_revision:
+            raise ValueError("shared gateway tokenizer revision is required")
+        self._revision = tokenizer_revision
+
+    @property
+    def tokenizer_revision(self) -> str:
+        return self._revision
+
+    def count_request(self, request: ChatCompletionRequest) -> int:
+        from redteam_agent.llm.client import VLLMChatClient
+
+        wire = json.dumps(
+            VLLMChatClient._payload(request),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return len(wire) + 64
+
+
 class TokenCounter(Protocol):
     """Counts tokens of a complete chat request for a fixed tokenizer revision.
 
@@ -159,4 +188,9 @@ class TokenCounter(Protocol):
         ...
 
 
-__all__ = ["HuggingFaceTokenCounter", "TokenCounter", "verify_tokenizer_artifacts"]
+__all__ = [
+    "HuggingFaceTokenCounter",
+    "SharedGatewayTokenCounter",
+    "TokenCounter",
+    "verify_tokenizer_artifacts",
+]

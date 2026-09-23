@@ -16,6 +16,7 @@ from redteam_agent.llm.attestation import (
     HttpServerMetadataProvider,
     LocalModelArtifactSource,
     attest_local_llm_server,
+    attest_shared_gateway,
     derive_attestation_provenance,
     verify_server_attestation,
 )
@@ -25,6 +26,38 @@ from redteam_agent.llm.config import LocalLLMEndpointConfig
 from redteam_agent.storage.database import Database
 
 BASE = "http://127.0.0.1:8000/v1"
+
+
+def test_shared_gateway_accepts_multiplexed_model_list_without_artifact_root() -> None:
+    ds = _ds()
+    profile = fake.local_profile(ds)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"status": "ok"})
+        if request.url.path == "/version":
+            return httpx.Response(200, json={"app": "GoModel", "version": "0.1.94"})
+        if request.url.path == "/v1/models":
+            return httpx.Response(200, json={"object": "list", "data": [
+                {"id": "provider/other", "object": "model"},
+                {"id": "qwen-test", "object": "model"},
+            ]})
+        return httpx.Response(200, json={
+            "model": "qwen-test",
+            "choices": [{"message": {"content": '{"ok": true}'}}],
+        })
+
+    attestation = attest_shared_gateway(
+        profile=profile,
+        endpoint=LocalLLMEndpointConfig(model=profile.model_name, base_url=BASE),
+        provider=HttpServerMetadataProvider(transport=httpx.MockTransport(handler)),
+        digest_service=ds,
+    )
+
+    assert attestation.model_root == "shared-gateway:qwen-test"
+    assert attestation.runtime_version == profile.runtime_version
+    assert attestation.provenance == "test_double"
+    assert "/version#gateway=0.1.94" in attestation.evidence_sources
 
 
 def _ds() -> DigestService:

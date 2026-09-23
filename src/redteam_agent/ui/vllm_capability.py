@@ -7,6 +7,7 @@ after the same signed manifest, tokenizer and model identity have been attested.
 
 from __future__ import annotations
 
+import hashlib
 import threading
 import time
 from collections.abc import Callable
@@ -32,6 +33,7 @@ from redteam_agent.llm.attestation import (
     HttpServerMetadataProvider,
     SignedManifestArtifactSource,
     attest_local_llm_server,
+    attest_shared_gateway,
     require_attestation_binding,
 )
 from redteam_agent.llm.attestation_store import ServerAttestationRepository
@@ -50,7 +52,11 @@ from redteam_agent.llm.evaluation_gateway import EvaluationGateway
 from redteam_agent.llm.profile import LocalLLMProfile, build_local_llm_profile
 from redteam_agent.llm.schemas import compute_schema_digest
 from redteam_agent.llm.secrets import FileAPIKeySource
-from redteam_agent.llm.tokenizer import HuggingFaceTokenCounter
+from redteam_agent.llm.tokenizer import (
+    HuggingFaceTokenCounter,
+    SharedGatewayTokenCounter,
+    TokenCounter,
+)
 from redteam_agent.runtime.clock import SystemMonotonicClock
 from redteam_agent.storage.database import Database
 from redteam_agent.ui.control_plane import UIConflictError
@@ -71,10 +77,11 @@ class Phase2VllmCapabilitySettings:
     base_url: str
     model: str
     api_key_file: Path
-    manifest_path: Path
-    public_key_path: Path
-    manifest_key_id: str
-    tokenizer_directory: Path
+    endpoint_kind: Literal["shared_gateway", "direct_vllm"] = "shared_gateway"
+    manifest_path: Path | None = None
+    public_key_path: Path | None = None
+    manifest_key_id: str | None = None
+    tokenizer_directory: Path | None = None
     profile_revision: str = "gemma-4-31b-it-vllm-0.25.1-r2"
     max_context_tokens: int = 131_072
     max_output_tokens: int = 1_024
@@ -83,19 +90,28 @@ class Phase2VllmCapabilitySettings:
     capability_deadline_seconds: int = 900
 
     def __post_init__(self) -> None:
-        path_fields = (
-            self.database_path,
-            self.api_key_file,
-            self.manifest_path,
-            self.public_key_path,
-            self.tokenizer_directory,
+        path_fields = tuple(
+            path for path in (
+                self.database_path,
+                self.api_key_file,
+                self.manifest_path,
+                self.public_key_path,
+                self.tokenizer_directory,
+            ) if path is not None
         )
         if any(not path.is_absolute() for path in path_fields):
             raise ValueError("vLLM database, secret and artifact paths must be absolute")
         if not self.database_path.is_file():
             raise ValueError("vLLM capability requires an existing application database")
-        if not self.manifest_key_id or not self.profile_revision:
-            raise ValueError("vLLM manifest key and profile revisions are required")
+        if not self.profile_revision:
+            raise ValueError("LLM profile revision is required")
+        if self.endpoint_kind == "direct_vllm" and any(value is None for value in (
+            self.manifest_path,
+            self.public_key_path,
+            self.manifest_key_id,
+            self.tokenizer_directory,
+        )):
+            raise ValueError("direct vLLM requires manifest, public key and tokenizer artifacts")
         if self.max_context_tokens <= 0 or not 0 < self.max_output_tokens <= self.max_context_tokens:
             raise ValueError("vLLM profile token limits are invalid")
         if self.attestation_timeout_seconds <= 0 or self.capability_deadline_seconds <= 0:
@@ -141,38 +157,67 @@ class Phase2VllmCapabilityPort:
             request_timeout_seconds=settings.attestation_timeout_seconds,
         )
         digest_service = DigestService()
-        manifest = load_and_verify_remote_model_artifact_manifest(
-            manifest_path=settings.manifest_path,
-            public_key_path=settings.public_key_path,
-            expected_key_id=settings.manifest_key_id,
-            digest_service=digest_service,
-        )
-        if manifest.served_model_id != settings.model:
-            raise ValueError("configured vLLM model does not match the signed manifest")
+        if settings.endpoint_kind == "direct_vllm":
+            assert settings.manifest_path is not None
+            assert settings.public_key_path is not None
+            assert settings.manifest_key_id is not None
+            assert settings.tokenizer_directory is not None
+            manifest = load_and_verify_remote_model_artifact_manifest(
+                manifest_path=settings.manifest_path,
+                public_key_path=settings.public_key_path,
+                expected_key_id=settings.manifest_key_id,
+                digest_service=digest_service,
+            )
+            if manifest.served_model_id != settings.model:
+                raise ValueError("configured vLLM model does not match the signed manifest")
+            model_hash = manifest.model_hash
+            tokenizer_revision = manifest.tokenizer_revision
+            chat_template_digest = manifest.chat_template_digest
+            runtime_version = manifest.runtime_version
+        else:
+            identity = hashlib.sha256(
+                f"shared-gateway:{settings.base_url.rstrip('/')}:{settings.model}".encode()
+            ).hexdigest()
+            model_hash = identity
+            tokenizer_revision = f"shared-gateway-bytes-v1:{identity}"
+            chat_template_digest = None
+            runtime_version = "shared-gateway-v1"
         self._profile = build_local_llm_profile(
             profile_revision=settings.profile_revision,
             structured_output_mode=settings.profile_output_mode,
             max_context_tokens=settings.max_context_tokens,
             max_output_tokens=settings.max_output_tokens,
-            model_name=manifest.served_model_id,
-            model_hash=manifest.model_hash,
-            chat_template_digest=manifest.chat_template_digest,
-            tokenizer_revision=manifest.tokenizer_revision,
-            runtime_version=manifest.runtime_version,
+            model_name=settings.model,
+            model_hash=model_hash,
+            chat_template_digest=chat_template_digest,
+            tokenizer_revision=tokenizer_revision,
+            runtime_version=runtime_version,
             digest_service=digest_service,
         )
         self._key_source = FileAPIKeySource(settings.api_key_file)
-        self._artifact_source = SignedManifestArtifactSource(
-            manifest_path=settings.manifest_path,
-            public_key_path=settings.public_key_path,
-            expected_key_id=settings.manifest_key_id,
-            digest_service=digest_service,
-        )
-        self._token_counter = HuggingFaceTokenCounter(
-            model_directory=settings.tokenizer_directory,
-            tokenizer_revision=self._profile.tokenizer_revision,
-            chat_template_digest=self._profile.chat_template_digest,
-        )
+        self._artifact_source: SignedManifestArtifactSource | None
+        self._token_counter: TokenCounter
+        if settings.endpoint_kind == "direct_vllm":
+            assert settings.manifest_path is not None
+            assert settings.public_key_path is not None
+            assert settings.manifest_key_id is not None
+            assert settings.tokenizer_directory is not None
+            self._artifact_source = SignedManifestArtifactSource(
+                manifest_path=settings.manifest_path,
+                public_key_path=settings.public_key_path,
+                expected_key_id=settings.manifest_key_id,
+                digest_service=digest_service,
+            )
+            self._token_counter = HuggingFaceTokenCounter(
+                model_directory=settings.tokenizer_directory,
+                tokenizer_revision=self._profile.tokenizer_revision,
+                chat_template_digest=self._profile.chat_template_digest,
+            )
+        else:
+            self._artifact_source = None
+            self._token_counter = SharedGatewayTokenCounter(
+                tokenizer_revision=self._profile.tokenizer_revision
+            )
 
     @property
     def public_config(self) -> VllmConfigInput:
@@ -334,14 +379,28 @@ class Phase2VllmCapabilityPort:
             # remains on the ThreadingHTTPServer worker that owns it.
             database = Database(str(self._settings.database_path), create_schema=False)
             digest_service = DigestService()
-            attestation = attest_local_llm_server(
-                profile=self._profile,
-                endpoint=self._endpoint,
-                provider=HttpServerMetadataProvider(api_key_source=self._key_source),
-                artifact_source=self._artifact_source,
-                digest_service=digest_service,
-                timeout_seconds=self._settings.attestation_timeout_seconds,
+            provider = HttpServerMetadataProvider(
+                api_key_source=self._key_source,
+                probe_max_tokens=(256 if self._settings.endpoint_kind == "shared_gateway" else 16),
             )
+            if self._settings.endpoint_kind == "shared_gateway":
+                attestation = attest_shared_gateway(
+                    profile=self._profile,
+                    endpoint=self._endpoint,
+                    provider=provider,
+                    digest_service=digest_service,
+                    timeout_seconds=self._settings.attestation_timeout_seconds,
+                )
+            else:
+                assert self._artifact_source is not None
+                attestation = attest_local_llm_server(
+                    profile=self._profile,
+                    endpoint=self._endpoint,
+                    provider=provider,
+                    artifact_source=self._artifact_source,
+                    digest_service=digest_service,
+                    timeout_seconds=self._settings.attestation_timeout_seconds,
+                )
             ServerAttestationRepository(database, digest_service).save(attestation)
             client = VLLMChatClient(
                 base_url=self._settings.base_url,

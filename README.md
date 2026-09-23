@@ -157,19 +157,26 @@ cd ..
   --operator-token-file /absolute/private/path/ui-operator.token
 ```
 
-現在の閉域LLMをUIからCapability Checkする場合は次の固定構成で起動する。APIキー値は引数やブラウザへ渡さない。
+共有OpenAI互換gatewayをUIからCapability Checkする場合は、provider-qualified model IDと
+service-owned API key fileを指定する。APIキー値は引数やブラウザへ渡さない。共有gatewayでは
+backendのmanifest、公開鍵、tokenizerのローカルコピーを要求しない。gatewayのTLS/API認証、health、
+model catalog、およびstructured-output probeを実ネットワーク経路で確認する。token budgetはUTF-8 byte数を
+用いた安全側の上限で事前検査する。
 
 ```sh
 .venv/bin/redteam-ui \
   --database /absolute/path/to/redteam-agent.db \
   --operator-token-file /absolute/private/path/ui-operator.token \
-  --vllm-base-url http://10.0.6.181:8100/v1 \
-  --vllm-model gemma-4-31B-it \
-  --vllm-api-key-file /absolute/path/to/vllm-api.key \
-  --vllm-manifest /absolute/path/to/gemma-4-31b.manifest.json \
-  --vllm-public-key /absolute/path/to/attestation-signing-public.pem \
-  --vllm-tokenizer-directory /absolute/path/to/gemma-4-31b-tokenizer
+  --llm-endpoint-kind shared_gateway \
+  --llm-base-url https://llm-gateway.example/v1 \
+  --llm-model provider/model-name \
+  --llm-api-key-file /absolute/path/to/gateway-api.key
 ```
+
+旧来の単一vLLM直結とartifact attestationが必要な環境だけ、
+`--llm-endpoint-kind direct_vllm`と`--vllm-manifest`、`--vllm-public-key`、
+`--vllm-tokenizer-directory`を併用する。旧`--vllm-base-url`、`--vllm-model`、
+`--vllm-api-key-file`は移行用aliasとして受理する。
 
 `http://127.0.0.1:18000/dashboard`で開く。詳細は[UI統合記録](docs/development/ui-integration.md)と
 [UI操作ガイド](frontend/UI_GUIDE.md)を参照する。
