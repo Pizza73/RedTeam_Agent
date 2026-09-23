@@ -700,12 +700,31 @@ def main() -> int:
     parser.add_argument("--vllm-public-key", type=Path)
     parser.add_argument("--vllm-manifest-key-id", default="llm001-gemma4-2026")
     parser.add_argument("--vllm-tokenizer-directory", type=Path)
-    parser.add_argument("--vllm-profile-revision", default="gemma-4-31b-it-vllm-0.25.1-r2")
-    parser.add_argument("--vllm-max-context-tokens", type=int, default=131072)
-    parser.add_argument("--vllm-max-output-tokens", type=int, default=1024)
-    parser.add_argument("--vllm-structured-output-mode", choices=("native", "tool_output"), default="native")
-    parser.add_argument("--vllm-attestation-timeout", type=int, default=60)
-    parser.add_argument("--vllm-capability-deadline", type=int, default=900)
+    parser.add_argument(
+        "--llm-profile-revision", "--vllm-profile-revision",
+        dest="vllm_profile_revision", default="shared-gateway-profile-v1",
+    )
+    parser.add_argument(
+        "--llm-max-context-tokens", "--vllm-max-context-tokens",
+        dest="vllm_max_context_tokens", type=int, default=131072,
+    )
+    parser.add_argument(
+        "--llm-max-output-tokens", "--vllm-max-output-tokens",
+        dest="vllm_max_output_tokens", type=int, default=1024,
+    )
+    parser.add_argument(
+        "--llm-structured-output-mode", "--vllm-structured-output-mode",
+        dest="vllm_structured_output_mode",
+        choices=("native", "tool_output"), default="native",
+    )
+    parser.add_argument(
+        "--llm-attestation-timeout", "--vllm-attestation-timeout",
+        dest="vllm_attestation_timeout", type=int, default=60,
+    )
+    parser.add_argument(
+        "--llm-capability-deadline", "--vllm-capability-deadline",
+        dest="vllm_capability_deadline", type=int, default=900,
+    )
     args = parser.parse_args()
     if not 1 <= args.port <= 65535:
         parser.error("port must be between 1 and 65535")
