@@ -14,7 +14,7 @@ The provider surface also exposes a closed AD configuration-assessment catalog. 
 ## Architecture
 
 ```text
-Browser on loopback
+Browser on loopback or an allowed IPv4
         |
         | same-origin HTTP + HttpOnly session + strict JSON
         v
@@ -28,7 +28,7 @@ redteam-ui (ThreadingHTTPServer)
         +-- optional AD port ------> fixed-IP LDAPS + fixed Certipy find worker
 ```
 
-`src/redteam_agent/ui/models.py` owns the strict browser boundary. `control_plane.py` projects safe data without creating a second Mission, Policy, Approval, or Knowledge authority. `server.py` serves the built SPA and the `/api/v1` API on loopback only.
+`src/redteam_agent/ui/models.py` owns the strict browser boundary. `control_plane.py` projects safe data without creating a second Mission, Policy, Approval, or Knowledge authority. `server.py` serves the built SPA and the `/api/v1` API on loopback or an explicitly configured IPv4 interface.
 
 ## API
 
@@ -107,7 +107,7 @@ For development, run `redteam-ui --api-only --operator-token-file /absolute/priv
 
 ## Safety properties
 
-- Only loopback bind targets are accepted and Host headers are allowlisted.
+- Loopback is the default bind target. Direct IPv4 access requires an explicit same-origin policy, and Host headers are checked.
 - The bootstrap token is exchanged once for a bounded, restart-ephemeral HttpOnly SameSite session and is never persisted.
 - CORS and framing are denied; CSP and no-store API responses are enabled.
 - Unknown JSON fields, duplicate JSON keys, invalid timestamps, oversized requests, unsafe identifiers, and stale decisions fail closed.

@@ -6,7 +6,7 @@
   "operatorPrincipal": "redteam-operator",
   "uiHost": "0.0.0.0",
   "uiPort": 18000,
-  "uiOriginPolicy": "rfc1918_same_origin",
+  "uiOriginPolicy": "local_ipv4_same_origin",
   "uiAllowedOrigins": [],
   "vllmBaseUrl": "http://10.0.6.181:8100/v1",
   "vllmModel": "gemma-4-31B-it",

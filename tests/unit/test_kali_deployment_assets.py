@@ -13,7 +13,7 @@ def test_kali_product_config_is_strict_and_contains_no_secret_values() -> None:
     settings = KaliProductSettings.from_untrusted_json(raw)
     assert settings.productionEligible is False
     assert settings.uiHost == "0.0.0.0"
-    assert settings.uiOriginPolicy == "rfc1918_same_origin"
+    assert settings.uiOriginPolicy == "local_ipv4_same_origin"
     assert settings.uiAllowedOrigins == ()
     assert settings.impacketAllowedTargets == ("10.0.10.212/32",)
     assert settings.vllmAllowedCidrs == ("10.0.6.0/24",)

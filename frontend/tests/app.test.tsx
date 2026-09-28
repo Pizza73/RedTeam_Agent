@@ -2,7 +2,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { App } from "../src/App";
 
 function renderRoute(route: string) {
@@ -72,6 +72,20 @@ describe("operator console", () => {
     renderRoute("/missions/new");
     await user.selectOptions(await screen.findByLabelText("Target type"), "other");
     expect(screen.getByText(/stored as an unresolved draft/i)).toBeInTheDocument();
+  });
+
+  it("creates mission targets when randomUUID is unavailable on HTTP", async () => {
+    const originalCrypto = globalThis.crypto;
+    vi.stubGlobal("crypto", { getRandomValues: originalCrypto.getRandomValues.bind(originalCrypto) });
+    try {
+      const user = userEvent.setup();
+      renderRoute("/missions/new");
+      expect(await screen.findByRole("heading", { name: "Create Mission draft" })).toBeInTheDocument();
+      await user.click(screen.getByRole("button", { name: "Add target" }));
+      expect(screen.getAllByLabelText("Target type")).toHaveLength(2);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it("shows actionable execution blockers instead of a generic failure", async () => {

@@ -18,6 +18,14 @@ function defaultValidity(): string {
   return date.toISOString().slice(0, 16);
 }
 
+function newTargetId(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
 export function MissionBuilderPage() {
   const queryClient = useQueryClient();
   const { data: health } = useQuery({ queryKey: ["health"], queryFn: () => gateway.getHealth() });
@@ -29,7 +37,7 @@ export function MissionBuilderPage() {
     description: "Validate whether the authorized service principal can satisfy the defined lab objective.",
     authorizationReference: "LAB-AUTH-2026-084",
     validUntil: defaultValidity(),
-    targets: [{ id: crypto.randomUUID(), type: "network", value: "10.0.10.212/32", port: 445, protocol: "tcp" }],
+    targets: [{ id: newTargetId(), type: "network", value: "10.0.10.212/32", port: 445, protocol: "tcp" }],
     successType: "session_exists",
     successValue: "beacon:<approved-id>",
     maxIterations: 20,
@@ -70,7 +78,7 @@ export function MissionBuilderPage() {
     setDraft((current) => ({ ...current, targets: current.targets.map((target) => target.id === id ? { ...target, ...patch } : target) }));
   }
   function addTarget() {
-    setDraft((current) => ({ ...current, targets: [...current.targets, { id: crypto.randomUUID(), type: "network", value: "", port: null, protocol: "tcp" }] }));
+    setDraft((current) => ({ ...current, targets: [...current.targets, { id: newTargetId(), type: "network", value: "", port: null, protocol: "tcp" }] }));
   }
   function validateStep() {
     const nextErrors: string[] = [];

@@ -40,9 +40,9 @@ VLLM Settingsから実Capability Checkを行う場合は、初期接続先、許
 
 APIキーの値はCLI引数やブラウザへ渡しません。ブラウザには固定Endpoint、Model、Wire API、Structured Output Modeだけが公開され、別のURLへ変更できません。
 
-ブラウザで`http://127.0.0.1:18000/dashboard`を開きます。隔離LANへ直接公開する場合は
-`--host 0.0.0.0 --allow-rfc1918-same-origin`を指定します。ブラウザで実際に使用した実行環境IPを動的に採用するため、
-IPの固定設定は不要です。外部OriginはRFC1918のliteral IPv4とbind portへ限定され、Host/Origin完全一致が必要です。
+ブラウザで`http://127.0.0.1:18000/dashboard`を開きます。サーバのIPv4へ直接HTTP接続する場合は
+`--host 0.0.0.0 --allow-local-ipv4-same-origin`を指定します。サンプルの`redteam-product`も同じOrigin policyを使用します。
+外部Originは起動時にサーバへ割り当てられたIPv4とbind portへ限定され、Host/Origin完全一致が必要です。
 
 開発時はAPIとViteを別プロセスで起動できます。
 

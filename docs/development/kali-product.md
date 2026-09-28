@@ -6,7 +6,7 @@
 
 ## 固定境界
 
-- UI: loopbackを既定とし、隔離LAN向けに`0.0.0.0:18000`を明示選択できる。`rfc1918_same_origin` policyは要求された実行環境のRFC1918 literal IPv4を動的に採用し、Host/Origin不一致を拒否する。
+- UI: loopbackを既定とし、サンプル配備では`0.0.0.0:18000`を明示選択する。`local_ipv4_same_origin` policyは起動時にサーバへ割り当てられたIPv4だけを採用し、Host/Origin不一致を拒否する。
 - LLM: 初期値は`http://10.0.6.181:8100/v1`。UIで`vllmAllowedCidrs`内のliteral IPv4 `/v1` endpointとAPI keyを候補登録できる。モデル`gemma-4-31B-it`、署名済みManifest、Tokenizerは固定する。
 - Target allowlist: `10.0.10.212/32`。Impacketの登録済みSMB/RPC操作だけに使用する。
 - AD Collector: 固定DC IPv4、証明書検証済みLDAPS/TCP 636、Referral無効、LDAP write無効。AD CSは固定Certipy `find`のみ。
@@ -20,10 +20,10 @@
 2. `product.json`と署名済みLLM manifest/public keyを`/etc/redteam-agent`へ配置する。秘密値は設定JSONに書かない。
 3. 32 byte以上のランダムなUI token、vLLM API key、既存の`joe.cfg`に加え、読み取り用AD credential JSONを、それぞれ`systemd-creds encrypt`で`/etc/credstore.encrypted`へ保存する。AD JSONは`domain`、`username`、`password`だけを持つ。平文をjournalやコマンド引数へ渡さない。
 4. `redteam-agent.service`と必要な`redteam-agent.service.d/sliver-operator.conf`を配置し、`systemctl daemon-reload`後にサービスを開始する。
-5. loopbackでは`http://127.0.0.1:18000`、サンプルの隔離LAN構成では`http://実行環境のRFC1918 IPv4:18000`を開き、UI tokenを一度入力する。tokenはHttpOnly session cookieへ交換され、プロセス再起動時に全sessionが失効する。
+5. loopbackでは`http://127.0.0.1:18000`、サンプルの直接接続構成では`http://サーバに割り当てられたIPv4:18000`を開き、UI tokenを一度入力する。tokenはHttpOnly session cookieへ交換され、プロセス再起動時に全sessionが失効する。
 
-直接外部bindでは、`uiHost=0.0.0.0`、`uiOriginPolicy=rfc1918_same_origin`、空の`uiAllowedOrigins`を設定する。
-起動時のNIC自動選択には依存せず、要求のHost/Originから実際に使用された実行環境IPを検証するため、DHCP変更や複数NICに対応する。
+直接外部bindでは、`uiHost=0.0.0.0`、`uiOriginPolicy=local_ipv4_same_origin`、空の`uiAllowedOrigins`を設定する。
+起動時に割り当てられたIPv4と要求のHost/Originを照合する。起動後にIPが変わった場合はサービスを再起動する。
 現在のsystemdサンプルは
 `IPAddressAllow=0.0.0.0/0`で接続元IPv4を制限しない。この指定はIPv4 egressも実質全許可にする。
 HTTP上のtoken/cookieは暗号化されないためinternetへ直接公開せず、必要に応じてhostまたはnetwork firewallで接続元を限定する。

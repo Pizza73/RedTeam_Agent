@@ -19,6 +19,31 @@ for (const [route, heading] of routes) {
   });
 }
 
+test("every operator page works on a non-loopback HTTP origin", async ({ page }) => {
+  const errors: string[] = [];
+  page.on("pageerror", (error) => errors.push(error.message));
+  await page.route("http://192.0.2.1:4173/**", async (route) => {
+    const requested = new URL(route.request().url());
+    const upstream = `http://127.0.0.1:4173${requested.pathname}${requested.search}`;
+    const response = await route.fetch({
+      url: upstream,
+      headers: { ...route.request().headers(), host: "127.0.0.1:4173" },
+    });
+    await route.fulfill({ response });
+  });
+
+  for (const [route, heading] of routes) {
+    await page.goto(`http://192.0.2.1:4173${route}`);
+    expect(await page.evaluate(() => window.isSecureContext)).toBe(false);
+    expect(await page.evaluate(() => typeof crypto.randomUUID)).toBe("undefined");
+    await expect(page.getByRole("heading", { name: heading }).first()).toBeVisible();
+  }
+  await page.goto("http://192.0.2.1:4173/missions/new");
+  await page.getByRole("button", { name: "Add target" }).click();
+  await expect(page.getByLabel("Target type")).toHaveCount(2);
+  expect(errors).toEqual([]);
+});
+
 test("mock capability check completes without external dispatch", async ({ page }) => {
   await page.goto("/settings/llm");
   await page.getByRole("button", { name: /test connection & capabilities/i }).click();
