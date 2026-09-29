@@ -17,6 +17,8 @@ TargetExtractorId = Literal[
     "session_target_v1",
     "host_target_v1",
     "artifact_target_v1",
+    "ad_mcp_targets_v1",
+    "ad_mcp_offline_v1",
 ]
 
 AdapterType = Literal["c2", "mcp", "local"]
@@ -57,3 +59,4 @@ class ToolDefinition(StrictImmutableBoundaryModel):
     required_target_binding_modes: frozenset[TargetBindingMode]
     allows_redirects: Literal[False] = False
     sandbox_requirement: SandboxRequirement | None
+    result_delivery_mode: Literal["provider_task", "local_result"] | None = None

@@ -517,6 +517,12 @@ class Executor:
     def _build_request(
         self, *, record: ExecutionRecord, decision: PolicyDecision, tool: ToolDefinition, plan: ExecutionPlan
     ) -> ExecutionRequest:
+        claims = getattr(self, "_claims", None)
+        claim = (
+            claims.get(f"claim-{record.execution_id}") if claims is not None else None
+        )
+        configured_result_mode = getattr(tool, "result_delivery_mode", None)
+        mission_id = getattr(decision, "mission_id", None)
         return ExecutionRequest(
             execution_id=record.execution_id,
             task_id=record.task_id,
@@ -524,12 +530,17 @@ class Executor:
             adapter_id=decision.resolved_adapter_id,
             provider_tool_name=tool.provider_tool_name,
             result_delivery_mode=(
-                "provider_task" if tool.adapter == "c2" else "local_result"
+                configured_result_mode
+                if configured_result_mode is not None
+                else ("provider_task" if tool.adapter == "c2" else "local_result")
             ),
             idempotency_key=record.idempotency_key,
             timeout_seconds=tool.default_timeout_seconds,
             arguments=plan.proposal.arguments,
             target_dispatch_bindings=decision.target_dispatch_bindings,
+            mission_id=mission_id,
+            actor_id="executor" if mission_id is not None else None,
+            approval_id=claim.approval_record_id if claim is not None else None,
         )
 
     def _new_record(

@@ -1,0 +1,7 @@
+schema_version: ad-mcp-scope-v1
+cidrs:
+  - 192.0.2.0/24
+domains:
+  - lab.example
+hosts:
+  - dc01.lab.example

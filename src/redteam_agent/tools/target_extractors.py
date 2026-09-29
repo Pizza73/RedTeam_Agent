@@ -74,6 +74,18 @@ class _ArtifactArgs(StrictBoundaryModel):
     report_ids: tuple[str, ...] = ()
 
 
+class _AdMcpCall(StrictBoundaryModel):
+    targets: tuple[str, ...]
+    domain: str | None = None
+    username: str | None = None
+    parameters: CanonicalJsonObject
+    dry_run: bool
+
+
+class _AdMcpArgs(StrictBoundaryModel):
+    call: _AdMcpCall
+
+
 def _parse_args(model: type[StrictBoundaryModel], arguments: CanonicalJsonObject) -> StrictBoundaryModel:
     # Validate through the JSON-wire path so a JSON array satisfies a tuple
     # field, while strict mode still rejects unknown fields and numeric-string
@@ -169,6 +181,38 @@ def _extract_artifact(data: TargetExtractionInput) -> tuple[NormalizedTarget, ..
     return ()
 
 
+def _extract_ad_mcp(data: TargetExtractionInput) -> tuple[NormalizedTarget, ...]:
+    args = _parse_args(_AdMcpArgs, data.arguments)
+    assert isinstance(args, _AdMcpArgs)
+    addresses = list(args.call.targets)
+    for reference in data.requested_targets:
+        if reference.type != "ip":
+            raise TargetExtractorResolutionError(
+                "ad_mcp_targets_v1 accepts only IP targets"
+            )
+        addresses.append(reference.address)
+    canonical_addresses = _dedupe([canonicalize_ip(address) for address in addresses])
+    if not canonical_addresses:
+        raise TargetExtractorResolutionError("ad_mcp_targets_v1 resolved no targets")
+    return tuple(
+        NormalizedTarget(
+            type="ip",
+            canonical_value=address,
+            resolved_addresses=(address,),
+            source="argument",
+        )
+        for address in canonical_addresses
+    )
+
+
+def _extract_ad_mcp_offline(data: TargetExtractionInput) -> tuple[NormalizedTarget, ...]:
+    args = _parse_args(_AdMcpArgs, data.arguments)
+    assert isinstance(args, _AdMcpArgs)
+    if args.call.targets or data.requested_targets:
+        raise TargetExtractorResolutionError("ad_mcp_offline_v1 does not accept targets")
+    return ()
+
+
 _Extractor = Callable[[TargetExtractionInput], tuple[NormalizedTarget, ...]]
 
 # Keyed by ``str`` so lookups with an arbitrary (possibly unregistered) id are
@@ -178,6 +222,8 @@ _EXTRACTORS: dict[str, _Extractor] = {
     "host_target_v1": _extract_host,
     "session_target_v1": _extract_session,
     "artifact_target_v1": _extract_artifact,
+    "ad_mcp_targets_v1": _extract_ad_mcp,
+    "ad_mcp_offline_v1": _extract_ad_mcp_offline,
 }
 
 

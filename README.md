@@ -1,7 +1,16 @@
 # RedTeam Agent — 設計資料と段階実装
 
 許可された隔離演習向け支援AIエージェントの設計資料と、Phase 0A〜5の段階実装を保持するリポジトリ。
-実ネットワークは閉域Local LLM資格と承認済みImpacket Target試験に限定し、Payload生成・汎用Shell実行は含まない。Phase 4はTuoni 0.16.1とSliver 1.7.7、Phase 5はMCP 2026-07-28のオフライン実装まで完了し、Production Activationだけを保留している。
+現行実装の実ネットワークは閉域Local LLM資格と承認済みImpacket Target試験に限定し、Payload生成・汎用Shell実行は含まない。Phase 4はTuoni 0.16.1とSliver 1.7.7、Phase 5はMCP 2026-07-28のオフライン実装まで完了し、Production Activationだけを保留している。
+
+2026-09-29にAD MCPの追加計画・仕様を承認済み方針へ更新した。独立`ad-mcp/`パッケージ、公式SDK v2の
+`MCPServer`、本プロジェクト経由限定で、添付のADツール群・長時間ジョブ・登録済みWindowsペイロード実行を追加する。
+新経路では専用Sandboxを必須にせず、生出力は非公開の平文ファイル、LLMには検証した公開用JSONを渡す。
+実環境での専用資格判定はツールごとの結合テストと確認記録へ簡素化する。
+`ad-mcp/`の共通実行基盤と本体Adapterを実装した。公式SDK v2のstdio接続、78操作の閉じたCatalog、
+Scope・risk・dry-run、バイナリDigest、非公開生ログ、固定Parser、JSONL監査、永続Job、停止・再起動時の
+`outcome_unknown`、本体のExecution / Actor / Mission BindingをMockとSDK実プロセスで確認している。
+実ツールの有効化、実AD試験、Windows PayloadとRemote Transport、HTTP、未確定Riskの採用はまだ行っていない。
 
 ## 担当方針
 
@@ -19,6 +28,9 @@
 | --- | --- |
 | [SystemDesign.md](SystemDesign.md) | 設計正本。構成、安全基盤、接続Schema、Phase要件、開発規約 |
 | [SystemDesign_AI_Control.md](SystemDesign_AI_Control.md) | 必須別冊。証拠・計画・認可の分離と共通制御ループ |
+| [docs/ad-mcp-spec.md](docs/ad-mcp-spec.md) | 新AD MCPの規範仕様。承認済み限定置換、カタログ、保存、Job、Windows実行、未確定事項 |
+| [docs/development/ad-mcp-plan.md](docs/development/ad-mcp-plan.md) | AD MCPの実装計画。予定構成、再利用・変更対象、工程、完了条件 |
+| [ad-mcp/README.md](ad-mcp/README.md) | AD MCPパッケージの導入、設定、安全境界、現時点の制限 |
 | [docs/acceptance-criteria.md](docs/acceptance-criteria.md) | Phase別の製品受入条件と開発記録の条件 |
 | [docs/safety-invariants.md](docs/safety-invariants.md) | 製品の安全不変条件と開発時の遵守事項 |
 | [docs/threat-model.md](docs/threat-model.md) | 製品と現行開発体制の脅威・対策・限界 |
@@ -33,9 +45,10 @@
 | [docs/development/kali-product.md](docs/development/kali-product.md) | Kaliローカル製品構成、systemd hardening、Credential、実環境待ちGate |
 | [docs/development/ad-assessment.md](docs/development/ad-assessment.md) | AD設定監査、固定LDAPS Collector、LLM候補制約、決定論的判定 |
 
-設計改訂は`system-design-v1-r3` / `ai-control-v1-r3`。
+設計改訂は`system-design-v1-r4` / `ai-control-v1-r4`。AD MCP追加は`ad-mcp-v1` / `ad-mcp-plan-v1`。
 AIの意味・判断は別冊を先に読み、安全基盤と接続Schemaは正本で確認する。
 Phase順序・製品要件は正本§36〜38、開発開始・記録・独立レビューは§40と受入条件に従う。
+新AD MCPへの適用・置換範囲は正本§19.4に限定する。既存コードと下記開発記録の過去の試験結果を、新仕様のPASSへ読み替えない。
 
 ## Phase 0A 実装
 
@@ -519,6 +532,9 @@ Fallback はない。品質Evidenceの実消費量はvLLM応答の`usage.prompt_
 
 ## 今回の整合方針（設計）
 
+AD MCP追加の承認済み変更は正本§19.4と[AD MCP仕様](docs/ad-mcp-spec.md)を参照する。
+以下の既存基盤のQuarantine・消去・実Adapter Human Gateは、新AD MCPでは同節の範囲で置換する。
+
 - 期限切れ確定は既存Retention Schedulerが行い、通常Workerの未失効Lease条件と分ける。
 - 新規成果物の内部保存は既存Secure Ingestionへ限定し、追加の作成認可Recordを設けない。保存後のアクセス認可は維持する。
 - 停止中のRecoveryは既存Graph状態とMission状態の対応表で表し、暗黙Resumeを行わない。
@@ -527,8 +543,8 @@ Fallback はない。品質Evidenceの実消費量はvLLM応答の`usage.prompt_
 - Ingestion Retryは同じ入力・固定Rule / Parserと既存予算内に限定し、変更Ruleでの既存Quarantine再処理はMVP対象外とする。
 - 結果経路の正規値は`provider_task | local_result`へ統一し、表記揺れの互換Aliasを設けない。
 
-新しい製品状態・Record種別・独立Service・開発状態機械は追加しない。根拠と適用限界は正本§41.11に記録する。
-Scope・Policy・Human Approval・Secret保護・監査・Phase順序・実AdapterのHuman Gateは保持する。
+AI制御の認可状態・開発状態機械は追加しない。AD MCPのProvider Jobと保存Metadataは正本§19.4の契約で扱う。
+Scope・Policy・Human Approval・Secret保護・監査・Phase順序を保持し、新AD MCP専用の有効化条件は結合テスト記録へ置換する。
 D4の実機消去Qualificationは`NOT_EVALUATED`であり、Production採用は未承認である。
 
 ## 履歴と整合性
@@ -537,7 +553,7 @@ D4の実機消去Qualificationは`NOT_EVALUATED`であり、Production採用は�
 現在の文書は承認済み整合を反映しており、旧原文のままではない。
 正本§41の旧仕様・旧PR状態・旧開発Loopは履歴に限定し、新実装のGateや権限へ読み替えない。
 
-`SHA256SUMS`は正本・別冊・受入/安全/脅威モデル文書・LICENSE・このREADMEの整合性を対象とする。
+`SHA256SUMS`は正本・別冊・AD MCP仕様/計画・受入/安全/脅威モデル文書・LICENSE・このREADMEの整合性を対象とする。
 リポジトリ直下で`sha256sum --check SHA256SUMS`により確認できる。実装コード（`src/`, `tests/`）はGitで追跡し、
 上記の静的検査・試験で検証する。
 

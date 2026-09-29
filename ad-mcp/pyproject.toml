@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools==80.9.0", "wheel==0.45.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "redteam-ad-mcp"
+version = "0.1.0"
+description = "Closed MCP server for authorized Active Directory assessment operations"
+requires-python = ">=3.11"
+dependencies = [
+  "mcp==2.2.0",
+  "pydantic>=2.12,<3",
+  "PyYAML>=6,<7",
+]
+
+[project.optional-dependencies]
+dev = [
+  "mypy==1.18.2",
+  "pytest>=8,<10",
+  "pytest-asyncio>=0.24,<2",
+  "ruff==0.14.5",
+  "types-PyYAML>=6,<7",
+]
+
+[project.scripts]
+ad-mcp = "ad_mcp.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "S", "C4", "SIM", "RUF"]
+ignore = ["S101"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S", "B011"]
+"src/ad_mcp/auth.py" = ["S105"]
+"src/ad_mcp/models.py" = ["S105"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+mypy_path = "src"
+packages = ["ad_mcp"]
+warn_unused_ignores = false
+disallow_any_explicit = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+asyncio_mode = "auto"
+pythonpath = ["src"]

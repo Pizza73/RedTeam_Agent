@@ -47,6 +47,8 @@ _EXTRACTOR_SCOPE_TYPE: dict[str, str | None] = {
     "host_target_v1": "host",
     "session_target_v1": "session",
     "artifact_target_v1": None,
+    "ad_mcp_targets_v1": "network",
+    "ad_mcp_offline_v1": None,
 }
 
 

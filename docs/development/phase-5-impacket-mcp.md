@@ -1,5 +1,10 @@
 # Phase 5 Impacket MCP Server 開発記録
 
+> 2026-09-29補記: 本書は既存4操作サーバの実装記録である。追加する独立AD MCPの仕様は
+> [ad-mcp-v1](../ad-mcp-spec.md)、工程は[実装計画](ad-mcp-plan.md)を参照する。
+> 新経路では専用Sandbox・暗号化Quarantine・専用資格判定を必須にしないが、この既存サーバのコードや
+> 下記の実装・検証結果を変更したものではない。新AD MCPの全ツール・Job・Windows実行は未実装。
+
 ## 判定
 
 Fortra Impacket `0.13.1`を使用するローカルMCP Serverの、実環境接続を必要としない実装は完了した。

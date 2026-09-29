@@ -1,5 +1,10 @@
 # Kaliローカル製品構成
 
+> 2026-09-29補記: 以下は現在の製品構成・残条件の記録である。[AD MCP追加仕様](../ad-mcp-spec.md)では、
+> 新AD MCP専用のSandbox資格を必須から外し、導入確認をツール別結合テストへ変更する。
+> 本文の既存Blockerや稼働設定はまだ変更していない。適用対象外の本体Runtime、Secret / Audit / TPM、C2等の
+> 依存は残るため、新仕様の文書化だけでMission実行可能とは扱わない。
+
 `redteam-product`は、現在のKali Linux上で認証済みオペレーターUI、永続Mission/Approval状態、Phase 2 vLLM能力検証を一つのサービスとして構成する。設定は`deployment/kali/product.json`、systemd単位は`deployment/systemd/redteam-agent.service`に固定する。
 
 この構成は安全側に閉じており、`productionEligible=false`である。UIからMission draftの作成、正式Missionへの変換、検証、Approval判断、LLM能力試験、Provider policy draftの管理はできる。一方、Missionの`start`/`resume`は実行runtimeがないため拒否する。

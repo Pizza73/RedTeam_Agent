@@ -59,6 +59,12 @@ class ExecutionRequest(StrictImmutableBoundaryModel):
     # planner or MCP server.  Network-capable adapters must use them as the
     # authoritative destinations and reject any argument/binding mismatch.
     target_dispatch_bindings: tuple[TargetDispatchBinding, ...] = ()
+    # The AD MCP provider-job contract binds every management call to the
+    # authorization context that created it. Existing adapters may omit these
+    # fields; the AD MCP adapter fails closed when they are absent.
+    mission_id: str | None = None
+    actor_id: str | None = None
+    approval_id: str | None = None
 
 
 class AdapterIdentity(StrictImmutableBoundaryModel):

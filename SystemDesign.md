@@ -1,8 +1,8 @@
 # レッドチーム演習支援AIエージェント 要件定義
 
-> 改訂状態: `system-design-v1-r3` / 2026-09-06。状態・Record種別・独立Serviceを増やさず、承認された整合方針を反映した。
+> 改訂状態: `system-design-v1-r4` / 2026-09-29。承認済みAD MCP追加と、Sandbox・生出力保存・導入確認の簡素化を§19.4へ反映した。
 > 本書は安全基盤・接続Schema・移行の正本であり、[SystemDesign_AI_Control.md](SystemDesign_AI_Control.md)を必須の規範別冊とする。
-> AI制御の意味・判断・受入Scenarioは別冊へ一元化する。適用・置換の範囲は別冊§12に限定し、その他の安全機構は維持する。
+> AI制御の意味・判断・受入ScenarioはAI別冊へ一元化する。AIの置換範囲は同書§12、AD MCPの限定置換は本書§19.4と[AD MCP仕様](docs/ad-mcp-spec.md)へ固定する。その他の安全機構は維持する。
 > 関連する要件・安全条件・受入条件・Phaseごとの実装範囲も同じ改訂に整合させる。残る矛盾は実装者が独自に解釈せず、該当箇所の実装前に設計で解決する。
 > D4のTPM-backed Resource消去方式は採用候補であり、対象実機・Firmwareの保証と復元試験は未検証。
 > 本文の受入条件は実行済みTest結果ではなく、D4のProduction採用を承認した記録でもない。
@@ -52,6 +52,9 @@
 「初期侵入の支援」には、許可済みの情報収集および登録済みToolの選択・実行を含む。ただしMVPでは、実環境向けPayload生成、Implant生成、配布基盤の構築を実装しない。Mission開始時にSessionが存在しない状態を許容し、Operatorによる初期Session登録、または許可済みLocal / MCP Toolによる処理から開始可能とする。
 
 将来、Payload生成や配布を対象に加える場合は、専用Tool、Scope Rule、Risk定義、Human Approval、監査要件を追加した上で明示的に有効化する。汎用シェルや自由形式コマンドを、この代替として自動実行させてはならない。
+
+2026-09-29承認のAD MCP追加では、登録済みWindowsペイロードの配布・実行・回収を§19.4 / AD MCP仕様§8に従って対象へ加える。
+Payload / Implantの生成や自由形式Shellは含めない。上記のMVP除外は、この限定された追加範囲を妨げる条件として使わない。
 
 ---
 
@@ -1465,6 +1468,9 @@ ExecutorのDispatch処理へLangGraph Automatic Retryを設定してはならな
 
 # 10. Raw Result Streaming / ExecutionResult
 
+> AD MCPの生出力保存は§19.4とAD MCP仕様§5を適用する。本節の暗号化Quarantine固有の保存・鍵・消去表現は同経路では置換する。
+> 認可、ExecutionへのBinding、結果不明時の再送禁止、公開Resultの確定は維持する。
+
 ProviderのRaw Content、Adapterが返すControl Metadata、Applicationが生成する正規化済みExecutionResultを分離する。
 
 ```text
@@ -2203,6 +2209,8 @@ Local Modeは保存済みCaptureのReadだけから復旧し、初回Submit / �
 
 ## 10.4 Secure Ingestion Retry Policy
 
+> AD MCPは保存済みの非公開生ログを固定Parserで再処理する（§19.4 / AD MCP仕様§5）。元Actionの再送や期限延長は許可しない。
+
 `ResultIngestionStatus=FAILED -> PENDING`は自由な再処理入口ではなく、同じProvider Resultを安全に再取込するための目的限定Recoveryとする。
 
 ```python
@@ -2239,6 +2247,9 @@ MVPではClassification / Redaction / Secret Detection RuleやParserを変更し
 Retry要求はSecure Ingestion Coordinatorまたは認証済みOperatorのRecovery Commandだけが発行でき、Planner / Analyzer / Adapter / CallerはAttempt CounterをResetまたは上限拡大できない。`recovery_until`後でも、同じCOMMITTED Quarantineが`trusted_now < min(quarantine.retention_until, mission.evidence_retention_until)`を満たす場合はLocal Retryできるが、Provider Status照会、Result Collection、Reconcile、CancelをRetryの一部として呼び出してはならない。上限到達、Digest不一致、Key unavailableでは`QUARANTINED / PAUSED / Human Review`へ進める。Quarantine固有`retention_until`到達後は新しいRetryを開始せず`EVIDENCE_RETENTION_EXPIRED`へ遷移してRetention-expiry Erasureへ送る。External ActionやProvider Result CollectionをRetryのために再実行してはならない。
 
 ## 10.5 Task Identity / Synchronous Result Capture（D3）
+
+> AD MCPの保存先は§19.4で置換するが、`local_result | provider_task`、単回Dispatch、Collection / Recoveryの認可境界は維持する。
+> 独自Job APIと標準MCP TasksのCapabilityを同一視せず、接続方式はAD MCP仕様§7・§10で確定する。
 
 全ExecutionにApplication発行のtask_idを付け、ProviderのTask IDと区別する。
 結果経路はAdapterの固定result_delivery_modeとResultTaskBindingのDiscriminated Unionで一意に決める。正規値は`provider_task | local_result`だけとし、Model / Adapter / Repository / 受入試験は同じ型定義を参照する。`local_capture`は互換Aliasとして受理・自動変換せず、未知値と同様に境界で拒否する。Bindingの作成・保存OwnerはExecutor / Collection Coordinatorであり、Adapterの戻り値は元ExecutionRequest / Claimへ照合する候補である。Adapterが返した別ExecutionのMappingをそのまま認可Recordとして採用しない。
@@ -3766,6 +3777,9 @@ MCP以外または`local_process`だけのSnapshotでもFieldを省略せず、�
 
 ## 19.3 Sandbox境界
 
+> §19.4で識別する新AD MCPは専用Sandbox構築・検証の必須条件を外す。本節の一律のSandbox必須・不足時拒否は同経路へ適用しない。
+> Scope・時間・出力量等の個別制限を維持し、他AdapterのSandbox条件へこの変更を広げない。
+
 Policy EngineはLogical Authorizationを担当し、OS / Container / Network SandboxはTool内部の誤動作またはRegistry定義違反に対するDefense-in-Depth Enforcementを担当する。SandboxがPolicy Engineの代わりにScopeや承認を決定してはならない。
 
 Local Toolおよび外部Processとして起動するMCP Server向けに、以下を表現できるSandbox Interface、Sandbox Policy、Sandbox Capabilityを定義する。
@@ -3815,12 +3829,60 @@ Filesystem AllowlistはCanonical PathとSymlink解決後に評価し、Network E
 
 MVPではSandbox InterfaceとCapability Checkを実装境界とし、個別Isolation MechanismはPhaseごとの明示的な受入条件に従って追加する。未実装のSandbox Capabilityを利用可能とみなしてはならない。
 
+## 19.4 AD MCP追加と承認済みの限定置換（2026-09-29）
+
+本節と[AD MCP仕様 `ad-mcp-v1`](docs/ad-mcp-spec.md)を、今回追加するAD MCPと本体接続の規範とする。
+実装計画は[AD MCP実装計画](docs/development/ad-mcp-plan.md)を参照する。現在の製品コードは本改訂へ未対応であり、
+文書反映をサーバ実装・試験・Migration・実環境有効化の完了として扱わない。
+
+### 適用対象
+
+- 同一リポジトリ内の独立`ad-mcp/`パッケージ。公式Python SDK v2の`MCPServer`を使用する。
+- 本プロジェクトのPolicy / Approval / Executor / MCP Adapterを通す。一般MCPクライアントからの直接実行は提供範囲外。
+- Composition Rootが固定するServer / Adapter IDと承認済みRegistry Revisionで対象を識別する。
+- 既存Impacket 4操作サーバ、C2、他MCP、Secret Store全体へ暗黙に適用しない。
+
+### 本文との適用・置換表
+
+以下の項目は、本書の共通原則、概念Model、図、MVP・試験条件にも同じ範囲で適用する。
+暗号化・Sandboxの失敗時にこの構成へ切り替えるFallbackを設けない。
+
+| 対象 | 新AD MCPへの適用 |
+| --- | --- |
+| §1 / §36 / §38 / §40の対象範囲 | 添付全ツール、登録済みWindowsペイロードの配布・実行・回収を段階実装へ加える。生成・自由形式Shellは対象外 |
+| §19.1 / 既存one-shot Transport | MCPServerと長時間Jobへ対応する。Protocol・Identity・Schema固定を維持し、Task対応を推測しない |
+| §2 / §19.3 / §20 / §38のSandbox必須 | 専用Sandbox構築・外部検証証跡を必須から外す。Registry、Availability、Pre-dispatch、Compositionの要求を整合して変更する |
+| §10 / §29 / §33 / §34の生出力・原本保存 | アクセス制限付きの非公開生ログと公開用JSONへ置換。生出力の暗号化は必須とせず、通常ログ・Promptへは複製しない |
+| §10.4 / §33の保存・公開・復旧 | 実行ID、部分・完了、Digest、保持期限を管理し、保存済み原本から固定Parserを再開。公開結果の検証と読取認可を維持 |
+| §33.1 / §33.2 / §34.1のQuarantine鍵・消去 | 新しい平文生ログには暗号鍵、暗号学的消去、Quarantine固有のD4資格を要求しない。期限後の通常削除と失敗記録へ置換 |
+| §36〜§40のMCP専用適格性確認 | 専用資格判定・Sandbox attestation必須を、ツール別実環境結合テストと確認記録へ置換 |
+| §34 / §35.2の本体Production依存 | Secret Store、Audit / Wrapped Key Witness、他経路の資格は維持。MCP単体確認と本体全体の稼働成立を区別 |
+
+### 維持する条件と保証の範囲
+
+入力Schema、Scope照合、`intrusive`既定無効、Human Approval、Secret参照・注入、単回Dispatch、監査、
+結果不明時の再送禁止、Raw非信頼扱い、公開Field検証、Knowledge / GoalのEvidence条件を維持する。
+`run_allowlisted_tool`とImpacket汎用ラッパも、登録済み操作と同じ検証経路を使う。
+
+専用Sandboxがない構成では、内部動作を含むOSレベルの全通信・Filesystem封じ込めを保証しない。
+平文生ログを読めるOS主体はその中のSecretも読める。通常ファイル削除を復元不能性の証明にしない。
+この変更を、未実装Sandboxの`verified=true`、存在しない暗号鍵・消去証跡、未実施試験のPASSで表現しない。
+
+### 受入と移行
+
+単体試験は実バイナリをモックし、CIで実Targetへ接続しない。実環境でツール版・対象・試験内容・結果・
+ログ参照・未完了項目を記録する。ツール単体の合格を本体全製品の受入としない。
+既存の暗号化データと未完了Executionは従来のReader / Recovery / Retentionで処理し、平文化・再送しない。
+新経路の構成・保存形式・カタログ改訂は明示的に導入し、必要なSchema移行は§38に従う。
+未確定の版、Transport、Risk対応、Job切断動作、Windows Transport、BloodHound方式、運用上限はAD MCP仕様§10で管理する。
+
 ---
 
 # 20. Tool Registry
 
 > 安全属性は維持し、[AI制御仕様](SystemDesign_AI_Control.md) §5のActionContract参照を追加する。
 > 新しい候補化・前提探索を旧normal / investigate制約と併用しない。
+> 新AD MCPのSandbox要求は§19.4で置換する。RiskやApprovalを引き下げたり、利用不能Capabilityを有効と申告したりして回避しない。
 
 例:
 
@@ -5755,6 +5817,8 @@ Adapter Timeout、通信断、Checkpoint復旧等により実行結果を確定�
 
 # 29. ログ
 
+> AD MCPの非公開生ログと監査JSONLは§19.4 / AD MCP仕様§5を適用する。以下の監査本文のSecretマスキングは維持する。
+
 すべての処理を追跡可能にする。
 
 記録対象:
@@ -6196,6 +6260,9 @@ Serviceを唯一の計算入口とし、ComponentはDigest Definition名と型�
 
 # 33. Artifact Store
 
+> 以下の暗号化Quarantine Pipelineは既存経路の規範である。新AD MCPは§19.4 / AD MCP仕様§5の
+> 非公開生ログ→固定Parser・機密分離→公開用JSONへ置き換える。公開Rule、読取認可、結果と実行の対応は維持する。
+
 大量出力はDBへ直接格納しない。
 
 Tool出力は以下のSecure Ingestion Pipelineを必ず通す。
@@ -6289,6 +6356,8 @@ Artifact / Fact / SummaryのContent削減は認可集合を拡張しない。
 
 ## 33.1 Encrypted Raw Result Quarantine
 
+> 新AD MCPの生ログには本節の暗号化・鍵管理を要求しない。保存・期限・部分結果・復旧はAD MCP仕様§5へ置換する。
+
 Encrypted Raw Result Quarantineは通常Artifact Storeと分離した内部耐久領域であり、Raw Result Streaming中およびCommit直後のCrashからResultを保護する。通常Application Database、通常Artifact Store、LLM、Context Builder、通常OperatorからRaw Contentへアクセスできないようにする。
 
 Quarantineは最低限以下を満たす。
@@ -6356,6 +6425,9 @@ Quarantineから平文全体を返す`resume()`、`_resume_for_ingestion()`、�
 Encrypted Raw Result QuarantineはIngestion前の短期Crash Recovery領域であり、Section 33の`variant="encrypted_raw"` Artifactとは異なる。後者はMission Policyにより原本保持が必要と判断された場合だけSecure Ingestionが生成する長期管理対象であり、Quarantine Objectをそのまま通常Artifactへ昇格させてはならない。
 
 ## 33.2 Durable Secure Ingestion Transaction
+
+> 新AD MCPの平文生ログは§19.4 / AD MCP仕様§5を適用する。暗号鍵・Quarantine消去Claimを捏造せず、
+> 生ログの保存完了、公開Resultの確定、期限後の通常削除と復旧を実装する。既存暗号化経路は本節を維持する。
 
 SQLite、暗号化File Store、Key Providerを単一ACID Transactionとは扱わない。
 決定的Identity、Fence固有Staging、DBによる一括公開、read-back verificationを使う。
@@ -6694,6 +6766,8 @@ Secret Valueの注入は、PolicyDecision Envelope内のexact DataAccessGrantに
 Raw Tool OutputにSecretが含まれる可能性があるため、Secure Ingestionで分類・Secret Detection・Redactionを行う。Raw SecretをLLM Promptへ渡してはならない。
 
 ## 34.1 Encryption Key Management
+
+> §19.4の新AD MCP生ログは暗号化必須対象から除く。Secret Store、既存Quarantine、その他の鍵保護・Witness要件は維持する。
 
 暗号化は**Domain KEK（Key Encryption Key）**と**Resource DEK（Data Encryption Key）**のEnvelope Encryptionへ固定する。Secret Store、Quarantine、Artifact Store、Audit SigningのDomainを分離するだけでなく、Cryptographic Erasure対象となるResourceごとに独立DEKを発行する。
 
@@ -7481,6 +7555,9 @@ Transition CommandやDigest Definitionを重複実装しない。
 
 ## 35.2 Composition Root / Dependency Wiring
 
+> 新AD MCPの配線では§19.4のSandbox・保存・導入確認を明示的に適用する。
+> 本体のSecret / Audit / TPM等、置換対象外の依存を削除したり、Test Doubleで有効化したりしない。
+
 Production Composition Rootは次の順序を固定する（F2）。通常StartupはSchemaを変更せず、
 Migration / Provisioning / Offline Recoveryは全Worker停止中の明示管理Commandへ分離する。
 
@@ -7935,6 +8012,9 @@ C2そのもの、Payload、Implant生成機能は本プロジェクトのMVPで�
 
 ## Phase 5: MCP Adapter
 
+新AD MCPの追加範囲・受入条件は§19.4、AD MCP仕様、docs/acceptance-criteria.mdのAD MCP追加開発を併せて適用する。
+専用Sandbox・暗号化Quarantine・MCP専用資格判定の旧必須条件は同経路へ重ねて要求しない。
+
 管理者承認済みMCP ToolだけをTool Registry Revisionへ登録し、Tool Availability Resolverを経由して利用可能にする。MCPのTool変更通知からRegistryを自動更新しない。
 
 ```text
@@ -8163,11 +8243,12 @@ Foundation / WitnessはPhase 0C、Goal / Context / Action前提との統合はPh
 
 ## Implementation Strategy（再実装と既存資産の扱い）
 
-現リポジトリは設計資料だけを保持し、既存の製品コード・テスト・CI/CDは含まない。新規実装を§36の
-Phase 0Aから開始し、Claude Codeが実装、別セッションのCodexが独立レビューを担当する。開始・受入は§40に従う。
+現リポジトリには設計資料に加え、`src/`、`tests/`、配備設定と段階実装の開発記録がある。
+設計資料だけとしてPhase 0Aから作り直す前提を置かず、現在の実コードと契約を確認して追加・置換を計画する。
+Claude Codeが実装、別セッションのCodexが独立レビューを担当する。開始・受入は§40に従う。
 過去のPR、Phase PASS、旧自動開発Loopを新実装の権限または適合証拠として扱わない。
 
-外部に保存された旧コード・データを採用することになった場合だけ、次の分類を責務単位で行う。
+既存コードおよび外部から採用するコード・データについて、次の分類を責務単位で行う。
 
 | 区分 | 方針 |
 | --- | --- |
@@ -8181,13 +8262,16 @@ Positive / Negative / Failure-pathを検証し、状態を扱う変更にはProp
 失敗回避のために安全試験を削除・skip・xfail化したり、実装へ仕様を合わせたりしない。
 
 旧Runtimeの実データを取り込む場合は、本節のSchema Migration ContractとAI別冊§12を適用する。
-設計資料だけのリポジトリから始めることは、外部に存在するDB、未完了Task、Quarantine、鍵、監査、
+今回の追加開発は、既存のDB、未完了Task、Quarantine、鍵、監査、
 Claim / Budget履歴を破棄する許可ではない。新規環境のProvisioningと、旧状態のImport / Migrationを区別する。
-D4の実機QualificationはNOT_EVALUATEDのままであり、再実装やMock試験でProduction採用条件を緩めない。
+D4の実機QualificationはNOT_EVALUATEDのままとする。新AD MCPの平文生ログへの非適用範囲は§19.4で限定し、他のD4対象をMockで適格としない。
 
 今回の整合は既存状態・Record種別・Serviceを再利用する。期限切れ処理は既存Scheduler / Aggregate、
 成果物保存は既存Ingestion / Manifest、停止中Recoveryは既存Graph状態の対応表で表す。
 実装に移す際のApplication / Policy / CatalogのRevision管理は維持し、既存稼働環境へ挙動をHot Swapしない。
+
+§19.4のAD MCP追加では、Provider Jobと生ログの保存Metadataを接続契約に従って追加できる。
+Applicationの認可状態機械・認可Recordを別系統に増設する許可とはしない。
 
 ## Modularity
 
@@ -8555,6 +8639,9 @@ D1〜D11の互換性境界も以下へ固定する。
 
 ## Security
 
+以下の共通条件のうち、新AD MCPの専用Sandbox、生出力暗号化・Quarantine固有の鍵管理は§19.4で置換する。
+それ以外のScope、Policy、Human Approval、Secret、Audit等は同じ経路にも適用する。
+
 * Scopeを必須設定とする
 * Execution ScopeとData Access Policyを分離する
 * Default Denyとする
@@ -8634,6 +8721,11 @@ Codex、コーディング・実装はClaude Codeが担当する。製品のLoca
 Phase 0Aから3まではMock Adapterで検証する。実環境向け攻撃ロジック、任意Shell、Payload / Implant生成・
 配布基盤を追加しない。Phase 4 / 5は製品・Version・隔離環境・接続・認証・Egress等の既存Human Gateを満たしてから
 実Adapterを有効化する。CIから実C2 / MCP / Targetへ接続しない。D4実機Qualification等のProduction条件も維持する。
+
+ただし、承認済みの新AD MCP追加は§19.4とAD MCP仕様に従う。登録済みWindowsペイロードの配布を含め、
+MCP専用のSandbox・資格判定Gateをツール別実環境結合テストと確認記録へ置き換える。
+実装・試験はAD MCP実装計画の工程で進め、既存Phaseを初めから再実装することを開始条件にしない。
+未確定事項と追加の方針変更はユーザーへ確認し、承認済み変更に同じ承認を重ねて要求しない。
 
 ## 40.1 Phaseごとの開発記録と独立レビュー
 
@@ -8952,3 +9044,22 @@ Phase PASS・Production採用を実施したものではない。D4の実機Qual
 
 受入条件は§36〜38およびdocs/acceptance-criteria.mdへ反映した。今回の整合範囲では、新しい状態・Record種別・
 独立Service・開発状態機械を追加せず既存設計へ接続できる。製品実装・製品試験・独立レビュー・Phase PASSは未実施である。
+
+## 41.12 AD MCP追加と運用条件の簡素化（2026-09-29）
+
+ユーザー承認に基づき`system-design-v1-r4` / `ai-control-v1-r4`へ更新した。
+同一リポジトリ内の独立`ad-mcp/`、本プロジェクト経由限定、公式SDK v2 `MCPServer`、添付全ツール、
+長時間Job、登録済みWindowsペイロードの配布・実行・回収を計画へ追加した。
+
+新AD MCPに限り、専用Sandbox構築・検証を必須から外し、生出力の暗号化Quarantineを非公開生ログと
+公開用JSON生成へ置換した。MCP専用適格性判定はツール別実環境結合テストと確認記録へ簡素化した。
+本文の共通条件への適用範囲は§19.4で列挙し、安全条件・受入条件・脅威モデル・AI接続規約へ反映した。
+
+Human Approval、Scope、単回Dispatch、Secret管理、監査、結果不明時の再送禁止は維持する。
+生出力以外の暗号化・TPM / D4条件を一律撤廃する改訂ではない。既存実装・試験結果の意味は変更せず、
+新仕様の実装・製品試験・実環境確認は未実施とする。未確定事項はAD MCP仕様§10に記録した。
+
+2026-09-29追記: 上記方針に基づく共通基盤を`ad-mcp/`と本体Adapterへ実装した。公式SDK v2 stdio、
+閉じたCatalog、Scope / Risk / dry-run、Digest固定、非公開生ログ、固定Parser、監査、Provider Job、
+Execution / Actor / Mission BindingをMockで確認した。既存を含む全1101試験のうち1094件がPASS、7件がskipである。
+実AD・実ツール試験、未分類Riskの採用、HTTP、Windows Transport / Payloadは未完了のため有効化しない。

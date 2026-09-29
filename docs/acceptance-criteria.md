@@ -2,8 +2,10 @@
 
 ## Specification revision and traceability
 
-`system-design-v1-r3`と規範別冊`ai-control-v1-r3`を受入対象とする。以下の正本の詳細条件も必須であり、
-この一覧は製品の安全試験・品質条件を削減しない。開発Gateは正本§40の新体制へ置き換える。Phase順序は維持し、後続Production機構は前Phaseの安全な型 / Test Double境界と分離する。
+`system-design-v1-r4`と規範別冊`ai-control-v1-r4`を受入対象とする。新AD MCPは正本§19.4と
+[AD MCP仕様](ad-mcp-spec.md)の承認済み限定置換を適用する。本書の共通・Phase別条件のうち、専用Sandbox、
+生出力暗号化・Quarantine固有の鍵消去、MCP専用適格性は下記「AD MCP追加開発」へ置換する。
+その他の安全試験・品質条件は維持する。開発Gateは正本§40に従い、Phase順序は維持する。
 過去のPASSを新仕様の成立証拠へ読み替えず、Current PhaseはPhaseごとの開発記録と実コード・試験・独立レビューから確認する。
 
 | 要件群 | 必須の詳細条件と検証段階 |
@@ -14,6 +16,7 @@
 | AI-01〜12 / AC-01〜20 | SystemDesign_AI_Control.md §10〜12。Phase 1でMock Integration、Phase 2でD11 Corpusを評価し、設計参照モデルだけで合格しない |
 | D4実機消去 | §34.1.1 / §37.1。現状NOT_EVALUATED。独立Qualification PASS前のProduction有効化を拒否し、文書採用やswtpmで代替しない |
 | 移行 / 互換性 | SystemDesign.md §38と別冊§12。Schema / Catalog / Witness Policyの一体移行、旧権限の非昇格、消費履歴保持、既存Execution回収、停止中Activationを検証する |
+| AD MCP追加 | 正本§19.4、ad-mcp-v1、本書のAD MCP追加開発。新しい平文生ログにはQuarantine鍵・D4消去資格を要求しない。他のD4対象と本体Production依存を区別する |
 
 ## Common Gate
 
@@ -39,7 +42,7 @@
 - 実装者の要約、モデルのPASS文字列、終了コード0、過去のPhase PASSだけで受入を完了しない。試験未実行、失敗、未解決指摘を記録から除外しない。
 - 実装・試験・依存・設計の後続変更では対象コミット、差分と影響範囲を確認し、必要な試験・独立レビューを更新する。記録のみの追記によるコミット自己参照や無変更コードの再レビューを要求しない。
 - BLOCKER / HIGHと未解決仕様矛盾がなく、Common Gateと対象Phaseの製品条件が成立してから次Phaseへ進む。通常の実装・修正・レビューごとの追加Human Gateは要求しない。
-- Phase 4 / 5の既存Provider Human Gate、D4実機Qualification、Scope / Secret / Audit / 単回Dispatch等の製品条件を維持する。
+- 新AD MCPの導入確認は正本§19.4へ置換する。他のPhase 4 / 5のProvider Human Gate、適用対象のD4実機Qualification、Scope / Secret / Audit / 単回Dispatch等の製品条件は維持する。
 - 旧Launcher、GitHub Marker、Workflow、自動Merge、開発Loop用Claim / Journalを要求しない。新しい開発状態機械・認可Recordを追加しない。
 - CI / GitHubの利用は任意の試験・証跡保存手段とし、未確認の外部設定を成立済みとみなさない。公開・Mergeは当該作業のユーザー指示に従う。
 
@@ -318,7 +321,8 @@ Human GateでC2製品、Version、隔離環境、認証方式、Egressを確定�
 
 ## Phase 5: Approved MCP Adapter
 
-Human GateでMCP Server、Protocol Revision、Transport Identity、Trust Policyを確定後に開始する。
+既存経路はHuman GateでMCP Server、Protocol Revision、Transport Identity、Trust Policyを確定後に開始する。
+新AD MCPは承認済み実装計画に従い、具体的な版・接続契約を確定して開発する。有効化確認は次節へ置換する。
 
 - Protocol Revisionを完全一致でPin
 - Unknown upgrade/legacy fallbackを禁止
@@ -332,6 +336,37 @@ Human GateでMCP Server、Protocol Revision、Transport Identity、Trust Policy�
 - 承認済みTest ServerでContract/Integration/Security TestをPASS
 - CIから未承認MCP/外部Targetへ接続しない
 
+### AD MCP追加開発
+
+以下は新仕様の受入条件であり、今回実行済みのTest結果ではない。
+
+| ID | 確認項目 |
+| --- | --- |
+| AD-MCP-01 | 同一リポジトリの独立パッケージ、公式SDK v2 MCPServer、本プロジェクト経由限定で一覧取得・呼出ができる |
+| AD-MCP-02 | 承認したSDK / Protocol / Identity / Schemaで接続し、未知操作・Schema変更を自動採用しない |
+| AD-MCP-03 | 許可された対象で登録操作を実行し、構造化結果・Coverage・生ログ参照が返る。ping sweepのRiskは分類確定後の値で検証 |
+| AD-MCP-04 | Scope外、DNSによる逸脱、未検査の追加接続先、不正入力・オプション・パスを拒否する |
+| AD-MCP-05 | intrusiveは既定拒否。有効化後も本体Policy / 必要なApprovalを通し、汎用ラッパから迂回できない |
+| AD-MCP-06 | dry-runでマスク済みコマンド表示と検証結果を返し、プロセス起動・Secret解決・対象通信が0件 |
+| AD-MCP-07 | 専用Sandboxなしで新AD MCPを構成でき、能力を偽装しない。個別の時間・容量・対象制限を検証する |
+| AD-MCP-08 | 平文生ログを実行別Rootへ保存し、アクセス権・上限・保持期限・部分/完了・Digestを検証する |
+| AD-MCP-09 | 生ログはLLM・公開Resource・通常UIへ直接渡らず、公開用JSON・例外・監査にSecretが混入しない |
+| AD-MCP-10 | Parser失敗・不完全収集を未検出や成功と誤認しない。保存済み原本から再開し、元Actionを再送しない |
+| AD-MCP-11 | Jobの照会・停止・回収をExecution / Actor / MissionへBindingし、他Executionからの操作と重複起動を拒否する |
+| AD-MCP-12 | timeout、子プロセス停止、応答消失、切断・再起動、部分結果、Windows側停止不明を契約どおり扱う |
+| AD-MCP-13 | JSONLへ日時・操作・マスク済み引数・対象・実行ID・終了コード・結果参照を記録し、本体監査と照合できる |
+| AD-MCP-14 | 期限後の通常削除・失敗記録・再処理を検証する。暗号鍵・暗号学的消去の偽証跡を生成しない |
+| AD-MCP-15 | 仕様§6の全ツールを操作・Parser・検出観点・対応版・試験へ対応付け、未実装Stubを完了扱いしない |
+| AD-MCP-16 | Windows PayloadのSHA256不一致を拒否し、配布・実行・回収・後処理と失敗時の残存物を追跡する |
+| AD-MCP-17 | pytest / ruff / mypyと本体影響範囲の回帰がPASS。実バイナリは単体試験でモックし、CIの実AD操作は0件 |
+| AD-MCP-18 | 実環境結合テストをツールと版ごとに記録する。設定・対象・試験内容・結果・ログ参照・未完了項目を含め、専用資格判定サービスを要求しない |
+| AD-MCP-19 | 既存暗号化データを平文化せず、他Adapterの条件を緩和しない。旧未完了Executionを新経路で再送しない |
+| AD-MCP-20 | READMEに導入・Scope・本体接続・intrusive・Job・生ログ管理・認可済み環境限定を記載する |
+
+Secret Leakageの判定では、承認された非公開生ログ中の秘密値と、禁止されたPrompt・公開JSON・監査等への漏えいを区別する。
+専用Sandboxの未実装を隠さず、OS封じ込め・保存時暗号化・復元不能な削除を保証したと記録しない。
+本体のSecret / Audit / TPM等の適用対象外の必須依存は別に確認し、MCP単体合格を全製品の稼働可否へ読み替えない。
+
 ## Project Complete
 
 Phase 0A〜5について、次をすべて満たしたとき製品の受入完了を開発記録へ記載する。
@@ -339,7 +374,7 @@ Phase 0A〜5について、次をすべて満たしたとき製品の受入完�
 - 各Phaseの対象実装コミット、対応要件、試験結果、独立レビュー・指摘対応を記録済み
 - 最終対象コミットでCommon Gateと全Phaseの製品要件が成立し、後続変更の影響を検証済み
 - 全PhaseのBLOCKER / HIGH、未解決仕様矛盾、Security-critical TODOが0件
-- Phase 4 / 5のProvider Human Gateと、Production構成に必要なD4を含む実機適格性のEvidenceがある
+- 新AD MCPは上記結合テスト記録、他のPhase 4 / 5はProvider Human Gate、Production構成で引き続き必要なD4等は対応する実機Evidenceがある
 - README / SystemDesign / Config / Runbookが実装と一致する
 - Fresh environment setupとMock end-to-endを再現できる
 - Known limitationsと残存MEDIUM / LOWを明文化し、未実行試験・未確認結果をPASSとしない

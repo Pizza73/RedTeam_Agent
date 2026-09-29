@@ -1,9 +1,29 @@
 # Safety Invariants
 
-以下はPhase・実装方式・Adapterに関係なく破ってはならない。
+以下は適用対象ごとの安全条件である。新AD MCPには、次節の承認済み限定置換を適用する。
 
-設計改訂は`system-design-v1-r3`。AI固有の規約は[規範別冊](../SystemDesign_AI_Control.md)のAI-01〜12と
+設計改訂は`system-design-v1-r4`。AI固有の規約は[規範別冊](../SystemDesign_AI_Control.md)のAI-01〜12と
 併せて適用する。実装が旧方式であることを理由に製品の安全条件を弱めない。開発のPhase受入は正本§40、既存データを扱う場合の移行は正本§38に従う。
+
+## AD MCPの承認済み限定置換
+
+正本§19.4と[AD MCP仕様](ad-mcp-spec.md)に従い、新AD MCPとその本体接続だけに次を適用する。
+以下の共通節にあるQuarantine・暗号化・鍵消去・Sandbox・適格性の条件も、この表の範囲で置換する。
+
+| 旧条件 | 新AD MCPの条件 |
+| --- | --- |
+| 専用Sandboxの構築・能力検証必須 | 専用Sandboxを必須にしない。Schema / Scope / 時間・出力量等を検証し、OS封じ込めを保証しない |
+| 生出力の暗号化Quarantine必須 | アクセス制限付きの非公開生ログ、固定Parser、機密分離、公開Field検証を通したJSON |
+| 原本の暗号鍵・暗号学的消去 | 実行別の保存・容量・期限・Digest・部分結果を管理し、期限後に通常削除。鍵や消去証跡を捏造しない |
+| MCP専用の適格性・Sandbox attestation | ツールと版ごとの実環境結合テスト・確認記録。未実施やMockを実環境PASSへ変換しない |
+
+- 適用対象はComposition Root固定のAdapter / Server / Registryで識別し、LLMや呼出引数から選べる緩和Modeにしない。
+- Policy、Human Approval、Scope、intrusive既定無効、単回Dispatch、Secret注入、Audit、Raw非公開を維持する。
+- 生ログに含まれる秘密値の平文保存は承認された例外であり、通常監査・Prompt・公開JSONへの混入許可ではない。
+- 生ログ保存・公開・復旧・削除の全経路を変更し、暗号化処理の例外を握りつぶすFallbackで実現しない。
+- 既存C2・他MCP・Secret Store・本体Audit / TPMの条件を広く解除しない。既存暗号化データは従来の契約で完了させる。
+- 登録済みWindowsペイロードの配布・実行・回収を含める。Payload生成、任意Shell、CIの実Target操作は含めない。
+- これらは仕様改訂であり、コード実装・有効化・実環境試験済みを意味しない。
 
 ## Authorization
 
@@ -128,7 +148,7 @@
 - Coarse Agent GraphのContext、Persistent Commit、Dispatch、Collection、Ingestion、ReconciliationはRetry Budgetを
   共有せず、Composite Nodeの再実行から外部副作用を再送しない。
 - ReconciliationなしにOutcomeを推測しない。
-- Payload/Implant生成・配布・永続化機能はMVP対象外。
+- Payload/Implant生成・配布・永続化機能はMVP対象外。ただし新AD MCPの登録済みWindowsペイロード配布・実行・回収は正本§19.4で明示追加する。
 
 - PAUSED / WAITING_HUMAN_REVIEWでも既存GraphのRECONCILINGからCurrent Recovery Authorityの範囲で既存Executionを照合できる。MissionをRUNNINGへ変えず、終了後はCurrent Missionに対応する状態へ戻す。通常ResumeやLLM / 新規Dispatch権限に代用しない。
 
@@ -152,6 +172,6 @@
 - 未実施の試験・レビューを実施済みと記録しない。安全条件を満たす試験を失敗回避のために削除・skip・xfail化しない。
 - 設計・受入条件を合格目的で無断に緩和しない。承認済みの設計改訂は関連文書へ一貫して反映し、旧自動Design Approvalを追加要求しない。
 - BLOCKER / HIGH、未解決仕様矛盾、Security-critical TODOを残して次Phaseを受入済みとしない。同じ問題で進展しない場合は設計と関連経路を見直す。
-- 製品のScope・Policy・Approval・Secret・単回実行・Audit・移行・Production適格性は開発規約の簡素化で変更しない。Phase 4 / 5の外部選択は既存Human Gateを通す。
+- 製品のScope・Policy・Approval・Secret・単回実行・Audit・移行は開発規約の簡素化で変更しない。新AD MCPの適格性条件は正本§19.4のユーザー承認済み製品改訂として変更し、他のPhase 4 / 5の外部選択は既存Human Gateを通す。
 - 開発・CIには実演習Secretや不要なCredentialを渡さず、実C2 / MCP / Targetへの操作を行わない。
 - 旧Launcher / Bot Marker / Workflow / 自動Merge / 開発用Claimは現行Gateではない。新しい開発状態機械や認可Tokenを追加しない。公開・Mergeは当該作業のユーザー指示に従い、Phase受入だけで自動実行しない。

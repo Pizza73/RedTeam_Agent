@@ -1,6 +1,6 @@
 # AI制御仕様 — 証拠・計画・認可の分離
 
-改訂: `ai-control-v1-r3` / 2026-09-06（`system-design-v1-r3`の規範別冊）
+改訂: `ai-control-v1-r4` / 2026-09-29（`system-design-v1-r4`の規範別冊）
 
 ## 0. 位置付けと適用境界
 
@@ -10,18 +10,25 @@
 図・受入条件も本書へ整合させ、旧規則は同書§41の改訂履歴に限定する。安全基盤の適用範囲も§12で限定し、
 「新しい文書だから全規則に優先する」と解釈しない。
 
+AD MCPの追加と保存・Sandbox・導入確認の限定置換は正本§19.4と[AD MCP仕様](docs/ad-mcp-spec.md)を適用する。
+本改訂はその接続範囲を整合するもので、AI-01〜12の判断権限・証拠・認可の分離は変更しない。
+
 設計正本、[安全条件](docs/safety-invariants.md)、[受入条件](docs/acceptance-criteria.md)を同じ改訂へ整合する。
 開発担当・実装開始・Phase受入は正本§40に従い、旧PRの状態や自動開発Loopを現行Gateへ使用しない。
 今回の文書更新は製品実装・試験・独立レビュー・Phase受入を完了した記録ではない。
 Phaseの並び（S1）、単一Executor既定、Secretの別認可Executionでの再利用、単回Dispatch、Lease更新 / Fencingは維持する。
 D4の実機消去Qualificationは依然`NOT_EVALUATED`であり、本書の検査からProduction採用を承認しない。
 
-本改訂では新しい製品状態・Record種別・独立Serviceを追加しない。期限切れ確定は既存Retention Scheduler
+AI制御の改訂では新しい認可状態・認可Record・独立Serviceを追加しない。
+AD MCPのProvider Job・生ログMetadataは正本§19.4の接続契約で扱う。期限切れ確定は既存Retention Scheduler
 から正本§10.3の条件で行い、新規成果物の内部保存は既存Secure Ingestion（§33.2）に限定する。
 停止中のRecoveryは既存RECONCILINGとMission状態の対応（§17.3）で表し、暗黙Resumeを行わない。
 公開時の本文検証と後日のQuarantine消去証跡を正本§33.2で分離する。保存済みResult / Proofは過去の公開を表し、
 Current Context / Goalでの利用には本書のFreshness・Source・認可条件を引き続き要求する。
-Ingestion Retryは正本§10.4の同じ入力・固定Rule / Parserに限定し、結果経路の正規値は§10.5の`local_result`へ統一する。
+Ingestion Retryは正本§10.4の同じ入力・固定Rule / Parserに限定し、結果経路の正規値は§10.5の`local_result | provider_task`に従う。`local_capture`は受理しない。
+
+新AD MCPの原本は暗号化Quarantine必須から外し、非公開生ログとして保存できる。公開用JSONの生成と
+Current Read認可を通してからAI Contextへ渡す。Provider Jobを持つ操作には§10.5の`provider_task`を使用できる。
 
 本書の参照モデルは意味の確認用であり、実際のRepository、認可、暗号、LLM、Adapterを実装したものではない。
 コードに移す際のSchema / Catalog Revision変更と移行は§12に従う。
@@ -76,6 +83,8 @@ LangGraphは唯一のWorkflow Engineとし、本書のControllerはそのApplica
 三つの区分はDiscriminated Unionとし、任意の`is_trusted`フラグやCaller指定の区分昇格を認めない。
 機密区分と事実の信頼性は別軸であり、verifiedでもReadが禁止ならPromptへ渡せない。
 Raw Result、Secret、未公開Artifactはこの区分へ入れる前に既存Secure Ingestion境界で隔離する。
+
+新AD MCPでは正本§19.4の非公開生ログと公開用JSON生成をこの境界へ接続する。平文保存はRawをAIへ公開する許可ではない。
 
 ### 3.2 Factの意味
 
@@ -516,7 +525,8 @@ SystemDesign.mdのAIモデル例、略図、Phase内のAI受入記述、Digest /
 | §27のCounter / Reservation | Mission Budgetを維持。旧Retry Key / 調査枠だけを本書§9へ対応付け、消費履歴を捨てない |
 | §28のAI Error Routing、§35のAI wiring、§36〜§38のAI受入・移行 | 本書§6〜§11 / 本節。新しい独立Service / Workflow Engineは不要 |
 | §37.2 / §41.4のF3 / F4 | §37.2は新しい受入期待へ更新。§41.4だけが旧方式の履歴。AC-01〜04 / 10〜14 / 16〜19で役割の移管を確認 |
-| §9〜§10、§13〜§15、§19、§21〜§23、§29〜§34の安全機構 | 上記の限定置換以外は維持。Dispatch / Secret / Recovery / Encryption / Approvalの代替経路なし |
+| §9〜§10、§13〜§15、§19、§21〜§23、§29〜§34の安全機構 | 本表のAI置換と正本§19.4のAD MCP置換以外は維持。Dispatch / Secret / Recovery / Approvalの代替認可経路なし |
+| 正本§19.4の新AD MCP | 専用Sandbox、生出力暗号化・Quarantine、MCP専用適格性判定を承認済み方式へ置換。Raw非公開、公開Field検証、Scope / Approval / 単回Dispatch / Secret / Evidence規約を維持 |
 | §35.2の起動と§34.1.1のD4 Qualification | 維持。AI再設計をTPM / Schema / Activation Lock / 実機未検証の迂回に使わない |
 
 ### 12.2 移行を一つの変更単位にする

@@ -29,11 +29,14 @@ _EXTRACTOR_ARGUMENT_FIELDS: dict[str, frozenset[str]] = {
     "host_target_v1": frozenset({"host_ids", "timeout_seconds"}),
     "session_target_v1": frozenset({"session_ids", "timeout_seconds"}),
     "artifact_target_v1": frozenset({"artifact_ids", "report_ids"}),
+    "ad_mcp_targets_v1": frozenset({"call"}),
+    "ad_mcp_offline_v1": frozenset({"call"}),
 }
 _EXTRACTOR_REQUIRED_TARGET_FIELD: dict[str, str] = {
     "network_target_v1": "destinations",
     "host_target_v1": "host_ids",
     "session_target_v1": "session_ids",
+    "ad_mcp_targets_v1": "call",
 }
 _RESOURCE_ARGUMENT_FIELDS: dict[str, str] = {
     "artifact": "artifact_ids",
@@ -139,7 +142,10 @@ def _validate_argument_contract(tool: ToolDefinition) -> None:
             raise ToolRegistryValidationError(
                 f"tool {tool.tool_ref.tool_id}: artifact extractor requires target_mode=none"
             )
-        if tool.target_mode == "none" and extractor_id != "artifact_target_v1":
+        if tool.target_mode == "none" and extractor_id not in {
+            "artifact_target_v1",
+            "ad_mcp_offline_v1",
+        }:
             raise ToolRegistryValidationError(
                 f"tool {tool.tool_ref.tool_id}: target_mode=none requires the artifact extractor or no extractor"
             )
@@ -154,6 +160,24 @@ def _validate_argument_contract(tool: ToolDefinition) -> None:
         for resource_type, field in _RESOURCE_ARGUMENT_FIELDS.items()
         if field in property_names
     )
+    if extractor_id in {"ad_mcp_targets_v1", "ad_mcp_offline_v1"}:
+        call_node = properties.get("call")
+        if isinstance(call_node, dict):
+            call_properties = call_node.get("properties")
+            parameters_node = (
+                call_properties.get("parameters")
+                if isinstance(call_properties, dict)
+                else None
+            )
+            parameter_properties = (
+                parameters_node.get("properties")
+                if isinstance(parameters_node, dict)
+                else None
+            )
+            if isinstance(parameter_properties, dict) and "input_resource" in parameter_properties:
+                declared_resource_types = frozenset(
+                    {*declared_resource_types, "local_artifact"}
+                )
     required_resource_types = frozenset(
         item for item in tool.required_data_access_types if item != "secret_reference"
     )
@@ -161,7 +185,11 @@ def _validate_argument_contract(tool: ToolDefinition) -> None:
         raise ToolRegistryValidationError(
             f"tool {tool.tool_ref.tool_id}: resource arguments and required data-access types differ"
         )
-    if declared_resource_types and extractor_id != "artifact_target_v1":
+    if declared_resource_types and extractor_id not in {
+        "artifact_target_v1",
+        "ad_mcp_targets_v1",
+        "ad_mcp_offline_v1",
+    }:
         raise ToolRegistryValidationError(
             f"tool {tool.tool_ref.tool_id}: resource arguments require the artifact extractor"
         )
@@ -280,7 +308,12 @@ def _validate_tool(
 
     _validate_argument_contract(tool)
 
-    if tool.minimum_risk_level == "high" and tool.adapter in ("local", "mcp") and tool.sandbox_requirement is None:
+    if (
+        tool.minimum_risk_level == "high"
+        and tool.adapter in ("local", "mcp")
+        and tool.adapter_id != "mcp-ad-local"
+        and tool.sandbox_requirement is None
+    ):
         raise ToolRegistryValidationError(
             f"tool {tool.tool_ref.tool_id}: high-risk {tool.adapter} tool requires a sandbox requirement"
         )

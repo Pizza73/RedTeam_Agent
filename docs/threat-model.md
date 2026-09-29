@@ -1,9 +1,14 @@
 # Product and Development Threat Model
 
-Revision: `system-design-v1-r3` / `ai-control-v1-r3`.
+Revision: `system-design-v1-r4` / `ai-control-v1-r4`.
 Product controls follow [SystemDesign.md](../SystemDesign.md) and its AI-control companion.
 Development follows SystemDesign.md §40: Claude Code implements; Codex reviews independently in a separate session.
 This document specifies required controls, not evidence that a runtime, CI or external repository control is deployed.
+
+The new AD MCP path follows SystemDesign.md §19.4 and [ad-mcp-v1](ad-mcp-spec.md). Only that path replaces
+mandatory dedicated sandbox qualification and encrypted raw quarantine with application checks, private raw files,
+validated public JSON, and per-tool live integration records. The existing encryption/erasure controls below still
+apply to other paths and existing encrypted data. Secret Store and application audit/TPM protections are not removed.
 
 ## Assets
 
@@ -69,7 +74,21 @@ Development / CI --mock-only--> no real C2/MCP/Target operation
 | Changed processing intent is disguised as retry or resets its budget | Same input and frozen rule/parser digest only; changed-rule reprocessing of existing quarantine is outside MVP. Existing attempt budgets survive retries and ID changes cannot bypass them. Unavailable/revoked rules use existing failure/expiry paths, never an external resubmit |
 | Inconsistent result-mode names select an unintended adapter path | Share the canonical provider_task/local_result discriminator across model, adapter and repository; reject local_capture, unknown values and missing branch fields without alias conversion |
 
+## AD MCP追加での制御と保証の限界
+
+| 脅威 | 採用する制御と限界 |
+| --- | --- |
+| ツール内部が想定外の通信・ファイル操作を行う | 登録済み操作、全対象の抽出・Scope検査、引数検証、資源制限を適用する。専用Sandboxを必須としないため、OS層での全面的な封じ込めは保証しない |
+| 生ログ中のハッシュ等をOSユーザーが読む | 保存Root・ファイル権限・保持期限を制限する。生ログ暗号化は必須でなく、読取権限を持つ主体への秘密保持は保証しない |
+| 生ログ・エラー中の命令やSecretがLLMへ渡る | Rawを非公開にし、固定Parser・機密分離・公開Field Allowlist・本体Rule検証を通す。マスキングだけでPrompt Injectionを完全排除したとは扱わない |
+| Crash後に部分出力を成功結果と誤認、または元操作を再送する | Job / ExecutionへのBinding、部分・完了、サイズ・Digest・保存期限を永続化し、原本から解析を再開する。結果不明の副作用を自動再送しない |
+| 削除した平文生ログがBackup等に残る | 期限後の通常削除と失敗記録を実装する。暗号学的消去や全媒体での復元不能性を主張しない |
+| 未実施の実環境確認を資格取得済みとして扱う | ツール版・対象・試験内容・結果を記録する。専用attestationを追加せず、Mock合格、ツール単体合格、本体統合を区別する |
+| 緩和対象が他Adapterへ広がる | Composition Root固定の新AD MCP契約で適用を限定し、他経路・既存暗号化データの回帰試験を置く |
+
 ## Development Threats and Controls
+
+The following development controls remain applicable, with the AD MCP-specific activation replacement above.
 
 | Threat | Control |
 | --- | --- |
@@ -79,7 +98,7 @@ Development / CI --mock-only--> no real C2/MCP/Target operation
 | Tests or safety requirements are weakened to make implementation pass | Preserve the required safety and quality coverage; no failure-avoidance deletion, skip or xfail. Approved design changes must update all normative documents consistently and remain visible in the phase record |
 | Phase ordering or unresolved high-impact findings are ignored | Preserve Phase 0A → 0B → 0C → 1 → 2 → 3 → 4 → 5 and applicable Common/Product Gates. Do not accept a phase with BLOCKER/HIGH, unresolved specification contradictions or security-critical TODOs. Repeated non-progress requires review of the design and related paths |
 | Old Launcher, bot marker or GitHub status is treated as current authority | Current acceptance is based on phase records, actual implementation/tests and independent review. No new development state machine, token, claim or automatic merge mechanism is required; publication and merge follow the applicable user instruction |
-| Real offensive action or credential leakage from development/CI | Use mocks/test servers and avoid real exercise secrets or unnecessary credentials. CI never accesses real C2/MCP/Targets. Preserve the existing Phase 4/5 Provider Human Gates; secret values and raw output do not enter prompts, logs or uploaded artifacts |
+| Real offensive action or credential leakage from development/CI | Use mocks/test servers and avoid real exercise secrets or unnecessary credentials. CI never accesses real C2/MCP/Targets. AD MCP activation uses §19.4 integration records; other Phase 4/5 Provider Human Gates remain. Secret values and raw output do not enter prompts, ordinary audit logs or uploaded development artifacts |
 | Optional CI is assumed secure or enforced without evidence | If CI/GitHub is used, verify its actual permissions, dependencies and evidence binding to the implementation commit. Do not claim unavailable branch protection, an undeployed workflow or an old PASS as an enforced control |
 
 ## Residual Risk
@@ -91,3 +110,4 @@ Development / CI --mock-only--> no real C2/MCP/Target operation
 - Development model services and any optional CI remain data-handling boundaries. This document does not establish offline inference, service settings, sandbox enforcement or external repository permissions.
 - Review and phase acceptance are process controls. External repository enforcement, if used, must be checked separately; acceptance alone never performs a commit, push or merge.
 - Phase 4/5 vendor behavior may differ from mocks and requires approved isolated integration testing.
+- The AD MCP relaxations are approved design choices, not proof of OS containment, encrypted-at-rest raw confidentiality, or irreversible raw-file deletion. Implementation and live verification remain outstanding.

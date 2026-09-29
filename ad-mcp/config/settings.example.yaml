@@ -1,0 +1,18 @@
+schema_version: ad-mcp-settings-v1
+client_id: redteam-agent
+workspace_root: /var/lib/redteam-ad-mcp
+raw_root: /var/lib/redteam-ad-mcp/raw
+state_db: /var/lib/redteam-ad-mcp/state/jobs.sqlite3
+audit_log: /var/lib/redteam-ad-mcp/audit/events.jsonl
+binary_paths:
+  nmap: /usr/bin/nmap
+binary_sha256:
+  nmap: REPLACE_WITH_64_LOWERCASE_HEX_DIGEST
+resources: {}
+enabled_operations: []
+intrusive_enabled: false
+max_concurrent_jobs: 2
+max_targets: 16
+retention_hours: 24
+transport: stdio
+remote_transport: disabled

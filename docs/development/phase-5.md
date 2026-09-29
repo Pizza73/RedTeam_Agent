@@ -1,5 +1,14 @@
 # Phase 5 MCP Adapter 開発記録
 
+## 2026-09-29の仕様追加との関係
+
+[AD MCP仕様](../ad-mcp-spec.md)と[実装計画](ad-mcp-plan.md)を追加した。
+新AD MCPは公式SDK v2 MCPServer、長時間Job、全ツール対応、非暗号化生ログと公開JSON、
+専用Sandbox必須の撤廃、ツール別結合テストによる導入確認を採用する。
+以下は既存Adapter / Impacketサーバの実装・検証記録である。one-shot、Task無効、暗号化Quarantine、
+Sandbox attestation等の記載を新AD MCPの規範へ転用しない。新仕様の実装・製品試験は未実施であり、
+既存のPASS・Production保留状態をこの文書追加で変更しない。
+
 ## 現在の判定
 
 Phase 5のオフライン実装は完了した。Protocol Contract、Identity / Trust境界、Adapter本体、Tool Candidate処理、

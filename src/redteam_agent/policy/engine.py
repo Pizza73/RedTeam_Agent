@@ -211,6 +211,20 @@ class PolicyEngine:
             if field is None:
                 return False, [], ("UNSUPPORTED_DATA_ACCESS_TYPE",)
             resource_ids = arguments.get(field) if isinstance(arguments, dict) else None
+            if (
+                resource_type == "local_artifact"
+                and tool.target_extractor_id
+                in {"ad_mcp_targets_v1", "ad_mcp_offline_v1"}
+                and isinstance(arguments, dict)
+            ):
+                call = arguments.get("call")
+                parameters = call.get("parameters") if isinstance(call, dict) else None
+                input_resource = (
+                    parameters.get("input_resource")
+                    if isinstance(parameters, dict)
+                    else None
+                )
+                resource_ids = [input_resource] if isinstance(input_resource, str) else None
             if not isinstance(resource_ids, list) or not resource_ids:
                 return False, [], ("MISSING_RESOURCE_ARGUMENT",)
             for resource_id in resource_ids:
