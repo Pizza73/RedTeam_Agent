@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:redteam-agent:sliver-operator-config:v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["operator", "lhost", "lport", "token", "ca_certificate", "private_key", "certificate"],
+  "properties": {
+    "operator": {"const": "joe"},
+    "lhost": {"type": "string", "minLength": 1, "maxLength": 255},
+    "lport": {"type": "integer", "minimum": 1, "maximum": 65535},
+    "token": {"type": "string", "minLength": 1, "maxLength": 4096},
+    "ca_certificate": {"type": "string", "minLength": 1},
+    "private_key": {"type": "string", "minLength": 1},
+    "certificate": {"type": "string", "minLength": 1}
+  }
+}

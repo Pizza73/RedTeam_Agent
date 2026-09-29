@@ -1,0 +1,86 @@
+[build-system]
+requires = ["setuptools==80.9.0", "wheel==0.45.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "redteam-agent"
+version = "0.0.0a1"
+description = "Authorization kernel for an authorized, isolated red-team exercise support agent (Phase 0A)."
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic==2.12.4",
+    "cryptography==46.0.1",
+    "langgraph==1.2.11",
+    "langgraph-checkpoint-sqlite==3.1.1",
+    "transformers==5.13.1",
+    "jinja2==3.1.6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==8.4.2",
+    "hypothesis==6.140.3",
+    "coverage==7.11.0",
+    "ruff==0.14.5",
+    "mypy==1.18.2",
+]
+impacket-mcp = [
+    "impacket==0.13.1",
+    # 26.x requires cryptography >=49 and conflicts with the project pin.
+    "pyOpenSSL==25.3.0",
+]
+sliver-c2 = [
+    "grpcio==1.84.0",
+]
+ad-collector = [
+    "ldap3==2.9.1",
+]
+
+[project.scripts]
+redteam-impacket-mcp = "redteam_agent.mcp_servers.impacket_server:main"
+redteam-ui = "redteam_agent.ui.server:main"
+redteam-product = "redteam_agent.product_cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "S", "C4", "SIM", "RUF"]
+ignore = ["S101"]  # asserts are used in tests and as internal invariants
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S", "B011", "E501", "RUF059", "SIM105", "SIM117"]
+"scripts/**" = ["S"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+mypy_path = "src"
+packages = ["redteam_agent"]
+warn_unused_ignores = false
+disallow_any_explicit = false
+
+# The ``cryptography`` package ships its own type hints but is an optional
+# system-provided dependency; when it is not installed in the checking
+# environment, treat its imports as untyped rather than failing the run. The
+# runtime still fails closed via EncryptionUnavailableError when it is absent.
+[[tool.mypy.overrides]]
+module = ["cryptography.*", "certipy.*", "ldap3.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+pythonpath = ["tests"]
+
+[tool.coverage.run]
+branch = true
+source = ["redteam_agent"]
+
+[tool.coverage.report]
+show_missing = true
