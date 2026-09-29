@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
+from datetime import datetime
 
 from redteam_agent.agent.models import (
     ActionCandidateProjection,
@@ -15,6 +17,7 @@ from redteam_agent.agent.outcome_accounting import ExecutionOutcomeAccountingSer
 from redteam_agent.agent.planner_context import ActionCandidateProjector
 from redteam_agent.canonical.digest_service import DigestService
 from redteam_agent.errors import AgentLoopError
+from redteam_agent.execution.budget import MissionExecutionBudgetService
 from redteam_agent.goal.service import GoalEvaluationService
 from redteam_agent.mission.models import Mission
 from redteam_agent.runtime.authorization_context import AuthorizationContextResolver
@@ -24,7 +27,12 @@ from redteam_agent.storage.execution_repositories import (
     ExecutionRecordRepository,
     MissionExecutionBudgetRepository,
 )
-from redteam_agent.storage.repositories import AvailableToolSnapshotRepository
+from redteam_agent.storage.repositories import (
+    ApprovalRecordRepository,
+    ApprovalRequestRepository,
+    AvailableToolSnapshotRepository,
+    PolicyDecisionRepository,
+)
 
 _CHECKPOINT_NS = "agent_checkpoint"
 # Provider execution states that still require recovery/reconciliation. Shared
@@ -46,6 +54,10 @@ class AgentController:
         snapshot_repository: AvailableToolSnapshotRepository,
         candidate_projector: ActionCandidateProjector,
         outcome_accounting: ExecutionOutcomeAccountingService,
+        budget_service: MissionExecutionBudgetService,
+        decision_repository: PolicyDecisionRepository,
+        approval_request_repository: ApprovalRequestRepository,
+        approval_record_repository: ApprovalRecordRepository,
     ) -> None:
         self._db = database
         self._ds = digest_service
@@ -57,29 +69,66 @@ class AgentController:
         self._snapshots = snapshot_repository
         self._projector = candidate_projector
         self._outcomes = outcome_accounting
+        self._budget_service = budget_service
+        self._decisions = decision_repository
+        self._approval_requests = approval_request_repository
+        self._approval_records = approval_record_repository
 
     def step(
         self, *, mission_id: str, operation_id: str,
         projection: ActionCandidateProjection | None = None,
+        projection_supplier: Callable[[], ActionCandidateProjection] | None = None,
     ) -> ControllerDecision:
         now = self._clock.now()
         mission = self._resolver.resolve(mission_id, now=now).mission
+        executions = self._executions.all_for_mission(mission_id)
+        incomplete = tuple(
+            item for item in executions
+            if item.provider_execution_state in ACTIVE_EXECUTION_STATES or (
+                item.provider_execution_state in {"SUCCEEDED", "FAILED", "CANCELLED"}
+                and item.result_ingestion_state != "SUCCEEDED"
+            )
+        )
+        approval_reason = (
+            self._approval_wait_reason(mission, now)
+            if mission.state == "RUNNING" and not incomplete else None
+        )
+        runtime_active = bool(incomplete) or (
+            mission.state == "RUNNING"
+            and (
+                approval_reason is None
+                or mission.approval_policy.count_approval_wait_in_runtime
+            )
+        )
+        budget = self._budget_service.account_runtime(
+            mission_id=mission_id,
+            mission_revision=mission.mission_revision,
+            active=runtime_active,
+        )
+        if mission.state in ("RUNNING", "PAUSED", "WAITING_HUMAN_REVIEW") and (
+            not mission.valid_from <= now < mission.valid_until
+            or budget.consumed_planner_invocations >= mission.max_iterations
+            or budget.consumed_dispatch_claims >= budget.max_dispatch_claims
+            or budget.active_runtime_seconds >= mission.max_runtime_minutes * 60
+        ):
+            return self._save(
+                mission=mission, operation_id=operation_id,
+                decision=ControllerDecision(
+                    action="FINALIZE", reason_code="HARD_LIMIT", goal_evaluation_id=None, candidate_ids=(),
+                ), active_execution_id=None,
+            )
         if mission.state in ("PAUSED", "WAITING_HUMAN_REVIEW"):
             # Durable resume: reconcile an existing execution through the same
             # RECONCILING recovery path, without planning, dispatching, or moving
             # the mission to RUNNING (SystemDesign §17.3 / §21.1.1). If nothing is
             # incomplete, stop; the mission stays stopped / under review.
-            active = tuple(
-                item for item in self._executions.all_for_mission(mission_id)
-                if item.provider_execution_state in ACTIVE_EXECUTION_STATES
-            )
-            if active:
+            if incomplete:
                 return self._save(
                     mission=mission, operation_id=operation_id,
                     decision=ControllerDecision(
                         action="RECOVER", reason_code="EXECUTION_IN_PROGRESS",
                         goal_evaluation_id=None, candidate_ids=(),
-                    ), active_execution_id=active[0].execution_id,
+                    ), active_execution_id=incomplete[0].execution_id,
                 )
             return self._save(
                 mission=mission, operation_id=operation_id,
@@ -104,15 +153,22 @@ class AgentController:
                     candidate_ids=(),
                 ), active_execution_id=None,
             )
-        budget = self._budgets.get(mission_id, mission.mission_revision)
-        if budget is None:
-            raise AgentLoopError("mission execution budget is missing")
         consecutive_failures = self._outcomes.reconcile(
             mission_id=mission_id, mission_revision=mission.mission_revision
         )
+        if consecutive_failures >= self._outcomes.MAX_CONSECUTIVE_FAILURES:
+            return self._save(
+                mission=mission, operation_id=operation_id,
+                decision=ControllerDecision(
+                    action="FINALIZE", reason_code="HARD_LIMIT", goal_evaluation_id=None, candidate_ids=(),
+                ), active_execution_id=None,
+            )
         active = tuple(
             item for item in self._executions.all_for_mission(mission_id)
-            if item.provider_execution_state in _ACTIVE_EXECUTION_STATES
+            if item.provider_execution_state in _ACTIVE_EXECUTION_STATES or (
+                item.provider_execution_state in {"SUCCEEDED", "FAILED", "CANCELLED"}
+                and item.result_ingestion_state != "SUCCEEDED"
+            )
         )
         if active:
             active_execution_id = active[0].execution_id
@@ -123,24 +179,30 @@ class AgentController:
                     candidate_ids=(),
                 ), active_execution_id=active_execution_id,
             )
-        if consecutive_failures >= self._outcomes.MAX_CONSECUTIVE_FAILURES:
-            return self._save(
-                mission=mission, operation_id=operation_id,
-                decision=ControllerDecision(
-                    action="FINALIZE", reason_code="HARD_LIMIT", goal_evaluation_id=None,
-                    candidate_ids=(),
-                ), active_execution_id=None,
-            )
         evaluation = self._goals.evaluate(mission_id=mission_id)
         if evaluation.status.status == "achieved":
             action: ControllerAction = "FINALIZE"
             reason: ControllerReason = "GOAL_ACHIEVED"
             selected: tuple[str, ...] = ()
-        elif budget.consumed_dispatch_claims >= min(budget.max_dispatch_claims, mission.max_iterations):
-            action, reason, selected = "PAUSE", "BUDGET_EXHAUSTED", ()
+        elif approval_reason is not None:
+            if approval_reason == "APPROVAL_PENDING":
+                action = "WAIT"
+            elif approval_reason == "APPROVAL_APPROVED":
+                action = "EXECUTE_APPROVED"
+            else:
+                action = "PAUSE"
+            reason, selected = approval_reason, ()
+        elif (
+            budget.consumed_planner_invocations >= mission.max_iterations
+            or budget.consumed_dispatch_claims >= budget.max_dispatch_claims
+            or budget.active_runtime_seconds >= mission.max_runtime_minutes * 60
+        ):
+            action, reason, selected = "FINALIZE", "HARD_LIMIT", ()
         else:
             candidates: tuple[str, ...] = ()
             planning_search_limited = False
+            if projection is None and projection_supplier is not None:
+                projection = projection_supplier()
             if projection is not None:
                 snapshot = self._snapshots.get(projection.available_tool_snapshot_id)
                 if snapshot is None:
@@ -162,6 +224,38 @@ class AgentController:
             ), active_execution_id=None,
         )
 
+    def _approval_wait_reason(
+        self, mission: Mission, now: datetime,
+    ) -> ControllerReason | None:
+        for policy_decision in reversed(self._decisions.all_for_mission(mission.mission_id)):
+            if policy_decision.mission_revision != mission.mission_revision:
+                continue
+            if policy_decision.decision != "REQUIRE_APPROVAL":
+                continue
+            if self._executions.get_by_decision(policy_decision.decision_id) is not None:
+                continue
+            request = self._approval_requests.find_by_decision(policy_decision.decision_id)
+            # A decision/request crash gap is resumed by replaying the saved
+            # Planner operation through ActionService, which issues the missing
+            # request from the exact stored Plan. There is nothing for a human
+            # to act on until that request exists.
+            if request is None:
+                continue
+            record = self._approval_records.find_by_request(request.approval_request_id)
+            if record is None and now < request.expires_at:
+                return "APPROVAL_PENDING"
+            if record is None and now >= request.expires_at:
+                return "APPROVAL_EXPIRED"
+            if record is not None and record.decision != "APPROVED":
+                return "APPROVAL_REJECTED"
+            if record is not None and (
+                now >= request.expires_at or now >= record.expires_at
+            ):
+                return "APPROVAL_EXPIRED"
+            if record is not None:
+                return "APPROVAL_APPROVED"
+        return None
+
     def checkpoint(self, mission_id: str) -> AgentCheckpoint | None:
         row = self._db.occ_get(_CHECKPOINT_NS, mission_id)
         if row is None:
@@ -177,7 +271,7 @@ class AgentController:
     def _save(self, *, mission: Mission, operation_id: str, decision: ControllerDecision,
               active_execution_id: str | None) -> ControllerDecision:
         budget = self._budgets.get(mission.mission_id, mission.mission_revision)
-        iteration = 0 if budget is None else budget.consumed_dispatch_claims
+        iteration = 0 if budget is None else budget.consumed_planner_invocations
         updated_at = self._clock.now()
         fields = {
             "checkpoint_id": f"checkpoint-{mission.mission_id}", "mission_id": mission.mission_id,

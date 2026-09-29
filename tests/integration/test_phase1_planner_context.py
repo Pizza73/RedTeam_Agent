@@ -23,11 +23,16 @@ from redteam_agent.plan.models import PlannerActionOutput, PlannerContextRequest
 from redteam_agent.policy.scope_models import IpTargetReference
 
 
-def _inputs(*, phase0c=None):
+def _inputs(
+    *, phase0c=None, require_for_side_effect: frozenset[str] = frozenset(),
+):
     kernel = build_phase1_kernel(
         phase0c=p0c.make_phase0c() if phase0c is None else phase0c
     )
-    seeded = p0b.seed_authorized(kernel.phase0c.phase0b)
+    seeded = p0b.seed_authorized(
+        kernel.phase0c.phase0b,
+        require_for_side_effect=require_for_side_effect,
+    )
     mission_id = seeded.seeded.revision.mission_id
     head = kernel.knowledge_service.initialize_mission(
         mission_id=mission_id,

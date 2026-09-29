@@ -81,7 +81,7 @@ class TuoniLabIsolationPolicy(StrictImmutableBoundaryModel):
     topology: Literal["colocated_control_vm_disposable_target"] = (
         "colocated_control_vm_disposable_target"
     )
-    control_vm_operating_system: Literal["ubuntu_24_04_lts"] = "ubuntu_24_04_lts"
+    control_vm_operating_system: Literal["kali_2026_3"] = "kali_2026_3"
     control_vm_architecture: Literal["x86_64"] = "x86_64"
     adapter_placement: Literal["same_control_vm_loopback"] = (
         "same_control_vm_loopback"

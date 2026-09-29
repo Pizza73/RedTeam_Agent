@@ -13,6 +13,7 @@ import hashlib
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 
 from redteam_agent.errors import (
     ExecutionStateConflictError,
@@ -20,6 +21,7 @@ from redteam_agent.errors import (
 )
 
 _ROW_DIGEST_DOMAIN = b"kv-row-integrity-v1"
+APPLICATION_SCHEMA_REVISION = "redteam-agent-application-v2"
 _APPROVAL_RECORD_INDEX_NAME = "uq_approval_record_request"
 _APPROVAL_RECORD_INDEX_SQL = " ".join(
     """
@@ -67,7 +69,13 @@ class Database:
         # ``isolation_level=None`` gives explicit transaction control; the unit
         # of work issues BEGIN/COMMIT. Foreign keys are enabled per §32.
         self._path = path
-        self._conn = sqlite3.connect(path, isolation_level=None)
+        if not create_schema and path != ":memory:":
+            # Normal startup must never create a missing database as a side effect.
+            self._conn = sqlite3.connect(
+                Path(path).absolute().as_uri() + "?mode=rw", uri=True, isolation_level=None,
+            )
+        else:
+            self._conn = sqlite3.connect(path, isolation_level=None)
         self._after_commit: list[Callable[[], None]] = []
         self._critical_mutation_recorder: CriticalMutationRecorder | None = None
         self._transaction_counter = 0
@@ -84,6 +92,20 @@ class Database:
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
         ).fetchone()
         return row is not None
+
+    def application_schema_revision_is_current(self) -> bool:
+        """Verify the exact provisioned application revision without changing it."""
+        columns = tuple(
+            row[1] for row in self._conn.execute(
+                "PRAGMA table_info(application_schema_metadata)"
+            ).fetchall()
+        )
+        if columns != ("singleton_id", "schema_revision"):
+            return False
+        rows = self._conn.execute(
+            "SELECT singleton_id, schema_revision FROM application_schema_metadata"
+        ).fetchall()
+        return rows == [(1, APPLICATION_SCHEMA_REVISION)]
 
     def graph_checkpoint_schema_is_current(self) -> bool:
         expected = {
@@ -117,6 +139,21 @@ class Database:
         return " ".join(row[0].lower().split()) == _APPROVAL_RECORD_INDEX_SQL
 
     def _create_schema(self) -> None:
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS application_schema_metadata (
+                singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+                schema_revision TEXT NOT NULL
+            )
+            """
+        )
+        self._conn.execute(
+            """
+            INSERT OR IGNORE INTO application_schema_metadata (singleton_id, schema_revision)
+            VALUES (1, ?)
+            """,
+            (APPLICATION_SCHEMA_REVISION,),
+        )
         # ``row_digest`` binds (namespace, key, json) so a raw single-row edit
         # that changes the JSON without recomputing the digest is caught on read
         # (R10). This is simple-edit integrity, not TPM rollback resistance.

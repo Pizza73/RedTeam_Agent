@@ -860,8 +860,19 @@ class IsolatedPhase1ScenarioRunner:
     @staticmethod
     def _finish_execution(phase1: Phase1Kernel, execution_id: str) -> ExecutionResult | None:
         phase0b = phase1.phase0c.phase0b
+        record = phase0b.execution_repository.get(execution_id)
+        existing = phase0b.result_repository.get(execution_id)
+        if (
+            record is not None
+            and record.result_ingestion_state == "SUCCEEDED"
+            and existing is not None
+        ):
+            return existing
         phase0b.collection_coordinator.collect(execution_id=execution_id)
-        phase0b.ingestion_coordinator.ingest(execution_id=execution_id)
+        ingestion = phase0b.ingestion_coordinator.ingest(execution_id=execution_id)
+        deletion_intent_id = getattr(ingestion, "deletion_intent_id", None)
+        if deletion_intent_id is not None:
+            phase1.phase0c.eraser.run(deletion_intent_id=deletion_intent_id)
         return phase1.phase0c.phase0b.result_repository.get(execution_id)
 
     def _analyze(

@@ -311,11 +311,22 @@ class SecureIngestionService:
     # --- retry / fail -----------------------------------------------------
 
     def fail(self, *, ingestion_id: str, reason: str) -> SecureIngestionOutcome:
+        del reason  # Error content is intentionally not persisted at this boundary.
         state = self._require_state(ingestion_id)
         if state.status != "INGESTING":
             raise SecureIngestionError("only an INGESTING ingestion can fail")
         failed = self._advance_ingestion(state, "FAILED", attempt_count=state.attempt_count)
+        self._leases.release_ingestion_lease(
+            ingestion_id=ingestion_id, owner_id=self._owner_id,
+        )
         return self._terminal_outcome(failed)
+
+    def retry(self, *, ingestion_id: str) -> SecureIngestionOutcome:
+        state = self._require_state(ingestion_id)
+        if state.status != "FAILED":
+            raise SecureIngestionError("only a FAILED ingestion can be retried")
+        self._advance_ingestion(state, "PENDING", attempt_count=state.attempt_count)
+        return self.ingest(ingestion_id=ingestion_id)
 
     # --- read a published manifest / intent -------------------------------
 

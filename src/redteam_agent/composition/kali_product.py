@@ -8,6 +8,7 @@ live-environment attestations are supplied to ``ProductionCompositionRoot``.
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 from dataclasses import dataclass
 from ipaddress import IPv4Address, IPv4Network, ip_address, ip_network
 from pathlib import Path
@@ -22,6 +23,8 @@ from redteam_agent.ad_assessment.collector import (
     VerifiedADCollector,
 )
 from redteam_agent.canonical.digest_service import DigestService
+from redteam_agent.composition.activation_lock import HostActivationLock
+from redteam_agent.composition.startup_self_check import check_schema_read_only
 from redteam_agent.composition.testing import Phase0AKernel, build_test_kernel
 from redteam_agent.llm.attestation_store import ServerAttestationRepository
 from redteam_agent.llm.capability import CapabilityRepository, MissionCapabilityVerifier
@@ -60,6 +63,7 @@ class _DeferredCapabilityVerifier:
 class KaliProductSettings(StrictImmutableBoundaryModel):
     schemaVersion: Literal["kali-product-v1"] = "kali-product-v1"
     databasePath: str = "/var/lib/redteam-agent/redteam-agent.db"
+    activationLockPath: str = "/run/redteam-agent/activation.lock"
     staticDirectory: str = "/opt/redteam-agent/frontend/dist"
     operatorTokenFile: str = "/run/credentials/redteam-agent.service/ui-operator.token"
     operatorPrincipal: str = Field(default="redteam-operator", min_length=1, max_length=200)
@@ -98,6 +102,7 @@ class KaliProductSettings(StrictImmutableBoundaryModel):
     def _absolute_paths(self) -> KaliProductSettings:
         for value in (
             self.databasePath,
+            self.activationLockPath,
             self.staticDirectory,
             self.operatorTokenFile,
             self.vllmApiKeyFile,
@@ -155,123 +160,153 @@ class KaliProductApplication:
     authenticator: OperatorSessionAuthenticator
     vllm_port: VllmSettingsManager
     ad_collector: VerifiedADCollector | None
+    activation_lock: HostActivationLock
 
     def close(self) -> None:
-        self.vllm_port.close()
-        self.kernel.database.close()
+        try:
+            self.vllm_port.close()
+        finally:
+            try:
+                self.kernel.database.close()
+            finally:
+                self.activation_lock.release()
 
 
 def build_kali_product_application(settings: KaliProductSettings) -> KaliProductApplication:
     """Build the persistent control plane without enabling unqualified adapters."""
-    database_path = Path(settings.databasePath)
-    database_path.parent.mkdir(parents=True, exist_ok=True)
-    if not database_path.exists():
-        Database(str(database_path)).close()
+    with ExitStack() as cleanup:
+        database_path = Path(settings.databasePath)
+        lock_path = Path(settings.activationLockPath)
+        database_files = tuple(
+            Path(str(database_path) + suffix) for suffix in ("", "-wal", "-shm", "-journal")
+        )
+        if lock_path in database_files:
+            raise ValueError("activation lock must be separate from all database files")
+        activation_lock = HostActivationLock(str(lock_path))
+        activation_lock.acquire()
+        cleanup.callback(activation_lock.release)
 
-    deferred = _DeferredCapabilityVerifier()
-    kernel = build_test_kernel(
-        db_path=str(database_path),
-        allowed_profile_types=frozenset({"vllm"}),
-        capability_verifier=deferred,
-        registered_session_refs=frozenset(settings.approvedSessionRefs),
-    )
-    corpus = build_schema_capability_corpus()
-    vllm_settings = Phase2VllmCapabilitySettings(
-        database_path=database_path,
-        base_url=settings.vllmBaseUrl,
-        model=settings.vllmModel,
-        api_key_file=Path(settings.vllmApiKeyFile),
-        manifest_path=Path(settings.vllmManifest),
-        public_key_path=Path(settings.vllmPublicKey),
-        manifest_key_id="llm001-gemma4-2026",
-        tokenizer_directory=Path(settings.vllmTokenizerDirectory),
-    )
-    initial_vllm_port = Phase2VllmCapabilityPort(settings=vllm_settings)
-    vllm_port = VllmSettingsManager(
-        initial_port=initial_vllm_port,
-        settings_template=vllm_settings,
-        settings_directory=Path(settings.vllmSettingsDirectory),
-        allowed_cidrs=settings.vllmAllowedCidrs,
-        port_factory=Phase2VllmCapabilityPort,
-    )
-    deferred.bind(
-        MissionCapabilityVerifier(
-            repository=CapabilityRepository(
-                database=kernel.database,
+        schema_probe = Database(str(database_path), create_schema=False)
+        try:
+            check_schema_read_only(schema_probe)
+        finally:
+            schema_probe.close()
+
+        deferred = _DeferredCapabilityVerifier()
+        kernel = build_test_kernel(
+            db_path=str(database_path), create_schema=False,
+            allowed_profile_types=frozenset({"vllm"}),
+            capability_verifier=deferred,
+            registered_session_refs=frozenset(settings.approvedSessionRefs),
+        )
+        cleanup.callback(kernel.database.close)
+        corpus = build_schema_capability_corpus()
+        vllm_settings = Phase2VllmCapabilitySettings(
+            database_path=database_path,
+            base_url=settings.vllmBaseUrl,
+            model=settings.vllmModel,
+            api_key_file=Path(settings.vllmApiKeyFile),
+            manifest_path=Path(settings.vllmManifest),
+            public_key_path=Path(settings.vllmPublicKey),
+            manifest_key_id="llm001-gemma4-2026",
+            tokenizer_directory=Path(settings.vllmTokenizerDirectory),
+        )
+        initial_vllm_port = Phase2VllmCapabilityPort(settings=vllm_settings)
+        vllm_port = VllmSettingsManager(
+            initial_port=initial_vllm_port,
+            settings_template=vllm_settings,
+            settings_directory=Path(settings.vllmSettingsDirectory),
+            allowed_cidrs=settings.vllmAllowedCidrs,
+            port_factory=Phase2VllmCapabilityPort,
+        )
+        cleanup.callback(vllm_port.close)
+        deferred.bind(
+            MissionCapabilityVerifier(
+                repository=CapabilityRepository(
+                    database=kernel.database,
+                    digest_service=kernel.digest_service,
+                ),
                 digest_service=kernel.digest_service,
-            ),
-            digest_service=kernel.digest_service,
-            corpus=corpus,
-            attestation_repository=ServerAttestationRepository(
-                kernel.database,
-                kernel.digest_service,
-            ),
-            endpoint_provider=lambda: vllm_port.public_config.baseUrl,
+                corpus=corpus,
+                attestation_repository=ServerAttestationRepository(
+                    kernel.database,
+                    kernel.digest_service,
+                ),
+                endpoint_provider=lambda: vllm_port.public_config.baseUrl,
+            )
         )
-    )
-    owner = MissionCommandOwner(
-        kernel=kernel,
-        profile=vllm_port.profile,
-        principal_id=settings.operatorPrincipal,
-        execution_enabled=False,
-    )
-    provider_status = KaliProviderStatusPort(
-        sliver_credential=Path(settings.sliverOperatorCredential),
-        impacket_executable=Path(settings.impacketExecutable),
-        impacket_allowed_targets=settings.impacketAllowedTargets,
-    )
-    ad_collector = None
-    if settings.adCollectorEnabled:
-        collector_settings = ADCollectorSettings(
-            server_ip=IPv4Address(settings.adCollectorServerIp),
-            port=settings.adCollectorPort,
-            domain=settings.adCollectorDomain,
-            credential_file=Path(settings.adCollectorCredentialFile),
-            tls_ca_file=(None if settings.adCollectorTlsCaFile is None else Path(settings.adCollectorTlsCaFile)),
-            certipy_python=Path(settings.adCollectorCertipyPython),
-            stale_password_days=settings.adCollectorStalePasswordDays,
-            max_constrained_delegation_targets=settings.adCollectorMaxConstrainedDelegationTargets,
-            expected_tier_zero_names=settings.adCollectorExpectedTierZeroNames,
-            timeout_seconds=settings.adCollectorTimeoutSeconds,
+        owner = MissionCommandOwner(
+            kernel=kernel,
+            profile=vllm_port.profile,
+            principal_id=settings.operatorPrincipal,
+            execution_enabled=False,
         )
-        ad_collector = VerifiedADCollector(
-            settings=collector_settings,
-            directory_source=Ldap3DirectoryEvidenceSource(collector_settings),
-            adcs_source=CertipyADCSAssessmentSource(collector_settings),
-            digest_service=DigestService(),
+        provider_status = KaliProviderStatusPort(
+            sliver_credential=Path(settings.sliverOperatorCredential),
+            impacket_executable=Path(settings.impacketExecutable),
+            impacket_allowed_targets=settings.impacketAllowedTargets,
         )
+        ad_collector = None
+        if settings.adCollectorEnabled:
+            collector_settings = ADCollectorSettings(
+                server_ip=IPv4Address(settings.adCollectorServerIp),
+                port=settings.adCollectorPort,
+                domain=settings.adCollectorDomain,
+                credential_file=Path(settings.adCollectorCredentialFile),
+                tls_ca_file=(
+                    None
+                    if settings.adCollectorTlsCaFile is None
+                    else Path(settings.adCollectorTlsCaFile)
+                ),
+                certipy_python=Path(settings.adCollectorCertipyPython),
+                stale_password_days=settings.adCollectorStalePasswordDays,
+                max_constrained_delegation_targets=settings.adCollectorMaxConstrainedDelegationTargets,
+                expected_tier_zero_names=settings.adCollectorExpectedTierZeroNames,
+                timeout_seconds=settings.adCollectorTimeoutSeconds,
+            )
+            ad_collector = VerifiedADCollector(
+                settings=collector_settings,
+                directory_source=Ldap3DirectoryEvidenceSource(collector_settings),
+                adcs_source=CertipyADCSAssessmentSource(collector_settings),
+                digest_service=DigestService(),
+            )
 
-    def collect_and_evaluate_ad() -> dict[str, object]:
-        if ad_collector is None:
-            raise RuntimeError("AD collector is not attached")
-        return vllm_port.evaluate_ad_assessment_with_llm(ad_collector.collect())
+        def collect_and_evaluate_ad() -> dict[str, object]:
+            if ad_collector is None:
+                raise RuntimeError("AD collector is not attached")
+            return vllm_port.evaluate_ad_assessment_with_llm(ad_collector.collect())
 
-    control_plane = UIControlPlane(
-        database_path=str(database_path),
-        approval_decision_port=owner.submit_approval,
-        mission_command_port=owner,
-        provider_status_port=provider_status,
-        approved_session_refs=frozenset(settings.approvedSessionRefs),
-        ad_assessment_reasoning_port=vllm_port.recommend_ad_assessment,
-        ad_assessment_evaluation_port=vllm_port.evaluate_ad_assessment_with_llm,
-        ad_assessment_collector_port=(collect_and_evaluate_ad if ad_collector is not None else None),
-        vllm_capability_port=vllm_port,
-        vllm_public_config=vllm_port.public_config,
-        vllm_settings_port=vllm_port,
-    )
-    authenticator = OperatorSessionAuthenticator(
-        principal_id=settings.operatorPrincipal,
-        operator_token=read_operator_token(Path(settings.operatorTokenFile)),
-    )
-    return KaliProductApplication(
-        settings=settings,
-        kernel=kernel,
-        mission_owner=owner,
-        control_plane=control_plane,
-        authenticator=authenticator,
-        vllm_port=vllm_port,
-        ad_collector=ad_collector,
-    )
+        control_plane = UIControlPlane(
+            database_path=str(database_path),
+            approval_decision_port=owner.submit_approval,
+            mission_command_port=owner,
+            provider_status_port=provider_status,
+            approved_session_refs=frozenset(settings.approvedSessionRefs),
+            ad_assessment_reasoning_port=vllm_port.recommend_ad_assessment,
+            ad_assessment_evaluation_port=vllm_port.evaluate_ad_assessment_with_llm,
+            ad_assessment_collector_port=(
+                collect_and_evaluate_ad if ad_collector is not None else None
+            ),
+            vllm_capability_port=vllm_port,
+            vllm_public_config=vllm_port.public_config,
+            vllm_settings_port=vllm_port,
+        )
+        authenticator = OperatorSessionAuthenticator(
+            principal_id=settings.operatorPrincipal,
+            operator_token=read_operator_token(Path(settings.operatorTokenFile)),
+        )
+        application = KaliProductApplication(
+            settings=settings,
+            kernel=kernel,
+            mission_owner=owner,
+            control_plane=control_plane,
+            authenticator=authenticator,
+            vllm_port=vllm_port,
+            ad_collector=ad_collector,
+            activation_lock=activation_lock,
+        )
+        cleanup.pop_all()
+        return application
 
 
 def serve_kali_product(application: KaliProductApplication) -> None:

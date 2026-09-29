@@ -28,7 +28,7 @@ def build_tuoni_linux_adapter(
     clock: Clock,
     digest_service: DigestService,
 ) -> TuoniAdapter:
-    """Build the fixed Ubuntu transport and exact Tuoni 0.16.1 adapter.
+    """Build the fixed Kali transport and exact Tuoni 0.16.1 adapter.
 
     Deployment identities are checked before the OS-specific transport is
     constructed.  An incomplete profile therefore fails before subprocess,

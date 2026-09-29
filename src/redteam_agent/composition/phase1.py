@@ -22,7 +22,11 @@ from redteam_agent.composition.phase0c import Phase0CKernel, build_phase0c_kerne
 from redteam_agent.composition.testing import OPERATOR_ACTOR_TOKEN
 from redteam_agent.context.builder import ContextBodyStore, ContextBuilder
 from redteam_agent.context.selector import ContextSelector
-from redteam_agent.errors import SchemaMigrationRequiredError
+from redteam_agent.errors import (
+    MissionExecutionBudgetError,
+    MissionRevisionConflictError,
+    SchemaMigrationRequiredError,
+)
 from redteam_agent.goal.service import GoalEvaluationService
 from redteam_agent.knowledge.entities import EntityResolver
 from redteam_agent.knowledge.reducer import KnowledgeReducer
@@ -60,6 +64,9 @@ def build_phase1_kernel(*, phase0c: Phase0CKernel | None = None) -> Phase1Kernel
     phase0b = kernel.phase0b
     phase0a = phase0b.phase0a
     phase0a.contract_catalog.enable_typed_predicates()
+    phase0b.budget_service.bind_runtime_clock(
+        clock_guard=kernel.clock_guard, boot_identity=kernel.boot_identity,
+    )
     ds = phase0a.digest_service
     evidence_catalog_digest = ds.compute(
         "security_projection_digest",
@@ -73,6 +80,9 @@ def build_phase1_kernel(*, phase0c: Phase0CKernel | None = None) -> Phase1Kernel
         database=phase0a.database, digest_service=ds, clock=kernel.monotonic_clock,
         context_resolver=phase0a.context_resolver,
         session_repository=phase0a.session_repository, knowledge_service=knowledge,
+    )
+    phase0b.executor.bind_goal_checker(
+        lambda mission_id: goals.evaluate(mission_id=mission_id).status.status == "achieved"
     )
     entity_resolver = EntityResolver(database=phase0a.database, digest_service=ds)
     semantic_catalog = build_phase1_semantic_catalog(ds)
@@ -99,6 +109,8 @@ def build_phase1_kernel(*, phase0c: Phase0CKernel | None = None) -> Phase1Kernel
         database=phase0a.database, digest_service=ds,
         execution_repository=phase0b.execution_repository,
         result_repository=phase0b.result_repository,
+        cancel_attempt_repository=phase0b.cancel_attempt_repository,
+        task_binding_repository=phase0b.task_binding_repository,
     )
     controller = AgentController(
         database=phase0a.database, digest_service=ds, clock=kernel.monotonic_clock,
@@ -108,6 +120,10 @@ def build_phase1_kernel(*, phase0c: Phase0CKernel | None = None) -> Phase1Kernel
         snapshot_repository=phase0a.snapshot_repository,
         candidate_projector=candidate_projector,
         outcome_accounting=outcome_accounting,
+        budget_service=phase0b.budget_service,
+        decision_repository=phase0a.decision_repository,
+        approval_request_repository=phase0a.request_repository,
+        approval_record_repository=phase0a.record_repository,
     )
     planner_state = PlannerStateManager(
         database=phase0a.database, digest_service=ds,
@@ -151,6 +167,50 @@ def build_phase1_kernel(*, phase0c: Phase0CKernel | None = None) -> Phase1Kernel
         mission_budget_repository=phase0b.budget_repository,
     )
     llm_gateway.bind_planner_context_revalidator(planner_context.revalidate)
+
+    def check_llm_runtime(mission_id: str, mission_revision: int) -> None:
+        mission = phase0a.context_resolver.resolve(
+            mission_id, now=kernel.monotonic_clock.now()
+        ).mission
+        if mission.mission_revision != mission_revision or mission.state != "RUNNING":
+            raise MissionRevisionConflictError(
+                "LLM runtime check requires the current running mission"
+            )
+        budget = phase0b.budget_service.account_runtime(
+            mission_id=mission_id, mission_revision=mission_revision, active=True,
+        )
+        if budget.active_runtime_seconds >= mission.max_runtime_minutes * 60:
+            raise MissionExecutionBudgetError("mission active runtime budget exhausted")
+
+    llm_gateway.bind_runtime_check(check_llm_runtime)
+
+    def reserve_planner(mission_id: str, mission_revision: int) -> None:
+        mission = phase0a.context_resolver.resolve(mission_id, now=kernel.monotonic_clock.now()).mission
+        if mission.mission_revision != mission_revision or mission.state != "RUNNING":
+            raise MissionRevisionConflictError("Planner reservation requires the current running mission")
+        phase0b.budget_service.reserve_planner_in_txn(
+            mission_id=mission_id, mission_revision=mission_revision, max_iterations=mission.max_iterations,
+        )
+
+    llm_gateway.bind_planner_budget(reserve_planner)
+
+    def reserve_analyzer(mission_id: str, mission_revision: int) -> None:
+        phase0b.budget_service.reserve_analyzer_in_txn(
+            mission_id=mission_id, mission_revision=mission_revision,
+        )
+
+    llm_gateway.bind_analyzer_budget(reserve_analyzer)
+
+    def execution_runtime_available(mission_id: str) -> bool:
+        mission = phase0a.context_resolver.resolve(
+            mission_id, now=kernel.monotonic_clock.now()
+        ).mission
+        budget = phase0b.budget_service.account_runtime(
+            mission_id=mission_id, mission_revision=mission.mission_revision, active=True,
+        )
+        return budget.active_runtime_seconds < mission.max_runtime_minutes * 60
+
+    phase0b.executor.bind_runtime_checker(execution_runtime_available)
     prerequisite_search = FinitePrerequisiteSearch(catalog=phase0a.contract_catalog, digest_service=ds)
     action_service = PlannerActionApplicationService(
         planner_context_service=planner_context, goal_service=goals,
@@ -160,6 +220,13 @@ def build_phase1_kernel(*, phase0c: Phase0CKernel | None = None) -> Phase1Kernel
         authorization_service=phase0a.execution_authorization_service,
         executor=phase0b.executor, digest_service=ds, clock=kernel.monotonic_clock,
         prerequisite_search=prerequisite_search,
+        database=phase0a.database,
+        approval_service=phase0a.approval_service,
+        approval_requests=phase0a.request_repository,
+        approval_records=phase0a.record_repository,
+        decisions=phase0a.decision_repository,
+        executions=phase0b.execution_repository,
+        budget_service=phase0b.budget_service,
     )
     finalization = FinalizationService(
         goal_service=goals, mission_manager=phase0a.mission_manager,
@@ -219,6 +286,7 @@ def build_phase1_kernel(*, phase0c: Phase0CKernel | None = None) -> Phase1Kernel
         context_resolver=phase0a.context_resolver,
         clock=kernel.monotonic_clock,
         mission_manager=phase0a.mission_manager,
+        operator_actor_token=OPERATOR_ACTOR_TOKEN,
     )
     return Phase1Kernel(
         phase0c=kernel, knowledge_service=knowledge, goal_service=goals, controller=controller,

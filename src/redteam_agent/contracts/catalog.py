@@ -17,9 +17,11 @@ import hashlib
 from dataclasses import dataclass
 
 from redteam_agent.canonical.canonical_json import canonical_dumps
+from redteam_agent.canonical.digest_service import DigestService
 from redteam_agent.canonical.immutable import thaw
 from redteam_agent.errors import ToolRegistryValidationError
 from redteam_agent.models.common import ActionContractReference
+from redteam_agent.policy.scope_models import TargetReference
 
 
 @dataclass(frozen=True)
@@ -77,6 +79,29 @@ class ActionContractDefinition:
 
 def parameter_schema_digest(parameter_schema: object) -> str:
     return hashlib.sha256(b"parameter-schema-v1\x00" + canonical_dumps(thaw(parameter_schema))).hexdigest()
+
+
+def compute_execution_precondition_digest(
+    *, definition: ActionContractDefinition,
+    requested_targets: tuple[TargetReference, ...],
+    predicate_snapshot_digest: str,
+    predicate_evidence: tuple[dict[str, object], ...],
+    digest_service: DigestService,
+) -> str:
+    """Bind the exact contract, target and current source evidence used by a Plan."""
+    targets = sorted(
+        (item.model_dump(mode="python") for item in requested_targets),
+        key=canonical_dumps,
+    )
+    evidence = sorted(predicate_evidence, key=canonical_dumps)
+    return digest_service.compute("execution_precondition_digest", {
+        "schema_version": "execution-precondition-v2",
+        "action_contract_digest": definition.definition_digest,
+        "contract_preconditions": list(definition.preconditions),
+        "canonical_targets": targets,
+        "predicate_snapshot_digest": predicate_snapshot_digest,
+        "predicate_evidence": evidence,
+    })
 
 
 class ActionContractCatalog:

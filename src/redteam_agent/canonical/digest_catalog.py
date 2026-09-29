@@ -101,6 +101,13 @@ _DEFINITIONS: tuple[DigestDefinition, ...] = (
         "proposal_digest", "plan",
         ("schema_version", "objective", "phase", "tool_ref", "requested_targets", "session_id", "arguments"),
     ),
+    _explicit(
+        "execution_precondition_digest", "plan",
+        (
+            "schema_version", "action_contract_digest", "contract_preconditions",
+            "canonical_targets", "predicate_snapshot_digest", "predicate_evidence",
+        ),
+    ),
     _explicit("authorization_digest", "policy", _AUTHORIZATION_DIGEST_FIELDS),
     _explicit("execution_scope_digest", "tools", ("allowed", "prohibited", "implemented_scope_types")),
     _explicit("session_security_context_digest", "session", ("sessions",)),
@@ -134,6 +141,7 @@ _DEFINITIONS: tuple[DigestDefinition, ...] = (
     _obj("raw_control_metadata_digest", "executor", exclude_self="record_digest"),
     _obj("execution_result_projection_digest", "executor", exclude_self="projection_digest"),
     _obj("mission_execution_budget_digest", "executor", exclude_self="record_digest"),
+    _obj("runtime_segment_digest", "executor", exclude_self="record_digest"),
     _obj("execution_recovery_authority_digest", "executor", exclude_self="authority_digest"),
     _obj("cancel_attempt_digest", "executor", exclude_self="record_digest"),
     # Explicit-input progress/intent digests (variable-shape payloads).

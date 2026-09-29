@@ -119,8 +119,8 @@ Phase 4のProvider Human Gateで確定済みの範囲とオフライン開発受
 ## Phase 4 C2 Adapters（オフライン開発受入完了）
 
 Commercial Tuoni 0.16.1のRelease、Source Commit、Server Image Digestを固定し、実環境OpenAPI Digestを未解決Blockerとして分離したうえで、Provider中立の
-`C2Adapter`境界、閉じたJSON-only送信契約、Session / Task Control応答の厳密な正規化を実装している。Ubuntu 24.04
-LTS / x86_64のControl VM上でTuoniと同居するone-shot process Transport、最小権限Account検査、固定Production
+`C2Adapter`境界、閉じたJSON-only送信契約、Session / Task Control応答の厳密な正規化を実装している。Kali Linux 2026.3
+/ x86_64のControl VM上でTuoniと同居するone-shot process Transport、最小権限Account検査、固定Production
 Composition、状態付きTest Doubleによる全操作Scenarioも実装し、実C2 / Targetへの通信は行わない。
 確定事項とActivation Blockerは
 [Phase 4開発記録](docs/development/phase-4.md)を参照する。
@@ -244,13 +244,22 @@ sudo install -d -o root -g root -m 0755 /opt/redteam-agent/gemma-4-31b-tokenizer
 sudo cp -a /path/to/gemma-4-31b-tokenizer/. /opt/redteam-agent/gemma-4-31b-tokenizer/
 sudo chown -R root:root /opt/redteam-agent/gemma-4-31b-tokenizer
 sudo chmod -R go-w /opt/redteam-agent/gemma-4-31b-tokenizer
+
+sudo /opt/redteam-agent/venv/bin/redteam-db initialize \
+  --database /var/lib/redteam-agent/redteam-agent.db \
+  --activation-lock /run/redteam-agent/activation.lock
 ```
+
+通常起動はDBを暗黙作成しない。不明なDBが見つかった場合は全Workerを停止し、`redteam-db remove-unknown`で
+表示されるDB/sidecarを確認する。対話端末でexact確認文字列を入力した場合だけ、その表示済みファイルを再照合して削除する。
+鍵、TPM状態、DB外ログは対象外であり、新規Schema作成は上記`initialize`を別に実行する。
 
 主な設定項目は次のとおり。
 
 | 項目 | 設定内容 |
 | --- | --- |
 | `databasePath` | `/var/lib/redteam-agent/redteam-agent.db`を推奨。`StateDirectory=redteam-agent`が親directoryを作成する |
+| `activationLockPath` | 通常起動とDB管理Commandで共用する絶対path。DBおよびsidecarとは別pathにする |
 | `staticDirectory` | build済みFrontendの絶対path。標準Unitでは`/opt/redteam-agent/frontend/dist` |
 | `uiHost` / `uiPort` | loopbackは`127.0.0.1:18000`。隔離LANへ直接公開する場合だけ`0.0.0.0:18000` |
 | `uiOriginPolicy` | `exact`、`rfc1918_same_origin`、`local_ipv4_same_origin`から選ぶ。別環境へ移設する場合は`local_ipv4_same_origin`を推奨する |

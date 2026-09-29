@@ -14,7 +14,10 @@ from redteam_agent.models.common import ActionContractReference, ToolRef
 from redteam_agent.plan.models import OperationalPhase
 from redteam_agent.policy.scope_models import TargetReference
 
-ControllerAction = Literal["SECURITY_STOP", "STOP", "RECOVER", "FINALIZE", "PLAN", "WAIT", "PAUSE"]
+ControllerAction = Literal[
+    "SECURITY_STOP", "STOP", "RECOVER", "FINALIZE", "PLAN",
+    "EXECUTE_APPROVED", "WAIT", "PAUSE",
+]
 ControllerReason = Literal[
     "SECURITY_ERROR",
     "MISSION_NOT_RUNNING",
@@ -26,6 +29,11 @@ ControllerReason = Literal[
     "NO_ACTION_IN_SUPPORTED_MODEL",
     "PLANNING_SEARCH_LIMIT",
     "BUDGET_EXHAUSTED",
+    "NO_VALID_PROPOSAL",
+    "APPROVAL_PENDING",
+    "APPROVAL_APPROVED",
+    "APPROVAL_EXPIRED",
+    "APPROVAL_REJECTED",
 ]
 
 

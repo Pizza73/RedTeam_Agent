@@ -3,7 +3,7 @@
 The wire request contains no endpoint, credential, JWT, proxy, redirect, or
 DNS option.  Those choices belong to the composition-owned transport and are
 bound by an immutable attestation before :class:`TuoniAdapter` can be built.
-The concrete Ubuntu one-shot process transport is implemented separately so
+The concrete Kali one-shot process transport is implemented separately so
 this module remains free of subprocess, credential-file, and network details.
 Unit and integration tests can use an in-memory implementation of this exact
 protocol without contacting a provider.
@@ -31,7 +31,7 @@ class TuoniTransportAttestation(StrictImmutableBoundaryModel):
     channel_type: Literal["process_isolated_https_loopback"] = (
         "process_isolated_https_loopback"
     )
-    control_vm_operating_system: Literal["ubuntu_24_04_lts"] = "ubuntu_24_04_lts"
+    control_vm_operating_system: Literal["kali_2026_3"] = "kali_2026_3"
     control_vm_architecture: Literal["x86_64"] = "x86_64"
     adapter_placement: Literal["same_control_vm_loopback"] = (
         "same_control_vm_loopback"

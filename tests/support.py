@@ -27,6 +27,7 @@ from redteam_agent.contracts.catalog import (
     ActionContractCatalog,
     ActionContractDefinition,
     RuleCatalog,
+    compute_execution_precondition_digest,
     parameter_schema_digest,
 )
 from redteam_agent.llm.profile import AgentModelProfile, mock_agent_profile
@@ -432,6 +433,13 @@ def make_plan(
     ds = kernel.digest_service
     snapshot = seeded.snapshot
     tool = tool if tool is not None else seeded.tool
+    predicate_snapshot_digest = ds.compute("security_projection_digest", {
+        "mission_id": MISSION_ID,
+        "mission_revision": seeded.revision.mission_revision,
+        "authorization_epoch": seeded.running_state.authorization_epoch,
+        "evaluations": (),
+    })
+    contract = _contract_for(tool)
     return ExecutionPlan(
         plan_id=plan_id,
         mission_id=MISSION_ID,
@@ -445,7 +453,13 @@ def make_plan(
         goal_evaluation_id="phase0a-no-goal-eval",
         goal_evaluation_digest="phase0a-no-goal-eval-digest",
         action_contract_ref=tool.action_contract_ref,
-        execution_precondition_digest=_contract_for(tool).execution_precondition_digest,
+        execution_precondition_digest=compute_execution_precondition_digest(
+            definition=contract, requested_targets=proposal.requested_targets,
+            predicate_snapshot_digest=predicate_snapshot_digest,
+            predicate_evidence=(), digest_service=ds,
+        ),
+        execution_precondition_snapshot_digest=predicate_snapshot_digest,
+        execution_precondition_evidence=(),
         available_tool_snapshot_id=snapshot.snapshot_id,
         available_tool_snapshot_digest=snapshot.snapshot_digest,
         session_security_context_digest=snapshot.session_security_context_digest,

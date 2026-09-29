@@ -48,13 +48,48 @@ def _invoke(gateway, invocation, *, operation_id="op-1"):
     )
 
 
+def _gateway(
+    ds: DigestService, clock: ManualClock,
+    *, runtime_check=None,  # type: ignore[no-untyped-def]
+) -> SharedLLMGateway:
+    gateway = SharedLLMGateway(
+        database=Database(":memory:"), digest_service=ds, clock=clock
+    )
+    # This suite isolates attempt/preflight behavior. Production composition
+    # binds this hook to the durable mission Analyzer counter.
+    gateway.bind_analyzer_budget(lambda _mission_id, _mission_revision: None)
+    gateway.bind_runtime_check(
+        runtime_check or (lambda _mission_id, _mission_revision: None)
+    )
+    return gateway
+
+
+def test_analyzer_runtime_rejection_happens_before_network_and_budget_reservation() -> None:
+    ds = DigestService()
+    clock = ManualClock(_NOW)
+    profile = fake.local_profile(ds)
+    transport = fake.CountingTransport(
+        lambda r: fake.native_response(fake.VALID_ANALYSIS_OUTPUT)
+    )
+    client = VLLMChatClient(base_url="http://vllm.local/v1", transport=transport)
+
+    def reject_runtime(_mission_id: str, _mission_revision: int) -> None:
+        raise AgentLoopError("runtime exhausted")
+
+    gateway = _gateway(ds, clock, runtime_check=reject_runtime)
+    with pytest.raises(AgentLoopError, match="runtime exhausted"):
+        _invoke(gateway, _analyzer(ds, client, profile, clock=clock))
+    assert transport.calls == 0
+    assert gateway._db.occ_get_all("llm_gateway_input") == []
+
+
 def test_valid_output_succeeds_and_persists_redacted_metadata() -> None:
     ds = DigestService()
     clock = ManualClock(_NOW)
     profile = fake.local_profile(ds)
     transport = fake.CountingTransport(lambda r: fake.native_response(fake.VALID_ANALYSIS_OUTPUT))
     client = VLLMChatClient(base_url="http://vllm.local/v1", transport=transport)
-    gateway = SharedLLMGateway(database=Database(":memory:"), digest_service=ds, clock=clock)
+    gateway = _gateway(ds, clock)
     result = _invoke(gateway, _analyzer(ds, client, profile, clock=clock))
     assert result.observation_id == "obs-1"
     assert transport.calls == 1
@@ -75,7 +110,7 @@ def test_over_budget_rejects_with_zero_network_calls() -> None:
     profile = fake.local_profile(ds, max_context_tokens=1300, max_output_tokens=1024)
     transport = fake.CountingTransport(lambda r: fake.native_response(fake.VALID_ANALYSIS_OUTPUT))
     client = VLLMChatClient(base_url="http://vllm.local/v1", transport=transport)
-    gateway = SharedLLMGateway(database=Database(":memory:"), digest_service=ds, clock=clock)
+    gateway = _gateway(ds, clock)
     with pytest.raises(LLMRequestBudgetError):
         _invoke(gateway, _analyzer(ds, client, profile, clock=clock))
     assert transport.calls == 0
@@ -96,7 +131,7 @@ def test_tokenizer_mismatch_rejects_zero_network() -> None:
         execution_id="exec-1", result_digest="rd", authorized_context=_CTX,
         deadline=clock.now() + timedelta(seconds=30),
     )
-    gateway = SharedLLMGateway(database=Database(":memory:"), digest_service=ds, clock=clock)
+    gateway = _gateway(ds, clock)
     with pytest.raises(LLMRequestBudgetError):
         _invoke(gateway, invocation)
     assert transport.calls == 0
@@ -117,7 +152,7 @@ def test_deadline_passed_rejects_zero_network() -> None:
         execution_id="exec-1", result_digest="rd", authorized_context=_CTX,
         deadline=clock.now() - timedelta(seconds=1),
     )
-    gateway = SharedLLMGateway(database=Database(":memory:"), digest_service=ds, clock=clock)
+    gateway = _gateway(ds, clock)
     with pytest.raises(LLMRequestBudgetError):
         _invoke(gateway, invocation)
     assert transport.calls == 0
@@ -134,7 +169,7 @@ def test_binding_mismatch_fails_closed_zero_network() -> None:
         def check(self) -> None:
             raise LLMProfileMismatchError("model changed mid-mission")
 
-    gateway = SharedLLMGateway(database=Database(":memory:"), digest_service=ds, clock=clock)
+    gateway = _gateway(ds, clock)
     with pytest.raises(LLMProfileMismatchError):
         _invoke(gateway, _analyzer(ds, client, profile, clock=clock, binding_checker=_Changed()))
     assert transport.calls == 0
@@ -146,7 +181,7 @@ def test_malformed_output_retries_within_budget_then_exhausts() -> None:
     profile = fake.local_profile(ds)
     transport = fake.CountingTransport(lambda r: fake.native_response(fake.INVALID_UNKNOWN_FIELD))
     client = VLLMChatClient(base_url="http://vllm.local/v1", transport=transport)
-    gateway = SharedLLMGateway(database=Database(":memory:"), digest_service=ds, clock=clock)
+    gateway = _gateway(ds, clock)
     with pytest.raises(AgentLoopError):
         _invoke(gateway, _analyzer(ds, client, profile, clock=clock))
     # 1 initial + 3 validation retries = 4 network attempts.
@@ -163,7 +198,7 @@ def test_transport_unknown_is_not_retried() -> None:
 
     transport = fake.CountingTransport(_raise)
     client = VLLMChatClient(base_url="http://vllm.local/v1", transport=transport)
-    gateway = SharedLLMGateway(database=Database(":memory:"), digest_service=ds, clock=clock)
+    gateway = _gateway(ds, clock)
     with pytest.raises(AgentLoopError):
         _invoke(gateway, _analyzer(ds, client, profile, clock=clock))
     assert transport.calls == 1
@@ -176,7 +211,7 @@ def test_preflight_rejection_leaves_attempt_row_and_failed_operation() -> None:
     profile = fake.local_profile(ds, max_context_tokens=1300, max_output_tokens=1024)
     transport = fake.CountingTransport(lambda r: fake.native_response(fake.VALID_ANALYSIS_OUTPUT))
     client = VLLMChatClient(base_url="http://vllm.local/v1", transport=transport)
-    gateway = SharedLLMGateway(database=Database(":memory:"), digest_service=ds, clock=clock)
+    gateway = _gateway(ds, clock)
     with pytest.raises(LLMRequestBudgetError):
         _invoke(gateway, _analyzer(ds, client, profile, clock=clock))
     assert transport.calls == 0
@@ -196,7 +231,7 @@ def test_completed_attempt_row_records_outcome() -> None:
     profile = fake.local_profile(ds)
     transport = fake.CountingTransport(lambda r: fake.native_response(fake.VALID_ANALYSIS_OUTPUT))
     client = VLLMChatClient(base_url="http://vllm.local/v1", transport=transport)
-    gateway = SharedLLMGateway(database=Database(":memory:"), digest_service=ds, clock=clock)
+    gateway = _gateway(ds, clock)
     _invoke(gateway, _analyzer(ds, client, profile, clock=clock))
     row = gateway._db.occ_get("llm_gateway_attempt", "m1:1:analyzer:op-1:0")
     assert row is not None
@@ -213,7 +248,7 @@ def test_attempt_update_verifies_integrity_before_mutation() -> None:
     profile = fake.local_profile(ds)
     transport = fake.CountingTransport(lambda r: fake.native_response(fake.VALID_ANALYSIS_OUTPUT))
     client = VLLMChatClient(base_url="http://vllm.local/v1", transport=transport)
-    gateway = SharedLLMGateway(database=Database(":memory:"), digest_service=ds, clock=clock)
+    gateway = _gateway(ds, clock)
     _invoke(gateway, _analyzer(ds, client, profile, clock=clock))
     key = "m1:1:analyzer:op-1:0"
     version, payload = gateway._db.occ_get("llm_gateway_attempt", key)

@@ -17,7 +17,7 @@ Scenarioを実装済みである。実Tuoni、実Target、実Credentialへの接
 | Server Image Digest | `sha256:e1e24a1f0fcee7ce8728f1d7fd0790da116651505c6ad88afe58daf1067d6e95` |
 | OpenAPI SHA-256 | 実環境で未取得。`GET /docs/api`の実ArtifactをActivation時に固定する |
 | 構成 | Red AgentとTuoni Serverを同一Control VMへ配置、Target VMは使い捨て |
-| Control VM | Ubuntu 24.04 LTS / x86_64 |
+| Control VM | Kali Linux 2026.3 / x86_64 |
 | Adapter配置 | Tuoni Serverと同じControl VM。固定Loopback Endpointへ接続 |
 | Target | Windows Server / Windows 11。Target構築は本プロジェクト外 |
 | Tuoni Agent | Targetへ手動導入済みを前提。生成・配布は実装しない |
@@ -38,7 +38,7 @@ Scenarioを実装済みである。実Tuoni、実Target、実Credentialへの接
   `TuoniTransportAttestation`。
 - EndpointやCredentialをcallerが指定できないprivate `TuoniTransport` Protocolと、Response本文をrepr・serializeしない
   ephemeral response境界。TransportへResponse上限とTimeoutを必須指定する。
-- Ubuntu 24.04 LTS / x86_64専用のone-shot child-process Transport。各API操作ごとに固定Moduleを`python -I -m`で起動し、
+- Kali Linux 2026.3 / x86_64専用のone-shot child-process Transport。各API操作ごとに固定Moduleを`python -I -m`で起動し、
   Shell、Retry、Redirect、Proxy、DNS解決、caller指定Endpointを使用しない。
 - `LoadCredentialEncrypted=`で暗号化・認証されたCredentialをsystemdがService起動時だけ復号し、child processだけが
   read-only runtime pathの`/run/credentials/redteam-agent.service/tuoni-credential.json`を読む。Credential平文を
@@ -94,7 +94,7 @@ PYTHONPATH=src .venv/bin/python scripts/phase4_offline_readiness.py
 - Tuoni ServerのVersion、`GET /docs/api`のOpenAPI Digest、Container Digest、TLS Certificate Digestを実機で
   完全一致確認する。公開SourceにないOpenAPIへ架空のDigestを設定しない。
 - 短時間JWT、Memory-only保持、Redirect無効、Proxy無効、DNS解決なし、最小権限Accountを検証する。
-- Control VMがUbuntu 24.04 LTS / x86_64であり、Adapter packageをsystem Pythonから`-I`でimportできること、Credential
+- Control VMがKali Linux 2026.3 / x86_64であり、Adapter packageをsystem Pythonから`-I`でimportできること、Credential
   が`LoadCredentialEncrypted=`からread-only runtime fileとして渡され、CA fileがrootまたはservice owner管理で
   あることを確認する。
 - 隔離LabのTest Double / 実TuoniでSession、Capability、Submit、Task Status、Result、Cancel、Reconciliation、Timeout、

@@ -1,4 +1,4 @@
-"""Ubuntu 24.04/x86_64 one-shot process transport for local Tuoni.
+"""Kali 2026.3/x86_64 one-shot process transport for local Tuoni.
 
 Each provider request executes in a fresh isolated Python process.  The child
 owns credential-file access, Basic login, the short-lived JWT, TLS certificate
@@ -70,12 +70,12 @@ class TuoniWorkerResponse(StrictImmutableBoundaryModel):
 
 
 class TuoniLinuxProcessTransport:
-    """Fixed local process channel for Ubuntu 24.04 LTS on x86_64."""
+    """Fixed local process channel for Kali 2026.3 on x86_64."""
 
     def __init__(self, attestation: TuoniTransportAttestation) -> None:
-        _verify_ubuntu_24_04_x86_64()
+        _verify_kali_2026_3_x86_64()
         if (
-            attestation.control_vm_operating_system != "ubuntu_24_04_lts"
+            attestation.control_vm_operating_system != "kali_2026_3"
             or attestation.control_vm_architecture != "x86_64"
             or attestation.adapter_placement != "same_control_vm_loopback"
             or attestation.channel_type != "process_isolated_https_loopback"
@@ -160,15 +160,15 @@ class TuoniLinuxProcessTransport:
         )
 
 
-def _verify_ubuntu_24_04_x86_64() -> None:
+def _verify_kali_2026_3_x86_64() -> None:
     if platform.system() != "Linux" or platform.machine() != "x86_64":
         raise C2AdapterTransportError("Tuoni worker requires Linux x86_64")
     try:
         entries = _parse_os_release(Path("/etc/os-release").read_text(encoding="utf-8"))
     except OSError as exc:
         raise C2AdapterTransportError("Control VM OS identity is unavailable") from exc
-    if entries.get("ID") != "ubuntu" or entries.get("VERSION_ID") != "24.04":
-        raise C2AdapterTransportError("Tuoni worker requires Ubuntu 24.04 LTS")
+    if entries.get("ID") != "kali" or entries.get("VERSION_ID") != "2026.3":
+        raise C2AdapterTransportError("Tuoni worker requires Kali 2026.3")
 
 
 def _parse_os_release(raw: str) -> dict[str, str]:

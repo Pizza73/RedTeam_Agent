@@ -1,6 +1,7 @@
 {
   "schemaVersion": "kali-product-v1",
   "databasePath": "/var/lib/redteam-agent/redteam-agent.db",
+  "activationLockPath": "/run/redteam-agent/activation.lock",
   "staticDirectory": "/opt/redteam-agent/frontend/dist",
   "operatorTokenFile": "/run/credentials/redteam-agent.service/ui-operator.token",
   "operatorPrincipal": "redteam-operator",

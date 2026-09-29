@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
-from typing import TypedDict, cast
+from dataclasses import dataclass, field, replace
+from typing import Literal, TypedDict, cast
 
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
@@ -18,7 +18,12 @@ from redteam_agent.agent.application import (
 from redteam_agent.agent.controller import ACTIVE_EXECUTION_STATES, AgentController
 from redteam_agent.agent.finalization import FinalizationService
 from redteam_agent.agent.llm_gateway import SharedLLMGateway
-from redteam_agent.agent.models import ControllerDecision, PlannerContextEnvelope
+from redteam_agent.agent.models import (
+    ActionCandidateProjection,
+    ControllerDecision,
+    PlannerContextEnvelope,
+    RecentExecutionSummary,
+)
 from redteam_agent.agent.planner_context import PlannerContextService
 from redteam_agent.agent.retry_budget import AgentRetryBudgetService
 from redteam_agent.agent.unresolved import UnresolvedItemService, UnresolvedReason
@@ -92,6 +97,14 @@ class WorkflowStepResult:
     action_transition: ActionTransitionResult | None
 
 
+@dataclass(frozen=True)
+class LoopContinuationResult:
+    waiting_for_execution: bool
+    observation: KnowledgeObservation | None
+    verified_finding: VerifiedFinding | None
+    planning_step: WorkflowStepResult | None
+
+
 class _PlanningGraphState(TypedDict, total=False):
     mission_id: str
     mission_revision: int
@@ -102,6 +115,8 @@ class _PlanningGraphState(TypedDict, total=False):
     controller_action: str
     controller_reason: str
     planner_output_kind: str
+    planner_attempt_index: int
+    context_request_route: str
 
 
 @dataclass
@@ -120,6 +135,7 @@ class _PlanningRuntime:
     mission_id: str
     mission_revision: int
     envelope: PlannerContextEnvelope | None = None
+    continue_context_requests: bool = False
 
 
 class _AnalysisGraphState(TypedDict, total=False):
@@ -150,6 +166,32 @@ class _AnalysisRuntime:
     context_grant_id: str
     invoke_analyzer: Callable[[], object]
     sink: _AnalysisResultSink
+
+
+class _ContinuationGraphState(TypedDict, total=False):
+    mission_id: str
+    mission_revision: int
+    parent_context_id: str
+    execution_id: str
+    next_context_id: str
+    continuation_route: str
+    analysis_route: str
+
+
+@dataclass
+class _ContinuationResultSink:
+    waiting_for_execution: bool = False
+    observation: KnowledgeObservation | None = None
+    verified_finding: VerifiedFinding | None = None
+    planning_step: WorkflowStepResult | None = None
+
+
+@dataclass(frozen=True)
+class _ContinuationRuntime:
+    ids: PlanningOperationIds
+    invoke_analyzer: Callable[[], object]
+    invoke_planner: Callable[[PlannerContextEnvelope], object]
+    sink: _ContinuationResultSink
 
 
 # Graph State / Mission State mapping (SystemDesign §17.3). A durable resume
@@ -212,6 +254,7 @@ class Phase1AgentWorkflow:
         context_resolver: AuthorizationContextResolver,
         clock: Clock,
         mission_manager: MissionManager,
+        operator_actor_token: str,
     ) -> None:
         self._controller = controller
         self._gateway = llm_gateway
@@ -242,8 +285,10 @@ class Phase1AgentWorkflow:
         self._resolver = context_resolver
         self._clock = clock
         self._mission_manager = mission_manager
+        self._operator_actor_token = operator_actor_token
         self.graph = self._build_planning_graph()
         self.analysis_graph = self._build_analysis_graph()
+        self.loop_graph = self._build_continuation_graph()
 
     def run_planning_iteration(
         self, *, envelope: PlannerContextEnvelope, ids: PlanningOperationIds,
@@ -260,6 +305,34 @@ class Phase1AgentWorkflow:
             mission_id=envelope.mission_id,
             mission_revision=current_revision,
         )
+        return self._run_planning(
+            envelope=envelope, ids=ids, invoke_planner=invoke_planner,
+            continue_context_requests=False,
+        )
+
+    def run_planning_loop(
+        self, *, envelope: PlannerContextEnvelope, ids: PlanningOperationIds,
+        invoke_planner: Callable[[PlannerContextEnvelope], object],
+    ) -> WorkflowStepResult:
+        """Run bounded ContextRequest replanning inside the compiled LangGraph."""
+        current_revision = self._contexts.current_mission_revision(envelope.mission_id)
+        if envelope.mission_revision != current_revision:
+            raise MissionRevisionConflictError("planner context mission revision is not current")
+        verify_run_thread_binding(
+            thread_id=ids.thread_id, run_id=ids.run_id,
+            mission_id=envelope.mission_id, mission_revision=current_revision,
+        )
+        return self._run_planning(
+            envelope=envelope, ids=ids, invoke_planner=invoke_planner,
+            continue_context_requests=True,
+        )
+
+    def _run_planning(
+        self, *, envelope: PlannerContextEnvelope, ids: PlanningOperationIds,
+        invoke_planner: Callable[[PlannerContextEnvelope], object],
+        continue_context_requests: bool,
+    ) -> WorkflowStepResult:
+        current_revision = self._contexts.current_mission_revision(envelope.mission_id)
         sink = _PlanningResultSink()
         cast(
             _PlanningGraphState,
@@ -270,11 +343,13 @@ class Phase1AgentWorkflow:
                     "run_id": ids.run_id,
                     "operation_id": ids.operation_id,
                     "planner_context_id": envelope.planner_context_id,
+                    "planner_attempt_index": 0,
                 },
                 config={"configurable": {"thread_id": ids.thread_id}},
                 context=_PlanningRuntime(
                     envelope=envelope, ids=ids, invoke_planner=invoke_planner, sink=sink,
                     mission_id=envelope.mission_id, mission_revision=current_revision,
+                    continue_context_requests=continue_context_requests,
                 ),
             ),
         )
@@ -311,7 +386,9 @@ class Phase1AgentWorkflow:
                     "execution_id": execution_id,
                     "context_grant_id": context_grant_id,
                 },
-                config={"configurable": {"thread_id": thread_id}},
+                config={"configurable": {
+                    "thread_id": self._checkpoint_thread_id(thread_id, "analysis"),
+                }},
                 context=_AnalysisRuntime(
                     mission_id=mission_id,
                     mission_revision=mission_revision,
@@ -329,6 +406,228 @@ class Phase1AgentWorkflow:
             raise AgentLoopError("analysis graph returned no observation")
         return observation
 
+    def advance_after_execution(
+        self, *, parent_context_id: str, execution_id: str,
+        ids: PlanningOperationIds,
+        invoke_analyzer: Callable[[], object],
+        invoke_planner: Callable[[PlannerContextEnvelope], object],
+    ) -> LoopContinuationResult:
+        """Advance the event-driven loop after an existing external execution.
+
+        The continuation LangGraph owns recovery, verified-source projection,
+        Analyzer routing, next-context creation and re-entry into planning. An
+        in-flight or unknown provider outcome returns a wait result and never
+        re-submits.
+        """
+        parent = self._contexts.get(parent_context_id)
+        record = self._executions.get(execution_id)
+        if parent is None or record is None or record.mission_id != parent.mission_id:
+            raise AgentLoopError("loop continuation binding is missing")
+        verify_run_thread_binding(
+            thread_id=ids.thread_id, run_id=ids.run_id,
+            mission_id=parent.mission_id, mission_revision=parent.mission_revision,
+        )
+        sink = _ContinuationResultSink()
+        cast(
+            _ContinuationGraphState,
+            self.loop_graph.invoke(
+                {
+                    "mission_id": parent.mission_id,
+                    "mission_revision": parent.mission_revision,
+                    "parent_context_id": parent_context_id,
+                    "execution_id": execution_id,
+                },
+                config={"configurable": {
+                    "thread_id": self._checkpoint_thread_id(ids.thread_id, "continuation"),
+                }},
+                context=_ContinuationRuntime(
+                    ids=ids, invoke_analyzer=invoke_analyzer,
+                    invoke_planner=invoke_planner, sink=sink,
+                ),
+            ),
+        )
+        return LoopContinuationResult(
+            sink.waiting_for_execution, sink.observation,
+            sink.verified_finding, sink.planning_step,
+        )
+
+    @staticmethod
+    def _checkpoint_thread_id(thread_id: str, graph_name: str) -> str:
+        """Give each compiled graph an isolated physical checkpoint stream.
+
+        The public/canonical thread binding is verified before this derivation and
+        remains in graph state. LangGraph reserves ``checkpoint_ns`` for nested
+        graphs and resets caller-provided values at a top-level invocation, so a
+        deterministic physical suffix prevents the three compiled graphs from
+        overwriting each other's checkpoints.
+        """
+        return f"{thread_id}:{graph_name}"
+
+    def _build_continuation_graph(
+        self,
+    ) -> CompiledStateGraph[
+        _ContinuationGraphState,
+        _ContinuationRuntime,
+        _ContinuationGraphState,
+        _ContinuationGraphState,
+    ]:
+        builder = StateGraph(_ContinuationGraphState, context_schema=_ContinuationRuntime)
+        builder.add_node("recover_execution", self._graph_continuation_recover)
+        builder.add_node("project_verified_source", self._graph_continuation_project)
+        builder.add_node("analyze_result", self._graph_continuation_analyze)
+        builder.add_node("build_next_context", self._graph_continuation_context)
+        builder.add_node("plan_next_action", self._graph_continuation_plan)
+        builder.add_edge(START, "recover_execution")
+        builder.add_conditional_edges(
+            "recover_execution", self._continuation_route,
+            {"settled": "project_verified_source", "wait": END},
+        )
+        builder.add_conditional_edges(
+            "project_verified_source", self._analysis_route,
+            {"analyze": "analyze_result", "skip": "build_next_context"},
+        )
+        builder.add_edge("analyze_result", "build_next_context")
+        builder.add_edge("build_next_context", "plan_next_action")
+        builder.add_edge("plan_next_action", END)
+        return cast(
+            CompiledStateGraph[
+                _ContinuationGraphState,
+                _ContinuationRuntime,
+                _ContinuationGraphState,
+                _ContinuationGraphState,
+            ],
+            builder.compile(checkpointer=self._checkpointer),
+        )
+
+    def _graph_continuation_recover(
+        self, state: _ContinuationGraphState,
+        runtime: Runtime[_ContinuationRuntime],
+    ) -> _ContinuationGraphState:
+        record = self._executions.get(state["execution_id"])
+        parent = self._contexts.get(state["parent_context_id"])
+        if record is None or parent is None or record.mission_id != parent.mission_id:
+            raise AgentLoopError("loop continuation binding disappeared")
+        incomplete = record.provider_execution_state in ACTIVE_EXECUTION_STATES or (
+            record.provider_execution_state in {"SUCCEEDED", "FAILED", "CANCELLED"}
+            and record.result_ingestion_state != "SUCCEEDED"
+        )
+        if incomplete:
+            self.run_planning_iteration(
+                envelope=parent, ids=runtime.context.ids,
+                invoke_planner=lambda _envelope: (_ for _ in ()).throw(
+                    AssertionError("recovery must not invoke the Planner")
+                ),
+            )
+            record = self._executions.get(state["execution_id"])
+        if (
+            record is None
+            or record.provider_execution_state in ACTIVE_EXECUTION_STATES
+            or record.result_ingestion_state != "SUCCEEDED"
+        ):
+            runtime.context.sink.waiting_for_execution = True
+            return {"continuation_route": "wait"}
+        if self._results.get(record.execution_id) is None:
+            raise AgentLoopError("settled execution result is missing")
+        return {"continuation_route": "settled"}
+
+    @staticmethod
+    def _continuation_route(state: _ContinuationGraphState) -> str:
+        return state["continuation_route"]
+
+    def _graph_continuation_project(
+        self, state: _ContinuationGraphState,
+        runtime: Runtime[_ContinuationRuntime],
+    ) -> _ContinuationGraphState:
+        result = self._results.get(state["execution_id"])
+        if result is None:
+            raise AgentLoopError("settled execution result disappeared")
+        if result.status != "SUCCEEDED":
+            return {"analysis_route": "skip"}
+        runtime.context.sink.verified_finding = self.project_verified_execution(
+            result.execution_id
+        )
+        return {"analysis_route": "analyze"}
+
+    @staticmethod
+    def _analysis_route(state: _ContinuationGraphState) -> str:
+        return state["analysis_route"]
+
+    def _graph_continuation_analyze(
+        self, state: _ContinuationGraphState,
+        runtime: Runtime[_ContinuationRuntime],
+    ) -> _ContinuationGraphState:
+        parent = self._contexts.get(state["parent_context_id"])
+        result = self._results.get(state["execution_id"])
+        if parent is None or result is None or result.status != "SUCCEEDED":
+            raise AgentLoopError("Analyzer continuation source is unavailable")
+        selected = self._context_selector.select(parent.mission_id, frozenset())
+        grant = self._context_authorization.issue_grant(
+            grant_id=f"analyzer-{result.execution_id}-grant",
+            mission_id=parent.mission_id,
+            service_identity="analyzer_context",
+            candidate_resource_ids=tuple(item.candidate.resource_id for item in selected),
+            session_ids=(), ttl_seconds=120,
+        )
+        digest = self._digests.compute(
+            "execution_outcome_source_digest", result.model_dump(mode="python")
+        )
+        try:
+            runtime.context.sink.observation = self.run_analysis(
+                mission_id=parent.mission_id,
+                mission_revision=parent.mission_revision,
+                operation_id=f"analyzer-{result.execution_id}",
+                execution_id=result.execution_id,
+                result_digest=digest,
+                invoke_analyzer=runtime.context.invoke_analyzer,
+                context_grant_id=grant.grant_id,
+                run_id=runtime.context.ids.run_id,
+                thread_id=runtime.context.ids.thread_id,
+            )
+        except AgentLoopError:
+            # The owner-derived verified fact remains current. Analyzer failure
+            # cannot retract it or cause the external action to be submitted again.
+            runtime.context.sink.observation = None
+        return {}
+
+    def _graph_continuation_context(
+        self, state: _ContinuationGraphState,
+        runtime: Runtime[_ContinuationRuntime],
+    ) -> _ContinuationGraphState:
+        result = self._results.get(state["execution_id"])
+        if result is None:
+            raise AgentLoopError("continuation result is missing")
+        summary_outcome: Literal[
+            "succeeded", "failed", "blocked", "partial", "unknown"
+        ] = {
+            "SUCCEEDED": "succeeded", "FAILED": "failed", "CANCELLED": "blocked",
+        }[result.status]  # type: ignore[assignment]
+        summary = RecentExecutionSummary(
+            execution_id=result.execution_id,
+            outcome=summary_outcome,
+            result_reference_ids=result.redacted_artifact_ids,
+        )
+        next_context_id = f"{runtime.context.ids.operation_id}-next-context"
+        self._contexts.next_context(
+            parent_context_id=state["parent_context_id"],
+            planner_context_id=next_context_id,
+            recent_execution_summaries=(summary,),
+        )
+        return {"next_context_id": next_context_id}
+
+    def _graph_continuation_plan(
+        self, state: _ContinuationGraphState,
+        runtime: Runtime[_ContinuationRuntime],
+    ) -> _ContinuationGraphState:
+        envelope = self._contexts.get(state["next_context_id"])
+        if envelope is None:
+            raise AgentLoopError("next Planner context is missing")
+        runtime.context.sink.planning_step = self.run_planning_loop(
+            envelope=envelope,
+            ids=runtime.context.ids,
+            invoke_planner=runtime.context.invoke_planner,
+        )
+        return {}
+
     def _build_planning_graph(
         self,
     ) -> CompiledStateGraph[
@@ -345,6 +644,8 @@ class Phase1AgentWorkflow:
         builder.add_node("planner", self._graph_planner)
         builder.add_node("context_request", self._graph_context_request)
         builder.add_node("action_application", self._graph_action_application)
+        builder.add_node("approved_action", self._graph_approved_action)  # type: ignore[call-overload]
+        builder.add_node("pause", self._graph_pause)  # type: ignore[call-overload]
         builder.add_node("reconciliation", self._graph_reconciliation)  # type: ignore[call-overload]
         builder.add_node("finalization", self._graph_finalization)
         builder.add_edge(START, "session_refresh")
@@ -354,9 +655,11 @@ class Phase1AgentWorkflow:
             self._planning_route,
             {
                 "plan": "context_rebuild",
+                "execute_approved": "approved_action",
                 "recover": "reconciliation",
                 "finalize": "finalization",
                 "stop": "finalization",
+                "pause": "pause",
                 "end": END,
             },
         )
@@ -370,8 +673,13 @@ class Phase1AgentWorkflow:
             self._planner_output_route,
             {"context_request": "context_request", "action": "action_application"},
         )
-        builder.add_edge("context_request", END)
+        builder.add_conditional_edges(
+            "context_request", self._context_request_route,
+            {"continue": "controller", "pause": "pause", "end": END},
+        )
         builder.add_edge("action_application", END)
+        builder.add_edge("approved_action", END)
+        builder.add_edge("pause", END)
         # Re-evaluate the existing finalization node in the same invocation.
         # This is a no-op for PAUSED / still-open review missions, but lets a
         # WAITING_HUMAN_REVIEW mission advance immediately when this pass
@@ -483,20 +791,19 @@ class Phase1AgentWorkflow:
         return {}
 
     def _graph_session_refresh(
-        self, _state: _PlanningGraphState, runtime: Runtime[_PlanningRuntime]
+        self, state: _PlanningGraphState, runtime: Runtime[_PlanningRuntime]
     ) -> _PlanningGraphState:
         evaluation = self._goals.evaluate(mission_id=runtime.context.mission_id)
         return {"goal_evaluation_id": evaluation.evaluation_id}
 
     def _graph_controller(
-        self, _state: _PlanningGraphState, runtime: Runtime[_PlanningRuntime]
+        self, state: _PlanningGraphState, runtime: Runtime[_PlanningRuntime]
     ) -> _PlanningGraphState:
         ctx = runtime.context
-        projection = ctx.envelope.action_candidate_projection if ctx.envelope is not None else None
         decision = self._controller.step(
             mission_id=ctx.mission_id,
             operation_id=ctx.ids.operation_id,
-            projection=projection,
+            projection_supplier=lambda: self._stored_projection(state["planner_context_id"]),
         )
         runtime.context.sink.controller_decision = decision
         return {
@@ -504,17 +811,27 @@ class Phase1AgentWorkflow:
             "controller_reason": decision.reason_code,
         }
 
+    def _stored_projection(self, planner_context_id: str) -> ActionCandidateProjection:
+        envelope = self._contexts.get(planner_context_id)
+        if envelope is None:
+            raise AgentLoopError("planner context is missing")
+        return envelope.action_candidate_projection
+
     @staticmethod
     def _planning_route(state: _PlanningGraphState) -> str:
         action = state["controller_action"]
         if action == "PLAN":
             return "plan"
+        if action == "EXECUTE_APPROVED":
+            return "execute_approved"
         if action == "RECOVER":
             return "recover"
         if action == "FINALIZE":
             return "finalize"
         if action == "STOP":
             return "stop"
+        if action == "PAUSE":
+            return "pause"
         return "end"
 
     def _graph_context_rebuild(
@@ -557,8 +874,9 @@ class Phase1AgentWorkflow:
         self, state: _PlanningGraphState, runtime: Runtime[_PlanningRuntime]
     ) -> _PlanningGraphState:
         envelope = self._contexts.revalidate(state["planner_context_id"])
+        attempt = state.get("planner_attempt_index", 0)
         output = self._gateway.invoke_planner(
-            operation_id=runtime.context.ids.operation_id,
+            operation_id=self._ids_for_attempt(runtime.context.ids, attempt).operation_id,
             envelope=envelope,
             invoke=runtime.context.invoke_planner,
         )
@@ -579,8 +897,9 @@ class Phase1AgentWorkflow:
         output = runtime.context.sink.planner_output
         if output is None:
             envelope = self._contexts.revalidate(state["planner_context_id"])
+            attempt = state.get("planner_attempt_index", 0)
             output = self._gateway.invoke_planner(
-                operation_id=runtime.context.ids.operation_id,
+                operation_id=self._ids_for_attempt(runtime.context.ids, attempt).operation_id,
                 envelope=envelope,
                 invoke=runtime.context.invoke_planner,
             )
@@ -591,17 +910,44 @@ class Phase1AgentWorkflow:
         self, state: _PlanningGraphState, runtime: Runtime[_PlanningRuntime]
     ) -> _PlanningGraphState:
         output = cast(PlannerContextRequest, self._current_planner_output(state, runtime))
+        current = self._contexts.revalidate(state["planner_context_id"])
+        if current.context_rebuild_count >= 2:
+            runtime.context.sink.controller_decision = ControllerDecision(
+                action="PAUSE", reason_code="NO_VALID_PROPOSAL",
+                goal_evaluation_id=current.goal_evaluation_id, candidate_ids=(),
+            )
+            return {"controller_action": "PAUSE", "controller_reason": "NO_VALID_PROPOSAL",
+                    "context_request_route": "pause"}
         self._contexts.accept_context_request(
             planner_context_id=state["planner_context_id"],
             output=output,
         )
-        return {}
+        if not runtime.context.continue_context_requests:
+            return {"context_request_route": "end"}
+        attempt = state.get("planner_attempt_index", 0) + 1
+        next_context = self._contexts.next_context(
+            parent_context_id=current.planner_context_id,
+            planner_context_id=f"{runtime.context.ids.operation_id}-context-{attempt}",
+            context_request=True,
+        )
+        runtime.context.sink.planner_output = None
+        return {
+            "planner_context_id": next_context.planner_context_id,
+            "planner_attempt_index": attempt,
+            "context_request_route": "continue",
+        }
+
+    @staticmethod
+    def _context_request_route(state: _PlanningGraphState) -> str:
+        return state.get("context_request_route", "end")
 
     def _graph_action_application(
         self, state: _PlanningGraphState, runtime: Runtime[_PlanningRuntime]
     ) -> _PlanningGraphState:
         output = cast(PlannerActionOutput, self._current_planner_output(state, runtime))
-        ids = runtime.context.ids
+        ids = self._ids_for_attempt(
+            runtime.context.ids, state.get("planner_attempt_index", 0)
+        )
         transition = self._actions.execute(
             planner_context_id=state["planner_context_id"],
             output=output,
@@ -615,6 +961,42 @@ class Phase1AgentWorkflow:
         runtime.context.sink.action_transition = transition
         return {}
 
+    def _graph_approved_action(
+        self, _state: _PlanningGraphState, runtime: Runtime[_PlanningRuntime]
+    ) -> _PlanningGraphState:
+        runtime.context.sink.action_transition = self._actions.continue_approved(
+            runtime.context.mission_id
+        )
+        return {}
+
+    def _graph_pause(
+        self, _state: _PlanningGraphState, runtime: Runtime[_PlanningRuntime]
+    ) -> _PlanningGraphState:
+        mission = self._resolver.resolve(
+            runtime.context.mission_id, now=self._clock.now()
+        ).mission
+        if mission.state == "RUNNING":
+            self._mission_manager.pause_mission(
+                mission.mission_id,
+                expected_version=mission.mission_state_version,
+                actor_token=self._operator_actor_token,
+            )
+        return {}
+
+    @staticmethod
+    def _ids_for_attempt(ids: PlanningOperationIds, attempt: int) -> PlanningOperationIds:
+        if attempt == 0:
+            return ids
+        suffix = f"-planner-{attempt}"
+        return replace(
+            ids,
+            operation_id=f"{ids.operation_id}{suffix}",
+            plan_id=f"{ids.plan_id}{suffix}",
+            decision_id=f"{ids.decision_id}{suffix}",
+            execution_id=f"{ids.execution_id}{suffix}",
+            task_id=f"{ids.task_id}{suffix}",
+        )
+
     def _graph_reconciliation(
         self, _state: _PlanningGraphState, runtime: Runtime[_PlanningRuntime]
     ) -> _PlanningGraphState:
@@ -627,7 +1009,10 @@ class Phase1AgentWorkflow:
         incomplete = sorted(
             (
                 item for item in self._executions.all_for_mission(mission_id)
-                if item.provider_execution_state in ACTIVE_EXECUTION_STATES
+                if item.provider_execution_state in ACTIVE_EXECUTION_STATES or (
+                    item.provider_execution_state in {"SUCCEEDED", "FAILED", "CANCELLED"}
+                    and item.result_ingestion_state != "SUCCEEDED"
+                )
             ),
             key=lambda item: item.execution_id,
         )
@@ -638,8 +1023,14 @@ class Phase1AgentWorkflow:
         for record in incomplete:
             execution_id = record.execution_id
             try:
+                if record.provider_execution_state in {"SUCCEEDED", "FAILED", "CANCELLED"}:
+                    if self._settle_result(mission_id, execution_id):
+                        sink.reconcile_outcomes.append((execution_id, "RESULT_SETTLED"))
+                    continue
                 outcome = self._reconcile(mission_id, execution_id)
                 sink.reconcile_outcomes.append((execution_id, outcome.reason_code))
+                if outcome.provider_execution_state in {"SUCCEEDED", "FAILED", "CANCELLED"}:
+                    self._settle_result(mission_id, execution_id)
             except AgentLoopError as exc:
                 if str(exc) != "reconciliation retry budget exhausted":
                     raise
@@ -987,13 +1378,22 @@ class Phase1AgentWorkflow:
                 operation_id=f"ingestion-{execution_id}",
                 retry_kind="ingestion",
             )
-            published = self._ingestion.ingest(ingestion_id=ingestion_id)
+            ingestion = self._ingestion_states.find_by_execution(execution_id)
+            if ingestion is not None and ingestion.status == "FAILED":
+                published = self._ingestion.retry(ingestion_id=ingestion_id)
+            else:
+                published = self._ingestion.ingest(ingestion_id=ingestion_id)
             if published.deletion_intent_id is not None:
                 self._eraser.run(deletion_intent_id=published.deletion_intent_id)
         except RawResultQuarantineError:
             self._hold_for_review(mission_id, execution_id, "COLLECTION_COMPLETE")
             return False
-        except (OutputPublicationError, SecureIngestionError, VerifiedErasureError):
+        except (OutputPublicationError, SecureIngestionError, VerifiedErasureError) as exc:
+            ingestion = self._ingestion_states.find_by_execution(execution_id)
+            if ingestion is not None and ingestion.status == "INGESTING":
+                self._ingestion.fail(
+                    ingestion_id=ingestion.ingestion_id, reason=type(exc).__name__,
+                )
             self._hold_for_review(mission_id, execution_id, "INGESTION_COMPLETE")
             return False
         except AgentLoopError as exc:
@@ -1015,4 +1415,13 @@ class Phase1AgentWorkflow:
             source_execution_id=execution_id,
             reason_code=reason_code,
         )
-        self._finalization.wait_for_human_review(mission_id)
+        state = self._finalization.mission_state(mission_id)
+        if state is None:
+            raise AgentLoopError("human review mission is missing")
+        if state.state == "RUNNING":
+            self._finalization.begin_abort(mission_id)
+            self._finalization.wait_for_human_review(mission_id)
+        elif state.state == "FINALIZING":
+            self._finalization.wait_for_human_review(mission_id)
+        elif state.state not in {"PAUSED", "WAITING_HUMAN_REVIEW"}:
+            raise AgentLoopError("mission state cannot preserve a human review hold")

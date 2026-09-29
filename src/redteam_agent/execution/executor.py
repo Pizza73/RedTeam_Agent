@@ -23,6 +23,7 @@ drifted plan. The executor:
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -62,7 +63,7 @@ from redteam_agent.execution.secret_injection import (
 )
 from redteam_agent.execution.secret_source import TrustedSecretSource
 from redteam_agent.execution.state_machine import is_legal_provider_edge
-from redteam_agent.executor.authorization_gate import ExecutorAuthorizationGate
+from redteam_agent.executor.authorization_gate import ExecutorAuthorizationGate, GateResult
 from redteam_agent.plan.models import ExecutionPlan
 from redteam_agent.policy.models import PolicyDecision
 from redteam_agent.resources.secret_metadata import SecretMetadataReader
@@ -110,6 +111,7 @@ _BLOCK_REASON_MAP: dict[str, PreDispatchBlockReason] = {
     "APPROVAL_AUTHORITY_REVOKED": "APPROVAL_INVALID",
     "APPROVAL_ROLE_INVALID": "APPROVAL_INVALID",
     "MISLEADING_PRESENTATION": "APPROVAL_INVALID",
+    "GOAL_ACHIEVED": "GOAL_ACHIEVED",
 }
 
 
@@ -174,6 +176,8 @@ class Executor:
         self._guard = write_guard
         self._registry_revision = registry_revision
         self._phase0c_dependencies_bound = False
+        self._goal_checker: Callable[[str], bool] | None = None
+        self._runtime_checker: Callable[[str], bool] | None = None
         # Repository ownership is bound once by the composition root (the same
         # guard is shared by every execution-safety service), so no service binds
         # ownership in its constructor.
@@ -191,6 +195,20 @@ class Executor:
         self._secret_source = secret_source
         self._secret_metadata = secret_metadata_reader
         self._phase0c_dependencies_bound = True
+
+    def can_execute(self, *, decision_id: str, plan: ExecutionPlan) -> GateResult:
+        """Read-only current authorization check used while an approval is pending."""
+        return self._gate.authorize_execution(decision_id=decision_id, plan=plan)
+
+    def bind_goal_checker(self, checker: Callable[[str], bool]) -> None:
+        if self._goal_checker is not None:
+            return
+        self._goal_checker = checker
+
+    def bind_runtime_checker(self, checker: Callable[[str], bool]) -> None:
+        if self._runtime_checker is not None:
+            return
+        self._runtime_checker = checker
 
     # --- create (PLANNED -> AUTHORIZED) -----------------------------------
 
@@ -241,6 +259,12 @@ class Executor:
         tool = self._require_tool(decision)
 
         # 1. Pre-dispatch revalidation: re-run the gate over current trusted state.
+        if self._goal_checker is not None and self._goal_checker(record.mission_id):
+            blocked = self._block(record, reason="GOAL_ACHIEVED")
+            return self._blocked_outcome(blocked, attempts=0, reason="GOAL_ACHIEVED")
+        if self._runtime_checker is not None and not self._runtime_checker(record.mission_id):
+            blocked = self._block(record, reason="RUNTIME_LIMIT")
+            return self._blocked_outcome(blocked, attempts=0, reason="RUNTIME_LIMIT")
         gate_result = self._gate.authorize_execution(decision_id=decision.decision_id, plan=plan)
         if not gate_result.authorized:
             blocked = self._block(record, reason=_block_reason_for(gate_result.reason_code))
@@ -255,7 +279,13 @@ class Executor:
             return self._blocked_outcome(blocked, attempts=0, reason="SECRET_VERSION_STALE")
 
         # 3. Atomic AUTHORIZED -> DISPATCH_CLAIMED + create the unconsumed claim.
-        claim = self._claim_execution(record=record, decision=decision, version_ids=version_ids, heads=heads)
+        claim, claim_block_reason = self._claim_execution(
+            record=record, decision=decision, plan=plan,
+            version_ids=version_ids, heads=heads,
+        )
+        if claim is None:
+            blocked = self._block(record, reason=_block_reason_for(claim_block_reason))
+            return self._blocked_outcome(blocked, attempts=0, reason=claim_block_reason)
 
         # 4. Consume the claim durably, re-verifying versions in the same transaction.
         consumption_id = self._consume_claim(
@@ -285,8 +315,8 @@ class Executor:
 
     def _claim_execution(
         self, *, record: ExecutionRecord, decision: PolicyDecision, version_ids: tuple[str, ...],
-        heads: dict[str, str],
-    ) -> DispatchClaim:
+        heads: dict[str, str], plan: ExecutionPlan,
+    ) -> tuple[DispatchClaim | None, str]:
         now = self._clock.now()
         claimed_version = record.execution_state_version + 1
         claimed = self._finalize_execution(
@@ -335,6 +365,11 @@ class Executor:
         )
         self._require_edge(record.provider_execution_state, "DISPATCH_CLAIMED")
         with UnitOfWork(self._db):
+            current_gate = self._gate.authorize_execution(
+                decision_id=decision.decision_id, plan=plan
+            )
+            if not current_gate.authorized:
+                return None, current_gate.reason_code
             # Reserve the durable dispatch budget in the same transaction, before
             # the claim exists. An exhausted budget rolls back the whole unit of
             # work, so no claim is created and no provider call happens.
@@ -342,7 +377,7 @@ class Executor:
             self._executions.transition(claimed, expected_version=record.execution_state_version, guard=self._guard)
             self._claims.create(claim, guard=self._guard)
             self._record_claim_mutation(record.mission_id, claim)
-        return claim
+        return claim, "AUTHORIZED"
 
     def _reserve_budget(self, record: ExecutionRecord) -> None:
         self._budget.reserve_in_txn(mission_id=record.mission_id, mission_revision=record.mission_revision)

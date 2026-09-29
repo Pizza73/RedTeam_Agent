@@ -209,13 +209,14 @@ def test_durable_resume_after_recovery_window_makes_no_provider_read() -> None:
     kernel.phase0c.phase0b.phase0a.clock.set(kernel.phase0c.monotonic_clock.now())  # type: ignore[attr-defined]
 
     # Recovery authority cannot be issued past recovery_until, so no RECONCILING
-    # transition and no provider read occurs; the mission stays PAUSED.
+    # transition and no provider read occurs. valid_until is already past, so the
+    # Controller has moved the mission into the required FINALIZING state.
     with pytest.raises(ExecutionRecoveryAuthorityError):
         _resume(kernel, mission_id)
     assert adapter.reconcile_calls == before  # adapter never consulted
     record = phase0b.execution_repository.get(EXECUTION_ID)
     assert record is not None and record.provider_execution_state == "DISPATCHED"
-    assert _state(phase0b, mission_id).state == "PAUSED"  # lifecycle preserved
+    assert _state(phase0b, mission_id).state == "FINALIZING"
 
 
 def test_pre_pause_decision_is_not_reused_after_resume() -> None:
@@ -322,6 +323,7 @@ def test_durable_resume_restores_a_persisted_checkpoint_in_a_new_kernel(tmp_path
 
     # Process-equivalent restart: a fresh Phase 1 workflow + a fresh SqliteSaver
     # connection over the same durable SQLite file.
+    kernel1.workflow._checkpointer.conn.close()
     kernel2 = build_phase1_kernel(phase0c=phase0c)
     thread_id = _thread(mission_id)
     assert kernel2.workflow._checkpointer.get({"configurable": {"thread_id": thread_id}}) is not None
@@ -559,6 +561,9 @@ def test_reconciliation_advances_review_when_last_execution_settles() -> None:
     )
     kernel.finalization_service.wait_for_human_review(mission_id)
     adapter = phase0b.mock_adapter
+    adapter._stdout_chunks = (  # type: ignore[attr-defined]
+        b'{"host":"10.1.2.3","status":"open","port":443}\n',
+    )
     original = adapter.reconcile
 
     def first_pass(execution_id, task_binding):

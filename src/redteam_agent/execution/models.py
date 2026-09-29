@@ -49,6 +49,8 @@ PreDispatchBlockReason = Literal[
     "ENCRYPTION_KEY_UNAVAILABLE",
     "SECRET_VERSION_STALE",
     "MISSION_EXPIRED",
+    "GOAL_ACHIEVED",
+    "RUNTIME_LIMIT",
     "DIGEST_INTEGRITY_FAILURE",
 ]
 
@@ -568,6 +570,9 @@ class MissionExecutionBudget(StrictImmutableBoundaryModel):
     budget_version: int = Field(ge=1)
     max_dispatch_claims: int = Field(gt=0)
     consumed_dispatch_claims: int = Field(ge=0)
+    consumed_planner_invocations: int = Field(default=0, ge=0)
+    consumed_analyzer_invocations: int = Field(default=0, ge=0)
+    active_runtime_seconds: float = Field(default=0.0, ge=0.0)
     updated_at: datetime
     record_digest: str = Field(min_length=1)
 
@@ -575,4 +580,30 @@ class MissionExecutionBudget(StrictImmutableBoundaryModel):
     def _within_budget(self) -> MissionExecutionBudget:
         if self.consumed_dispatch_claims > self.max_dispatch_claims:
             raise ValueError("consumed dispatch claims exceed the budget")
+        return self
+
+
+class RuntimeSegment(StrictImmutableBoundaryModel):
+    """Durable active-runtime interval accounted with a trusted monotonic clock."""
+
+    segment_id: str = Field(min_length=1)
+    mission_id: str = Field(min_length=1)
+    mission_revision: int = Field(ge=1)
+    boot_identity: str = Field(min_length=1)
+    started_at: datetime
+    started_monotonic_ns: int = Field(ge=0)
+    accounted_until: datetime
+    accounted_monotonic_ns: int = Field(ge=0)
+    closed_at: datetime | None
+    accounted_seconds: float = Field(ge=0.0)
+    record_digest: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _ordered(self) -> RuntimeSegment:
+        if self.accounted_until < self.started_at:
+            raise ValueError("runtime accounting precedes the segment start")
+        if self.accounted_monotonic_ns < self.started_monotonic_ns:
+            raise ValueError("runtime monotonic accounting precedes the segment start")
+        if self.closed_at is not None and self.closed_at < self.accounted_until:
+            raise ValueError("runtime segment closes before its accounted boundary")
         return self

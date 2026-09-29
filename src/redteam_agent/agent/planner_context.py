@@ -524,6 +524,61 @@ class PlannerContextService:
             stale_rebuild=True,
         )
 
+    def next_context(
+        self, *, parent_context_id: str, planner_context_id: str,
+        recent_execution_summaries: tuple[RecentExecutionSummary, ...] = (),
+        feedback: tuple[PlannerFeedback, ...] = (),
+        context_request: bool = False,
+    ) -> PlannerContextEnvelope:
+        """Build a new iteration from current owners, never from a cached prompt.
+
+        The initial finite target/tool seeds remain the bound planning scope;
+        visibility, sessions, goal, grants and indexed context are recomputed.
+        Context requests retain their lineage so new IDs cannot reset the cap.
+        """
+        parent = self.get(parent_context_id)
+        if parent is None:
+            raise PlannerContextError("next context parent not found")
+        current = self._resolver.resolve(parent.mission_id, now=self._clock.now())
+        if current.mission.state != "RUNNING" or current.mission.mission_revision != parent.mission_revision:
+            raise MissionRevisionConflictError("next context requires the current running mission revision")
+        goal = self._goals.evaluate(mission_id=parent.mission_id)
+        snapshot = self._tool_availability.publish(
+            snapshot_id=f"{planner_context_id}-tools", mission_id=parent.mission_id,
+        )
+        visible = {item.tool_ref for item in snapshot.tools}
+        seeds = tuple(ActionCandidateSeed(
+            tool_ref=item.tool_ref, canonical_target_binding=item.canonical_target_binding,
+            satisfied_precondition_refs=item.satisfied_precondition_refs,
+            objective_dependency_ids=item.objective_dependency_ids,
+            suggested_arguments=item.suggested_arguments,
+        ) for item in parent.action_candidate_projection.candidates if item.tool_ref in visible)
+        projection = self._projector.build(
+            snapshot_id=snapshot.snapshot_id, seeds=seeds,
+            source_version_digests=(goal.evaluation_digest, goal.knowledge_head_digest),
+        )
+        ranked = self._context_selector.select(parent.mission_id, _projection_target_values(projection))
+        grant = self._context_auth.issue_grant(
+            grant_id=f"{planner_context_id}-grant", mission_id=parent.mission_id,
+            service_identity="planner_context",
+            candidate_resource_ids=tuple(item.candidate.resource_id for item in ranked),
+            session_ids=tuple(sorted({
+                session for item in projection.candidates for session in item.eligible_session_ids
+            })), ttl_seconds=120,
+        )
+        budget = self._mission_budgets.get(parent.mission_id, parent.mission_revision)
+        if budget is None:
+            raise PlannerContextError("mission budget is missing")
+        return self.build(
+            planner_context_id=planner_context_id, mission_id=parent.mission_id,
+            goal_evaluation_id=goal.evaluation_id, projection=projection,
+            context_grant_id=grant.grant_id, available_tool_snapshot_id=snapshot.snapshot_id,
+            iteration=budget.consumed_dispatch_claims, ranked_candidate_metadata=ranked,
+            recent_execution_summaries=recent_execution_summaries, feedback=feedback,
+            operational_phase=parent.operational_phase,
+            parent_context_id=parent_context_id if context_request else None,
+        )
+
     def revalidate_or_rebuild(self, planner_context_id: str) -> PlannerContextEnvelope:
         """Return the current envelope or rebuild a stale trusted-source binding."""
         try:

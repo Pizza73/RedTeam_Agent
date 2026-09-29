@@ -119,7 +119,7 @@ def test_complete_builder_wires_the_fixed_linux_transport(
     profile = _complete_profile(digest_service)
     monkeypatch.setattr(
         linux_transport,
-        "_verify_ubuntu_24_04_x86_64",
+        "_verify_kali_2026_3_x86_64",
         lambda: None,
     )
 

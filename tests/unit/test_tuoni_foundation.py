@@ -33,7 +33,7 @@ def test_tuoni_foundation_defaults_capture_approved_lab_and_unresolved_inputs() 
     assert profile.provider.edition == "commercial"
     assert profile.connection.api_origin == "https://127.0.0.1:8443"
     assert profile.isolation.topology == "colocated_control_vm_disposable_target"
-    assert profile.isolation.control_vm_operating_system == "ubuntu_24_04_lts"
+    assert profile.isolation.control_vm_operating_system == "kali_2026_3"
     assert profile.isolation.control_vm_architecture == "x86_64"
     assert profile.isolation.adapter_placement == "same_control_vm_loopback"
     assert profile.isolation.target_listener_port == 8444

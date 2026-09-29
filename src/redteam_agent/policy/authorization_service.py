@@ -9,7 +9,8 @@ the guard held only here).
 
 from __future__ import annotations
 
-from redteam_agent.contracts.catalog import ActionContractCatalog
+from redteam_agent.canonical.digest_service import DigestService
+from redteam_agent.contracts.catalog import ActionContractCatalog, compute_execution_precondition_digest
 from redteam_agent.errors import PolicyEvaluationIndeterminateError
 from redteam_agent.plan.models import ExecutionPlan
 from redteam_agent.policy.engine import PolicyEngine, context_from_mission
@@ -42,6 +43,7 @@ class ExecutionAuthorizationService:
         write_guard: WriteGuard,
         registry_revision: int,
         contract_catalog: ActionContractCatalog,
+        digest_service: DigestService,
     ) -> None:
         self._engine = engine
         self._resolver = context_resolver
@@ -54,6 +56,7 @@ class ExecutionAuthorizationService:
         self._guard = write_guard
         self._registry_revision = registry_revision
         self._contracts = contract_catalog
+        self._digests = digest_service
         decision_repository.bind_owner(write_guard)
 
     def issue(self, *, decision_id: str, plan: ExecutionPlan) -> PolicyDecision:
@@ -76,7 +79,19 @@ class ExecutionAuthorizationService:
             raise PolicyEvaluationIndeterminateError("registered action contract is unavailable")
         if plan.action_contract_ref != tool.action_contract_ref:
             raise PolicyEvaluationIndeterminateError("plan action contract does not match the registered tool")
-        if plan.execution_precondition_digest != contract.execution_precondition_digest:
+        expected_preconditions = compute_execution_precondition_digest(
+            definition=contract, requested_targets=plan.proposal.requested_targets,
+            predicate_snapshot_digest=plan.execution_precondition_snapshot_digest,
+            predicate_evidence=tuple(dict(item) for item in plan.execution_precondition_evidence),
+            digest_service=self._digests,
+        )
+        evidence = tuple(dict(item) for item in plan.execution_precondition_evidence)
+        if contract.preconditions and (
+            {str(item.get("predicate_id")) for item in evidence} != set(contract.preconditions)
+            or any(item.get("truth") != "true" or item.get("eligible") is not True for item in evidence)
+        ):
+            raise PolicyEvaluationIndeterminateError("plan precondition evidence is incomplete")
+        if plan.execution_precondition_digest != expected_preconditions:
             raise PolicyEvaluationIndeterminateError("plan precondition digest does not match the registered contract")
         adapter = self._adapters.get(tool.adapter_id)
         if adapter is None:

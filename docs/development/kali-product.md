@@ -21,10 +21,15 @@
 
 ## 配備
 
+通常起動はDBを作成・変更しない。初回だけ全Worker停止中に`redteam-db initialize`で現行Schemaを作成する。
+不明なDBまたはsidecarが存在する場合、起動は停止する。`redteam-db remove-unknown`は対象path、size、SHA-256を表示し、
+対話端末でexact `DELETE <databasePath>`が入力された場合だけ表示済みDB/sidecarを再照合して削除する。鍵、TPM状態、
+DB外ログは削除せず、削除後の初期構築は別の`initialize`操作とする。
+
 1. 専用の`redteam-agent`システムユーザーを用意し、`ad-collector` extraを含むwheel/venvと`frontend/dist`を`/opt/redteam-agent`へ配置する。KaliのCertipyも必要である。
 2. `product.json`と署名済みLLM manifest/public keyを`/etc/redteam-agent`へ配置する。秘密値は設定JSONに書かない。
 3. 32 byte以上のランダムなUI token、vLLM API key、既存の`joe.cfg`に加え、読み取り用AD credential JSONを、それぞれ`systemd-creds encrypt`で`/etc/credstore.encrypted`へ保存する。AD JSONは`domain`、`username`、`password`だけを持つ。平文をjournalやコマンド引数へ渡さない。
-4. `redteam-agent.service`と必要な`redteam-agent.service.d/sliver-operator.conf`を配置し、`systemctl daemon-reload`後にサービスを開始する。
+4. `redteam-agent.service`と必要な`redteam-agent.service.d/sliver-operator.conf`を配置し、同じ`activationLockPath`を指定してDBを明示初期構築する。`systemctl daemon-reload`後にサービスを開始する。
 5. loopbackでは`http://127.0.0.1:18000`、サンプルの直接接続構成では`http://サーバに割り当てられたIPv4:18000`を開き、UI tokenを一度入力する。tokenはHttpOnly session cookieへ交換され、プロセス再起動時に全sessionが失効する。
 
 直接外部bindでは、`uiHost=0.0.0.0`、`uiOriginPolicy=local_ipv4_same_origin`、空の`uiAllowedOrigins`を設定する。

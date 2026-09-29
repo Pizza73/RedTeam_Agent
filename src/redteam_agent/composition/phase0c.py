@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import cast
+from uuid import uuid4
 
 from redteam_agent.audit.critical_witness import CriticalWitnessBarrier
 from redteam_agent.audit.generation import AuthenticatedGenerationCoordinator
@@ -174,6 +175,7 @@ class Phase0CKernel:
     phase0b: Phase0BKernel
     monotonic_clock: MonotonicClock
     clock_guard: ClockIntegrityGuard
+    boot_identity: str
     data_guard: WriteGuard
     key_provider_identity: str
     nv_witness: InMemoryNvExtendWitness
@@ -207,6 +209,7 @@ def build_phase0c_kernel(
     *,
     phase0b: Phase0BKernel | None = None,
     monotonic_clock: MonotonicClock | None = None,
+    boot_identity: str | None = None,
     result_delivery_mode: str = "provider_task",
 ) -> Phase0CKernel:
     kernel = phase0b if phase0b is not None else build_phase0b_kernel(result_delivery_mode=result_delivery_mode)
@@ -509,7 +512,8 @@ def build_phase0c_kernel(
     kernel.collection_coordinator = cast(ResultCollectionCoordinator, collection_facade)
     kernel.ingestion_coordinator = cast(ResultIngestionCoordinator, ingestion_facade)
     return Phase0CKernel(
-        phase0b=kernel, monotonic_clock=clock, clock_guard=clock_guard, data_guard=guard,
+        phase0b=kernel, monotonic_clock=clock, clock_guard=clock_guard,
+        boot_identity=boot_identity or f"process-{uuid4()}", data_guard=guard,
         key_provider_identity=key_provider.provider_identity, nv_witness=witness,
         generation_coordinator=coordinator,
         generation_store=generation_store, audit_store=audit_store, epoch_service=epoch_service,

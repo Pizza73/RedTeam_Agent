@@ -8262,8 +8262,11 @@ Positive / Negative / Failure-pathを検証し、状態を扱う変更にはProp
 失敗回避のために安全試験を削除・skip・xfail化したり、実装へ仕様を合わせたりしない。
 
 旧Runtimeの実データを取り込む場合は、本節のSchema Migration ContractとAI別冊§12を適用する。
-今回の追加開発は、既存のDB、未完了Task、Quarantine、鍵、監査、
-Claim / Budget履歴を破棄する許可ではない。新規環境のProvisioningと、旧状態のImport / Migrationを区別する。
+本Revisionの対象環境には移行対象DBがないため、現行SchemaのFresh Provisioningへ統一する。Provisioning時に
+exact Application Schema Revisionを単一行のMetadataへ保存し、通常起動はそのRevisionをread-only検証してDBを作成せず、
+不明なDBまたはsidecarを検出した場合は停止する。全Worker停止と共通Host Activation Lockの下で、対象path、size、Digestを
+表示し、Operatorがexact削除文字列を入力した場合だけ再照合済みのDB/sidecarを削除できる。無回答・拒否・使用中・確認後の
+変更・部分失敗では続行せず、鍵、TPM状態、DB外ログを暗黙削除しない。削除とFresh Provisioningは別操作とする。
 D4の実機QualificationはNOT_EVALUATEDのままとする。新AD MCPの平文生ログへの非適用範囲は§19.4で限定し、他のD4対象をMockで適格としない。
 
 今回の整合は既存状態・Record種別・Serviceを再利用する。期限切れ処理は既存Scheduler / Aggregate、

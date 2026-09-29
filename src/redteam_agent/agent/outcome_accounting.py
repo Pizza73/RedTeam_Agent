@@ -6,10 +6,13 @@ import json
 
 from redteam_agent.canonical.digest_service import DigestService
 from redteam_agent.errors import AgentLoopError
+from redteam_agent.execution.models import ProviderTaskBinding
 from redteam_agent.storage.database import Database, UnitOfWork
 from redteam_agent.storage.execution_repositories import (
+    CancelAttemptRepository,
     ExecutionRecordRepository,
     ExecutionResultRepository,
+    ResultTaskBindingRepository,
 )
 
 
@@ -20,9 +23,12 @@ class ExecutionOutcomeAccountingService:
         self, *, database: Database, digest_service: DigestService,
         execution_repository: ExecutionRecordRepository,
         result_repository: ExecutionResultRepository,
+        cancel_attempt_repository: CancelAttemptRepository,
+        task_binding_repository: ResultTaskBindingRepository,
     ) -> None:
         self._db, self._ds = database, digest_service
         self._executions, self._results = execution_repository, result_repository
+        self._cancels, self._bindings = cancel_attempt_repository, task_binding_repository
 
     def reconcile(self, *, mission_id: str, mission_revision: int) -> int:
         state_key = f"{mission_id}:{mission_revision}"
@@ -70,9 +76,25 @@ class ExecutionOutcomeAccountingService:
                 source_digest = self._ds.compute(
                     "execution_outcome_source_digest", result.model_dump(mode="python")
                 )
-                outcome = {
-                    "SUCCEEDED": "success", "FAILED": "failure", "CANCELLED": "neutral",
-                }[result.status]
+                if result.status == "CANCELLED":
+                    binding = self._bindings.find_by_execution(execution.execution_id)
+                    cancel = (
+                        self._cancels.find(execution.execution_id, binding.provider_task_id)
+                        if isinstance(binding, ProviderTaskBinding) else None
+                    )
+                    operator_cancel = (
+                        cancel is not None
+                        and cancel.attempt_state == "CONFIRMED"
+                        and cancel.reason == "operator_explicit_cancel"
+                    )
+                    outcome = "neutral" if operator_cancel else "failure"
+                    source_digest = self._ds.compute("security_projection_digest", {
+                        "execution_result_digest": source_digest,
+                        "cancel_attempt_digest": None if cancel is None else cancel.record_digest,
+                        "operator_explicit": operator_cancel,
+                    })
+                else:
+                    outcome = {"SUCCEEDED": "success", "FAILED": "failure"}[result.status]
             if outcome == "failure":
                 failures += 1
             elif outcome == "success":

@@ -219,6 +219,7 @@ class Phase1AgentStateMachine(RuleBasedStateMachine):
             "controller_action",
             "controller_reason",
             "planner_output_kind",
+            "planner_attempt_index",
         }
         if self.operation:
             checkpointer = self.kernel.workflow.graph.checkpointer
@@ -232,7 +233,11 @@ class Phase1AgentStateMachine(RuleBasedStateMachine):
             values = snapshot["channel_values"]
             assert set(values) <= allowed
             assert all(
-                isinstance(value, str) or (key == "mission_revision" and isinstance(value, int))
+                isinstance(value, str)
+                or (
+                    key in {"mission_revision", "planner_attempt_index"}
+                    and isinstance(value, int)
+                )
                 for key, value in values.items()
             )
 

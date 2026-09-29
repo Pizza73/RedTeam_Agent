@@ -17,7 +17,7 @@ from redteam_agent.errors import AgentLoopError, MissionRevisionConflictError
 from redteam_agent.execution.models import AdapterCollectionControl
 from redteam_agent.execution.thread import compute_thread_id
 from redteam_agent.knowledge.models import AnalyzerCandidateObservation
-from redteam_agent.plan.models import PlannerActionOutput
+from redteam_agent.plan.models import PlannerActionOutput, PlannerContextRequest, RetrievalHint
 from redteam_agent.policy.scope_models import IpTargetReference
 from redteam_agent.runtime.clock import ManualClock, ManualMonotonicClock
 
@@ -30,6 +30,7 @@ def test_phase1_uses_compiled_coarse_graphs_without_automatic_retry() -> None:
     kernel, *_ = _inputs()
     planning_nodes = set(kernel.workflow.graph.get_graph().nodes)
     analysis_nodes = set(kernel.workflow.analysis_graph.get_graph().nodes)
+    continuation_nodes = set(kernel.workflow.loop_graph.get_graph().nodes)
     assert {
         "session_refresh",
         "controller",
@@ -41,6 +42,7 @@ def test_phase1_uses_compiled_coarse_graphs_without_automatic_retry() -> None:
         "planner",
         "context_request",
         "action_application",
+        "approved_action",
         "reconciliation",
         "finalization",
     } <= planning_nodes
@@ -54,10 +56,19 @@ def test_phase1_uses_compiled_coarse_graphs_without_automatic_retry() -> None:
         "post_analysis_session_refresh",
         "goal_evaluation",
     } <= analysis_nodes
+    assert {
+        "recover_execution",
+        "project_verified_source",
+        "analyze_result",
+        "build_next_context",
+        "plan_next_action",
+    } <= continuation_nodes
     assert kernel.workflow.graph.checkpointer is not None
     assert kernel.workflow.analysis_graph.checkpointer is not None
+    assert kernel.workflow.loop_graph.checkpointer is not None
     assert all(node.retry_policy is None for node in kernel.workflow.graph.nodes.values())
     assert all(node.retry_policy is None for node in kernel.workflow.analysis_graph.nodes.values())
+    assert all(node.retry_policy is None for node in kernel.workflow.loop_graph.nodes.values())
 
 
 def test_stale_planner_context_is_rebuilt_before_the_model_call() -> None:
@@ -126,12 +137,14 @@ def test_stale_planner_context_is_rebuilt_before_the_model_call() -> None:
         "goal_evaluation_id",
         "controller_action",
         "controller_reason",
-        "planner_output_kind",
-    }
+            "planner_output_kind",
+            "planner_attempt_index",
+        }
     # Only application-issued record-identity / routing fields; the sole non-string
     # is the integer mission_revision (a repository record identity, not free text).
     assert all(
-        isinstance(value, str) or (key == "mission_revision" and isinstance(value, int))
+        isinstance(value, str)
+        or (key in {"mission_revision", "planner_attempt_index"} and isinstance(value, int))
         for key, value in values.items()
     )
 
@@ -182,6 +195,212 @@ def test_workflow_rejects_malformed_wrong_revision_and_reused_run_threads() -> N
         })
         assert snapshot is None
     assert not invoked
+
+
+def test_langgraph_context_request_returns_to_planner_without_execution() -> None:
+    kernel, seeded, goal, grant, projection = _inputs()
+    mission_id = seeded.seeded.revision.mission_id
+    envelope = kernel.planner_context_service.build(
+        planner_context_id="context-loop-root", mission_id=mission_id,
+        goal_evaluation_id=goal.evaluation_id, projection=projection,
+        context_grant_id=grant.grant_id,
+        available_tool_snapshot_id=seeded.seeded.snapshot.snapshot_id, iteration=0,
+    )
+    request = PlannerContextRequest(
+        objective="get current evidence",
+        retrieval_hints=(RetrievalHint(
+            resource_types=("artifact",), related_entity_refs=("host-1",),
+            requested_fact_types=("service",), recency_class="current",
+            purpose_code="prepare_next_action",
+        ),),
+        working_state_update=None,
+    )
+    action = PlannerActionOutput(
+        proposal=support.make_proposal(
+            tool=seeded.seeded.tool,
+            arguments={"destinations": ["10.1.2.3"], "port": 443, "protocol": "tcp"},
+            requested_targets=(IpTargetReference(type="ip", address="10.1.2.3"),),
+        ),
+        working_state_update=None, next_iteration_hints=(),
+    )
+    seen = []
+
+    def invoke(current):
+        seen.append(current)
+        return request if len(seen) == 1 else action
+
+    step = kernel.workflow.run_planning_loop(
+        envelope=envelope,
+        ids=PlanningOperationIds(
+            operation_id="context-loop", plan_id="context-loop-plan",
+            run_id="context-loop-run", thread_id=_thread_id(mission_id, "context-loop-run"),
+            decision_id="context-loop-decision", execution_id="context-loop-execution",
+            task_id="context-loop-task",
+        ),
+        invoke_planner=invoke,
+    )
+    assert len(seen) == 2
+    assert seen[1].parent_context_id == seen[0].planner_context_id
+    assert step.action_transition is not None and step.action_transition.dispatch is not None
+    assert step.action_transition.plan.plan_id == "context-loop-plan-planner-1"
+    assert kernel.phase0c.phase0b.budget_repository.get(
+        mission_id, 1
+    ).consumed_planner_invocations == 2  # type: ignore[union-attr]
+
+
+def test_approval_wait_resumes_the_exact_plan_once_without_replanning() -> None:
+    phase0c = p0c.make_phase0c()
+    support.register_approver(phase0c.phase0b.phase0a)
+    kernel, seeded, goal, grant, projection = _inputs(
+        phase0c=phase0c,
+        require_for_side_effect=frozenset({"read_only"})
+    )
+    mission_id = seeded.seeded.revision.mission_id
+    envelope = kernel.planner_context_service.build(
+        planner_context_id="approval-loop-context", mission_id=mission_id,
+        goal_evaluation_id=goal.evaluation_id, projection=projection,
+        context_grant_id=grant.grant_id,
+        available_tool_snapshot_id=seeded.seeded.snapshot.snapshot_id, iteration=0,
+    )
+    output = PlannerActionOutput(
+        proposal=support.make_proposal(
+            tool=seeded.seeded.tool,
+            arguments={"destinations": ["10.1.2.3"], "port": 443, "protocol": "tcp"},
+            requested_targets=(IpTargetReference(type="ip", address="10.1.2.3"),),
+        ),
+        working_state_update=None, next_iteration_hints=(),
+    )
+    planner = MockPlanner(output)
+    ids = PlanningOperationIds(
+        operation_id="approval-loop", plan_id="approval-loop-plan",
+        run_id="approval-loop-run", thread_id=_thread_id(mission_id, "approval-loop-run"),
+        decision_id="approval-loop-decision", execution_id="approval-loop-execution",
+        task_id="approval-loop-task",
+    )
+
+    proposed = kernel.workflow.run_planning_loop(
+        envelope=envelope, ids=ids, invoke_planner=planner.invoke,
+    )
+    assert proposed.action_transition is not None
+    assert proposed.action_transition.decision.decision == "REQUIRE_APPROVAL"
+    assert proposed.action_transition.dispatch is None
+    assert kernel.phase0c.phase0b.mock_adapter.submit_calls == 0
+    saved_plan = kernel.action_service.saved_plan(ids.plan_id)
+    assert saved_plan is not None
+
+    waiting = kernel.workflow.run_planning_loop(
+        envelope=envelope, ids=ids,
+        invoke_planner=lambda _current: (_ for _ in ()).throw(
+            AssertionError("approval wait must not invoke the Planner")
+        ),
+    )
+    assert waiting.controller_decision.action == "WAIT"
+    assert waiting.controller_decision.reason_code == "APPROVAL_PENDING"
+    kernel.phase0c.phase0b.phase0a.approval_service.submit_decision(
+        approval_id="approval-loop-record",
+        approval_request_id="approval-approval-loop-decision",
+        actor_token="tok-approver", verdict="APPROVED",
+    )
+
+    resume_ids = PlanningOperationIds(
+        operation_id="approval-loop-resume",
+        plan_id="unused-resume-plan",
+        run_id="approval-loop-resume-run",
+        thread_id=_thread_id(mission_id, "approval-loop-resume-run"),
+        decision_id="unused-resume-decision",
+        execution_id="unused-resume-execution",
+        task_id="unused-resume-task",
+    )
+    resumed = kernel.workflow.run_planning_loop(
+        envelope=envelope,
+        ids=resume_ids,
+        invoke_planner=lambda _current: (_ for _ in ()).throw(
+            AssertionError("approved continuation must not invoke the Planner")
+        ),
+    )
+    assert resumed.action_transition is not None
+    assert resumed.action_transition.plan == saved_plan
+    assert resumed.action_transition.dispatch is not None
+    assert resumed.action_transition.dispatch.execution_id == ids.execution_id
+    assert planner.call_count == 1
+    assert kernel.phase0c.phase0b.mock_adapter.submit_calls == 1
+
+
+def test_approval_wait_is_excluded_from_active_runtime_by_mission_policy() -> None:
+    phase0c = p0c.make_phase0c()
+    kernel, seeded, goal, grant, projection = _inputs(
+        phase0c=phase0c, require_for_side_effect=frozenset({"read_only"})
+    )
+    mission_id = seeded.seeded.revision.mission_id
+    envelope = kernel.planner_context_service.build(
+        planner_context_id="approval-runtime-context", mission_id=mission_id,
+        goal_evaluation_id=goal.evaluation_id, projection=projection,
+        context_grant_id=grant.grant_id,
+        available_tool_snapshot_id=seeded.seeded.snapshot.snapshot_id, iteration=0,
+    )
+    output = PlannerActionOutput(
+        proposal=support.make_proposal(
+            tool=seeded.seeded.tool,
+            arguments={"destinations": ["10.1.2.3"], "port": 443, "protocol": "tcp"},
+            requested_targets=(IpTargetReference(type="ip", address="10.1.2.3"),),
+        ), working_state_update=None, next_iteration_hints=(),
+    )
+    ids = PlanningOperationIds(
+        operation_id="approval-runtime", plan_id="approval-runtime-plan",
+        run_id="approval-runtime-run", thread_id=_thread_id(mission_id, "approval-runtime-run"),
+        decision_id="approval-runtime-decision", execution_id="approval-runtime-execution",
+        task_id="approval-runtime-task",
+    )
+    proposed = kernel.workflow.run_planning_loop(
+        envelope=envelope, ids=ids, invoke_planner=MockPlanner(output).invoke,
+    )
+    assert proposed.action_transition is not None
+    assert proposed.action_transition.decision.decision == "REQUIRE_APPROVAL"
+    before = kernel.phase0c.phase0b.budget_repository.get(mission_id, 1)
+    assert before is not None and before.active_runtime_seconds == 0
+
+    phase0c.monotonic_clock.advance(seconds=10 * 60)  # type: ignore[attr-defined]
+    waiting = kernel.workflow.run_planning_loop(
+        envelope=envelope, ids=ids,
+        invoke_planner=lambda _current: (_ for _ in ()).throw(
+            AssertionError("approval wait must not invoke the Planner")
+        ),
+    )
+    assert waiting.controller_decision.reason_code == "APPROVAL_PENDING"
+    after = kernel.phase0c.phase0b.budget_repository.get(mission_id, 1)
+    assert after is not None and after.active_runtime_seconds == 0
+
+
+def test_active_runtime_limit_finalizes_before_a_new_planner_call() -> None:
+    kernel, seeded, goal, grant, projection = _inputs()
+    mission_id = seeded.seeded.revision.mission_id
+    envelope = kernel.planner_context_service.build(
+        planner_context_id="runtime-limit-context", mission_id=mission_id,
+        goal_evaluation_id=goal.evaluation_id, projection=projection,
+        context_grant_id=grant.grant_id,
+        available_tool_snapshot_id=seeded.seeded.snapshot.snapshot_id, iteration=0,
+    )
+    kernel.phase0c.monotonic_clock.advance(  # type: ignore[attr-defined]
+        seconds=seeded.seeded.revision.max_runtime_minutes * 60
+    )
+    step = kernel.workflow.run_planning_loop(
+        envelope=envelope,
+        ids=PlanningOperationIds(
+            operation_id="runtime-limit", plan_id="runtime-limit-plan",
+            run_id="runtime-limit-run", thread_id=_thread_id(mission_id, "runtime-limit-run"),
+            decision_id="runtime-limit-decision", execution_id="runtime-limit-execution",
+            task_id="runtime-limit-task",
+        ),
+        invoke_planner=lambda _current: (_ for _ in ()).throw(
+            AssertionError("runtime limit must stop before the Planner")
+        ),
+    )
+    assert step.controller_decision.action == "FINALIZE"
+    assert step.controller_decision.reason_code == "HARD_LIMIT"
+    budget = kernel.phase0c.phase0b.budget_repository.get(mission_id, 1)
+    assert budget is not None
+    assert budget.active_runtime_seconds == seeded.seeded.revision.max_runtime_minutes * 60
+    assert budget.consumed_planner_invocations == 0
 
 
 def test_graph_checkpoints_are_written_to_the_application_sqlite_file(
@@ -457,6 +676,85 @@ def test_mock_agent_loop_reaches_goal_through_real_policy_and_executor() -> None
         "SELECT COUNT(*) FROM occ_store WHERE namespace = 'execution_budget_outcome'"
     ).fetchone()[0]
     assert outcomes == 1
+
+
+def test_execution_result_advances_through_analyzer_to_the_next_plan() -> None:
+    kernel, seeded, goal, grant, projection = _inputs()
+    mission_id = seeded.seeded.revision.mission_id
+    envelope = kernel.planner_context_service.build(
+        planner_context_id="continuation-root-context", mission_id=mission_id,
+        goal_evaluation_id=goal.evaluation_id, projection=projection,
+        context_grant_id=grant.grant_id,
+        available_tool_snapshot_id=seeded.seeded.snapshot.snapshot_id, iteration=0,
+    )
+    output = PlannerActionOutput(
+        proposal=support.make_proposal(
+            tool=seeded.seeded.tool,
+            arguments={"destinations": ["10.1.2.3"], "port": 443, "protocol": "tcp"},
+            requested_targets=(IpTargetReference(type="ip", address="10.1.2.3"),),
+        ),
+        working_state_update=None, next_iteration_hints=(),
+    )
+    initial_ids = PlanningOperationIds(
+        operation_id="continuation-initial", plan_id="continuation-initial-plan",
+        run_id="continuation-initial-run",
+        thread_id=_thread_id(mission_id, "continuation-initial-run"),
+        decision_id="continuation-initial-decision",
+        execution_id="continuation-initial-execution", task_id="continuation-initial-task",
+    )
+    initial = kernel.workflow.run_planning_loop(
+        envelope=envelope, ids=initial_ids, invoke_planner=MockPlanner(output).invoke,
+    )
+    assert initial.action_transition is not None
+    assert initial.action_transition.dispatch is not None
+    kernel.workflow.collect_ingest_and_erase(
+        execution_id=initial_ids.execution_id,
+        stdout=b'{"host":"10.1.2.3","status":"open","port":443}', stderr=b"",
+        control=AdapterCollectionControl(
+            provider_status="succeeded", exit_code=0, timed_out=False,
+            started_at=support.T0, finished_at=support.T0,
+            status_normalization_rule_id="status-normalization-v1",
+        ),
+    )
+    analyzer = MockAnalyzer(AnalyzerCandidateObservation(
+        observation_id="continuation-observation", condition_id="c1",
+        source_execution_id=initial_ids.execution_id, observation_type="finding",
+        subject_ref="host-1", predicate="session_candidate", object_ref="sess-next",
+        attributes={"status": "candidate"}, source_artifact_ids=(), llm_confidence=1.0,
+    ))
+    planner_inputs = []
+    continuation_ids = PlanningOperationIds(
+        operation_id="continuation-next", plan_id="continuation-next-plan",
+        run_id="continuation-next-run",
+        thread_id=_thread_id(mission_id, "continuation-next-run"),
+        decision_id="continuation-next-decision",
+        execution_id="continuation-next-execution", task_id="continuation-next-task",
+    )
+
+    advanced = kernel.workflow.advance_after_execution(
+        parent_context_id=envelope.planner_context_id,
+        execution_id=initial_ids.execution_id, ids=continuation_ids,
+        invoke_analyzer=lambda: analyzer.invoke(execution_id=initial_ids.execution_id),
+        invoke_planner=lambda current: planner_inputs.append(current) or output,
+    )
+
+    assert not advanced.waiting_for_execution
+    assert advanced.verified_finding is not None
+    assert advanced.observation is not None and analyzer.call_count == 1
+    assert advanced.planning_step is not None
+    assert advanced.planning_step.action_transition is not None
+    assert advanced.planning_step.action_transition.dispatch is not None
+    assert len(planner_inputs) == 1
+    assert planner_inputs[0].recent_execution_summaries[0].execution_id == initial_ids.execution_id
+    assert kernel.phase0c.phase0b.mock_adapter.submit_calls == 2
+    assert kernel.workflow.loop_graph.checkpointer is not None
+    assert kernel.workflow.loop_graph.checkpointer.get({
+        "configurable": {
+            "thread_id": f"{continuation_ids.thread_id}:continuation",
+        }
+    }) is not None
+    budget = kernel.phase0c.phase0b.budget_repository.get(mission_id, 1)
+    assert budget is not None and budget.consumed_analyzer_invocations == 1
 
 
 def test_hard_limit_aborts_without_planner_or_goal_rewrite() -> None:

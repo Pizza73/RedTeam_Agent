@@ -338,6 +338,17 @@ class PolicyDecisionRepository(_GuardedRepository):
         model = load_model_from_json(PolicyDecision, raw)
         return self._load(PolicyDecision, raw, row_key=decision_id, payload_key=model.decision_id)
 
+    def all_for_mission(self, mission_id: str) -> tuple[PolicyDecision, ...]:
+        decisions = []
+        for row_key, raw in self._db.get_all(self._NS):
+            model = load_model_from_json(PolicyDecision, raw)
+            decision = self._load(
+                PolicyDecision, raw, row_key=row_key, payload_key=model.decision_id
+            )
+            if decision.mission_id == mission_id:
+                decisions.append(decision)
+        return tuple(sorted(decisions, key=lambda item: (item.issued_at, item.decision_id)))
+
 
 class ApprovalRequestRepository(_GuardedRepository):
     _NS = "approval_requests"

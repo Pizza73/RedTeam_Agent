@@ -68,6 +68,8 @@ def _plan(tool_id: str) -> ExecutionPlan:
         goal_evaluation_digest="d",
         action_contract_ref=ActionContractReference(contract_id="c", revision="r", digest="d"),
         execution_precondition_digest="d",
+        execution_precondition_snapshot_digest="d",
+        execution_precondition_evidence=(),
         available_tool_snapshot_id="s",
         available_tool_snapshot_digest="d",
         session_security_context_digest="d",

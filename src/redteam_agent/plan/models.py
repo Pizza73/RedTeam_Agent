@@ -183,6 +183,8 @@ class ExecutionPlan(StrictImmutableBoundaryModel):
     goal_evaluation_digest: str
     action_contract_ref: ActionContractReference
     execution_precondition_digest: str
+    execution_precondition_snapshot_digest: str
+    execution_precondition_evidence: tuple[CanonicalJsonObject, ...]
     available_tool_snapshot_id: str
     available_tool_snapshot_digest: str
     session_security_context_digest: str

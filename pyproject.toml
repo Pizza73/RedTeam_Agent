@@ -44,6 +44,7 @@ ad-mcp = [
 redteam-impacket-mcp = "redteam_agent.mcp_servers.impacket_server:main"
 redteam-ui = "redteam_agent.ui.server:main"
 redteam-product = "redteam_agent.product_cli:main"
+redteam-db = "redteam_agent.database_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

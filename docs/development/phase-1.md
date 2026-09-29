@@ -11,12 +11,12 @@
 
 | 要件 | 実装 / Evidence |
 | --- | --- |
-| Mission→Planner→Policy→Executor→Analyzer→Goal | `Phase1AgentWorkflow`のcompiled LangGraph、`tests/integration/test_phase1_mock_loop.py::test_mock_agent_loop_reaches_goal_through_real_policy_and_executor` |
-| Coarse Agent Graph / retry境界 | `tests/integration/test_phase1_mock_loop.py::test_phase1_uses_compiled_coarse_graphs_without_automatic_retry`。Planning 12 node、Analysis 8 nodeを実経路に接続し、LangGraph automatic retryは全nodeで未設定 |
+| Mission→Planner→Policy→Executor→Analyzer→Goal | Planning / Analysisに加え、既存ExecutionのResult確定→Verified Source Projection→Analyzer→Current Context再構築→次Plannerを所有するContinuation LangGraphを接続。`tests/integration/test_phase1_mock_loop.py::test_execution_result_advances_through_analyzer_to_the_next_plan` |
+| Coarse Agent Graph / retry境界 | `tests/integration/test_phase1_mock_loop.py::test_phase1_uses_compiled_coarse_graphs_without_automatic_retry`。Planning、Analysis、Continuationのcompiled LangGraphを実経路に接続し、automatic retryは全nodeで未設定 |
 | Analyzer Context / Source Binding | Analyzer用Selector→Grant→Builderと、callback前のexact Execution/Result Digest検証、callback後のsource Execution一致を強制。正常loop内のforged digest / planner grant negative oracle |
 | Context Grant / Tool Snapshot前後検証 | `PlannerContextService`、`test_phase1_planner_context.py`、`test_phase1_context_builder.py` |
 | Scope外・UnavailableのProvider到達拒否 | `PlannerActionApplicationService`、Phase 0A/0B Policy・Executor negative suite |
-| Bounded Context Request / typed Retrieval Hint | Envelope lineage、durable context retry budget、Pydantic closed union tests |
+| Bounded Context Request / typed Retrieval Hint | Envelope lineage、durable context retry budget、Pydantic closed unionに加え、同じPlanning LangGraph内でControllerへ戻す。連続2回後は`NO_VALID_PROPOSAL`でPAUSED |
 | Stale Context再構築 | Planning Graphの`context_rebuild`でCurrent Goal / Tool Snapshot / Context Selection / Grant / Bodyを所有Serviceから再構築。Context Requestと同じ系譜別の永続2回上限を共有し、再構築後EnvelopeをPlanner callbackへ直接渡す |
 | Durable Graph checkpoint | `langgraph-checkpoint-sqlite==3.1.1`を固定し、Planning / Analysis Graphを同一Application SQLiteの専用接続へ保存。checkpoint stateはOperation / Repository Record IDとrouting文字列だけに限定し、業務RecordやContext本文を保存しない。checkpoint schemaは明示provisioning対象とし、通常起動時の暗黙migrationを拒否 |
 | Canonical run / thread binding | Planning / Analysisのcheckpoint load前とAction適用前に、Current Mission Revision、Application `run_id`、`thread_id = mission_id:mission_revision:run_id`を照合。Malformed、別Revision、別runからの再利用を副作用前に拒否 |
@@ -26,13 +26,15 @@
 | Verified Fact / Finding | `VerifiedFindingProjector`は成功・取込・消去完了済みExecutionだけを確認済みFindingへ投影し、Knowledge headをCritical mutationとして更新 |
 | Versioned Semantic Catalog | `SemanticCatalog`、unknown predicate rejection test |
 | ActionContract / finite prerequisite search | `FinitePrerequisiteSearch`、実行直前Predicate Snapshot再検証 |
-| Shared LLM Gateway / attempt reservation | `SharedLLMGateway`、同一InputのOperation ID差替えとstale Contextをcallback前に拒否 |
+| Shared LLM Gateway / attempt reservation | `SharedLLMGateway`、同一InputのOperation ID差替えとstale Contextをcallback前に拒否。論理Planner / Analyzer呼出しをMissionのdurable counterへ事前予約 |
+| Exact Approval Wait / Resume | `REQUIRE_APPROVAL`ではPlanを永続化して送信せず、Controllerは`APPROVAL_PENDING`で待機。承認後は同じPlan / Decisionだけを再検査して単回Dispatchし、Plannerを再呼出ししない |
+| Active Runtime | Boot identity付き`RuntimeSegment`を永続化し、単調Clockで未精算区間をPlanner / Dispatch前に計上。承認待ちの算入はMission Policyに従う |
 | D10 failure accounting | `ExecutionOutcomeAccountingService`、Execution作成順・取込完了後・一度だけ適用 |
 | retry境界分離 | context / persistent commit / dispatch / collection / ingestion / reconciliationの永続Budgetを別Keyで管理 |
 | AD Principal Context Goal | Current Active Session、exact principal、Session Managerが確認した登録済みAD Group SIDを同時要求。Group証明なしを拒否 |
 | Finalization | 終了理由を固定し、期限到達は`ABORTED`、Goal達成は`COMPLETED`へ収束。`tests/integration/test_phase1_mock_loop.py::test_finalizing_cancelled_execution_collects_ingests_and_completes`と`::test_finalizing_resume_uses_bounded_reconciliation_and_cancel` |
 | 有限Recovery停止 | RUNNING/FINALIZINGの予算枯渇をexact Execution固定のUnresolved Itemと`WAITING_HUMAN_REVIEW`へ収束。`tests/integration/test_phase1_mock_loop.py::test_running_recovery_budget_exhaustion_converges_to_human_review` |
-| 最大Iteration | Planner iterationをdurable dispatch budgetへ一致させ、ControllerがMission上限で停止 |
+| 最大Iteration | Planner論理呼出しをdispatch数と分離してdurable計上し、Context Requestを含めMission `max_iterations`で停止。AnalyzerとExternal Dispatchも別counterで管理 |
 
 ## AI-01〜12 対応
 

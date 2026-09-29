@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -123,7 +124,9 @@ def test_production_bundle_rejects_in_memory_generation_authentication() -> None
 def test_missing_schema_fails_closed_no_migration() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         db_path = str(Path(tmp) / "empty.db")
-        Database(db_path, create_schema=False).close()  # create an empty DB with no schema
+        # Provision an existing but empty file without asking the application
+        # startup path to create anything as a side effect.
+        sqlite3.connect(db_path).close()
         plan = ProductionStartupPlan(
             activation_lock_path=str(Path(tmp) / "act.lock"), application_db_path=db_path,
             topology=_single_host(), witness=_production_witness(),

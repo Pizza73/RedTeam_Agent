@@ -9,7 +9,9 @@ import pytest
 from redteam_agent.canonical.digest_service import DigestService
 from redteam_agent.composition import kali_product
 from redteam_agent.composition.kali_product import KaliProductSettings
+from redteam_agent.database_cli import initialize_database
 from redteam_agent.llm.profile import build_local_llm_profile
+from redteam_agent.ui.auth import UIAuthenticationError
 
 
 class _FakeVllmCapabilityPort:
@@ -57,6 +59,7 @@ def _settings(tmp_path: Path) -> KaliProductSettings:
     static.mkdir()
     return KaliProductSettings(
         databasePath=str(tmp_path / "product.db"),
+        activationLockPath=str(tmp_path / "activation.lock"),
         staticDirectory=str(static),
         operatorTokenFile=str(token),
         vllmApiKeyFile=str(tmp_path / "vllm.key"),
@@ -72,6 +75,7 @@ def _settings(tmp_path: Path) -> KaliProductSettings:
 def test_kali_product_wires_auth_and_persistent_owner_without_enabling_execution(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setattr(kali_product, "Phase2VllmCapabilityPort", _FakeVllmCapabilityPort)
     settings = _settings(tmp_path)
+    initialize_database(Path(settings.databasePath), lock_path=Path(settings.activationLockPath))
 
     first = kali_product.build_kali_product_application(settings)
     assert first.control_plane.health()["missionExecutionEnabled"] is False
@@ -88,6 +92,22 @@ def test_kali_product_wires_auth_and_persistent_owner_without_enabling_execution
         assert second.settings.productionEligible is False
     finally:
         second.close()
+
+
+def test_kali_product_build_failure_releases_database_and_activation_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(kali_product, "Phase2VllmCapabilityPort", _FakeVllmCapabilityPort)
+    settings = _settings(tmp_path)
+    initialize_database(Path(settings.databasePath), lock_path=Path(settings.activationLockPath))
+    token = Path(settings.operatorTokenFile)
+    token.write_bytes(b"short")
+    with pytest.raises(UIAuthenticationError, match="size is invalid"):
+        kali_product.build_kali_product_application(settings)
+
+    token.write_bytes(b"a" * 32)
+    application = kali_product.build_kali_product_application(settings)
+    application.close()
 
 
 def test_kali_product_direct_bind_requires_exact_matching_origin(tmp_path: Path) -> None:
@@ -150,6 +170,7 @@ def test_kali_product_attaches_server_owned_ad_collector_when_enabled(tmp_path: 
             "adCollectorCertipyPython": "/usr/bin/python3",
         }
     )
+    initialize_database(Path(settings.databasePath), lock_path=Path(settings.activationLockPath))
 
     application = kali_product.build_kali_product_application(settings)
     try:

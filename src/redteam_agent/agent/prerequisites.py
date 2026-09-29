@@ -20,6 +20,11 @@ class PredicateEvaluation(StrictImmutableBoundaryModel):
     predicate_id: str = Field(min_length=1)
     truth: Literal["true", "false", "unknown"]
     source_digest: str = Field(min_length=1)
+    source_owner: str = Field(min_length=1)
+    source_record_id: str = Field(min_length=1)
+    source_version: int = Field(ge=1)
+    rule_id: str = Field(min_length=1)
+    eligible: bool
 
 
 class PredicateSnapshot(StrictImmutableBoundaryModel):

@@ -8,6 +8,7 @@ start (it does not force-steal the lock). The lock is held for the life of the r
 from __future__ import annotations
 
 import fcntl
+import os
 from pathlib import Path
 from types import TracebackType
 from typing import IO
@@ -22,7 +23,8 @@ class HostActivationLock:
 
     def acquire(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        handle = open(self._path, "w")  # noqa: SIM115 - held open for the lock lifetime
+        descriptor = os.open(self._path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        handle = os.fdopen(descriptor, "r+")
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:

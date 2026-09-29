@@ -136,13 +136,14 @@ class Phase0AKernel:
 def build_test_kernel(
     *,
     db_path: str = ":memory:",
+    create_schema: bool = True,
     registry_revision: int = DEFAULT_REGISTRY_REVISION,
     clock: Clock | None = None,
     allowed_profile_types: frozenset[str] = frozenset({"mock"}),
     capability_verifier: LLMCapabilityVerifier | None = None,
     registered_session_refs: frozenset[str] = frozenset({"sess-1"}),
 ) -> Phase0AKernel:
-    database = Database(db_path)
+    database = Database(db_path, create_schema=create_schema)
     digest_service = DigestService()
     clock = clock if clock is not None else SystemUtcClock()
     risk_policy = default_risk_policy(digest_service)
@@ -252,6 +253,7 @@ def build_test_kernel(
         write_guard=guard,
         registry_revision=registry_revision,
         contract_catalog=contract_catalog,
+        digest_service=digest_service,
     )
     tool_availability_service = ToolAvailabilityService(
         state_repository=state_repo,

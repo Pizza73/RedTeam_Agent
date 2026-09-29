@@ -70,6 +70,24 @@ class SharedLLMGateway:
     def __init__(self, *, database: Database, digest_service: DigestService, clock: Clock) -> None:
         self._db, self._ds, self._clock = database, digest_service, clock
         self._planner_context_revalidator: Callable[[str], PlannerContextEnvelope] | None = None
+        self._reserve_planner: Callable[[str, int], None] | None = None
+        self._reserve_analyzer: Callable[[str, int], None] | None = None
+        self._check_runtime: Callable[[str, int], None] | None = None
+
+    def bind_planner_budget(self, reserve: Callable[[str, int], None]) -> None:
+        if self._reserve_planner is not None:
+            raise AgentLoopError("Planner budget is already bound")
+        self._reserve_planner = reserve
+
+    def bind_analyzer_budget(self, reserve: Callable[[str, int], None]) -> None:
+        if self._reserve_analyzer is not None:
+            raise AgentLoopError("Analyzer budget is already bound")
+        self._reserve_analyzer = reserve
+
+    def bind_runtime_check(self, check: Callable[[str, int], None]) -> None:
+        if self._check_runtime is not None:
+            raise AgentLoopError("LLM runtime check is already bound")
+        self._check_runtime = check
 
     def bind_planner_context_revalidator(
         self, revalidator: Callable[[str], PlannerContextEnvelope]
@@ -140,7 +158,18 @@ class SharedLLMGateway:
         input_key = f"{mission_id}:{mission_revision}:{role}:{input_digest}"
         if self._db.occ_get("llm_gateway_input", input_key) is not None:
             raise AgentLoopError("LLM input cannot reset its budget with a new operation id")
+        if self._check_runtime is None:
+            raise AgentLoopError("LLM runtime check is not bound")
+        self._check_runtime(mission_id, mission_revision)
         with UnitOfWork(self._db):
+            if role == "planner":
+                if self._reserve_planner is None:
+                    raise AgentLoopError("Planner budget is not bound")
+                self._reserve_planner(mission_id, mission_revision)
+            else:
+                if self._reserve_analyzer is None:
+                    raise AgentLoopError("Analyzer budget is not bound")
+                self._reserve_analyzer(mission_id, mission_revision)
             self._db.occ_insert(
                 "llm_gateway_input", input_key, 1,
                 json.dumps({"operation_id": operation_id}, sort_keys=True),

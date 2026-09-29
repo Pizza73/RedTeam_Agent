@@ -171,6 +171,7 @@ def build_phase0b_kernel(
     )
     budget_service = MissionExecutionBudgetService(
         database=database, repository=budget_repo, clock=kernel.clock, digest_service=ds, write_guard=exec_guard,
+        lifecycle_event_repository=kernel.event_repository,
     )
     executor = Executor(
         database=database, gate=kernel.authorization_gate, execution_repository=execution_repo,

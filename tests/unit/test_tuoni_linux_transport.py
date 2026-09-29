@@ -1,4 +1,4 @@
-"""Offline tests for the Ubuntu one-shot Tuoni process transport."""
+"""Offline tests for the Kali one-shot Tuoni process transport."""
 
 from __future__ import annotations
 
@@ -59,6 +59,25 @@ def _attestation() -> TuoniTransportAttestation:
     )
 
 
+def test_control_vm_identity_accepts_only_kali_2026_3_x86_64(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(linux_transport.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(linux_transport.platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(
+        linux_transport.Path, "read_text",
+        lambda _path, **_kwargs: 'ID=kali\nVERSION_ID="2026.3"\n',
+    )
+    linux_transport._verify_kali_2026_3_x86_64()
+
+    monkeypatch.setattr(
+        linux_transport.Path, "read_text",
+        lambda _path, **_kwargs: 'ID=ubuntu\nVERSION_ID="24.04"\n',
+    )
+    with pytest.raises(C2AdapterTransportError, match=r"Kali 2026\.3"):
+        linux_transport._verify_kali_2026_3_x86_64()
+
+
 def test_parent_process_transport_uses_fixed_module_and_bounded_ipc(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -79,7 +98,7 @@ def test_parent_process_transport_uses_fixed_module_and_bounded_ipc(
         )
         return subprocess.CompletedProcess(argv, 0, response.model_dump_json().encode(), b"")
 
-    monkeypatch.setattr(linux_transport, "_verify_ubuntu_24_04_x86_64", lambda: None)
+    monkeypatch.setattr(linux_transport, "_verify_kali_2026_3_x86_64", lambda: None)
     monkeypatch.setattr(linux_transport.subprocess, "run", fake_run)
     transport = TuoniLinuxProcessTransport(attestation)
 
@@ -107,7 +126,7 @@ def test_parent_process_timeout_is_content_free(
     def timed_out(*_args: object, **_kwargs: object) -> None:
         raise subprocess.TimeoutExpired("secret-command", 35)
 
-    monkeypatch.setattr(linux_transport, "_verify_ubuntu_24_04_x86_64", lambda: None)
+    monkeypatch.setattr(linux_transport, "_verify_kali_2026_3_x86_64", lambda: None)
     monkeypatch.setattr(linux_transport.subprocess, "run", timed_out)
     transport = TuoniLinuxProcessTransport(_attestation())
 
@@ -130,7 +149,7 @@ def test_parent_process_crash_is_content_free_and_discards_stderr(
         captured.update(kwargs)
         return subprocess.CompletedProcess(argv, 2, b"", b"provider-secret")
 
-    monkeypatch.setattr(linux_transport, "_verify_ubuntu_24_04_x86_64", lambda: None)
+    monkeypatch.setattr(linux_transport, "_verify_kali_2026_3_x86_64", lambda: None)
     monkeypatch.setattr(linux_transport.subprocess, "run", crashed)
     transport = TuoniLinuxProcessTransport(_attestation())
 
@@ -160,7 +179,7 @@ def test_parent_rejects_worker_response_bound_to_another_operation(
         )
         return subprocess.CompletedProcess(argv, 0, response.model_dump_json().encode(), b"")
 
-    monkeypatch.setattr(linux_transport, "_verify_ubuntu_24_04_x86_64", lambda: None)
+    monkeypatch.setattr(linux_transport, "_verify_kali_2026_3_x86_64", lambda: None)
     monkeypatch.setattr(linux_transport.subprocess, "run", confused)
     transport = TuoniLinuxProcessTransport(attestation)
 

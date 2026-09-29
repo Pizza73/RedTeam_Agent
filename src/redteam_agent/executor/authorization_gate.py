@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from redteam_agent.approval.service import evaluate_executable, verify_presentation_matches_intent
 from redteam_agent.auth.rbac import RbacPolicy
 from redteam_agent.canonical.digest_service import DigestService
-from redteam_agent.contracts.catalog import ActionContractCatalog
+from redteam_agent.contracts.catalog import ActionContractCatalog, compute_execution_precondition_digest
 from redteam_agent.errors import AuthorizationKernelError, MisleadingApprovalPresentationError
 from redteam_agent.plan.models import ExecutionPlan, compute_proposal_digest
 from redteam_agent.policy.engine import PolicyEngine, context_from_mission
@@ -182,7 +182,19 @@ class ExecutorAuthorizationGate:
         contract = self._contracts.get(tool.action_contract_ref.contract_id)
         if contract is None:
             return GateResult(False, "CONTRACT_NOT_REGISTERED")
-        if plan.execution_precondition_digest != contract.execution_precondition_digest:
+        expected_preconditions = compute_execution_precondition_digest(
+            definition=contract, requested_targets=plan.proposal.requested_targets,
+            predicate_snapshot_digest=plan.execution_precondition_snapshot_digest,
+            predicate_evidence=tuple(dict(item) for item in plan.execution_precondition_evidence),
+            digest_service=self._digests,
+        )
+        evidence = tuple(dict(item) for item in plan.execution_precondition_evidence)
+        if contract.preconditions and (
+            {str(item.get("predicate_id")) for item in evidence} != set(contract.preconditions)
+            or any(item.get("truth") != "true" or item.get("eligible") is not True for item in evidence)
+        ):
+            return GateResult(False, "PRECONDITION_EVIDENCE_STALE")
+        if plan.execution_precondition_digest != expected_preconditions:
             return GateResult(False, "PRECONDITION_DIGEST_MISMATCH")
         # The decision's resolved adapter must match the registered tool's fixed
         # adapter (a stored-field tamper with a recomputed decision digest is

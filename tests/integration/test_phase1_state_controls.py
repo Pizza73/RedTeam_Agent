@@ -142,7 +142,9 @@ def test_finite_prerequisite_search_uses_observer_for_unknown_predicate() -> Non
         tools=views, created_at=support.T0, expires_at=support.T0.replace(year=support.T0.year + 1),
     )
     evaluation = PredicateEvaluation(
-        predicate_id="session_exists", truth="unknown", source_digest="source"
+        predicate_id="session_exists", truth="unknown", source_digest="source",
+        source_owner="session_manager", source_record_id="session:sess-1",
+        source_version=1, rule_id="session-current-v1", eligible=True,
     )
     fields = {
         "mission_id": support.MISSION_ID, "mission_revision": 1, "authorization_epoch": 0,

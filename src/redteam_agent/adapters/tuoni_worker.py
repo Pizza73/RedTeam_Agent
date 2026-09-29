@@ -1,4 +1,4 @@
-"""One-shot Tuoni HTTPS worker for the Ubuntu local-process transport.
+"""One-shot Tuoni HTTPS worker for the Kali local-process transport.
 
 This module is launched only through ``python -I -m`` by the fixed parent
 transport.  It reads a root/service-owned credential file, logs in over a
